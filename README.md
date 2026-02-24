@@ -1,15 +1,16 @@
 # Conch
 
-LLM-assisted shell with built-in DevOps and security expertise. Press a key, describe what you want, get a command. Multi-turn chat for general questions. No dependencies beyond Python 3.9+ stdlib.
+An LLM in your shell. Describe any task in plain English — file operations, text processing, networking, DevOps, security, whatever — and get the right command back. Works with every command on your system.
 
 Created by **Tom Hallaran**.
 
 ## Features
 
-- **`ask`** — Describe what you want in plain language, get a shell command inserted on your line.
-- **`chat`** — Multi-turn conversation with the LLM for general questions and follow-ups.
-- **DevOps-aware** — Deep knowledge of kubectl, helm, terraform, AWS CLI, Vercel, npm, and infrastructure-as-code workflows. Auto-detects installed tools.
-- **Security-aware** — Deep knowledge of nmap, nikto, sqlmap, hydra, nuclei, and 30+ security tools. Adapts suggestions based on what's installed.
+- **`ask`** — Describe any task in plain English, get the shell command for it. Works for everything: `find`, `grep`, `awk`, `sed`, `curl`, `tar`, `rsync`, `ffmpeg`, `jq`, `xargs`, pipes, redirects — any command your shell can run.
+- **`chat`** — Multi-turn conversation with the LLM for general questions, explanations, and follow-ups.
+- **Understands your system** — Auto-detects 50+ installed tools and adapts suggestions to what you actually have. Knows your OS, shell, and current directory.
+- **DevOps expertise** — Deep knowledge of kubectl, helm, terraform, AWS CLI, Vercel, npm, Docker, git, and infrastructure-as-code workflows.
+- **Security expertise** — Deep knowledge of nmap, nikto, sqlmap, hydra, nuclei, and 30+ security/networking tools.
 - **Configurable LLM** — OpenAI, Anthropic, or Ollama. Swap models in one line.
 - **Shell completions** — kubectl, helm, terraform, AWS, npm, argocd, istioctl, kustomize, k9s, Docker, git, and general zsh completions out of the box.
 - **Zero deps** — Python stdlib only. No pip packages required.
@@ -33,11 +34,23 @@ Then open a **new terminal**.
 
 ## Usage
 
-### `ask` — Get a shell command
+### `ask` — Get any shell command
 
 ```
 $ ask find all python files larger than 1mb
 → find . -name "*.py" -size +1M
+
+$ ask replace all tabs with spaces in every .js file
+→ find . -name "*.js" -exec sed -i '' 's/\t/    /g' {} +
+
+$ ask compress this directory into a tar.gz excluding node_modules
+→ tar czf archive.tar.gz --exclude='node_modules' .
+
+$ ask show disk usage sorted by size
+→ du -sh * | sort -rh
+
+$ ask download this url and extract all email addresses
+→ curl -s https://example.com | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
 $ ask scan localhost for open ports and vulnerabilities
 → nmap -sS -sV -O --script vuln localhost
@@ -77,9 +90,9 @@ A Dockerfile is a text document that contains all the commands...
 
 **Keyboard shortcut:** **Ctrl+X then Ctrl+G** starts `chat`.
 
-### Kubernetes, Terraform, AWS, Vercel & npm
+### DevOps: Kubernetes, Terraform, AWS, Vercel & npm
 
-Conch understands cloud-native and DevOps workflows:
+Conch also has deep knowledge of cloud-native and DevOps workflows:
 
 ```
 $ ask list all pods in kube-system namespace
@@ -192,7 +205,7 @@ conch/
 └── pyproject.toml             # Optional pip install
 ```
 
-- **`conch-ask`** sends your request + context (cwd, OS, installed tools) to the LLM and prints one command.
+- **`conch-ask`** sends your request + context (cwd, OS, installed tools) to the LLM and returns one command. Works for any shell command — not limited to specific tools.
 - **`conch-chat`** maintains conversation history for multi-turn Q&A with highlighted output and animated spinner.
 - **Shell integration** uses `bindkey -s` to map shortcuts to the `ask`/`chat` functions. Completions for kubectl, helm, terraform, AWS, npm, argocd, istioctl, kustomize, k9s, Docker, git, and general commands are set up via `compinit`.
 - **Tool detection** scans for 50+ DevOps, security, and development tools at each invocation so the LLM knows what's available.

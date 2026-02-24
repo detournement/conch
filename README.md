@@ -8,11 +8,13 @@ Created by **Tom Hallaran**.
 
 - **`ask`** — Describe any task in plain English, get the shell command for it. Works for everything: `find`, `grep`, `awk`, `sed`, `curl`, `tar`, `rsync`, `ffmpeg`, `jq`, `xargs`, pipes, redirects — any command your shell can run.
 - **`chat`** — Multi-turn conversation with the LLM for general questions, explanations, and follow-ups. Supports **MCP tool calling** — connect any MCP server (Composio, filesystem, GitHub, custom) and the LLM can use those tools during chat.
-- **Understands your system** — Auto-detects 50+ installed tools and adapts suggestions to what you actually have. Knows your OS, shell, and current directory.
+- **Understands your system** — Auto-detects 50+ installed tools and adapts suggestions to what you actually have. Knows your OS, shell, current directory, and current date/time.
 - **DevOps expertise** — Deep knowledge of kubectl, helm, terraform, AWS CLI, Vercel, npm, Docker, git, and infrastructure-as-code workflows.
 - **Security expertise** — Deep knowledge of nmap, nikto, sqlmap, hydra, nuclei, and 30+ security/networking tools.
 - **Configurable LLM** — OpenAI, Anthropic, or Ollama. Swap models in one line.
 - **Shell completions** — kubectl, helm, terraform, AWS, npm, argocd, istioctl, kustomize, k9s, Docker, git, and general zsh completions out of the box.
+- **Self-aware** — Ask Conch what it can do, what shortcuts it has, or how to configure it, and it will tell you.
+- **Time-aware** — Always knows the current date and time for scheduling, flight lookups, time-sensitive queries.
 - **Zero deps** — Python stdlib only. No pip packages required.
 
 ## Install
@@ -89,6 +91,8 @@ A Dockerfile is a text document that contains all the commands...
 ```
 
 **Keyboard shortcut:** **Ctrl+X then Ctrl+G** starts `chat`.
+
+When MCP tools are configured (see below), chat can also call external tools — search the web, read files, run code, and more.
 
 ### DevOps: Kubernetes, Terraform, AWS, Vercel & npm
 
@@ -174,10 +178,7 @@ Create `~/.config/conch/mcp.json`:
     },
     "composio": {
       "type": "http",
-      "url": "https://mcp.composio.dev/v1/your-session-url",
-      "headers": {
-        "Authorization": "Bearer YOUR_COMPOSIO_API_KEY"
-      }
+      "url": "https://backend.composio.dev/v3/mcp/YOUR_SERVER_ID/mcp?user_id=YOUR_USER_ID"
     }
   }
 }
@@ -194,8 +195,12 @@ When MCP tools are configured, `chat` loads them automatically:
 ```
 $ chat
 Conch chat (openai/gpt-4o-mini)
-14 MCP tools available
+126 MCP tools available
 Type 'exit' or Ctrl+D to quit.
+
+you: search the web for kubernetes 1.32 release notes
+  ⚡ COMPOSIO_SEARCH_WEB
+assistant: Kubernetes 1.32 "Penelope" was released December 11, 2024...
 
 you: list the files in my project directory
   ⚡ list_directory
@@ -210,11 +215,23 @@ The LLM decides when to call tools based on your request. Tool calls show as `�
 
 ### Composio
 
-[Composio](https://docs.composio.dev/docs/tools-and-toolkits) provides 1000+ tools across GitHub, Slack, Jira, Gmail, and more via a single MCP endpoint. To set it up:
+[Composio](https://docs.composio.dev/docs/tools-and-toolkits) provides 1000+ tools across GitHub, Slack, Jira, Gmail, and more via a single MCP endpoint. Conch uses Composio's no-auth toolkits out of the box — web search, news, code interpreter, web scraping, and more.
+
+To set it up:
 
 1. Sign up at [composio.dev](https://composio.dev/) and get your API key
-2. Create an MCP session to get your endpoint URL
-3. Add the URL and key to `mcp.json` as shown above
+2. Create an MCP server via the [dashboard](https://platform.composio.dev/?next_page=/mcp-configs) or API:
+
+```bash
+curl -X POST https://backend.composio.dev/api/v3/mcp/servers \
+  -H "x-api-key: YOUR_COMPOSIO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "conch-tools", "auth_config_ids": [], "no_auth_apps": ["serpapi", "composio_search", "codeinterpreter", "firecrawl", "tavily"]}'
+```
+
+3. Copy the `mcp_url` from the response (append `/mcp?user_id=conch` to it) and add it to `~/.config/conch/mcp.json`
+
+This gives you 100+ tools including web search, news, code execution, web scraping, flight search, finance data, and more.
 
 See `mcp.example.json` in this repo for a full example config.
 

@@ -2,10 +2,7 @@
   "mcpServers": {
     "composio": {
       "type": "http",
-      "url": "https://mcp.composio.dev/v1/your-session-url",
-      "headers": {
-        "Authorization": "Bearer YOUR_COMPOSIO_API_KEY"
-      }
+      "url": "https://backend.composio.dev/v3/mcp/YOUR_SERVER_ID/mcp?user_id=conch-default"
     },
     "filesystem": {
       "type": "stdio",

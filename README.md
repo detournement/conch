@@ -7,7 +7,7 @@ Created by **Tom Hallaran**.
 ## Features
 
 - **`ask`** — Describe any task in plain English, get the shell command for it. Works for everything: `find`, `grep`, `awk`, `sed`, `curl`, `tar`, `rsync`, `ffmpeg`, `jq`, `xargs`, pipes, redirects — any command your shell can run.
-- **`chat`** — Multi-turn conversation with the LLM for general questions, explanations, and follow-ups.
+- **`chat`** — Multi-turn conversation with the LLM for general questions, explanations, and follow-ups. Supports **MCP tool calling** — connect any MCP server (Composio, filesystem, GitHub, custom) and the LLM can use those tools during chat.
 - **Understands your system** — Auto-detects 50+ installed tools and adapts suggestions to what you actually have. Knows your OS, shell, and current directory.
 - **DevOps expertise** — Deep knowledge of kubectl, helm, terraform, AWS CLI, Vercel, npm, Docker, git, and infrastructure-as-code workflows.
 - **Security expertise** — Deep knowledge of nmap, nikto, sqlmap, hydra, nuclei, and 30+ security/networking tools.
@@ -148,6 +148,76 @@ subfinder amass john-jumbo hashcat mtr socat testssl
 arp-scan wireshark
 ```
 
+## MCP Tools
+
+Conch's `chat` mode supports [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) tools. Connect any MCP-compatible server and the LLM can call those tools during conversation — read files, create GitHub issues, search the web, manage infrastructure, and more.
+
+### Setup
+
+Create `~/.config/conch/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/projects"]
+    },
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_your_token"
+      }
+    },
+    "composio": {
+      "type": "http",
+      "url": "https://mcp.composio.dev/v1/your-session-url",
+      "headers": {
+        "Authorization": "Bearer YOUR_COMPOSIO_API_KEY"
+      }
+    }
+  }
+}
+```
+
+Two transport types:
+- **`stdio`** — spawns a local process (e.g. `npx @modelcontextprotocol/server-*`)
+- **`http`** — connects to a remote HTTP endpoint (e.g. [Composio](https://composio.dev/))
+
+### Usage
+
+When MCP tools are configured, `chat` loads them automatically:
+
+```
+$ chat
+Conch chat (openai/gpt-4o-mini)
+14 MCP tools available
+Type 'exit' or Ctrl+D to quit.
+
+you: list the files in my project directory
+  ⚡ list_directory
+assistant: Here are the files in /Users/you/projects...
+
+you: read the README and summarize it
+  ⚡ read_text_file
+assistant: The README describes...
+```
+
+The LLM decides when to call tools based on your request. Tool calls show as `⚡ tool_name` in the output.
+
+### Composio
+
+[Composio](https://docs.composio.dev/docs/tools-and-toolkits) provides 1000+ tools across GitHub, Slack, Jira, Gmail, and more via a single MCP endpoint. To set it up:
+
+1. Sign up at [composio.dev](https://composio.dev/) and get your API key
+2. Create an MCP session to get your endpoint URL
+3. Add the URL and key to `mcp.json` as shown above
+
+See `mcp.example.json` in this repo for a full example config.
+
 ## Configuration
 
 Config file (first found wins): `$CONCH_CONFIG`, `~/.config/conch/config`, or `~/.conchrc`.
@@ -193,22 +263,25 @@ conch/
 │   └── conch-run-with-timeout # Subprocess timeout wrapper
 ├── conch/
 │   ├── cli.py                 # ask entrypoint (25s process timeout)
-│   ├── chat.py                # chat loop + one-shot mode
+│   ├── chat.py                # chat loop + MCP tool calling
 │   ├── config.py              # Config loader (file + defaults)
 │   ├── llm.py                 # OpenAI/Anthropic/Ollama clients + tool detection
+│   ├── mcp.py                 # MCP client (stdio + HTTP transports)
 │   └── render.py              # Terminal markdown highlighting + spinner
 ├── shell/
 │   ├── conch.zsh              # Zsh: ask, chat, key bindings, completions
 │   └── conch.bash             # Bash: ask, key bindings
 ├── install.sh                 # One-command installer
 ├── config.example             # Example config file
+├── mcp.example.json           # Example MCP server config
 └── pyproject.toml             # Optional pip install
 ```
 
 - **`conch-ask`** sends your request + context (cwd, OS, installed tools) to the LLM and returns one command. Works for any shell command — not limited to specific tools.
-- **`conch-chat`** maintains conversation history for multi-turn Q&A with highlighted output and animated spinner.
+- **`conch-chat`** maintains conversation history for multi-turn Q&A with highlighted output, animated spinner, and MCP tool execution.
 - **Shell integration** uses `bindkey -s` to map shortcuts to the `ask`/`chat` functions. Completions for kubectl, helm, terraform, AWS, npm, argocd, istioctl, kustomize, k9s, Docker, git, and general commands are set up via `compinit`.
 - **Tool detection** scans for 50+ DevOps, security, and development tools at each invocation so the LLM knows what's available.
+- **MCP integration** connects to any MCP server (stdio or HTTP) for tool calling in chat mode. Config in `~/.config/conch/mcp.json`.
 - **No auto-execution** — commands are inserted on your line; you always press Enter to run.
 
 ## Requirements

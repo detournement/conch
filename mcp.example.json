@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "composio": {
+      "type": "http",
+      "url": "https://mcp.composio.dev/v1/your-session-url",
+      "headers": {
+        "Authorization": "Bearer YOUR_COMPOSIO_API_KEY"
+      }
+    },
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/projects"]
+    },
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_your_token_here"
+      }
+    }
+  }
+}

@@ -1,4 +1,5 @@
 """LLM clients: OpenAI, Anthropic, Ollama. Return single command string."""
+import datetime
 import json
 import os
 import re
@@ -70,6 +71,8 @@ def build_messages(config: dict, user_request: str, context: dict) -> Tuple[List
     """Build OpenAI-style messages and system prompt."""
     system = config.get("system_prompt", "")
     parts = [user_request]
+    now = datetime.datetime.now()
+    parts.append(f"(Current date/time: {now.strftime('%Y-%m-%d %H:%M %Z').strip()})")
     if context.get("cwd"):
         parts.append(f"(Current directory: {context['cwd']})")
     if context.get("os_shell"):

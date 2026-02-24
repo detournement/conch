@@ -18,7 +18,7 @@ Created by **Tom Hallaran**.
 ## Install
 
 ```bash
-git clone <repo-url> ~/conch
+git clone git@github.com:detournement/conch.git ~/conch
 cd ~/conch
 ./install.sh
 ```

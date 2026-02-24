@@ -1,0 +1,20 @@
+# Conch config (copy to ~/.config/conch/config or ~/.conchrc)
+# Trigger keys are set in the shell integration (zsh or bash), not here.
+
+# LLM provider: openai | anthropic | ollama
+provider = openai
+api_key_env = OPENAI_API_KEY
+model = gpt-4o-mini
+
+# For Ollama (optional):
+# provider = ollama
+# base_url = http://localhost:11434
+# model = llama3.2
+
+# Context sent to the LLM
+send_cwd = true
+send_os_shell = true
+send_history_count = 0
+
+# System prompt (optional)
+# system_prompt = You are a shell assistant. Reply with exactly one shell command, no explanation, safe for the current OS. No markdown.

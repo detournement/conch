@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Conch-ask entrypoint: run from anywhere by ensuring conch package is on path."""
+import sys
+from pathlib import Path
+
+# Allow running as bin/conch-ask when conch is the package parent
+_root = Path(__file__).resolve().parent.parent
+if _root not in sys.path:
+    sys.path.insert(0, str(_root))
+
+from conch.cli import main
+
+if __name__ == "__main__":
+    main()

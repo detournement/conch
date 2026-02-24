@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conch"
+version = "0.1.0"
+description = "LLM-assisted shell: describe what you want, get a command suggested, Tab to accept."
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+conch-ask = "conch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["conch*"]

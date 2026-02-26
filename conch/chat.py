@@ -2,11 +2,13 @@
 import datetime
 import json
 import os
+import readline
 import sys
 import urllib.request
 from typing import Any, Dict, List, Optional
 
 from .config import load_config
+from .memory import MemoryStore
 from .render import Spinner, highlight
 from . import mcp as mcp_mod
 
@@ -34,6 +36,11 @@ CHAT_SYSTEM_PROMPT = (
     "- MCP tools config: ~/.config/conch/mcp.json.\n"
     "- The user can switch models live in chat with /models and /model <name>.\n"
     "  /provider <name> switches the LLM provider (openai, anthropic, ollama).\n"
+    "- Memory: the user can save persistent memories with /remember <text>.\n"
+    "  Saved memories are automatically included in context when relevant.\n"
+    "  /memories lists all saved memories, /forget <id> removes one.\n"
+    "  If the user shares a preference, fact, or instruction they'd clearly want\n"
+    "  remembered across sessions, suggest they use /remember to save it.\n"
     "- Install/update: run install.sh from the conch directory.\n"
     "When answering about your capabilities, be specific and helpful."
 )
@@ -42,28 +49,31 @@ MAX_TOOL_ROUNDS = 10
 
 KNOWN_MODELS = {
     "openai": [
-        "gpt-4o",
-        "gpt-4o-mini",
         "gpt-4.1",
         "gpt-4.1-mini",
         "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o4-mini",
         "o3",
         "o3-mini",
-        "o4-mini",
     ],
     "anthropic": [
-        "claude-sonnet-4-6-20250929",
-        "claude-sonnet-4-5-20250514",
+        "claude-sonnet-4-6",
         "claude-opus-4-6",
-        "claude-haiku-3-5-20241022",
+        "claude-haiku-4-5",
+        "claude-sonnet-4-5-20250929",
     ],
     "ollama": [
-        "llama3.2",
-        "llama3.1",
-        "mistral",
-        "codellama",
-        "deepseek-coder-v2",
+        "llama4",
+        "llama3.3",
+        "deepseek-r1",
+        "deepseek-v3",
+        "qwen3",
         "qwen2.5-coder",
+        "mistral",
+        "gemma3",
+        "phi4",
     ],
 }
 
@@ -128,7 +138,7 @@ def _raw_anthropic(config: dict, messages: List[dict],
             user_messages.append(m)
 
     body: Dict[str, Any] = {
-        "model": config.get("chat_model", config.get("model", "claude-3-5-haiku-20241022")),
+        "model": config.get("chat_model", config.get("model", "claude-sonnet-4-6")),
         "max_tokens": 1024,
         "system": system,
         "messages": user_messages,
@@ -245,7 +255,8 @@ DEFAULT_API_KEY_ENVS = {
 
 
 def _handle_slash_command(cmd: str, config: dict, provider: str,
-                          model_name: str) -> Optional[tuple]:
+                          model_name: str,
+                          memory: Optional["MemoryStore"] = None) -> Optional[tuple]:
     """Handle slash commands. Returns (provider, model, raw_fn) on change, None otherwise.
 
     Returns None if the command was handled but no model change occurred (or unknown command).
@@ -260,8 +271,45 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/models\033[0m              List available models\n"
             "  \033[1m/model <name>\033[0m        Switch model (e.g. /model gpt-4o)\n"
             "  \033[1m/provider <name>\033[0m     Switch provider (openai, anthropic, ollama)\n"
+            "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
+            "  \033[1m/memories\033[0m            List all saved memories\n"
+            "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
             "  \033[1m/help\033[0m                Show this help\n"
         )
+        return None
+
+    if command == "/remember" and memory is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /remember <something to remember>\033[0m\n")
+            return None
+        entry = memory.add(arg)
+        print(f"\n  \033[1;32m✓ Saved memory #{entry['id']}:\033[0m {entry['content']}\n")
+        return None
+
+    if command in ("/memories", "/mem") and memory is not None:
+        all_mem = memory.get_all()
+        if not all_mem:
+            print("\n  \033[2mNo saved memories yet. Use /remember <text> to save one.\033[0m\n")
+            return None
+        print(f"\n  \033[1;36mSaved memories ({len(all_mem)}):\033[0m")
+        for m in all_mem:
+            print(f"    \033[1m#{m['id']}\033[0m  {m['content']}  \033[2m({m['created_at']})\033[0m")
+        print(f"\n  \033[2mTip: /forget <id> to remove\033[0m\n")
+        return None
+
+    if command == "/forget" and memory is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /forget <id>  (use /memories to see IDs)\033[0m\n")
+            return None
+        try:
+            mid = int(arg.lstrip("#"))
+        except ValueError:
+            print(f"\n  \033[31mInvalid ID: {arg}\033[0m\n")
+            return None
+        if memory.forget(mid):
+            print(f"\n  \033[1;32m✓ Forgot memory #{mid}\033[0m\n")
+        else:
+            print(f"\n  \033[31mNo memory with ID #{mid}\033[0m\n")
         return None
 
     if command in ("/models", "/ls"):
@@ -429,11 +477,30 @@ def chat_loop():
     mcp_clients = mcp_mod.create_clients()
     tools, tool_map = mcp_mod.collect_tools(mcp_clients)
 
+    memory = MemoryStore()
+
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
+
+    # Set up readline for input history (up/down arrows) within this session.
+    # Save and restore any pre-existing readline state so we don't clobber
+    # the parent shell's history.
+    _prev_history_len = readline.get_current_history_length()
+    _history_file = os.path.join(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+        "conch", "chat_history")
+    os.makedirs(os.path.dirname(_history_file), exist_ok=True)
+    try:
+        readline.read_history_file(_history_file)
+    except (FileNotFoundError, OSError):
+        pass
+    readline.set_history_length(500)
 
     print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
     if tools:
         print(f"\033[2m{len(tools)} MCP tool{'s' if len(tools) != 1 else ''} available\033[0m")
+    mem_count = len(memory.get_all())
+    if mem_count:
+        print(f"\033[2m{mem_count} memor{'y' if mem_count == 1 else 'ies'} loaded\033[0m")
     print(f"\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
 
     try:
@@ -448,12 +515,29 @@ def chat_loop():
             if user_input.strip().lower() in ("exit", "quit", "/q"):
                 break
 
-            if user_input.strip().startswith("/"):
+            stripped = user_input.strip()
+            slash_input = None
+            if stripped.startswith("/"):
+                slash_input = stripped
+            else:
+                first_word = stripped.split()[0].lower() if stripped else ""
+                if first_word in ("models", "model", "provider", "help", "ls",
+                                  "remember", "memories", "mem", "forget"):
+                    slash_input = "/" + stripped
+
+            if slash_input is not None:
                 result = _handle_slash_command(
-                    user_input.strip(), config, provider, model_name)
+                    slash_input, config, provider, model_name, memory=memory)
                 if result is not None:
                     provider, model_name, raw_fn = result
                 continue
+
+            # Inject relevant persistent memories into the system prompt
+            mem_context = memory.build_context(user_input)
+            if mem_context:
+                messages[0]["content"] = system_prompt + "\n\n" + mem_context
+            else:
+                messages[0]["content"] = system_prompt
 
             messages.append({"role": "user", "content": user_input})
             reply = _chat_turn(config, provider, raw_fn, messages, tools, tool_map)
@@ -463,6 +547,10 @@ def chat_loop():
             else:
                 print("\n\033[2m[no response]\033[0m\n")
     finally:
+        try:
+            readline.write_history_file(_history_file)
+        except OSError:
+            pass
         mcp_mod.close_all(mcp_clients)
 
 
@@ -486,9 +574,14 @@ def main():
             f"(timezone: {datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()}). "
             f"Use this for any time-sensitive requests."
         )
+        user_text = " ".join(sys.argv[1:])
+        memory = MemoryStore()
+        mem_context = memory.build_context(user_text)
+        if mem_context:
+            system_prompt += "\n\n" + mem_context
         messages: List[dict] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": " ".join(sys.argv[1:])},
+            {"role": "user", "content": user_text},
         ]
         try:
             reply = _chat_turn(config, provider, raw_fn, messages, tools, tool_map)

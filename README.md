@@ -99,6 +99,9 @@ A Dockerfile is a text document that contains all the commands...
 | **/models** | List available models for all providers |
 | **/model \<name\>** | Switch model (auto-detects provider) |
 | **/provider \<name\>** | Switch provider (openai, anthropic, ollama) |
+| **/remember \<text\>** | Save a persistent memory |
+| **/memories** | List all saved memories |
+| **/forget \<id\>** | Delete a memory by ID |
 | **/help** | Show available commands |
 
 ```
@@ -109,12 +112,37 @@ you: /models
     ○ gpt-4.1
     ...
   anthropic
-    ○ claude-sonnet-4-6-20250929
+    ○ claude-sonnet-4-6
     ...
 
-you: /model claude-sonnet-4-6-20250929
-  Switched to anthropic/claude-sonnet-4-6-20250929
+you: /model claude-sonnet-4-6
+  Switched to anthropic/claude-sonnet-4-6
 ```
+
+### Memory
+
+Conch has a two-layer memory system:
+
+1. **Session memory** — your conversation history within the current chat (automatic).
+2. **Persistent memory** — facts, preferences, and context you explicitly save. These survive across chat sessions and are automatically included in context when relevant.
+
+```
+you: /remember I prefer TypeScript over JavaScript
+  ✓ Saved memory #1: I prefer TypeScript over JavaScript
+
+you: /remember Our production cluster is on AWS EKS in us-east-1
+  ✓ Saved memory #2: Our production cluster is on AWS EKS in us-east-1
+
+you: /memories
+  Saved memories (2):
+    #1  I prefer TypeScript over JavaScript  (2026-02-26 14:30:00)
+    #2  Our production cluster is on AWS EKS in us-east-1  (2026-02-26 14:31:00)
+
+you: help me set up a new microservice
+assistant: Since you prefer TypeScript, here's a setup using...
+```
+
+Memories are stored in `~/.local/state/conch/memory.json`. Relevant memories are retrieved using TF-IDF scoring — the most semantically relevant memories for each query are automatically included in the LLM's context. All commands also work without the `/` prefix (e.g. `remember`, `memories`, `forget`).
 
 When MCP tools are configured (see below), chat can also call external tools — search the web, read files, run code, and more.
 
@@ -357,6 +385,7 @@ conch/
 │   ├── config.py              # Config loader (file + defaults)
 │   ├── llm.py                 # OpenAI/Anthropic/Ollama clients + tool detection
 │   ├── mcp.py                 # MCP client (stdio + HTTP transports)
+│   ├── memory.py              # Persistent semantic memory (TF-IDF retrieval)
 │   └── render.py              # Terminal markdown highlighting + spinner
 ├── shell/
 │   ├── conch.zsh              # Zsh: ask, chat, key bindings, completions

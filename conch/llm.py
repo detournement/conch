@@ -130,7 +130,7 @@ def call_anthropic(config: dict, messages: list) -> str:
     system = next((m["content"] for m in messages if m["role"] == "system"), "")
     user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
     body = {
-        "model": config.get("model", "claude-3-5-haiku-20241022"),
+        "model": config.get("model", "claude-sonnet-4-6"),
         "max_tokens": 256,
         "system": system,
         "messages": [{"role": "user", "content": user_content}],

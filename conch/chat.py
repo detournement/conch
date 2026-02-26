@@ -564,8 +564,12 @@ def _chat_turn(config: dict, provider: str, raw_fn, messages: List[dict],
                 arguments = {}
 
             print(f"  \033[2m⚡ {name}\033[0m", file=sys.stderr)
-            with Spinner(f"Running {name}"):
-                result_text = mcp_mod.execute_tool(tool_map, name, arguments)
+            if name == "local_shell":
+                result_text = _local_shell_client.call_tool(name, arguments)
+                result_text = result_text.get("content", [{}])[0].get("text", "")
+            else:
+                with Spinner(f"Running {name}"):
+                    result_text = mcp_mod.execute_tool(tool_map, name, arguments)
             results.append({"id": tc.get("id", ""), "content": result_text})
 
         if provider == "anthropic":

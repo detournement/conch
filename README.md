@@ -9,6 +9,7 @@ Created by **Tom Hallaran**.
 - **`ask`** — Describe any task in plain English, get the shell command for it. Works for everything: `find`, `grep`, `awk`, `sed`, `curl`, `tar`, `rsync`, `ffmpeg`, `jq`, `xargs`, pipes, redirects — any command your shell can run.
 - **`chat`** — Multi-turn conversation with the LLM. Supports **MCP tool calling** — the LLM can search the web, read files, manage Jira tickets, query APIs, and call 100+ tools during conversation.
 - **MCP-native** — First-class [Model Context Protocol](https://modelcontextprotocol.io/) support. Connect any MCP server (stdio or HTTP). Ships with Composio integration for 100+ no-auth tools out of the box, plus `/connect` to OAuth into Gmail, Slack, GitHub, and more — right from chat.
+- **Local shell execution** — The LLM can run commands on your machine (nmap, docker, git, curl — anything) with your confirmation, then chain the output with other tools. "Scan localhost and email me the results" works in one prompt.
 - **Connect services live** — Type `/connect gmail` and Conch handles the OAuth flow, opens your browser, and loads the tools. No manual config editing.
 - **Persistent memory** — Save facts, preferences, and context with `/remember`. Relevant memories surface automatically via TF-IDF semantic matching.
 - **Switch models on the fly** — `/model claude-sonnet-4-6` or `/model gpt-4.1` — swap LLM mid-conversation. Supports OpenAI, Anthropic, and Ollama.
@@ -148,6 +149,25 @@ assistant: Since you prefer TypeScript, here's a setup using...
 Memories are stored in `~/.local/state/conch/memory.json`. Relevant memories are retrieved using TF-IDF scoring — the most semantically relevant memories for each query are automatically included in the LLM's context. All commands also work without the `/` prefix (e.g. `remember`, `memories`, `forget`).
 
 When MCP tools are configured (see below), chat can also call external tools — search the web, read files, run code, and more.
+
+### Local shell execution
+
+In `chat`, the LLM can run commands on your machine. You always confirm before anything executes. Output is captured and fed back to the LLM, so it can chain local commands with other tools.
+
+```
+you: nmap localhost and email the results to thallaran@gmail.com
+  ⚡ local_shell
+
+  ⚠ Run locally: nmap localhost
+  Execute? [y/N] y
+
+  (nmap output captured)
+
+  ⚡ GMAIL_SEND_EMAIL
+assistant: Scan complete. I've emailed the nmap results to thallaran@gmail.com.
+```
+
+Works for anything on your system: `docker`, `kubectl`, `git`, `curl`, `terraform`, security tools, file operations, etc. The LLM decides when a command needs to run locally vs. via a remote tool.
 
 ### DevOps: Kubernetes, Terraform, AWS, Vercel & npm
 

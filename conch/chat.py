@@ -33,6 +33,12 @@ CHAT_SYSTEM_PROMPT = (
     "- MCP tools: if tools are available, you can call them to take actions (create issues, "
     "  read files, search the web, manage infrastructure, etc.). Use tools when they would "
     "  help answer the user's request.\n"
+    "- local_shell: you have a built-in tool that can run commands on the user's machine. "
+    "  Use it for nmap, curl, docker, git, kubectl, file operations, etc. — anything that "
+    "  needs to run locally. The user will confirm before execution. You can chain: run a "
+    "  command locally, then use the output with other tools (e.g. scan a host, then email "
+    "  the results via Gmail). Prefer local_shell over sandbox/remote code interpreters for "
+    "  commands that need the user's local environment.\n"
     "- Configuration: ~/.config/conch/config or ~/.conchrc. Supports OpenAI, Anthropic, or Ollama.\n"
     "- MCP tools config: ~/.config/conch/mcp.json.\n"
     "- The user can switch models live in chat with /models and /model <name>.\n"
@@ -456,6 +462,85 @@ def _append_results_anthropic(messages: List[dict], response: dict,
 
 
 # ---------------------------------------------------------------------------
+# Built-in local shell tool — lets the LLM run commands on the host machine.
+# ---------------------------------------------------------------------------
+
+LOCAL_SHELL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "local_shell",
+        "description": (
+            "Execute a shell command on the user's local machine and return "
+            "stdout + stderr. Use this for tasks that require running commands "
+            "locally: nmap scans, file operations, git, docker, kubectl, etc. "
+            "The user will be asked to confirm before the command runs."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds to wait (default 60)",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+
+class _LocalShellClient:
+    """Pseudo-MCP client that runs commands on the local machine."""
+
+    name = "local_shell"
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        import subprocess as _sp
+
+        cmd = arguments.get("command", "")
+        timeout = arguments.get("timeout", 60)
+        if not cmd:
+            return {"content": [{"type": "text", "text": "Error: empty command"}]}
+
+        print(f"\n  \033[1;33m⚠ Run locally:\033[0m \033[1m{cmd}\033[0m")
+        try:
+            answer = input("  \033[1;33mExecute? [y/N]\033[0m ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            return {"content": [{"type": "text", "text": "User declined to execute the command."}]}
+
+        try:
+            result = _sp.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout,
+            )
+            output = ""
+            if result.stdout:
+                output += result.stdout
+            if result.stderr:
+                output += ("\n--- stderr ---\n" + result.stderr) if output else result.stderr
+            if not output:
+                output = f"(no output, exit code {result.returncode})"
+            elif result.returncode != 0:
+                output += f"\n(exit code {result.returncode})"
+            # Cap output to avoid blowing up context
+            if len(output) > 15000:
+                output = output[:15000] + "\n... (truncated)"
+            return {"content": [{"type": "text", "text": output}]}
+        except _sp.TimeoutExpired:
+            return {"content": [{"type": "text", "text": f"Command timed out after {timeout}s"}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Error: {e}"}]}
+
+
+_local_shell_client = _LocalShellClient()
+
+
+# ---------------------------------------------------------------------------
 # Core turn logic — calls the LLM, executes tools, loops until text reply.
 # ---------------------------------------------------------------------------
 
@@ -516,6 +601,10 @@ def chat_loop():
     mcp_clients = mcp_mod.create_clients()
     tools, tool_map = mcp_mod.collect_tools(mcp_clients)
 
+    # Inject built-in local shell tool
+    tools.append(LOCAL_SHELL_TOOL)
+    tool_map["local_shell"] = _local_shell_client
+
     memory = MemoryStore()
 
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
@@ -573,6 +662,8 @@ def chat_loop():
                     mcp_mod.close_all(mcp_clients)
                     mcp_clients = mcp_mod.create_clients()
                     tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+                    tools.append(LOCAL_SHELL_TOOL)
+                    tool_map["local_shell"] = _local_shell_client
                     print(f"  \033[1;32m{len(tools)} tool{'s' if len(tools) != 1 else ''} loaded\033[0m\n")
                 elif result is not None:
                     provider, model_name, raw_fn = result
@@ -612,6 +703,8 @@ def main():
 
         mcp_clients = mcp_mod.create_clients()
         tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+        tools.append(LOCAL_SHELL_TOOL)
+        tool_map["local_shell"] = _local_shell_client
 
         system_prompt = config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT)
         now = datetime.datetime.now()

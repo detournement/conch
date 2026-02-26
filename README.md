@@ -92,6 +92,30 @@ A Dockerfile is a text document that contains all the commands...
 
 **Keyboard shortcut:** **Ctrl+X then Ctrl+G** starts `chat`.
 
+**Slash commands** (type these during chat):
+
+| Command | Action |
+|---|---|
+| **/models** | List available models for all providers |
+| **/model \<name\>** | Switch model (auto-detects provider) |
+| **/provider \<name\>** | Switch provider (openai, anthropic, ollama) |
+| **/help** | Show available commands |
+
+```
+you: /models
+  openai ← active
+    ○ gpt-4o
+    ● gpt-4o-mini  (current)
+    ○ gpt-4.1
+    ...
+  anthropic
+    ○ claude-sonnet-4-6-20250929
+    ...
+
+you: /model claude-sonnet-4-6-20250929
+  Switched to anthropic/claude-sonnet-4-6-20250929
+```
+
 When MCP tools are configured (see below), chat can also call external tools — search the web, read files, run code, and more.
 
 ### DevOps: Kubernetes, Terraform, AWS, Vercel & npm

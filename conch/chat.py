@@ -32,12 +32,40 @@ CHAT_SYSTEM_PROMPT = (
     "  help answer the user's request.\n"
     "- Configuration: ~/.config/conch/config or ~/.conchrc. Supports OpenAI, Anthropic, or Ollama.\n"
     "- MCP tools config: ~/.config/conch/mcp.json.\n"
-    "- The user can switch models by editing the config file (model = <model-name>).\n"
+    "- The user can switch models live in chat with /models and /model <name>.\n"
+    "  /provider <name> switches the LLM provider (openai, anthropic, ollama).\n"
     "- Install/update: run install.sh from the conch directory.\n"
     "When answering about your capabilities, be specific and helpful."
 )
 
 MAX_TOOL_ROUNDS = 10
+
+KNOWN_MODELS = {
+    "openai": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+    ],
+    "anthropic": [
+        "claude-sonnet-4-6-20250929",
+        "claude-sonnet-4-5-20250514",
+        "claude-opus-4-6",
+        "claude-haiku-3-5-20241022",
+    ],
+    "ollama": [
+        "llama3.2",
+        "llama3.1",
+        "mistral",
+        "codellama",
+        "deepseek-coder-v2",
+        "qwen2.5-coder",
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +237,98 @@ RAW_FNS = {
     "ollama": _raw_ollama,
 }
 
+DEFAULT_API_KEY_ENVS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "ollama": "",
+}
+
+
+def _handle_slash_command(cmd: str, config: dict, provider: str,
+                          model_name: str) -> Optional[tuple]:
+    """Handle slash commands. Returns (provider, model, raw_fn) on change, None otherwise.
+
+    Returns None if the command was handled but no model change occurred (or unknown command).
+    """
+    parts = cmd.strip().split(None, 1)
+    command = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if command in ("/help", "/h", "/?"):
+        print(
+            "\n\033[1;36mSlash commands:\033[0m\n"
+            "  \033[1m/models\033[0m              List available models\n"
+            "  \033[1m/model <name>\033[0m        Switch model (e.g. /model gpt-4o)\n"
+            "  \033[1m/provider <name>\033[0m     Switch provider (openai, anthropic, ollama)\n"
+            "  \033[1m/help\033[0m                Show this help\n"
+        )
+        return None
+
+    if command in ("/models", "/ls"):
+        print()
+        for p, models in KNOWN_MODELS.items():
+            marker = " \033[1;33m← active\033[0m" if p == provider else ""
+            print(f"  \033[1;36m{p}\033[0m{marker}")
+            for m in models:
+                if m == model_name:
+                    print(f"    \033[1;32m● {m}\033[0m  \033[2m(current)\033[0m")
+                else:
+                    print(f"    \033[2m○\033[0m {m}")
+        print(f"\n  \033[2mTip: /model <name> to switch\033[0m\n")
+        return None
+
+    if command == "/model":
+        if not arg:
+            print(f"\n  \033[2mCurrent model:\033[0m \033[1m{model_name}\033[0m ({provider})\n"
+                  f"  \033[2mUsage: /model <name>\033[0m\n")
+            return None
+        new_model = arg
+        new_provider = provider
+        for p, models in KNOWN_MODELS.items():
+            if new_model in models:
+                new_provider = p
+                break
+        new_fn = RAW_FNS.get(new_provider)
+        if not new_fn:
+            print(f"\n  \033[31mUnknown provider for model '{new_model}'\033[0m\n")
+            return None
+        if new_provider != provider:
+            key_env = DEFAULT_API_KEY_ENVS.get(new_provider, "")
+            if key_env and not os.environ.get(key_env, "").strip():
+                print(f"\n  \033[31m{key_env} not set — cannot switch to {new_provider}\033[0m\n")
+                return None
+            config["provider"] = new_provider
+            config["api_key_env"] = key_env
+        config["chat_model"] = new_model
+        config["model"] = new_model
+        print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
+        return (new_provider, new_model, new_fn)
+
+    if command == "/provider":
+        if not arg:
+            print(f"\n  \033[2mCurrent provider:\033[0m \033[1m{provider}\033[0m\n"
+                  f"  \033[2mUsage: /provider <openai|anthropic|ollama>\033[0m\n")
+            return None
+        new_provider = arg.lower()
+        if new_provider not in RAW_FNS:
+            print(f"\n  \033[31mUnknown provider '{new_provider}'. "
+                  f"Choose: openai, anthropic, ollama\033[0m\n")
+            return None
+        key_env = DEFAULT_API_KEY_ENVS.get(new_provider, "")
+        if key_env and not os.environ.get(key_env, "").strip():
+            print(f"\n  \033[31m{key_env} not set — cannot switch to {new_provider}\033[0m\n")
+            return None
+        new_model = KNOWN_MODELS[new_provider][0]
+        new_fn = RAW_FNS[new_provider]
+        config["provider"] = new_provider
+        config["api_key_env"] = key_env
+        config["chat_model"] = new_model
+        config["model"] = new_model
+        print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
+        return (new_provider, new_model, new_fn)
+
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Tool-call helpers — append results in the format each provider expects.
@@ -314,7 +434,7 @@ def chat_loop():
     print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
     if tools:
         print(f"\033[2m{len(tools)} MCP tool{'s' if len(tools) != 1 else ''} available\033[0m")
-    print(f"\033[2mType 'exit' or Ctrl+D to quit.\033[0m\n")
+    print(f"\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
 
     try:
         while True:
@@ -327,6 +447,13 @@ def chat_loop():
                 continue
             if user_input.strip().lower() in ("exit", "quit", "/q"):
                 break
+
+            if user_input.strip().startswith("/"):
+                result = _handle_slash_command(
+                    user_input.strip(), config, provider, model_name)
+                if result is not None:
+                    provider, model_name, raw_fn = result
+                continue
 
             messages.append({"role": "user", "content": user_input})
             reply = _chat_turn(config, provider, raw_fn, messages, tools, tool_map)

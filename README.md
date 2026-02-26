@@ -7,7 +7,7 @@ Created by **Tom Hallaran**.
 ## Features
 
 - **`ask`** — Describe any task in plain English, get the shell command for it. Works for everything: `find`, `grep`, `awk`, `sed`, `curl`, `tar`, `rsync`, `ffmpeg`, `jq`, `xargs`, pipes, redirects — any command your shell can run.
-- **`chat`** — Multi-turn conversation with the LLM for general questions, explanations, and follow-ups. Supports **MCP tool calling** — connect any MCP server (Composio, filesystem, GitHub, custom) and the LLM can use those tools during chat.
+- **`chat`** — Multi-turn conversation with the LLM for general questions, explanations, and follow-ups. Supports **MCP tool calling** — connect any MCP server (Composio, filesystem, GitHub, Jira/Confluence, custom) and the LLM can use those tools during chat.
 - **Understands your system** — Auto-detects 50+ installed tools and adapts suggestions to what you actually have. Knows your OS, shell, current directory, and current date/time.
 - **DevOps expertise** — Deep knowledge of kubectl, helm, terraform, AWS CLI, Vercel, npm, Docker, git, and infrastructure-as-code workflows.
 - **Security expertise** — Deep knowledge of nmap, nikto, sqlmap, hydra, nuclei, and 30+ security/networking tools.
@@ -212,6 +212,55 @@ assistant: The README describes...
 ```
 
 The LLM decides when to call tools based on your request. Tool calls show as `⚡ tool_name` in the output.
+
+### Jira & Confluence
+
+[mcp-atlassian](https://github.com/sooperset/mcp-atlassian) provides 65+ tools for Jira and Confluence — search issues with JQL, create and update tickets, transition statuses, search Confluence with CQL, read and edit pages, and more. Supports both Cloud and Server/Data Center deployments.
+
+To set it up:
+
+1. Create an API token at [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens)
+2. Add to `~/.config/conch/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "atlassian": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-atlassian"],
+      "env": {
+        "JIRA_URL": "https://your-company.atlassian.net",
+        "JIRA_USERNAME": "your.email@company.com",
+        "JIRA_API_TOKEN": "your_api_token",
+        "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
+        "CONFLUENCE_USERNAME": "your.email@company.com",
+        "CONFLUENCE_API_TOKEN": "your_api_token"
+      }
+    }
+  }
+}
+```
+
+> For Server/Data Center, use `JIRA_PERSONAL_TOKEN` instead of `JIRA_USERNAME` + `JIRA_API_TOKEN`.
+
+You can configure just Jira or just Confluence — only include the env vars for the products you use.
+
+Then in `chat`:
+
+```
+you: find issues assigned to me in the PROJ project
+  ⚡ jira_search
+assistant: Here are your open issues in PROJ...
+
+you: transition PROJ-123 to Done
+  ⚡ jira_transition_issue
+assistant: PROJ-123 has been moved to Done.
+
+you: search confluence for onboarding docs
+  ⚡ confluence_search
+assistant: Found 3 pages matching "onboarding"...
+```
 
 ### Composio
 

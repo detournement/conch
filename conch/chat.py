@@ -408,7 +408,7 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             print(f"  \033[1;32m✓ {message}\033[0m\n")
         else:
             print(f"  \033[31m✗ {message}\033[0m\n")
-        return None
+        return "reload_tools"
 
     return None
 
@@ -564,7 +564,13 @@ def chat_loop():
             if slash_input is not None:
                 result = _handle_slash_command(
                     slash_input, config, provider, model_name, memory=memory)
-                if result is not None:
+                if result == "reload_tools":
+                    print("  \033[2mReloading MCP tools...\033[0m")
+                    mcp_mod.close_all(mcp_clients)
+                    mcp_clients = mcp_mod.create_clients()
+                    tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+                    print(f"  \033[1;32m{len(tools)} tool{'s' if len(tools) != 1 else ''} loaded\033[0m\n")
+                elif result is not None:
                     provider, model_name, raw_fn = result
                 continue
 

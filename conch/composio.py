@@ -156,7 +156,7 @@ def initiate_connection(app_slug: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def update_mcp_server(app_slug: str) -> Tuple[bool, str]:
-    """Add an app's auth config to the MCP server so its tools appear."""
+    """Add an app's auth config and toolkit to the MCP server so its tools appear."""
     server_id = _get_mcp_server_id()
     if not server_id:
         return False, "Could not find Composio MCP server ID in mcp.json"
@@ -167,14 +167,25 @@ def update_mcp_server(app_slug: str) -> Tuple[bool, str]:
 
     data, status = _request("GET", f"/mcp/{server_id}")
     current_ids = data.get("auth_config_ids", [])
+    current_toolkits = data.get("toolkits", [])
 
     auth_id = auth_cfg.get("id", "")
-    if auth_id in current_ids:
+    changed = False
+
+    if auth_id not in current_ids:
+        current_ids.append(auth_id)
+        changed = True
+
+    if app_slug not in current_toolkits:
+        current_toolkits.append(app_slug)
+        changed = True
+
+    if not changed:
         return True, "Already configured"
 
-    current_ids.append(auth_id)
     patch_data, patch_status = _request("PATCH", f"/mcp/{server_id}", body={
         "auth_config_ids": current_ids,
+        "toolkits": current_toolkits,
     })
 
     if patch_status in (200, 204):
@@ -203,7 +214,9 @@ def connect(app_slug: str) -> Tuple[bool, str]:
     existing = check_connection(app_slug)
     if existing:
         ok, msg = update_mcp_server(app_slug)
-        return True, f"{app_slug} is already connected. {msg if ok else ''} Restart chat to load tools."
+        if ok:
+            return True, f"{app_slug} is already connected and configured. Reloading tools..."
+        return True, f"{app_slug} is already connected. {msg}"
 
     redirect_url, error = initiate_connection(app_slug)
     if error:
@@ -212,9 +225,10 @@ def connect(app_slug: str) -> Tuple[bool, str]:
         return False, "No redirect URL returned"
 
     open_browser(redirect_url)
+    update_mcp_server(app_slug)
 
     return True, (
         f"Opening browser for {app_slug} authentication...\n"
-        f"  Complete the sign-in, then restart chat to load the new tools.\n"
-        f"  URL: {redirect_url}"
+        f"  Complete the sign-in in your browser, then come back here.\n"
+        f"  Tools will reload automatically."
     )

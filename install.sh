@@ -141,6 +141,11 @@ MCPEOF
             chmod 600 "$MCP_FILE"
             TOOL_COUNT="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("allowed_tools",[])))' 2>/dev/null || echo "100+")"
             ok "Composio configured: ${TOOL_COUNT} tools available"
+            # Save Composio API key to .env for /connect command
+            if [[ -f "$ENV_FILE" ]] && ! grep -q 'COMPOSIO_API_KEY' "$ENV_FILE" 2>/dev/null; then
+                echo "export COMPOSIO_API_KEY=\"${COMPOSIO_KEY}\"" >> "$ENV_FILE"
+                ok "Composio API key saved to ${ENV_FILE}"
+            fi
         else
             COMPOSIO_ERR="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error","unknown error"))' 2>/dev/null || echo "could not create server")"
             warn "Composio setup failed: ${COMPOSIO_ERR}"

@@ -8,6 +8,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from .config import load_config
+from . import composio as composio_mod
 from .memory import MemoryStore
 from .render import Spinner, highlight
 from . import mcp as mcp_mod
@@ -36,6 +37,10 @@ CHAT_SYSTEM_PROMPT = (
     "- MCP tools config: ~/.config/conch/mcp.json.\n"
     "- The user can switch models live in chat with /models and /model <name>.\n"
     "  /provider <name> switches the LLM provider (openai, anthropic, ollama).\n"
+    "- Connect services: /connect <app> authenticates services via Composio (e.g.\n"
+    "  /connect gmail, /connect slack). /apps lists available services.\n"
+    "  If the user asks for something that requires an unconnected service, suggest\n"
+    "  they use /connect to set it up.\n"
     "- Memory: the user can save persistent memories with /remember <text>.\n"
     "  Saved memories are automatically included in context when relevant.\n"
     "  /memories lists all saved memories, /forget <id> removes one.\n"
@@ -274,6 +279,8 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List all saved memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
+            "  \033[1m/connect <app>\033[0m       Connect a service via Composio (e.g. gmail)\n"
+            "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/help\033[0m                Show this help\n"
         )
         return None
@@ -374,6 +381,34 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
         config["model"] = new_model
         print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
         return (new_provider, new_model, new_fn)
+
+    if command == "/apps":
+        if not composio_mod.is_available():
+            print("\n  \033[31mCOMPOSIO_API_KEY not set. Add it to your .env or run install.sh.\033[0m\n")
+            return None
+        apps = composio_mod.list_apps()
+        print(f"\n  \033[1;36mConnectable services ({len(apps)}):\033[0m")
+        for slug, desc in apps:
+            print(f"    \033[1m{slug:<20}\033[0m \033[2m{desc}\033[0m")
+        print(f"\n  \033[2mTip: /connect <app> to authenticate\033[0m\n")
+        return None
+
+    if command == "/connect":
+        if not composio_mod.is_available():
+            print("\n  \033[31mCOMPOSIO_API_KEY not set. Add it to your .env or run install.sh.\033[0m\n")
+            return None
+        if not arg:
+            print("\n  \033[2mUsage: /connect <app>  (e.g. /connect gmail)\033[0m\n"
+                  "  \033[2mSee /apps for available services.\033[0m\n")
+            return None
+        app_slug = arg.lower().replace(" ", "_")
+        print(f"\n  \033[2mConnecting {app_slug}...\033[0m")
+        success, message = composio_mod.connect(app_slug)
+        if success:
+            print(f"  \033[1;32m✓ {message}\033[0m\n")
+        else:
+            print(f"  \033[31m✗ {message}\033[0m\n")
+        return None
 
     return None
 
@@ -522,7 +557,8 @@ def chat_loop():
             else:
                 first_word = stripped.split()[0].lower() if stripped else ""
                 if first_word in ("models", "model", "provider", "help", "ls",
-                                  "remember", "memories", "mem", "forget"):
+                                  "remember", "memories", "mem", "forget",
+                                  "connect", "apps"):
                     slash_input = "/" + stripped
 
             if slash_input is not None:

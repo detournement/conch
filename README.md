@@ -102,6 +102,8 @@ A Dockerfile is a text document that contains all the commands...
 | **/remember \<text\>** | Save a persistent memory |
 | **/memories** | List all saved memories |
 | **/forget \<id\>** | Delete a memory by ID |
+| **/connect \<app\>** | Connect a service via Composio (e.g. gmail) |
+| **/apps** | List connectable services |
 | **/help** | Show available commands |
 
 ```
@@ -349,16 +351,23 @@ curl -X POST https://backend.composio.dev/api/v3/mcp/servers \
 
 **Adding authenticated services (Gmail, Slack, GitHub, etc.):**
 
-With `managed_auth_via_composio` enabled, you can connect authenticated services:
+Use the `/connect` command directly in chat — no extra tools needed:
 
-```bash
-pip install composio-core
-composio add gmail       # opens browser for OAuth
-composio add slack
-composio add github
+```
+you: /connect gmail
+  Connecting gmail...
+  ✓ Opening browser for gmail authentication...
+    Complete the sign-in, then restart chat to load the new tools.
+
+you: /apps
+  Connectable services (15):
+    gmail                Gmail — read, send, search email
+    slack                Slack — messages, channels, reactions
+    github               GitHub — repos, issues, PRs, actions
+    ...
 ```
 
-Once connected, the tools appear automatically in your Composio MCP endpoint — no config changes needed.
+After authenticating, restart chat and the new tools will be available. The LLM will also suggest `/connect` when you ask for something that needs an unconnected service.
 
 See `mcp.example.json` in this repo for a full example config.
 
@@ -408,6 +417,7 @@ conch/
 ├── conch/
 │   ├── cli.py                 # ask entrypoint (25s process timeout)
 │   ├── chat.py                # chat loop + MCP tool calling
+│   ├── composio.py            # Composio OAuth flows (/connect, /apps)
 │   ├── config.py              # Config loader (file + defaults)
 │   ├── llm.py                 # OpenAI/Anthropic/Ollama clients + tool detection
 │   ├── mcp.py                 # MCP client (stdio + HTTP transports)

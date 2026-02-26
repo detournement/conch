@@ -94,6 +94,63 @@ else
     ok "Config exists: ${CONFIG_FILE}"
 fi
 
+# ── Composio MCP tools (optional) ────────────────────────────────────────
+
+MCP_FILE="$CONFIG_DIR/mcp.json"
+if [[ -f "$MCP_FILE" ]] && grep -q 'composio' "$MCP_FILE" 2>/dev/null; then
+    ok "Composio already configured in ${MCP_FILE}"
+else
+    printf "\n"
+    info "Composio adds 100+ tools to chat: web search, news, code execution, and more."
+    info "Enter your Composio API key (or press Enter to skip):"
+    printf "  ${DIM}Get one at https://composio.dev${RST}\n"
+    printf "  Key: "
+    read -r COMPOSIO_KEY
+    if [[ -n "$COMPOSIO_KEY" ]]; then
+        info "Creating Composio MCP server..."
+        COMPOSIO_RESP="$(curl -s -X POST "https://backend.composio.dev/api/v3/mcp/servers" \
+            -H "x-api-key: ${COMPOSIO_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"name": "conch-tools", "auth_config_ids": [], "no_auth_apps": ["serpapi", "composio_search", "codeinterpreter", "firecrawl", "tavily"], "managed_auth_via_composio": true}' 2>/dev/null || true)"
+
+        COMPOSIO_ID="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
+        if [[ -n "$COMPOSIO_ID" ]]; then
+            COMPOSIO_URL="https://backend.composio.dev/v3/mcp/${COMPOSIO_ID}/mcp?user_id=conch"
+            mkdir -p "$CONFIG_DIR"
+            if [[ -f "$MCP_FILE" ]]; then
+                python3 -c "
+import json
+with open('$MCP_FILE') as f:
+    cfg = json.load(f)
+cfg.setdefault('mcpServers', {})['composio'] = {'type': 'http', 'url': '$COMPOSIO_URL'}
+with open('$MCP_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+            else
+                cat > "$MCP_FILE" <<MCPEOF
+{
+  "mcpServers": {
+    "composio": {
+      "type": "http",
+      "url": "${COMPOSIO_URL}"
+    }
+  }
+}
+MCPEOF
+            fi
+            chmod 600 "$MCP_FILE"
+            TOOL_COUNT="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("allowed_tools",[])))' 2>/dev/null || echo "100+")"
+            ok "Composio configured: ${TOOL_COUNT} tools available"
+        else
+            COMPOSIO_ERR="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error","unknown error"))' 2>/dev/null || echo "could not create server")"
+            warn "Composio setup failed: ${COMPOSIO_ERR}"
+            echo "  You can configure it manually later. See README."
+        fi
+    else
+        warn "Skipped Composio. You can add it later — see README."
+    fi
+fi
+
 # ── .gitignore ───────────────────────────────────────────────────────────────
 
 if [[ ! -f "$CONCH_DIR/.gitignore" ]] || ! grep -q '\.env' "$CONCH_DIR/.gitignore" 2>/dev/null; then
@@ -163,4 +220,5 @@ printf "    ${CYAN}ask${RST} list files    → inline request\n"
 printf "    ${CYAN}chat${RST}             → multi-turn conversation\n"
 printf "    ${CYAN}Ctrl+X Ctrl+G${RST}    → start chat via shortcut\n\n"
 printf "  ${DIM}Config:  ${CONFIG_FILE}${RST}\n"
-printf "  ${DIM}API key: ${ENV_FILE}${RST}\n\n"
+printf "  ${DIM}API key: ${ENV_FILE}${RST}\n"
+printf "  ${DIM}MCP:     ${MCP_FILE}${RST}\n\n"

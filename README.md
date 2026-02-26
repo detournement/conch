@@ -316,23 +316,49 @@ assistant: Found 3 pages matching "onboarding"...
 
 ### Composio
 
-[Composio](https://docs.composio.dev/docs/tools-and-toolkits) provides 1000+ tools across GitHub, Slack, Jira, Gmail, and more via a single MCP endpoint. Conch uses Composio's no-auth toolkits out of the box — web search, news, code interpreter, web scraping, and more.
+[Composio](https://docs.composio.dev/docs/tools-and-toolkits) provides 1000+ tools across GitHub, Slack, Gmail, and more via a single MCP endpoint. The installer can set this up automatically — just have your Composio API key ready.
 
-To set it up:
+**Automatic setup (recommended):**
+
+The installer will prompt for your Composio API key and create an MCP server with 100+ no-auth tools (web search, news, code execution, web scraping, finance data, flights, and more) out of the box.
+
+**Manual setup:**
 
 1. Sign up at [composio.dev](https://composio.dev/) and get your API key
-2. Create an MCP server via the [dashboard](https://platform.composio.dev/?next_page=/mcp-configs) or API:
+2. Create an MCP server:
 
 ```bash
 curl -X POST https://backend.composio.dev/api/v3/mcp/servers \
   -H "x-api-key: YOUR_COMPOSIO_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name": "conch-tools", "auth_config_ids": [], "no_auth_apps": ["serpapi", "composio_search", "codeinterpreter", "firecrawl", "tavily"]}'
+  -d '{"name": "conch-tools", "auth_config_ids": [], "no_auth_apps": ["serpapi", "composio_search", "codeinterpreter", "firecrawl", "tavily"], "managed_auth_via_composio": true}'
 ```
 
-3. Copy the `mcp_url` from the response (append `/mcp?user_id=conch` to it) and add it to `~/.config/conch/mcp.json`
+3. Copy the `mcp_url` from the response, append `/mcp?user_id=conch`, and add it to `~/.config/conch/mcp.json`:
 
-This gives you 100+ tools including web search, news, code execution, web scraping, flight search, finance data, and more.
+```json
+{
+  "mcpServers": {
+    "composio": {
+      "type": "http",
+      "url": "https://backend.composio.dev/v3/mcp/YOUR_SERVER_ID/mcp?user_id=conch"
+    }
+  }
+}
+```
+
+**Adding authenticated services (Gmail, Slack, GitHub, etc.):**
+
+With `managed_auth_via_composio` enabled, you can connect authenticated services:
+
+```bash
+pip install composio-core
+composio add gmail       # opens browser for OAuth
+composio add slack
+composio add github
+```
+
+Once connected, the tools appear automatically in your Composio MCP endpoint — no config changes needed.
 
 See `mcp.example.json` in this repo for a full example config.
 

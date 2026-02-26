@@ -2,7 +2,7 @@
   "mcpServers": {
     "composio": {
       "type": "http",
-      "url": "https://backend.composio.dev/v3/mcp/YOUR_SERVER_ID/mcp?user_id=conch-default"
+      "url": "https://backend.composio.dev/v3/mcp/YOUR_SERVER_ID/mcp?user_id=default"
     },
     "filesystem": {
       "type": "stdio",

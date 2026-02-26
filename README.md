@@ -337,14 +337,14 @@ curl -X POST https://backend.composio.dev/api/v3/mcp/servers \
   -d '{"name": "conch-tools", "auth_config_ids": [], "no_auth_apps": ["serpapi", "composio_search", "codeinterpreter", "firecrawl", "tavily"], "managed_auth_via_composio": true}'
 ```
 
-3. Copy the `mcp_url` from the response, append `/mcp?user_id=conch`, and add it to `~/.config/conch/mcp.json`:
+3. Copy the `mcp_url` from the response, append `/mcp?user_id=default`, and add it to `~/.config/conch/mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "composio": {
       "type": "http",
-      "url": "https://backend.composio.dev/v3/mcp/YOUR_SERVER_ID/mcp?user_id=conch"
+      "url": "https://backend.composio.dev/v3/mcp/YOUR_SERVER_ID/mcp?user_id=default"
     }
   }
 }

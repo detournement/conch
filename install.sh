@@ -115,7 +115,7 @@ else
 
         COMPOSIO_ID="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
         if [[ -n "$COMPOSIO_ID" ]]; then
-            COMPOSIO_URL="https://backend.composio.dev/v3/mcp/${COMPOSIO_ID}/mcp?user_id=conch"
+            COMPOSIO_URL="https://backend.composio.dev/v3/mcp/${COMPOSIO_ID}/mcp?user_id=default"
             mkdir -p "$CONFIG_DIR"
             if [[ -f "$MCP_FILE" ]]; then
                 python3 -c "

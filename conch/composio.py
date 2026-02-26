@@ -82,21 +82,24 @@ def _request(method: str, path: str, body: dict = None,
         return {"error": str(e)}, 0
 
 
-def _get_mcp_server_id() -> Optional[str]:
-    """Extract the Composio MCP server ID from the local mcp.json config."""
+def _get_mcp_config() -> Tuple[Optional[str], str]:
+    """Extract the Composio MCP server ID and user_id from mcp.json."""
     mcp_path = Path(
         os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
     ) / "conch" / "mcp.json"
     if not mcp_path.is_file():
-        return None
+        return None, "default"
     try:
         with open(mcp_path) as f:
             cfg = json.load(f)
         url = cfg.get("mcpServers", {}).get("composio", {}).get("url", "")
-        m = re.search(r"/mcp/([a-f0-9-]+)", url)
-        return m.group(1) if m else None
+        sid_match = re.search(r"/mcp/([a-f0-9-]+)", url)
+        uid_match = re.search(r"[?&]user_id=([^&]+)", url)
+        server_id = sid_match.group(1) if sid_match else None
+        user_id = uid_match.group(1) if uid_match else "default"
+        return server_id, user_id
     except Exception:
-        return None
+        return None, "default"
 
 
 def is_available() -> bool:
@@ -122,10 +125,11 @@ def get_auth_config(app_slug: str) -> Optional[dict]:
 
 def check_connection(app_slug: str) -> Optional[dict]:
     """Check if the user already has an active connection for an app."""
+    _, user_id = _get_mcp_config()
     data, status = _request("GET", "/connected_accounts", params={
         "toolkit_slugs": app_slug,
         "status": "ACTIVE",
-        "user_id": "conch",
+        "user_id": user_id,
     })
     items = data.get("items", data.get("results", []))
     if isinstance(items, list) and items:
@@ -141,10 +145,11 @@ def initiate_connection(app_slug: str) -> Tuple[Optional[str], Optional[str]]:
 
     auth_config_id = auth_cfg.get("id", "")
 
+    _, user_id = _get_mcp_config()
     data, status = _request("POST", "/connected_accounts", body={
         "auth_config": {"id": auth_config_id},
         "connection": {"state": {"authScheme": "OAUTH2"}},
-        "user_id": "conch",
+        "user_id": user_id,
     })
 
     redirect_url = data.get("redirectUrl") or data.get("redirect_url")
@@ -157,7 +162,7 @@ def initiate_connection(app_slug: str) -> Tuple[Optional[str], Optional[str]]:
 
 def update_mcp_server(app_slug: str) -> Tuple[bool, str]:
     """Add an app's auth config and toolkit to the MCP server so its tools appear."""
-    server_id = _get_mcp_server_id()
+    server_id, _ = _get_mcp_config()
     if not server_id:
         return False, "Could not find Composio MCP server ID in mcp.json"
 
@@ -207,17 +212,16 @@ def open_browser(url: str):
 
 
 def connect(app_slug: str) -> Tuple[bool, str]:
-    """Full connection flow: check existing, initiate OAuth, update MCP server.
+    """Full connection flow: update MCP server, initiate OAuth, reload.
 
     Returns (success, message_for_user).
     """
-    existing = check_connection(app_slug)
-    if existing:
-        ok, msg = update_mcp_server(app_slug)
-        if ok:
-            return True, f"{app_slug} is already connected and configured. Reloading tools..."
-        return True, f"{app_slug} is already connected. {msg}"
+    # Always ensure the toolkit is on the MCP server
+    update_mcp_server(app_slug)
 
+    # Initiate a new OAuth connection for the current user_id.
+    # Even if a connection exists, it may be for a different entity;
+    # Composio will reuse the existing one if it matches.
     redirect_url, error = initiate_connection(app_slug)
     if error:
         return False, error
@@ -225,10 +229,8 @@ def connect(app_slug: str) -> Tuple[bool, str]:
         return False, "No redirect URL returned"
 
     open_browser(redirect_url)
-    update_mcp_server(app_slug)
 
     return True, (
         f"Opening browser for {app_slug} authentication...\n"
-        f"  Complete the sign-in in your browser, then come back here.\n"
-        f"  Tools will reload automatically."
+        f"  Complete the sign-in in your browser, then type \033[1m/reload\033[0m to load the new tools."
     )

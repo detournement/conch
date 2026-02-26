@@ -281,6 +281,7 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
             "  \033[1m/connect <app>\033[0m       Connect a service via Composio (e.g. gmail)\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
+            "  \033[1m/reload\033[0m              Reload MCP tools\n"
             "  \033[1m/help\033[0m                Show this help\n"
         )
         return None
@@ -393,6 +394,9 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
         print(f"\n  \033[2mTip: /connect <app> to authenticate\033[0m\n")
         return None
 
+    if command == "/reload":
+        return "reload_tools"
+
     if command == "/connect":
         if not composio_mod.is_available():
             print("\n  \033[31mCOMPOSIO_API_KEY not set. Add it to your .env or run install.sh.\033[0m\n")
@@ -408,7 +412,7 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             print(f"  \033[1;32m✓ {message}\033[0m\n")
         else:
             print(f"  \033[31m✗ {message}\033[0m\n")
-        return "reload_tools"
+        return None
 
     return None
 
@@ -558,7 +562,7 @@ def chat_loop():
                 first_word = stripped.split()[0].lower() if stripped else ""
                 if first_word in ("models", "model", "provider", "help", "ls",
                                   "remember", "memories", "mem", "forget",
-                                  "connect", "apps"):
+                                  "connect", "apps", "reload"):
                     slash_input = "/" + stripped
 
             if slash_input is not None:

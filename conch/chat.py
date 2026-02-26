@@ -105,7 +105,7 @@ def _raw_openai(config: dict, messages: List[dict],
         "model": config.get("chat_model", config.get("model", "gpt-4o-mini")),
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
     }
     if tools:
         body["tools"] = tools
@@ -150,7 +150,7 @@ def _raw_anthropic(config: dict, messages: List[dict],
 
     body: Dict[str, Any] = {
         "model": config.get("chat_model", config.get("model", "claude-sonnet-4-6")),
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "system": system,
         "messages": user_messages,
     }

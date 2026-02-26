@@ -1,20 +1,21 @@
 # Conch
 
-An LLM in your shell. Describe any task in plain English — file operations, text processing, networking, DevOps, security, whatever — and get the right command back. Works with every command on your system.
+An LLM in your shell with MCP superpowers. Get shell commands from plain English, chat with an AI that can call 100+ external tools, and connect services like Gmail, Slack, Jira, and GitHub — all from your terminal. Zero dependencies beyond Python 3.9+ stdlib.
 
 Created by **Tom Hallaran**.
 
 ## Features
 
 - **`ask`** — Describe any task in plain English, get the shell command for it. Works for everything: `find`, `grep`, `awk`, `sed`, `curl`, `tar`, `rsync`, `ffmpeg`, `jq`, `xargs`, pipes, redirects — any command your shell can run.
-- **`chat`** — Multi-turn conversation with the LLM for general questions, explanations, and follow-ups. Supports **MCP tool calling** — connect any MCP server (Composio, filesystem, GitHub, Jira/Confluence, custom) and the LLM can use those tools during chat.
+- **`chat`** — Multi-turn conversation with the LLM. Supports **MCP tool calling** — the LLM can search the web, read files, manage Jira tickets, query APIs, and call 100+ tools during conversation.
+- **MCP-native** — First-class [Model Context Protocol](https://modelcontextprotocol.io/) support. Connect any MCP server (stdio or HTTP). Ships with Composio integration for 100+ no-auth tools out of the box, plus `/connect` to OAuth into Gmail, Slack, GitHub, and more — right from chat.
+- **Connect services live** — Type `/connect gmail` and Conch handles the OAuth flow, opens your browser, and loads the tools. No manual config editing.
+- **Persistent memory** — Save facts, preferences, and context with `/remember`. Relevant memories surface automatically via TF-IDF semantic matching.
+- **Switch models on the fly** — `/model claude-sonnet-4-6` or `/model gpt-4.1` — swap LLM mid-conversation. Supports OpenAI, Anthropic, and Ollama.
 - **Understands your system** — Auto-detects 50+ installed tools and adapts suggestions to what you actually have. Knows your OS, shell, current directory, and current date/time.
 - **DevOps expertise** — Deep knowledge of kubectl, helm, terraform, AWS CLI, Vercel, npm, Docker, git, and infrastructure-as-code workflows.
 - **Security expertise** — Deep knowledge of nmap, nikto, sqlmap, hydra, nuclei, and 30+ security/networking tools.
-- **Configurable LLM** — OpenAI, Anthropic, or Ollama. Swap models in one line.
 - **Shell completions** — kubectl, helm, terraform, AWS, npm, argocd, istioctl, kustomize, k9s, Docker, git, and general zsh completions out of the box.
-- **Self-aware** — Ask Conch what it can do, what shortcuts it has, or how to configure it, and it will tell you.
-- **Time-aware** — Always knows the current date and time for scheduling, flight lookups, time-sensitive queries.
 - **Zero deps** — Python stdlib only. No pip packages required.
 
 ## Install
@@ -206,9 +207,9 @@ subfinder amass john-jumbo hashcat mtr socat testssl
 arp-scan wireshark
 ```
 
-## MCP Tools
+## MCP Tools — Connect Anything
 
-Conch's `chat` mode supports [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) tools. Connect any MCP-compatible server and the LLM can call those tools during conversation — read files, create GitHub issues, search the web, manage infrastructure, and more.
+Conch is built around [MCP (Model Context Protocol)](https://modelcontextprotocol.io/). In `chat` mode, the LLM can call any tool from any connected MCP server — search the web, manage Jira tickets, read files, send emails, query databases, and more. The installer sets up [Composio](https://composio.dev/) automatically, giving you 100+ tools on first run. Need Gmail or Slack? Just type `/connect gmail` — Conch handles the OAuth and loads the tools.
 
 ### Setup
 

@@ -65,6 +65,7 @@ def _request(method: str, path: str, body: dict = None,
     headers = {
         "x-api-key": key,
         "Content-Type": "application/json",
+        "User-Agent": "conch/1.0",
     }
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)

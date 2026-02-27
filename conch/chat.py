@@ -719,9 +719,28 @@ def chat_loop():
     all_tools.append(LOCAL_SHELL_TOOL)
     tool_map["local_shell"] = _local_shell_client
 
-    # Apply user's enable/disable preferences
+    # Apply user's enable/disable preferences, auto-trim oversized groups
     tool_prefs = _load_tool_prefs()
+    MAX_GROUP = 200
+    MAX_TOOLS = 300
+    groups = _group_tools(all_tools, tool_map)
+    disabled = set(tool_prefs.get("disabled_groups", []))
+    auto_disabled = []
+    for grp, names in groups.items():
+        if grp in disabled:
+            continue
+        if len(names) > MAX_GROUP:
+            disabled.add(grp)
+            auto_disabled.append((grp, len(names)))
+    if auto_disabled:
+        tool_prefs["disabled_groups"] = sorted(disabled)
+        _save_tool_prefs(tool_prefs)
+        for grp, cnt in auto_disabled:
+            print(f"\033[33m  Auto-disabled {grp} ({cnt} tools — exceeds {MAX_GROUP} limit). "
+                  f"Use /enable {grp} to override.\033[0m", file=sys.stderr)
     tools = _apply_filter(all_tools, tool_map, tool_prefs)
+    if len(tools) > MAX_TOOLS:
+        tools = tools[:MAX_TOOLS]
 
     memory = MemoryStore()
 

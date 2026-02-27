@@ -43,11 +43,13 @@ CHAT_SYSTEM_PROMPT = (
     "- MCP tools config: ~/.config/conch/mcp.json.\n"
     "- The user can switch models live in chat with /models and /model <name>.\n"
     "  /provider <name> switches the LLM provider (openai, anthropic, ollama).\n"
-    "- manage_tools: you have a tool that can enable/disable tool groups at runtime.\n"
+    "- manage_tools: you have a tool that can search and selectively load tools.\n"
     "  Some large tool groups (e.g. github with 800+ tools) are auto-disabled at start.\n"
-    "  If the user asks for something that needs a disabled group, call manage_tools\n"
-    "  with action='enable' and the group name. The tools load instantly and you can\n"
-    "  use them in the same turn. Always prefer this over telling the user to run /enable.\n"
+    "  When you need tools from a disabled group, use this workflow:\n"
+    "    1. manage_tools(action='search', query='repos org') — find the specific tools\n"
+    "    2. manage_tools(action='enable_tools', tools=['GITHUB_LIST_REPOS_FOR_ORG', ...]) — load only those\n"
+    "  For small groups (<50 tools) like gmail, use action='enable' to load the whole group.\n"
+    "  NEVER enable a large group (github) entirely — always search and pick.\n"
     "- Connect services: /connect <app> authenticates services via Composio (e.g.\n"
     "  /connect gmail, /connect slack). /apps lists available services.\n"
     "  If the user asks for something that requires an unconnected service, suggest\n"
@@ -114,12 +116,18 @@ def _group_tools(all_tools: List[dict], tool_map: dict) -> Dict[str, List[str]]:
 
 def _apply_filter(all_tools: List[dict], tool_map: dict,
                   prefs: dict) -> List[dict]:
-    """Return only tools whose group is enabled."""
+    """Return tools whose group is enabled, plus any individually picked tools."""
     disabled = set(prefs.get("disabled_groups", []))
+    picked = set(prefs.get("picked_tools", []))
     if not disabled:
         return all_tools
-    return [t for t in all_tools
-            if _tool_group(t["function"]["name"], tool_map) not in disabled]
+    result = []
+    for t in all_tools:
+        name = t["function"]["name"]
+        grp = _tool_group(name, tool_map)
+        if grp not in disabled or name in picked:
+            result.append(t)
+    return result
 
 KNOWN_MODELS = {
     "openai": [
@@ -676,24 +684,36 @@ MANAGE_TOOLS_TOOL = {
     "function": {
         "name": "manage_tools",
         "description": (
-            "Enable or disable tool groups to bring in the right tools for the "
-            "user's request. Call this when the user needs tools from a disabled "
-            "group (e.g. github, gmail, slack). After enabling, the tools become "
-            "available immediately for the next tool call in this turn. "
-            "Use action='list' to see all groups and their status. "
-            "Use action='enable' or action='disable' with the group name."
+            "Search for and selectively load the tools you need. "
+            "PREFERRED WORKFLOW for large groups like github (800+ tools):\n"
+            "  1. action='search', query='repos org members' — find specific tools by keyword\n"
+            "  2. action='enable_tools', tools=['GITHUB_LIST_REPOS', ...] — load only those\n"
+            "This avoids loading 800+ tools when you only need 3-5.\n\n"
+            "Other actions:\n"
+            "  action='list' — show all tool groups and their ON/OFF status\n"
+            "  action='enable', group='gmail' — enable an entire small group\n"
+            "  action='disable', group='gmail' — disable a group"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "enable", "disable"],
+                    "enum": ["list", "search", "enable_tools", "enable", "disable"],
                     "description": "The action to perform",
                 },
                 "group": {
                     "type": "string",
-                    "description": "Tool group name (e.g. github, gmail, composio, atlassian)",
+                    "description": "Tool group name for enable/disable (e.g. github, gmail)",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search query for action='search' — matches tool names and descriptions",
+                },
+                "tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Specific tool names for action='enable_tools'",
                 },
             },
             "required": ["action"],
@@ -760,6 +780,52 @@ class _ManageToolsClient:
             count = len(groups.get(group, []))
             return {"content": [{"type": "text", "text":
                 f"Disabled {group} ({count} tools removed). {len(tools)} tools now active."}]}
+
+        if action == "search":
+            query = arguments.get("query", "").lower()
+            if not query:
+                return {"content": [{"type": "text", "text": "Error: specify a search query"}]}
+            keywords = query.split()
+            matches = []
+            for t in all_tools:
+                fn = t["function"]
+                tname = fn["name"]
+                haystack = (tname + " " + fn.get("description", "")).lower()
+                if all(kw in haystack for kw in keywords):
+                    matches.append(tname)
+                elif any(kw in haystack for kw in keywords):
+                    matches.append(tname)
+                if len(matches) >= 25:
+                    break
+            if not matches:
+                return {"content": [{"type": "text", "text":
+                    f"No tools found matching '{query}'. Try broader keywords."}]}
+            lines = [f"Found {len(matches)} tools matching '{query}':"]
+            for m in matches:
+                grp = _tool_group(m, tool_map)
+                marker = " [disabled]" if grp in disabled and m not in set(prefs.get("picked_tools", [])) else ""
+                lines.append(f"  {m}{marker}")
+            lines.append("\nUse action='enable_tools' with the tool names you need.")
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+        if action == "enable_tools":
+            tool_names = arguments.get("tools", [])
+            if not tool_names:
+                return {"content": [{"type": "text", "text": "Error: specify tool names"}]}
+            valid = {t["function"]["name"] for t in all_tools}
+            picked = set(prefs.get("picked_tools", []))
+            added = []
+            for tn in tool_names:
+                if tn in valid:
+                    picked.add(tn)
+                    added.append(tn)
+            prefs["picked_tools"] = sorted(picked)
+            _save_tool_prefs(prefs)
+            tools = _apply_filter(all_tools, tool_map, prefs)
+            s["tools"] = tools
+            s["needs_tool_refresh"] = True
+            return {"content": [{"type": "text", "text":
+                f"Loaded {len(added)} tools: {', '.join(added)}. {len(tools)} tools now active."}]}
 
         return {"content": [{"type": "text", "text": f"Unknown action: {action}"}]}
 

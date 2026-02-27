@@ -58,6 +58,59 @@ CHAT_SYSTEM_PROMPT = (
 
 MAX_TOOL_ROUNDS = 10
 
+# ---------------------------------------------------------------------------
+# Tool filtering — load all tools but only send enabled ones to the LLM.
+# Preferences persist in ~/.local/state/conch/tool_prefs.json.
+# ---------------------------------------------------------------------------
+
+_TOOL_PREFS_PATH = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "conch", "tool_prefs.json")
+
+
+def _load_tool_prefs() -> dict:
+    try:
+        with open(_TOOL_PREFS_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_tool_prefs(prefs: dict):
+    os.makedirs(os.path.dirname(_TOOL_PREFS_PATH), exist_ok=True)
+    with open(_TOOL_PREFS_PATH, "w") as f:
+        json.dump(prefs, f, indent=2)
+
+
+def _tool_group(name: str, tool_map: dict) -> str:
+    """Derive the group/source name for a tool."""
+    if name == "local_shell":
+        return "local_shell"
+    client = tool_map.get(name)
+    if client:
+        return getattr(client, "name", "unknown")
+    return "unknown"
+
+
+def _group_tools(all_tools: List[dict], tool_map: dict) -> Dict[str, List[str]]:
+    """Group tool names by their source."""
+    groups: Dict[str, List[str]] = {}
+    for t in all_tools:
+        name = t["function"]["name"]
+        grp = _tool_group(name, tool_map)
+        groups.setdefault(grp, []).append(name)
+    return groups
+
+
+def _apply_filter(all_tools: List[dict], tool_map: dict,
+                  prefs: dict) -> List[dict]:
+    """Return only tools whose group is enabled."""
+    disabled = set(prefs.get("disabled_groups", []))
+    if not disabled:
+        return all_tools
+    return [t for t in all_tools
+            if _tool_group(t["function"]["name"], tool_map) not in disabled]
+
 KNOWN_MODELS = {
     "openai": [
         "gpt-4.1",
@@ -267,7 +320,9 @@ DEFAULT_API_KEY_ENVS = {
 
 def _handle_slash_command(cmd: str, config: dict, provider: str,
                           model_name: str,
-                          memory: Optional["MemoryStore"] = None) -> Optional[tuple]:
+                          memory: Optional["MemoryStore"] = None,
+                          all_tools: Optional[List[dict]] = None,
+                          tool_map: Optional[Dict[str, Any]] = None) -> Optional[tuple]:
     """Handle slash commands. Returns (provider, model, raw_fn) on change, None otherwise.
 
     Returns None if the command was handled but no model change occurred (or unknown command).
@@ -285,6 +340,9 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List all saved memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
+            "  \033[1m/tools\033[0m               List loaded tools by source\n"
+            "  \033[1m/enable <group>\033[0m      Enable a tool group (e.g. gmail, github)\n"
+            "  \033[1m/disable <group>\033[0m     Disable a tool group\n"
             "  \033[1m/connect <app>\033[0m       Connect a service via Composio (e.g. gmail)\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
@@ -388,6 +446,58 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
         config["model"] = new_model
         print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
         return (new_provider, new_model, new_fn)
+
+    if command == "/tools" and all_tools is not None and tool_map is not None:
+        prefs = _load_tool_prefs()
+        disabled = set(prefs.get("disabled_groups", []))
+        groups = _group_tools(all_tools, tool_map)
+        active_tools = _apply_filter(all_tools, tool_map, prefs)
+        print(f"\n  \033[1;36mTool groups ({len(active_tools)}/{len(all_tools)} active):\033[0m")
+        for grp in sorted(groups.keys()):
+            names = groups[grp]
+            is_disabled = grp in disabled
+            status = "\033[31m OFF\033[0m" if is_disabled else "\033[32m ON \033[0m"
+            print(f"    {status}  \033[1m{grp:<20}\033[0m \033[2m{len(names)} tools\033[0m")
+        print(f"\n  \033[2mTip: /disable <group> or /enable <group>\033[0m\n")
+        return None
+
+    if command == "/enable" and all_tools is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /enable <group>  (see /tools for groups)\033[0m\n")
+            return None
+        prefs = _load_tool_prefs()
+        disabled = set(prefs.get("disabled_groups", []))
+        target = arg.lower()
+        if target == "all":
+            disabled.clear()
+            print(f"\n  \033[1;32m✓ All tool groups enabled\033[0m\n")
+        elif target in disabled:
+            disabled.discard(target)
+            print(f"\n  \033[1;32m✓ Enabled {target}\033[0m\n")
+        else:
+            print(f"\n  \033[2m{target} is already enabled\033[0m\n")
+            return None
+        prefs["disabled_groups"] = sorted(disabled)
+        _save_tool_prefs(prefs)
+        return "reload_tools"
+
+    if command == "/disable" and all_tools is not None and tool_map is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /disable <group>  (see /tools for groups)\033[0m\n")
+            return None
+        prefs = _load_tool_prefs()
+        disabled = set(prefs.get("disabled_groups", []))
+        target = arg.lower()
+        groups = _group_tools(all_tools, tool_map)
+        if target not in groups:
+            print(f"\n  \033[31mUnknown group '{target}'. Use /tools to see groups.\033[0m\n")
+            return None
+        disabled.add(target)
+        prefs["disabled_groups"] = sorted(disabled)
+        _save_tool_prefs(prefs)
+        count = len(groups[target])
+        print(f"\n  \033[1;32m✓ Disabled {target} ({count} tools)\033[0m\n")
+        return "reload_tools"
 
     if command == "/apps":
         if not composio_mod.is_available():
@@ -603,20 +713,15 @@ def chat_loop():
         sys.exit(1)
 
     mcp_clients = mcp_mod.create_clients()
-    tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+    all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
 
     # Inject built-in local shell tool
-    tools.append(LOCAL_SHELL_TOOL)
+    all_tools.append(LOCAL_SHELL_TOOL)
     tool_map["local_shell"] = _local_shell_client
 
-    # Guard against bloated tool payloads that break the API
-    MAX_TOOLS = 300
-    if len(tools) > MAX_TOOLS:
-        print(f"\033[33m  Warning: {len(tools)} tools exceeds limit, keeping first {MAX_TOOLS}\033[0m",
-              file=sys.stderr)
-        kept_names = {t["function"]["name"] for t in tools[:MAX_TOOLS]}
-        tools = tools[:MAX_TOOLS]
-        tool_map = {k: v for k, v in tool_map.items() if k in kept_names}
+    # Apply user's enable/disable preferences
+    tool_prefs = _load_tool_prefs()
+    tools = _apply_filter(all_tools, tool_map, tool_prefs)
 
     memory = MemoryStore()
 
@@ -637,8 +742,11 @@ def chat_loop():
     readline.set_history_length(500)
 
     print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
-    if tools:
-        print(f"\033[2m{len(tools)} MCP tool{'s' if len(tools) != 1 else ''} available\033[0m")
+    if all_tools:
+        if len(tools) < len(all_tools):
+            print(f"\033[2m{len(tools)}/{len(all_tools)} tools active (/tools to manage)\033[0m")
+        else:
+            print(f"\033[2m{len(tools)} tools available\033[0m")
     mem_count = len(memory.get_all())
     if mem_count:
         print(f"\033[2m{mem_count} memor{'y' if mem_count == 1 else 'ies'} loaded\033[0m")
@@ -664,20 +772,24 @@ def chat_loop():
                 first_word = stripped.split()[0].lower() if stripped else ""
                 if first_word in ("models", "model", "provider", "help", "ls",
                                   "remember", "memories", "mem", "forget",
-                                  "connect", "apps", "reload"):
+                                  "connect", "apps", "reload",
+                                  "tools", "enable", "disable"):
                     slash_input = "/" + stripped
 
             if slash_input is not None:
                 result = _handle_slash_command(
-                    slash_input, config, provider, model_name, memory=memory)
+                    slash_input, config, provider, model_name, memory=memory,
+                    all_tools=all_tools, tool_map=tool_map)
                 if result == "reload_tools":
                     print("  \033[2mReloading MCP tools...\033[0m")
                     mcp_mod.close_all(mcp_clients)
                     mcp_clients = mcp_mod.create_clients()
-                    tools, tool_map = mcp_mod.collect_tools(mcp_clients)
-                    tools.append(LOCAL_SHELL_TOOL)
+                    all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+                    all_tools.append(LOCAL_SHELL_TOOL)
                     tool_map["local_shell"] = _local_shell_client
-                    print(f"  \033[1;32m{len(tools)} tool{'s' if len(tools) != 1 else ''} loaded\033[0m\n")
+                    tool_prefs = _load_tool_prefs()
+                    tools = _apply_filter(all_tools, tool_map, tool_prefs)
+                    print(f"  \033[1;32m{len(tools)}/{len(all_tools)} tools active\033[0m\n")
                 elif result is not None:
                     provider, model_name, raw_fn = result
                 continue

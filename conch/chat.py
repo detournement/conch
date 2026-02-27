@@ -609,6 +609,15 @@ def chat_loop():
     tools.append(LOCAL_SHELL_TOOL)
     tool_map["local_shell"] = _local_shell_client
 
+    # Guard against bloated tool payloads that break the API
+    MAX_TOOLS = 300
+    if len(tools) > MAX_TOOLS:
+        print(f"\033[33m  Warning: {len(tools)} tools exceeds limit, keeping first {MAX_TOOLS}\033[0m",
+              file=sys.stderr)
+        kept_names = {t["function"]["name"] for t in tools[:MAX_TOOLS]}
+        tools = tools[:MAX_TOOLS]
+        tool_map = {k: v for k, v in tool_map.items() if k in kept_names}
+
     memory = MemoryStore()
 
     messages: List[dict] = [{"role": "system", "content": system_prompt}]

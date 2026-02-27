@@ -488,12 +488,19 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
 
     if command == "/disable" and all_tools is not None and tool_map is not None:
         if not arg:
-            print("\n  \033[2mUsage: /disable <group>  (see /tools for groups)\033[0m\n")
+            print("\n  \033[2mUsage: /disable <group>  or  /disable all\033[0m\n")
             return None
         prefs = _load_tool_prefs()
         disabled = set(prefs.get("disabled_groups", []))
         target = arg.lower()
         groups = _group_tools(all_tools, tool_map)
+        if target == "all":
+            disabled = set(groups.keys()) - {"local_shell", "manage_tools"}
+            prefs["disabled_groups"] = sorted(disabled)
+            _save_tool_prefs(prefs)
+            total = sum(len(v) for k, v in groups.items() if k in disabled)
+            print(f"\n  \033[1;32m✓ Disabled all tool groups ({total} tools)\033[0m\n")
+            return "reload_tools"
         if target not in groups:
             print(f"\n  \033[31mUnknown group '{target}'. Use /tools to see groups.\033[0m\n")
             return None

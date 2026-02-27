@@ -43,6 +43,11 @@ CHAT_SYSTEM_PROMPT = (
     "- MCP tools config: ~/.config/conch/mcp.json.\n"
     "- The user can switch models live in chat with /models and /model <name>.\n"
     "  /provider <name> switches the LLM provider (openai, anthropic, ollama).\n"
+    "- manage_tools: you have a tool that can enable/disable tool groups at runtime.\n"
+    "  Some large tool groups (e.g. github with 800+ tools) are auto-disabled at start.\n"
+    "  If the user asks for something that needs a disabled group, call manage_tools\n"
+    "  with action='enable' and the group name. The tools load instantly and you can\n"
+    "  use them in the same turn. Always prefer this over telling the user to run /enable.\n"
     "- Connect services: /connect <app> authenticates services via Composio (e.g.\n"
     "  /connect gmail, /connect slack). /apps lists available services.\n"
     "  If the user asks for something that requires an unconnected service, suggest\n"
@@ -651,12 +656,118 @@ _local_shell_client = _LocalShellClient()
 
 
 # ---------------------------------------------------------------------------
+# Built-in tool management — lets the LLM enable/disable tool groups.
+# ---------------------------------------------------------------------------
+
+MANAGE_TOOLS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "manage_tools",
+        "description": (
+            "Enable or disable tool groups to bring in the right tools for the "
+            "user's request. Call this when the user needs tools from a disabled "
+            "group (e.g. github, gmail, slack). After enabling, the tools become "
+            "available immediately for the next tool call in this turn. "
+            "Use action='list' to see all groups and their status. "
+            "Use action='enable' or action='disable' with the group name."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "enable", "disable"],
+                    "description": "The action to perform",
+                },
+                "group": {
+                    "type": "string",
+                    "description": "Tool group name (e.g. github, gmail, composio, atlassian)",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class _ManageToolsClient:
+    """Pseudo-MCP client that manages tool groups at runtime."""
+
+    name = "manage_tools"
+
+    def __init__(self):
+        self._chat_state = None
+
+    def bind(self, state: dict):
+        """Bind to the chat loop's mutable state dict."""
+        self._chat_state = state
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        action = arguments.get("action", "list")
+        group = arguments.get("group", "").lower()
+
+        s = self._chat_state
+        if not s:
+            return {"content": [{"type": "text", "text": "Error: tool manager not initialized"}]}
+
+        all_tools = s["all_tools"]
+        tool_map = s["tool_map"]
+        groups = _group_tools(all_tools, tool_map)
+        prefs = _load_tool_prefs()
+        disabled = set(prefs.get("disabled_groups", []))
+
+        if action == "list":
+            lines = ["Tool groups:"]
+            for grp in sorted(groups.keys()):
+                status = "OFF" if grp in disabled else "ON"
+                lines.append(f"  [{status}] {grp} ({len(groups[grp])} tools)")
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+        if action == "enable":
+            if not group:
+                return {"content": [{"type": "text", "text": "Error: specify a group name"}]}
+            disabled.discard(group)
+            prefs["disabled_groups"] = sorted(disabled)
+            _save_tool_prefs(prefs)
+            tools = _apply_filter(all_tools, tool_map, prefs)
+            s["tools"] = tools
+            s["needs_tool_refresh"] = True
+            count = len(groups.get(group, []))
+            return {"content": [{"type": "text", "text":
+                f"Enabled {group} ({count} tools). {len(tools)} tools now active."}]}
+
+        if action == "disable":
+            if not group:
+                return {"content": [{"type": "text", "text": "Error: specify a group name"}]}
+            disabled.add(group)
+            prefs["disabled_groups"] = sorted(disabled)
+            _save_tool_prefs(prefs)
+            tools = _apply_filter(all_tools, tool_map, prefs)
+            s["tools"] = tools
+            s["needs_tool_refresh"] = True
+            count = len(groups.get(group, []))
+            return {"content": [{"type": "text", "text":
+                f"Disabled {group} ({count} tools removed). {len(tools)} tools now active."}]}
+
+        return {"content": [{"type": "text", "text": f"Unknown action: {action}"}]}
+
+
+_manage_tools_client = _ManageToolsClient()
+
+
+# ---------------------------------------------------------------------------
 # Core turn logic — calls the LLM, executes tools, loops until text reply.
 # ---------------------------------------------------------------------------
 
 def _chat_turn(config: dict, provider: str, raw_fn, messages: List[dict],
-               tools: Optional[List[dict]], tool_map: Dict[str, Any]) -> str:
+               tools: Optional[List[dict]], tool_map: Dict[str, Any],
+               chat_state: Optional[dict] = None) -> str:
     for _ in range(MAX_TOOL_ROUNDS):
+        # Pick up refreshed tools if manage_tools changed them
+        if chat_state and chat_state.get("needs_tool_refresh"):
+            tools = chat_state["tools"]
+            chat_state["needs_tool_refresh"] = False
+
         with Spinner("Thinking"):
             response = raw_fn(config, messages, tools if tools else None)
 
@@ -674,9 +785,10 @@ def _chat_turn(config: dict, provider: str, raw_fn, messages: List[dict],
                 arguments = {}
 
             print(f"  \033[2m⚡ {name}\033[0m", file=sys.stderr)
-            if name == "local_shell":
-                result_text = _local_shell_client.call_tool(name, arguments)
-                result_text = result_text.get("content", [{}])[0].get("text", "")
+            if name in ("local_shell", "manage_tools"):
+                client = _local_shell_client if name == "local_shell" else _manage_tools_client
+                raw_result = client.call_tool(name, arguments)
+                result_text = raw_result.get("content", [{}])[0].get("text", "")
             else:
                 with Spinner(f"Running {name}"):
                     result_text = mcp_mod.execute_tool(tool_map, name, arguments)
@@ -715,9 +827,11 @@ def chat_loop():
     mcp_clients = mcp_mod.create_clients()
     all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
 
-    # Inject built-in local shell tool
+    # Inject built-in tools
     all_tools.append(LOCAL_SHELL_TOOL)
+    all_tools.append(MANAGE_TOOLS_TOOL)
     tool_map["local_shell"] = _local_shell_client
+    tool_map["manage_tools"] = _manage_tools_client
 
     # Apply user's enable/disable preferences, auto-trim oversized groups
     tool_prefs = _load_tool_prefs()
@@ -741,6 +855,11 @@ def chat_loop():
     tools = _apply_filter(all_tools, tool_map, tool_prefs)
     if len(tools) > MAX_TOOLS:
         tools = tools[:MAX_TOOLS]
+
+    # Shared state so manage_tools can update the active tool list mid-turn
+    chat_state = {"all_tools": all_tools, "tool_map": tool_map,
+                  "tools": tools, "needs_tool_refresh": False}
+    _manage_tools_client.bind(chat_state)
 
     memory = MemoryStore()
 
@@ -805,9 +924,13 @@ def chat_loop():
                     mcp_clients = mcp_mod.create_clients()
                     all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
                     all_tools.append(LOCAL_SHELL_TOOL)
+                    all_tools.append(MANAGE_TOOLS_TOOL)
                     tool_map["local_shell"] = _local_shell_client
+                    tool_map["manage_tools"] = _manage_tools_client
                     tool_prefs = _load_tool_prefs()
                     tools = _apply_filter(all_tools, tool_map, tool_prefs)
+                    chat_state.update({"all_tools": all_tools, "tool_map": tool_map,
+                                       "tools": tools, "needs_tool_refresh": False})
                     print(f"  \033[1;32m{len(tools)}/{len(all_tools)} tools active\033[0m\n")
                 elif result is not None:
                     provider, model_name, raw_fn = result
@@ -821,7 +944,10 @@ def chat_loop():
                 messages[0]["content"] = system_prompt
 
             messages.append({"role": "user", "content": user_input})
-            reply = _chat_turn(config, provider, raw_fn, messages, tools, tool_map)
+            reply = _chat_turn(config, provider, raw_fn, messages, tools, tool_map,
+                               chat_state=chat_state)
+            # Pick up any tools changes made by manage_tools during the turn
+            tools = chat_state["tools"]
             if reply:
                 messages.append({"role": "assistant", "content": reply})
                 print(f"\n\033[1;36massistant:\033[0m\n{highlight(reply)}\n")

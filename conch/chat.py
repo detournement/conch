@@ -846,6 +846,116 @@ _manage_tools_client = _ManageToolsClient()
 
 
 # ---------------------------------------------------------------------------
+# Context management — estimate tokens and compress when nearing limits.
+# ---------------------------------------------------------------------------
+
+# Rough chars-per-token ratio (conservative; actual varies by model/language)
+_CHARS_PER_TOKEN = 3.5
+
+# Context budgets (input tokens). Leave room for output.
+_CONTEXT_LIMITS = {
+    "openai": 120000,      # 128k models, reserve 8k for output
+    "anthropic": 180000,   # 200k models, reserve 20k for output
+    "ollama": 28000,       # varies, conservative default
+}
+
+
+def _estimate_tokens(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
+    """Fast token estimate from character count."""
+    total = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total += len(json.dumps(block))
+                else:
+                    total += len(str(block))
+    if tools:
+        total += len(json.dumps(tools))
+    return int(total / _CHARS_PER_TOKEN)
+
+
+def _summarize_message(msg: dict) -> dict:
+    """Compress a message by truncating long content."""
+    content = msg.get("content", "")
+    role = msg.get("role", "")
+
+    if isinstance(content, str) and len(content) > 500:
+        # Keep first 200 and last 100 chars
+        compressed = content[:200] + "\n...[compressed]...\n" + content[-100:]
+        return {**msg, "content": compressed}
+
+    if isinstance(content, list):
+        compressed_blocks = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text", block.get("content", ""))
+                if isinstance(text, str) and len(text) > 500:
+                    block = {**block}
+                    key = "text" if "text" in block else "content"
+                    block[key] = text[:200] + "\n...[compressed]...\n" + text[-100:]
+            compressed_blocks.append(block)
+        return {**msg, "content": compressed_blocks}
+
+    return msg
+
+
+def _compress_context(messages: List[dict], tools: Optional[List[dict]],
+                      provider: str) -> List[dict]:
+    """Compress message history if estimated tokens exceed the context limit.
+
+    Strategy:
+    1. Always keep the system prompt (messages[0]) and last 4 messages intact.
+    2. Compress middle messages by truncating long content.
+    3. If still over budget, drop the oldest middle messages.
+    """
+    limit = _CONTEXT_LIMITS.get(provider, 120000)
+    est = _estimate_tokens(messages, tools)
+
+    if est <= limit:
+        return messages
+
+    if len(messages) <= 5:
+        # Not enough messages to compress, just truncate tool results
+        return [_summarize_message(m) for m in messages]
+
+    # Phase 1: compress middle messages
+    system = messages[0]
+    recent = messages[-4:]
+    middle = messages[1:-4]
+
+    compressed = [system]
+    for m in middle:
+        compressed.append(_summarize_message(m))
+    compressed.extend(recent)
+
+    est = _estimate_tokens(compressed, tools)
+    if est <= limit:
+        return compressed
+
+    # Phase 2: progressively drop oldest middle messages
+    while len(middle) > 0 and _estimate_tokens(
+            [system] + [_summarize_message(m) for m in middle] + recent, tools) > limit:
+        middle.pop(0)
+
+    if middle:
+        summary_note = {"role": "system", "content":
+            f"[Earlier conversation compressed — {len(messages) - len(middle) - 5} messages summarized]"}
+        result = [system, summary_note]
+        result.extend(_summarize_message(m) for m in middle)
+        result.extend(recent)
+        return result
+
+    # Phase 3: only system + recent, with a note
+    summary_note = {"role": "system", "content":
+        f"[Conversation history compressed — {len(messages) - 5} older messages dropped to fit context]"}
+    return [system, summary_note] + [_summarize_message(m) for m in recent]
+
+
+# ---------------------------------------------------------------------------
 # Core turn logic — calls the LLM, executes tools, loops until text reply.
 # ---------------------------------------------------------------------------
 
@@ -857,6 +967,12 @@ def _chat_turn(config: dict, provider: str, raw_fn, messages: List[dict],
         if chat_state and chat_state.get("needs_tool_refresh"):
             tools = chat_state["tools"]
             chat_state["needs_tool_refresh"] = False
+
+        # Compress context if nearing token limits
+        compressed = _compress_context(messages, tools, provider)
+        if len(compressed) < len(messages):
+            messages.clear()
+            messages.extend(compressed)
 
         with Spinner("Thinking"):
             response = raw_fn(config, messages, tools if tools else None)

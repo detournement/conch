@@ -98,7 +98,7 @@ def call_openai(config: dict, messages: list) -> str:
         "model": config.get("model", "gpt-4o-mini"),
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 512,
+        "max_tokens": 2048,
     }
     req = urllib.request.Request(
         url,
@@ -131,7 +131,7 @@ def call_anthropic(config: dict, messages: list) -> str:
     user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
     body = {
         "model": config.get("model", "claude-sonnet-4-6"),
-        "max_tokens": 256,
+        "max_tokens": 2048,
         "system": system,
         "messages": [{"role": "user", "content": user_content}],
     }

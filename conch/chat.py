@@ -786,25 +786,31 @@ class _ManageToolsClient:
             if not query:
                 return {"content": [{"type": "text", "text": "Error: specify a search query"}]}
             keywords = query.split()
-            matches = []
+            scored: List[tuple] = []
             for t in all_tools:
                 fn = t["function"]
                 tname = fn["name"]
-                haystack = (tname + " " + fn.get("description", "")).lower()
-                if all(kw in haystack for kw in keywords):
-                    matches.append(tname)
-                elif any(kw in haystack for kw in keywords):
-                    matches.append(tname)
-                if len(matches) >= 25:
-                    break
+                name_lower = tname.lower()
+                desc_lower = fn.get("description", "").lower()
+                # Score: keyword hits in name count double
+                name_hits = sum(1 for kw in keywords if kw in name_lower)
+                desc_hits = sum(1 for kw in keywords if kw in desc_lower)
+                if name_hits == 0 and desc_hits == 0:
+                    continue
+                score = (name_hits * 2 + desc_hits) / len(keywords)
+                # Boost disabled groups (likely what the user needs)
+                grp = _tool_group(tname, tool_map)
+                if grp in disabled:
+                    score += 1.0
+                scored.append((tname, score, fn.get("description", "")[:80]))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            matches = scored[:20]
             if not matches:
                 return {"content": [{"type": "text", "text":
                     f"No tools found matching '{query}'. Try broader keywords."}]}
             lines = [f"Found {len(matches)} tools matching '{query}':"]
-            for m in matches:
-                grp = _tool_group(m, tool_map)
-                marker = " [disabled]" if grp in disabled and m not in set(prefs.get("picked_tools", [])) else ""
-                lines.append(f"  {m}{marker}")
+            for tname, score, desc in matches:
+                lines.append(f"  {tname} — {desc}")
             lines.append("\nUse action='enable_tools' with the tool names you need.")
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
@@ -813,12 +819,18 @@ class _ManageToolsClient:
             if not tool_names:
                 return {"content": [{"type": "text", "text": "Error: specify tool names"}]}
             valid = {t["function"]["name"] for t in all_tools}
+            valid_lower = {n.lower(): n for n in valid}
             picked = set(prefs.get("picked_tools", []))
             added = []
             for tn in tool_names:
-                if tn in valid:
-                    picked.add(tn)
-                    added.append(tn)
+                clean = tn.split(" —")[0].split(" [")[0].strip()
+                if clean in valid:
+                    picked.add(clean)
+                    added.append(clean)
+                elif clean.lower() in valid_lower:
+                    real = valid_lower[clean.lower()]
+                    picked.add(real)
+                    added.append(real)
             prefs["picked_tools"] = sorted(picked)
             _save_tool_prefs(prefs)
             tools = _apply_filter(all_tools, tool_map, prefs)

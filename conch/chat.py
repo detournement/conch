@@ -88,13 +88,18 @@ def _save_tool_prefs(prefs: dict):
 
 
 def _tool_group(name: str, tool_map: dict) -> str:
-    """Derive the group/source name for a tool."""
-    if name == "local_shell":
-        return "local_shell"
+    """Derive the group/source name for a tool.
+
+    For Composio tools, split by prefix (GITHUB_*, GMAIL_*, SERPAPI_*, etc.)
+    so each service can be enabled/disabled independently.
+    """
+    if name in ("local_shell", "manage_tools"):
+        return name
     client = tool_map.get(name)
-    if client:
-        return getattr(client, "name", "unknown")
-    return "unknown"
+    client_name = getattr(client, "name", "unknown") if client else "unknown"
+    if client_name == "composio" and "_" in name:
+        return name.split("_")[0].lower()
+    return client_name
 
 
 def _group_tools(all_tools: List[dict], tool_map: dict) -> Dict[str, List[str]]:

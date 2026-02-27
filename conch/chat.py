@@ -910,20 +910,10 @@ def chat_loop():
                 break
 
             stripped = user_input.strip()
-            slash_input = None
-            if stripped.startswith("/"):
-                slash_input = stripped
-            else:
-                first_word = stripped.split()[0].lower() if stripped else ""
-                if first_word in ("models", "model", "provider", "help", "ls",
-                                  "remember", "memories", "mem", "forget",
-                                  "connect", "apps", "reload",
-                                  "tools", "enable", "disable"):
-                    slash_input = "/" + stripped
 
-            if slash_input is not None:
+            if stripped.startswith("/"):
                 result = _handle_slash_command(
-                    slash_input, config, provider, model_name, memory=memory,
+                    stripped, config, provider, model_name, memory=memory,
                     all_tools=all_tools, tool_map=tool_map)
                 if result == "reload_tools":
                     print("  \033[2mReloading MCP tools...\033[0m")

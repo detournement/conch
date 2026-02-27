@@ -882,6 +882,9 @@ def _chat_turn(config: dict, provider: str, raw_fn, messages: List[dict],
             else:
                 with Spinner(f"Running {name}"):
                     result_text = mcp_mod.execute_tool(tool_map, name, arguments)
+            # Cap individual tool results to prevent context blowup
+            if len(result_text) > 8000:
+                result_text = result_text[:8000] + "\n... (truncated — result too large)"
             results.append({"id": tc.get("id", ""), "content": result_text})
 
         if provider == "anthropic":

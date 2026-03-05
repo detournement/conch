@@ -21,9 +21,21 @@ TASKS_FILE = TASKS_DIR / "tasks.json"
 LOG_DIR = TASKS_DIR / "task_logs"
 
 
+_ENGLISH_INTERVALS = {
+    "daily": 86400, "everyday": 86400,
+    "hourly": 3600, "weekly": 604800,
+    "monthly": 2592000,
+    "biweekly": 1209600, "fortnightly": 1209600,
+}
+
+
 def _parse_interval(spec: str) -> Optional[int]:
-    """Parse interval like '10m', '1h', '30s', '2h30m' into seconds."""
+    """Parse interval like '10m', '1h', '30s', '2h30m', 'daily', 'hourly'."""
     spec = spec.strip().lower()
+
+    if spec in _ENGLISH_INTERVALS:
+        return _ENGLISH_INTERVALS[spec]
+
     total = 0
     for match in re.finditer(r"(\d+)\s*(s|sec|m|min|h|hr|d|day)", spec):
         val = int(match.group(1))

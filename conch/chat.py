@@ -402,29 +402,68 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
 
     if command == "/schedule" and sched is not None:
         if not arg:
-            print("\n  \033[2mUsage: /schedule <interval> <prompt>\033[0m\n"
+            print("\n  \033[2mUsage: /schedule <description>\033[0m\n"
                   "  \033[2mExamples:\033[0m\n"
-                  "  \033[2m  /schedule 10m send John an update email\033[0m\n"
-                  "  \033[2m  /schedule 1h check disk usage and alert if >90%\033[0m\n"
-                  "  \033[2m  /schedule once 30s remind me to stretch\033[0m\n")
+                  "  \033[2m  /schedule send John an update email every 10 minutes\033[0m\n"
+                  "  \033[2m  /schedule daily email to tom@capitol.ai with gold market updates\033[0m\n"
+                  "  \033[2m  /schedule every hour check disk usage and alert if >90%\033[0m\n")
             return None
-        parts = arg.split(None, 1)
+
+        # Try simple parse first (e.g. "/schedule 10m do something")
+        first_word = arg.split()[0]
         run_once = False
-        if parts[0].lower() == "once":
+        if first_word.lower() == "once":
+            rest = arg.split(None, 1)[1] if " " in arg else ""
+            first_word = rest.split()[0] if rest else ""
             run_once = True
-            parts = parts[1].split(None, 1) if len(parts) > 1 else []
-        if len(parts) < 2:
-            print("\n  \033[31mNeed both an interval and a prompt.\033[0m\n")
+        simple_interval = _parse_interval(first_word)
+        if simple_interval and " " in arg:
+            prompt = arg.split(None, 2 if run_once else 1)[-1]
+            task = sched.add(prompt, simple_interval, run_once=run_once)
+            kind = "one-time" if run_once else f"every {_format_interval(simple_interval)}"
+            print(f"\n  \033[1;32m✓ Scheduled task #{task.id}\033[0m ({kind})")
+            print(f"  \033[2m{prompt}\033[0m\n")
             return None
-        interval = _parse_interval(parts[0])
-        if not interval:
-            print(f"\n  \033[31mCan't parse interval '{parts[0]}'. Try: 10m, 1h, 30s, 2h30m\033[0m\n")
-            return None
-        prompt = parts[1]
-        task = sched.add(prompt, interval, run_once=run_once)
-        kind = "one-time" if run_once else f"every {_format_interval(interval)}"
-        print(f"\n  \033[1;32m✓ Scheduled task #{task.id}\033[0m ({kind})")
-        print(f"  \033[2m{prompt}\033[0m\n")
+
+        # LLM-based parse for natural language like "daily", "every 10 minutes", etc.
+        print("  \033[2mParsing schedule...\033[0m")
+        parse_prompt = (
+            "Extract the interval and task from this schedule request. "
+            "Reply with ONLY a JSON object, no other text:\n"
+            '{"interval_seconds": <number>, "prompt": "<the task to execute>", "run_once": <true/false>}\n\n'
+            "Common intervals: hourly=3600, daily=86400, weekly=604800, "
+            "every 10 minutes=600, every 30 minutes=1800, every 2 hours=7200.\n"
+            "The prompt should be the full task description without the timing part.\n\n"
+            f"Request: {arg}"
+        )
+        parse_messages = [
+            {"role": "system", "content": "You extract schedule parameters. Reply with ONLY valid JSON."},
+            {"role": "user", "content": parse_prompt},
+        ]
+        raw_fn = RAW_FNS.get(provider)
+        if raw_fn:
+            resp = raw_fn(config, parse_messages, None)
+            resp_text = resp.get("content", "")
+            try:
+                # Extract JSON from response
+                import re as _re
+                json_match = _re.search(r'\{[^}]+\}', resp_text)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                    interval = int(parsed.get("interval_seconds", 0))
+                    prompt = parsed.get("prompt", arg)
+                    run_once = parsed.get("run_once", False)
+                    if interval > 0:
+                        task = sched.add(prompt, interval, run_once=run_once)
+                        kind = "one-time" if run_once else f"every {_format_interval(interval)}"
+                        print(f"\n  \033[1;32m✓ Scheduled task #{task.id}\033[0m ({kind})")
+                        print(f"  \033[2m{prompt}\033[0m\n")
+                        return None
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
+        print(f"\n  \033[31mCouldn't parse schedule. Try: /schedule 10m <task> or include "
+              f"'daily', 'hourly', 'every N minutes' in your description.\033[0m\n")
         return None
 
     if command == "/tasks" and sched is not None:

@@ -358,6 +358,7 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List all saved memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
+            "  \033[1m/agent\033[0m               Toggle agent mode (auto-execute local commands)\n"
             "  \033[1m/tools\033[0m               List loaded tools by source\n"
             "  \033[1m/enable <group>\033[0m      Enable a tool group (e.g. gmail, github)\n"
             "  \033[1m/disable <group>\033[0m     Disable a tool group\n"
@@ -366,6 +367,21 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
             "  \033[1m/help\033[0m                Show this help\n"
         )
+        return None
+
+    if command == "/agent":
+        global _agent_mode
+        if arg in ("on", "true", "1"):
+            _agent_mode = True
+        elif arg in ("off", "false", "0"):
+            _agent_mode = False
+        else:
+            _agent_mode = not _agent_mode
+        status = "\033[1;32mON\033[0m" if _agent_mode else "\033[31mOFF\033[0m"
+        print(f"\n  Agent mode: {status}")
+        if _agent_mode:
+            print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
+        print()
         return None
 
     if command == "/remember" and memory is not None:
@@ -628,6 +644,9 @@ LOCAL_SHELL_TOOL = {
 }
 
 
+_agent_mode = False
+
+
 class _LocalShellClient:
     """Pseudo-MCP client that runs commands on the local machine."""
 
@@ -642,12 +661,15 @@ class _LocalShellClient:
             return {"content": [{"type": "text", "text": "Error: empty command"}]}
 
         print(f"\n  \033[1;33m⚠ Run locally:\033[0m \033[1m{cmd}\033[0m")
-        try:
-            answer = input("  \033[1;33mExecute? [y/N]\033[0m ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
-        if answer not in ("y", "yes"):
-            return {"content": [{"type": "text", "text": "User declined to execute the command."}]}
+        if not _agent_mode:
+            try:
+                answer = input("  \033[1;33mExecute? [y/N]\033[0m ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            if answer not in ("y", "yes"):
+                return {"content": [{"type": "text", "text": "User declined to execute the command."}]}
+        else:
+            print("  \033[2m(agent mode — auto-executing)\033[0m")
 
         try:
             result = _sp.run(

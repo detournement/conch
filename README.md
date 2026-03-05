@@ -10,6 +10,8 @@ Created by **Tom Hallaran**.
 - **`chat`** — Multi-turn conversation with the LLM. Supports **MCP tool calling** — the LLM can search the web, read files, manage Jira tickets, query APIs, and call 100+ tools during conversation.
 - **MCP-native** — First-class [Model Context Protocol](https://modelcontextprotocol.io/) support. Connect any MCP server (stdio or HTTP). Ships with Composio integration for 100+ no-auth tools out of the box, plus `/connect` to OAuth into Gmail, Slack, GitHub, and more — right from chat.
 - **Local shell execution** — The LLM can run commands on your machine (nmap, docker, git, curl — anything) with your confirmation, then chain the output with other tools. "Scan localhost and email me the results" works in one prompt.
+- **Task scheduler** — `/schedule 10m send John an update email` runs a prompt every 10 minutes in the background with full MCP tool access. `/tasks` to monitor, `/cancel` to stop.
+- **Agent mode** — `/agent on` enables auto-execution of local commands without confirmation. Combined with the scheduler, Conch becomes a fully autonomous agent.
 - **Connect services live** — Type `/connect gmail` and Conch handles the OAuth flow, opens your browser, and loads the tools. No manual config editing.
 - **Persistent memory** — Save facts, preferences, and context with `/remember`. Relevant memories surface automatically via TF-IDF semantic matching.
 - **Switch models on the fly** — `/model claude-sonnet-4-6` or `/model gpt-4.1` — swap LLM mid-conversation. Supports OpenAI, Anthropic, and Ollama.
@@ -443,7 +445,8 @@ conch/
 │   ├── llm.py                 # OpenAI/Anthropic/Ollama clients + tool detection
 │   ├── mcp.py                 # MCP client (stdio + HTTP transports)
 │   ├── memory.py              # Persistent semantic memory (TF-IDF retrieval)
-│   └── render.py              # Terminal markdown highlighting + spinner
+│   ├── render.py              # Terminal markdown highlighting + spinner
+│   └── scheduler.py           # Background task scheduler (/schedule, /tasks)
 ├── shell/
 │   ├── conch.zsh              # Zsh: ask, chat, key bindings, completions
 │   └── conch.bash             # Bash: ask, key bindings

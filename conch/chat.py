@@ -11,6 +11,7 @@ from .config import load_config
 from . import composio as composio_mod
 from .memory import MemoryStore
 from .render import Spinner, highlight
+from .scheduler import Scheduler, _parse_interval, _format_interval
 from . import mcp as mcp_mod
 
 CHAT_SYSTEM_PROMPT = (
@@ -47,6 +48,9 @@ CHAT_SYSTEM_PROMPT = (
     "    then email results, git log then create a Jira ticket, etc.).\n"
     "  - Prefer local_shell over sandbox/remote code interpreters.\n"
     "  - In agent mode (/agent on), commands auto-execute without confirmation.\n"
+    "  - For recurring/scheduled tasks, tell the user about /schedule — e.g.\n"
+    "    /schedule 10m send John an update email. Tasks run in the background\n"
+    "    with full MCP tool access while the chat stays interactive.\n"
     "- Configuration: ~/.config/conch/config or ~/.conchrc. Supports OpenAI, Anthropic, or Ollama.\n"
     "- MCP tools config: ~/.config/conch/mcp.json.\n"
     "- The user can switch models live in chat with /models and /model <name>.\n"
@@ -348,7 +352,8 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
                           model_name: str,
                           memory: Optional["MemoryStore"] = None,
                           all_tools: Optional[List[dict]] = None,
-                          tool_map: Optional[Dict[str, Any]] = None) -> Optional[tuple]:
+                          tool_map: Optional[Dict[str, Any]] = None,
+                          sched: Optional["Scheduler"] = None) -> Optional[tuple]:
     """Handle slash commands. Returns (provider, model, raw_fn) on change, None otherwise.
 
     Returns None if the command was handled but no model change occurred (or unknown command).
@@ -367,6 +372,9 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/memories\033[0m            List all saved memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
             "  \033[1m/agent\033[0m               Toggle agent mode (auto-execute local commands)\n"
+            "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a recurring task\n"
+            "  \033[1m/tasks\033[0m               List scheduled tasks\n"
+            "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
             "  \033[1m/tools\033[0m               List loaded tools by source\n"
             "  \033[1m/enable <group>\033[0m      Enable a tool group (e.g. gmail, github)\n"
             "  \033[1m/disable <group>\033[0m     Disable a tool group\n"
@@ -390,6 +398,63 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
         if _agent_mode:
             print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
         print()
+        return None
+
+    if command == "/schedule" and sched is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /schedule <interval> <prompt>\033[0m\n"
+                  "  \033[2mExamples:\033[0m\n"
+                  "  \033[2m  /schedule 10m send John an update email\033[0m\n"
+                  "  \033[2m  /schedule 1h check disk usage and alert if >90%\033[0m\n"
+                  "  \033[2m  /schedule once 30s remind me to stretch\033[0m\n")
+            return None
+        parts = arg.split(None, 1)
+        run_once = False
+        if parts[0].lower() == "once":
+            run_once = True
+            parts = parts[1].split(None, 1) if len(parts) > 1 else []
+        if len(parts) < 2:
+            print("\n  \033[31mNeed both an interval and a prompt.\033[0m\n")
+            return None
+        interval = _parse_interval(parts[0])
+        if not interval:
+            print(f"\n  \033[31mCan't parse interval '{parts[0]}'. Try: 10m, 1h, 30s, 2h30m\033[0m\n")
+            return None
+        prompt = parts[1]
+        task = sched.add(prompt, interval, run_once=run_once)
+        kind = "one-time" if run_once else f"every {_format_interval(interval)}"
+        print(f"\n  \033[1;32m✓ Scheduled task #{task.id}\033[0m ({kind})")
+        print(f"  \033[2m{prompt}\033[0m\n")
+        return None
+
+    if command == "/tasks" and sched is not None:
+        tasks = sched.list_tasks()
+        if not tasks:
+            print("\n  \033[2mNo scheduled tasks. Use /schedule to create one.\033[0m\n")
+            return None
+        print(f"\n  \033[1;36mScheduled tasks ({len(tasks)}):\033[0m")
+        for t in tasks:
+            status = "\033[32mactive\033[0m" if t.active else "\033[31mstopped\033[0m"
+            interval = _format_interval(t.interval)
+            last = t.last_run or "never"
+            print(f"    \033[1m#{t.id}\033[0m [{status}] every {interval} — {t.prompt}")
+            print(f"         \033[2mruns: {t.run_count}, last: {last}\033[0m")
+        print()
+        return None
+
+    if command == "/cancel" and sched is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /cancel <id>  (use /tasks to see IDs)\033[0m\n")
+            return None
+        try:
+            tid = int(arg.lstrip("#"))
+        except ValueError:
+            print(f"\n  \033[31mInvalid ID: {arg}\033[0m\n")
+            return None
+        if sched.cancel(tid):
+            print(f"\n  \033[1;32m✓ Cancelled task #{tid}\033[0m\n")
+        else:
+            print(f"\n  \033[31mNo task with ID #{tid}\033[0m\n")
         return None
 
     if command == "/remember" and memory is not None:
@@ -1104,6 +1169,18 @@ def chat_loop():
 
     memory = MemoryStore()
 
+    # Scheduler — runs prompts in the background with full tool access
+    sched = Scheduler()
+
+    def _execute_scheduled(prompt: str) -> str:
+        """Execute a scheduled prompt with its own message context."""
+        sched_messages: List[dict] = [{"role": "system", "content": system_prompt}]
+        sched_messages.append({"role": "user", "content": prompt})
+        return _chat_turn(config, provider, raw_fn, sched_messages, tools, tool_map)
+
+    sched.set_executor(_execute_scheduled)
+    sched.start()
+
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
 
     # Set up readline for input history (up/down arrows) within this session.
@@ -1129,6 +1206,9 @@ def chat_loop():
     mem_count = len(memory.get_all())
     if mem_count:
         print(f"\033[2m{mem_count} memor{'y' if mem_count == 1 else 'ies'} loaded\033[0m")
+    active_tasks = [t for t in sched.list_tasks() if t.active]
+    if active_tasks:
+        print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
     print(f"\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
 
     try:
@@ -1148,7 +1228,7 @@ def chat_loop():
             if stripped.startswith("/"):
                 result = _handle_slash_command(
                     stripped, config, provider, model_name, memory=memory,
-                    all_tools=all_tools, tool_map=tool_map)
+                    all_tools=all_tools, tool_map=tool_map, sched=sched)
                 if result == "reload_tools":
                     print("  \033[2mReloading MCP tools...\033[0m")
                     mcp_mod.close_all(mcp_clients)
@@ -1185,6 +1265,7 @@ def chat_loop():
             else:
                 print("\n\033[2m[no response]\033[0m\n")
     finally:
+        sched.stop()
         try:
             readline.write_history_file(_history_file)
         except OSError:

@@ -1468,21 +1468,52 @@ def chat_loop():
 
     _last_interrupt = [0.0]
 
+    def _read_input() -> Optional[str]:
+        """Read user input with multi-line support.
+
+        - End a line with \\ to continue on the next line
+        - Type \"\"\" on its own to enter/exit multi-line block mode
+        """
+        try:
+            first_line = input("\033[1;33myou:\033[0m ")
+        except EOFError:
+            return None
+        except KeyboardInterrupt:
+            now = time.time()
+            if now - _last_interrupt[0] < 1.5:
+                return None
+            _last_interrupt[0] = now
+            print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
+            return ""
+
+        if first_line.strip() == '"""':
+            lines = []
+            print("  \033[2m(multi-line mode — type \"\"\" to finish)\033[0m")
+            while True:
+                try:
+                    line = input("\033[2m...:\033[0m ")
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if line.strip() == '"""':
+                    break
+                lines.append(line)
+            return "\n".join(lines)
+
+        lines = [first_line]
+        while lines[-1].endswith("\\"):
+            lines[-1] = lines[-1][:-1]
+            try:
+                lines.append(input("\033[2m...:\033[0m "))
+            except (EOFError, KeyboardInterrupt):
+                break
+        return "\n".join(lines)
+
     try:
         while True:
-            try:
-                user_input = input("\033[1;33myou:\033[0m ")
-            except EOFError:
+            user_input = _read_input()
+            if user_input is None:
                 print("\n")
                 break
-            except KeyboardInterrupt:
-                now = time.time()
-                if now - _last_interrupt[0] < 1.5:
-                    print("\n")
-                    break
-                _last_interrupt[0] = now
-                print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
-                continue
             if not user_input.strip():
                 continue
             if user_input.strip().lower() in ("exit", "quit", "/q"):

@@ -67,11 +67,16 @@ CHAT_SYSTEM_PROMPT = (
     "  /connect gmail, /connect slack). /apps lists available services.\n"
     "  If the user asks for something that requires an unconnected service, suggest\n"
     "  they use /connect to set it up.\n"
-    "- Memory: the user can save persistent memories with /remember <text>.\n"
-    "  Saved memories are automatically included in context when relevant.\n"
+    "- Memory: you have a save_memory tool — use it PROACTIVELY to remember:\n"
+    "  * User preferences (language, framework, coding style, communication preferences)\n"
+    "  * Facts about their environment (OS, team, company, projects, repos)\n"
+    "  * Key people (names, emails, roles mentioned in conversation)\n"
+    "  * Decisions made or workflows established\n"
+    "  * Anything the user explicitly asks you to remember\n"
+    "  Don't ask permission — just save it when you learn something important.\n"
+    "  The user can also save manually with /remember <text>.\n"
     "  /memories lists all saved memories, /forget <id> removes one.\n"
-    "  If the user shares a preference, fact, or instruction they'd clearly want\n"
-    "  remembered across sessions, suggest they use /remember to save it.\n"
+    "  Past conversation summaries are loaded automatically at startup.\n"
     "- Install/update: run install.sh from the conch directory.\n"
     "When answering about your capabilities, be specific and helpful."
 )
@@ -983,6 +988,61 @@ _manage_tools_client = _ManageToolsClient()
 
 
 # ---------------------------------------------------------------------------
+# Built-in save_memory tool — lets the LLM auto-save important information.
+# ---------------------------------------------------------------------------
+
+SAVE_MEMORY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "save_memory",
+        "description": (
+            "Save important information to persistent memory. Use this proactively "
+            "when you learn something important about the user: preferences, facts "
+            "about their environment, project details, team members, workflows, "
+            "account info, or anything they'd want you to remember next time. "
+            "Also use when the user explicitly says to remember something. "
+            "Memories persist across chat sessions."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The fact or preference to remember",
+                },
+            },
+            "required": ["content"],
+        },
+    },
+}
+
+
+class _SaveMemoryClient:
+    """Pseudo-MCP client that saves memories on behalf of the LLM."""
+
+    name = "save_memory"
+
+    def __init__(self):
+        self._memory: Optional[MemoryStore] = None
+
+    def bind(self, memory: MemoryStore):
+        self._memory = memory
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        if not self._memory:
+            return {"content": [{"type": "text", "text": "Error: memory not initialized"}]}
+        content = arguments.get("content", "").strip()
+        if not content:
+            return {"content": [{"type": "text", "text": "Error: empty memory"}]}
+        entry = self._memory.add(content, source="auto")
+        return {"content": [{"type": "text", "text":
+            f"Saved memory #{entry['id']}: {content}"}]}
+
+
+_save_memory_client = _SaveMemoryClient()
+
+
+# ---------------------------------------------------------------------------
 # Context management — estimate tokens and compress when nearing limits.
 # ---------------------------------------------------------------------------
 
@@ -1128,8 +1188,10 @@ def _chat_turn(config: dict, provider: str, raw_fn, messages: List[dict],
                 arguments = {}
 
             print(f"  \033[2m⚡ {name}\033[0m", file=sys.stderr)
-            if name in ("local_shell", "manage_tools"):
-                client = _local_shell_client if name == "local_shell" else _manage_tools_client
+            if name in ("local_shell", "manage_tools", "save_memory"):
+                client = {"local_shell": _local_shell_client,
+                          "manage_tools": _manage_tools_client,
+                          "save_memory": _save_memory_client}[name]
                 raw_result = client.call_tool(name, arguments)
                 result_text = raw_result.get("content", [{}])[0].get("text", "")
             else:
@@ -1176,8 +1238,10 @@ def chat_loop():
     # Inject built-in tools
     all_tools.append(LOCAL_SHELL_TOOL)
     all_tools.append(MANAGE_TOOLS_TOOL)
+    all_tools.append(SAVE_MEMORY_TOOL)
     tool_map["local_shell"] = _local_shell_client
     tool_map["manage_tools"] = _manage_tools_client
+    tool_map["save_memory"] = _save_memory_client
 
     # Apply user's enable/disable preferences, auto-trim oversized groups
     tool_prefs = _load_tool_prefs()
@@ -1208,6 +1272,7 @@ def chat_loop():
     _manage_tools_client.bind(chat_state)
 
     memory = MemoryStore()
+    _save_memory_client.bind(memory)
 
     # Scheduler — runs prompts in the background with full tool access
     sched = Scheduler()
@@ -1286,8 +1351,10 @@ def chat_loop():
                     all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
                     all_tools.append(LOCAL_SHELL_TOOL)
                     all_tools.append(MANAGE_TOOLS_TOOL)
+                    all_tools.append(SAVE_MEMORY_TOOL)
                     tool_map["local_shell"] = _local_shell_client
                     tool_map["manage_tools"] = _manage_tools_client
+                    tool_map["save_memory"] = _save_memory_client
                     tool_prefs = _load_tool_prefs()
                     tools = _apply_filter(all_tools, tool_map, tool_prefs)
                     chat_state.update({"all_tools": all_tools, "tool_map": tool_map,
@@ -1322,6 +1389,31 @@ def chat_loop():
             else:
                 print("\n\033[2m[no response]\033[0m\n")
     finally:
+        # Summarize the session and save key facts to memory
+        user_turns = [m for m in messages if m.get("role") == "user"
+                      and isinstance(m.get("content"), str)]
+        if len(user_turns) >= 2 and raw_fn:
+            try:
+                summary_prompt = (
+                    "Summarize this conversation in 2-3 concise bullet points. "
+                    "Focus on: key facts learned about the user, decisions made, "
+                    "tasks completed, and anything worth remembering for future sessions. "
+                    "Reply with ONLY the bullet points, no preamble."
+                )
+                summary_msgs = [
+                    {"role": "system", "content": "You summarize conversations concisely."},
+                ]
+                for m in messages[1:]:
+                    if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant"):
+                        summary_msgs.append({"role": m["role"], "content": m["content"][:500]})
+                summary_msgs.append({"role": "user", "content": summary_prompt})
+                resp = raw_fn(config, summary_msgs, None)
+                summary = resp.get("content", "").strip()
+                if summary and len(summary) > 10:
+                    memory.add(f"[Session summary] {summary}", source="summary")
+            except Exception:
+                pass
+
         sched.stop()
         try:
             readline.write_history_file(_history_file)

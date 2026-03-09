@@ -90,14 +90,15 @@ class MemoryStore:
 
     # -- public API -----------------------------------------------------------
 
-    def add(self, content: str) -> dict:
-        """Save a new persistent memory. Returns the stored entry."""
+    def add(self, content: str, source: str = "user") -> dict:
+        """Save a new persistent memory. Source: 'user', 'auto', or 'summary'."""
         tokens = _tokenize(content)
         next_id = max((m["id"] for m in self._memories), default=0) + 1
         entry = {
             "id": next_id,
             "content": content.strip(),
             "tokens": tokens,
+            "source": source,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._memories.append(entry)

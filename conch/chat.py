@@ -8,6 +8,7 @@ import time
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from .browser import browse_conversations
 from .config import load_config
 from . import composio as composio_mod
 from .conversations import ConversationManager, Conversation
@@ -380,6 +381,7 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List all saved memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
+            "  \033[1m/browse\033[0m              Browse conversations (visual)\n"
             "  \033[1m/new\033[0m                 Start a new conversation\n"
             "  \033[1m/convos\033[0m              List past conversations\n"
             "  \033[1m/switch <id>\033[0m         Switch to a conversation\n"
@@ -411,6 +413,15 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
         if _agent_mode:
             print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
         print()
+        return None
+
+    if command in ("/browse", "/b") and conv_mgr is not None:
+        cid = current_conv.id if current_conv else ""
+        result = browse_conversations(conv_mgr, current_id=cid)
+        if result == "new":
+            return "new_conversation"
+        if result and result != cid:
+            return ("switch_conversation", result)
         return None
 
     if command == "/new" and conv_mgr is not None:

@@ -4,6 +4,7 @@ import json
 import os
 import readline
 import sys
+import time
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -1250,13 +1251,23 @@ def chat_loop():
         print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
     print(f"\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
 
+    _last_interrupt = [0.0]  # timestamp of last Ctrl+C
+
     try:
         while True:
             try:
                 user_input = input("\033[1;33myou:\033[0m ")
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 print("\n")
                 break
+            except KeyboardInterrupt:
+                now = time.time()
+                if now - _last_interrupt[0] < 1.5:
+                    print("\n")
+                    break
+                _last_interrupt[0] = now
+                print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
+                continue
             if not user_input.strip():
                 continue
             if user_input.strip().lower() in ("exit", "quit", "/q"):
@@ -1294,8 +1305,15 @@ def chat_loop():
                 messages[0]["content"] = system_prompt
 
             messages.append({"role": "user", "content": user_input})
-            reply = _chat_turn(config, provider, raw_fn, messages, tools, tool_map,
-                               chat_state=chat_state)
+            try:
+                reply = _chat_turn(config, provider, raw_fn, messages, tools, tool_map,
+                                   chat_state=chat_state)
+            except KeyboardInterrupt:
+                print("\n\n  \033[33m⚠ Interrupted\033[0m\n")
+                # Remove the dangling user message so history stays clean
+                if messages and messages[-1].get("role") == "user":
+                    messages.pop()
+                continue
             # Pick up any tools changes made by manage_tools during the turn
             tools = chat_state["tools"]
             if reply:

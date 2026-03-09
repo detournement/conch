@@ -11,6 +11,7 @@ Created by **Tom Hallaran**.
 - **MCP-native** — First-class [Model Context Protocol](https://modelcontextprotocol.io/) support. Connect any MCP server (stdio or HTTP). Ships with Composio integration for 100+ no-auth tools out of the box, plus `/connect` to OAuth into Gmail, Slack, GitHub, and more — right from chat.
 - **Local shell execution** — The LLM can run commands on your machine (nmap, docker, git, curl — anything) with your confirmation, then chain the output with other tools. "Scan localhost and email me the results" works in one prompt.
 - **Task scheduler** — `/schedule 10m send John an update email` runs a prompt every 10 minutes in the background with full MCP tool access. `/tasks` to monitor, `/cancel` to stop.
+- **Multiple conversations** — `/new` starts a fresh conversation, `/convos` lists past ones, `/switch <id>` resumes any. Full message history persisted to disk — pick up exactly where you left off.
 - **Agent mode** — `/agent on` enables auto-execution of local commands without confirmation. Combined with the scheduler, Conch becomes a fully autonomous agent.
 - **Connect services live** — Type `/connect gmail` and Conch handles the OAuth flow, opens your browser, and loads the tools. No manual config editing.
 - **Persistent memory** — Save facts, preferences, and context with `/remember`. Relevant memories surface automatically via TF-IDF semantic matching.
@@ -446,7 +447,8 @@ conch/
 │   ├── mcp.py                 # MCP client (stdio + HTTP transports)
 │   ├── memory.py              # Persistent semantic memory (TF-IDF retrieval)
 │   ├── render.py              # Terminal markdown highlighting + spinner
-│   └── scheduler.py           # Background task scheduler (/schedule, /tasks)
+│   ├── scheduler.py           # Background task scheduler (/schedule, /tasks)
+│   └── conversations.py      # Multi-conversation persistence (/convos, /switch)
 ├── shell/
 │   ├── conch.zsh              # Zsh: ask, chat, key bindings, completions
 │   └── conch.bash             # Bash: ask, key bindings

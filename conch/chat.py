@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import load_config
 from . import composio as composio_mod
+from .conversations import ConversationManager, Conversation
 from .memory import MemoryStore
 from .render import Spinner, highlight
 from .scheduler import Scheduler, _parse_interval, _format_interval
@@ -359,7 +360,9 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
                           memory: Optional["MemoryStore"] = None,
                           all_tools: Optional[List[dict]] = None,
                           tool_map: Optional[Dict[str, Any]] = None,
-                          sched: Optional["Scheduler"] = None) -> Optional[tuple]:
+                          sched: Optional["Scheduler"] = None,
+                          conv_mgr: Optional["ConversationManager"] = None,
+                          current_conv: Optional["Conversation"] = None) -> Optional[tuple]:
     """Handle slash commands. Returns (provider, model, raw_fn) on change, None otherwise.
 
     Returns None if the command was handled but no model change occurred (or unknown command).
@@ -377,6 +380,10 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List all saved memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory by ID\n"
+            "  \033[1m/new\033[0m                 Start a new conversation\n"
+            "  \033[1m/convos\033[0m              List past conversations\n"
+            "  \033[1m/switch <id>\033[0m         Switch to a conversation\n"
+            "  \033[1m/delete <id>\033[0m         Delete a conversation\n"
             "  \033[1m/agent\033[0m               Toggle agent mode (auto-execute local commands)\n"
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a recurring task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
@@ -404,6 +411,44 @@ def _handle_slash_command(cmd: str, config: dict, provider: str,
         if _agent_mode:
             print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
         print()
+        return None
+
+    if command == "/new" and conv_mgr is not None:
+        return "new_conversation"
+
+    if command == "/convos" and conv_mgr is not None:
+        convos = conv_mgr.list_all()
+        if not convos:
+            print("\n  \033[2mNo past conversations.\033[0m\n")
+            return None
+        print(f"\n  \033[1;36mConversations ({len(convos)}):\033[0m")
+        for c in convos[:20]:
+            is_current = " \033[1;33m← current\033[0m" if (current_conv and c["id"] == current_conv.id) else ""
+            msgs = c.get("message_count", 0)
+            updated = c.get("updated_at", "")[:16]
+            print(f"    \033[1m{c['id']}\033[0m  {c.get('title', 'untitled')}"
+                  f"  \033[2m({msgs} msgs, {updated})\033[0m{is_current}")
+        print(f"\n  \033[2m/switch <id> to resume, /new to start fresh\033[0m\n")
+        return None
+
+    if command == "/switch" and conv_mgr is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /switch <id>  (use /convos to see IDs)\033[0m\n")
+            return None
+        return ("switch_conversation", arg.strip())
+
+    if command == "/delete" and conv_mgr is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /delete <id>  (use /convos to see IDs)\033[0m\n")
+            return None
+        cid = arg.strip()
+        if current_conv and cid == current_conv.id:
+            print("\n  \033[31mCan't delete the current conversation. Switch first.\033[0m\n")
+            return None
+        if conv_mgr.delete(cid):
+            print(f"\n  \033[1;32m✓ Deleted conversation {cid}\033[0m\n")
+        else:
+            print(f"\n  \033[31mNo conversation with ID {cid}\033[0m\n")
         return None
 
     if command == "/schedule" and sched is not None:
@@ -1278,7 +1323,6 @@ def chat_loop():
     sched = Scheduler()
 
     def _execute_scheduled(prompt: str) -> str:
-        """Execute a scheduled prompt with its own message context."""
         sched_messages: List[dict] = [{"role": "system", "content": system_prompt}]
         sched_messages.append({"role": "user", "content": prompt})
         return _chat_turn(config, provider, raw_fn, sched_messages, tools, tool_map)
@@ -1286,11 +1330,22 @@ def chat_loop():
     sched.set_executor(_execute_scheduled)
     sched.start()
 
-    messages: List[dict] = [{"role": "system", "content": system_prompt}]
+    # Conversation management
+    conv_mgr = ConversationManager()
 
-    # Set up readline for input history (up/down arrows) within this session.
-    # Save and restore any pre-existing readline state so we don't clobber
-    # the parent shell's history.
+    # Resume most recent conversation or create new
+    current_conv = conv_mgr.get_most_recent()
+    if current_conv and current_conv.messages:
+        messages = current_conv.messages
+        # Ensure system prompt is current
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_prompt
+    else:
+        current_conv = conv_mgr.create(model=model_name, provider=provider)
+        messages = [{"role": "system", "content": system_prompt}]
+        current_conv.messages = messages
+
+    # Set up readline
     _prev_history_len = readline.get_current_history_length()
     _history_file = os.path.join(
         os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
@@ -1302,21 +1357,74 @@ def chat_loop():
         pass
     readline.set_history_length(500)
 
-    print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
-    if all_tools:
-        if len(tools) < len(all_tools):
-            print(f"\033[2m{len(tools)}/{len(all_tools)} tools active (/tools to manage)\033[0m")
-        else:
-            print(f"\033[2m{len(tools)} tools available\033[0m")
-    mem_count = len(memory.get_all())
-    if mem_count:
-        print(f"\033[2m{mem_count} memor{'y' if mem_count == 1 else 'ies'} loaded\033[0m")
-    active_tasks = [t for t in sched.list_tasks() if t.active]
-    if active_tasks:
-        print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
-    print(f"\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
+    def _print_banner():
+        print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
+        if all_tools:
+            if len(tools) < len(all_tools):
+                print(f"\033[2m{len(tools)}/{len(all_tools)} tools active (/tools to manage)\033[0m")
+            else:
+                print(f"\033[2m{len(tools)} tools available\033[0m")
+        mem_count = len(memory.get_all())
+        if mem_count:
+            print(f"\033[2m{mem_count} memor{'y' if mem_count == 1 else 'ies'} loaded\033[0m")
+        active_tasks = [t for t in sched.list_tasks() if t.active]
+        if active_tasks:
+            print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
+        # Show conversation info
+        user_msgs = [m for m in messages if m.get("role") == "user"
+                     and isinstance(m.get("content"), str)]
+        if user_msgs:
+            print(f"\033[2mResuming: {current_conv.title} ({len(user_msgs)} messages)\033[0m")
+        convos = conv_mgr.list_all()
+        if len(convos) > 1:
+            print(f"\033[2m{len(convos)} conversations (/convos to browse, /new for fresh)\033[0m")
+        print(f"\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
 
-    _last_interrupt = [0.0]  # timestamp of last Ctrl+C
+    _print_banner()
+
+    def _save_current():
+        current_conv.messages = messages
+        conv_mgr.save(current_conv)
+
+    def _summarize_and_save():
+        """Summarize session and save key facts to memory."""
+        user_turns = [m for m in messages if m.get("role") == "user"
+                      and isinstance(m.get("content"), str)]
+        if len(user_turns) >= 2 and raw_fn:
+            try:
+                summary_prompt = (
+                    "Summarize this conversation in 2-3 concise bullet points. "
+                    "Focus on: key facts learned about the user, decisions made, "
+                    "tasks completed, and anything worth remembering for future sessions. "
+                    "Reply with ONLY the bullet points, no preamble."
+                )
+                summary_msgs = [
+                    {"role": "system", "content": "You summarize conversations concisely."},
+                ]
+                for m in messages[1:]:
+                    if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant"):
+                        summary_msgs.append({"role": m["role"], "content": m["content"][:500]})
+                summary_msgs.append({"role": "user", "content": summary_prompt})
+                resp = raw_fn(config, summary_msgs, None)
+                summary = resp.get("content", "").strip()
+                if summary and len(summary) > 10:
+                    memory.add(f"[Session summary] {summary}", source="summary")
+            except Exception:
+                pass
+
+    def _switch_to(conv: Conversation):
+        nonlocal current_conv, messages
+        _save_current()
+        current_conv = conv
+        messages = conv.messages
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_prompt
+        user_msgs = [m for m in messages if m.get("role") == "user"
+                     and isinstance(m.get("content"), str)]
+        print(f"\n  \033[1;32m✓ Switched to: {conv.title}\033[0m "
+              f"\033[2m({len(user_msgs)} messages)\033[0m\n")
+
+    _last_interrupt = [0.0]
 
     try:
         while True:
@@ -1343,7 +1451,24 @@ def chat_loop():
             if stripped.startswith("/"):
                 result = _handle_slash_command(
                     stripped, config, provider, model_name, memory=memory,
-                    all_tools=all_tools, tool_map=tool_map, sched=sched)
+                    all_tools=all_tools, tool_map=tool_map, sched=sched,
+                    conv_mgr=conv_mgr, current_conv=current_conv)
+
+                if result == "new_conversation":
+                    _save_current()
+                    _summarize_and_save()
+                    current_conv = conv_mgr.create(model=model_name, provider=provider)
+                    messages = [{"role": "system", "content": system_prompt}]
+                    current_conv.messages = messages
+                    print("\n  \033[1;32m✓ New conversation started\033[0m\n")
+                    continue
+                if isinstance(result, tuple) and result[0] == "switch_conversation":
+                    conv = conv_mgr.load(result[1])
+                    if conv:
+                        _switch_to(conv)
+                    else:
+                        print(f"\n  \033[31mNo conversation with ID {result[1]}\033[0m\n")
+                    continue
                 if result == "reload_tools":
                     print("  \033[2mReloading MCP tools...\033[0m")
                     mcp_mod.close_all(mcp_clients)
@@ -1377,43 +1502,21 @@ def chat_loop():
                                    chat_state=chat_state)
             except KeyboardInterrupt:
                 print("\n\n  \033[33m⚠ Interrupted\033[0m\n")
-                # Remove the dangling user message so history stays clean
                 if messages and messages[-1].get("role") == "user":
                     messages.pop()
                 continue
-            # Pick up any tools changes made by manage_tools during the turn
             tools = chat_state["tools"]
             if reply:
                 messages.append({"role": "assistant", "content": reply})
                 print(f"\n\033[1;36massistant:\033[0m\n{highlight(reply)}\n")
             else:
                 print("\n\033[2m[no response]\033[0m\n")
-    finally:
-        # Summarize the session and save key facts to memory
-        user_turns = [m for m in messages if m.get("role") == "user"
-                      and isinstance(m.get("content"), str)]
-        if len(user_turns) >= 2 and raw_fn:
-            try:
-                summary_prompt = (
-                    "Summarize this conversation in 2-3 concise bullet points. "
-                    "Focus on: key facts learned about the user, decisions made, "
-                    "tasks completed, and anything worth remembering for future sessions. "
-                    "Reply with ONLY the bullet points, no preamble."
-                )
-                summary_msgs = [
-                    {"role": "system", "content": "You summarize conversations concisely."},
-                ]
-                for m in messages[1:]:
-                    if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant"):
-                        summary_msgs.append({"role": m["role"], "content": m["content"][:500]})
-                summary_msgs.append({"role": "user", "content": summary_prompt})
-                resp = raw_fn(config, summary_msgs, None)
-                summary = resp.get("content", "").strip()
-                if summary and len(summary) > 10:
-                    memory.add(f"[Session summary] {summary}", source="summary")
-            except Exception:
-                pass
 
+            # Auto-save after each exchange
+            _save_current()
+    finally:
+        _save_current()
+        _summarize_and_save()
         sched.stop()
         try:
             readline.write_history_file(_history_file)

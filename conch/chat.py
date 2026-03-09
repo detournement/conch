@@ -1259,17 +1259,48 @@ def _chat_turn(config: dict, provider: str, raw_fn, messages: List[dict],
 # Interactive loop and one-shot entry point.
 # ---------------------------------------------------------------------------
 
+def _detect_location() -> str:
+    """Best-effort location detection. Tries IP geolocation (fast, no permissions)."""
+    import urllib.request as _ur
+    try:
+        req = _ur.Request("https://ipinfo.io/json",
+                          headers={"User-Agent": "conch/1.0"})
+        with _ur.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read().decode())
+        parts = []
+        city = data.get("city")
+        region = data.get("region")
+        country = data.get("country")
+        if city:
+            parts.append(city)
+        if region and region != city:
+            parts.append(region)
+        if country:
+            parts.append(country)
+        loc = ", ".join(parts)
+        tz = data.get("timezone", "")
+        if tz:
+            loc += f" (tz: {tz})"
+        return loc
+    except Exception:
+        return ""
+
+
 def chat_loop():
     """Interactive multi-turn chat with optional MCP tool support."""
     config = load_config()
     provider = (config.get("provider") or "openai").lower()
     system_prompt = config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT)
     now = datetime.datetime.now()
-    system_prompt += (
-        f"\n\nCurrent date and time: {now.strftime('%A, %B %d, %Y %I:%M %p')} "
-        f"(timezone: {datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()}). "
-        f"Use this for any time-sensitive requests."
-    )
+    tz_name = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
+    location = _detect_location()
+    context_parts = [
+        f"Current date and time: {now.strftime('%A, %B %d, %Y %I:%M %p')} (timezone: {tz_name}).",
+    ]
+    if location:
+        context_parts.append(f"User location: {location}.")
+    context_parts.append("Use this for any time-sensitive or location-relevant requests.")
+    system_prompt += "\n\n" + " ".join(context_parts)
     model_name = config.get("chat_model", config.get("model", ""))
 
     raw_fn = RAW_FNS.get(provider)
@@ -1542,11 +1573,13 @@ def main():
 
         system_prompt = config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT)
         now = datetime.datetime.now()
-        system_prompt += (
-            f"\n\nCurrent date and time: {now.strftime('%A, %B %d, %Y %I:%M %p')} "
-            f"(timezone: {datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()}). "
-            f"Use this for any time-sensitive requests."
-        )
+        tz_name = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
+        location = _detect_location()
+        ctx = [f"Current date and time: {now.strftime('%A, %B %d, %Y %I:%M %p')} (timezone: {tz_name})."]
+        if location:
+            ctx.append(f"User location: {location}.")
+        ctx.append("Use this for any time-sensitive or location-relevant requests.")
+        system_prompt += "\n\n" + " ".join(ctx)
         user_text = " ".join(sys.argv[1:])
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)

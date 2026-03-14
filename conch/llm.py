@@ -79,7 +79,10 @@ def _detect_tools() -> str:
 
 def build_messages(config: dict, user_request: str, context: dict) -> Tuple[List[dict], str]:
     """Build OpenAI-style messages and system prompt."""
-    system = config.get("system_prompt", "")
+    from .prompts import get_ask_prompt
+    provider = (config.get("provider") or "openai").lower()
+    model = config.get("model", "")
+    system = config.get("system_prompt") or get_ask_prompt(provider, model)
     parts = [user_request]
     now = datetime.datetime.now()
     parts.append(f"(Current date/time: {now.strftime('%Y-%m-%d %H:%M %Z').strip()})")

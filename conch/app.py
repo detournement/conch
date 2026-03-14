@@ -37,12 +37,9 @@ from .tooling import (
 from . import mcp as mcp_mod
 
 
-CHAT_SYSTEM_PROMPT = (
-    "You are Conch, a helpful, concise assistant built into the user's shell. "
-    "Answer clearly. Use markdown formatting sparingly — this is a terminal.\n\n"
-    "You are an LLM-assisted shell with chat, memory, MCP tools, and background scheduling.\n"
-    "Use local_shell for local commands, use MCP tools when available, and keep answers practical."
-)
+from .prompts import get_chat_prompt
+
+CHAT_SYSTEM_PROMPT = None  # resolved per-provider at startup
 
 MAX_TOOL_ROUNDS = 10
 
@@ -171,7 +168,9 @@ def chat_loop():
         print(f"conch: unknown provider {provider}", file=sys.stderr)
         sys.exit(1)
 
-    system_prompt = _build_system_prompt(config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT))
+    from .prompts import get_chat_prompt
+    base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
+    system_prompt = _build_system_prompt(base_prompt)
     model_name = config.get("chat_model", config.get("model", ""))
     memory = MemoryStore()
     builtin_clients = _make_builtin_clients(memory, interactive=True)

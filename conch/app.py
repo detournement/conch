@@ -41,7 +41,7 @@ from .prompts import get_chat_prompt
 
 CHAT_SYSTEM_PROMPT = None  # resolved per-provider at startup
 
-MAX_TOOL_ROUNDS = 10
+MAX_TOOL_ROUNDS = 25  # default, adjustable via /rounds
 
 CONCH_SHELL_ART = [
     "    __",
@@ -200,6 +200,8 @@ def chat_loop():
     sched.set_executor(_scheduled_executor)
     sched.start()
 
+    max_tool_rounds = MAX_TOOL_ROUNDS
+
     conv_mgr = ConversationManager()
     current_conv = conv_mgr.get_most_recent()
     if current_conv and current_conv.messages:
@@ -333,7 +335,9 @@ def chat_loop():
                 if result == "reload_tools":
                     _reload_tools()
                     continue
-                if result is not None:
+                if isinstance(result, int):
+                    max_tool_rounds = result
+                elif result is not None:
                     provider, model_name, raw_fn = result
                 continue
 
@@ -350,7 +354,7 @@ def chat_loop():
                     chat_state.tools,
                     chat_state.tool_map,
                     builtin_clients,
-                    max_tool_rounds=MAX_TOOL_ROUNDS,
+                    max_tool_rounds=max_tool_rounds,
                     chat_state=chat_state,
                 )
             except KeyboardInterrupt:

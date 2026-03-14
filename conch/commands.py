@@ -54,6 +54,7 @@ def handle_slash_command(
             "  \033[1m/disable <group>\033[0m     Disable a tool group\n"
             "  \033[1m/connect <app>\033[0m       Connect a service\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
+            "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
         )
         return None
@@ -322,6 +323,20 @@ def handle_slash_command(
         save_tool_prefs(prefs)
         print(f"\n  \033[1;32m✓ Disabled {target}\033[0m\n")
         return "reload_tools"
+
+    if command == "/rounds":
+        if not arg:
+            print("\n  \033[2mMax tool rounds: currently set via /rounds <n>\033[0m\n")
+            return None
+        try:
+            n = int(arg)
+            if n < 1:
+                raise ValueError
+        except ValueError:
+            print(f"\n  \033[31mInvalid number: {arg}\033[0m\n")
+            return None
+        print(f"\n  \033[1;32m✓ Max tool rounds set to {n}\033[0m\n")
+        return n
 
     if command == "/apps":
         if not composio_mod.is_available():

@@ -1,4 +1,4 @@
-"""LLM clients: OpenAI, Anthropic, Ollama. Return single command string."""
+"""LLM clients: OpenAI, Anthropic, Cerebras, Ollama. Return single command string."""
 import datetime
 import json
 import os
@@ -10,23 +10,33 @@ from .config import load_config, get_bool, get_int
 
 
 def extract_command(text: str) -> str:
-    """Extract a single shell command from LLM response. No markdown, one line."""
+    """Extract a single shell command from LLM response or reasoning."""
     if not text or not text.strip():
         return ""
     text = text.strip()
-    # Strip markdown code blocks
-    for pattern in [
-        r"^```(?:bash|sh|zsh)?\s*\n?(.*?)```",
-        r"^```\n?(.*?)```",
-    ]:
+    # Try fenced code blocks
+    for pattern in [r"```(?:bash|sh|zsh)?\s*\n?(.*?)```", r"```\n?(.*?)```"]:
         m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
         if m:
-            text = m.group(1).strip()
-    # Strip leading $ or % from prompt-style output
+            cmd = m.group(1).strip().splitlines()[0].strip()
+            if cmd:
+                return re.sub(r"^\s*[$%]\s*", "", cmd)
+    # Try inline backtick commands (common in reasoning output from Cerebras)
+    backtick_cmds = re.findall(r"`([^`]{4,})`", text)
+    prefixes = ("nmap","arp","avahi","dns-sd","lpstat","find","grep","ls","cat",
+        "curl","wget","docker","kubectl","helm","terraform","aws","git",
+        "npm","pip","python","ssh","scp","rsync","ping","traceroute",
+        "dig","nc","netstat","ss","lsof","ps","top","kill","chmod",
+        "chown","mkdir","rm","cp","mv","tar","zip","unzip","sed",
+        "awk","sort","head","tail","wc","du","df","mount","systemctl")
+    shell_cmds = [c for c in backtick_cmds if any(c.startswith(t) for t in prefixes)]
+    if shell_cmds:
+        return shell_cmds[-1]
+    # Fall back to first non-empty line
     text = re.sub(r"^\s*[$%]\s*", "", text)
-    # Take first non-empty line
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[0] if lines else ""
+
 
 
 DETECTED_TOOLS = [
@@ -84,6 +94,45 @@ def build_messages(config: dict, user_request: str, context: dict) -> Tuple[List
         parts.append(f"({tools_info})")
     user_content = "\n".join(parts)
     return [{"role": "system", "content": system}, {"role": "user", "content": user_content}], user_content
+
+
+def call_cerebras(config: dict, messages: list) -> str:
+    import urllib.request
+
+    api_key = os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), "").strip()
+    if not api_key:
+        print("conch: CEREBRAS_API_KEY not set", file=sys.stderr)
+        sys.exit(1)
+    base = (config.get("base_url") or
+            os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")).rstrip("/")
+    body = {
+        "model": config.get("model", "zai-glm-4.7"),
+        "messages": messages,
+        "temperature": 0.2,
+        "max_completion_tokens": 2048,
+        "clear_thinking": True,
+    }
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "conch/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        print(f"conch: API error: {e}", file=sys.stderr)
+        sys.exit(1)
+    msg = (data.get("choices") or [{}])[0].get("message", {})
+    content = msg.get("content", "")
+    if not content.strip() and msg.get("reasoning"):
+        content = msg["reasoning"]
+    return extract_command(content)
 
 
 def call_openai(config: dict, messages: list) -> str:
@@ -201,6 +250,8 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
     messages, _ = build_messages(config, user_request, context)
     provider = (config.get("provider") or "openai").lower()
 
+    if provider == "cerebras":
+        return call_cerebras(config, messages)
     if provider == "openai":
         return call_openai(config, messages)
     if provider == "anthropic":

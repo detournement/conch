@@ -3,6 +3,10 @@
 
 : "${CONCH_ASK_CMD:=conch-ask}"
 
+_conch_source_env_bash() {
+  [[ -f "${CONCH_DIR}/.env" ]] && source "${CONCH_DIR}/.env"
+}
+
 _conch_trigger_bash() {
   local query cmd
   # Move to new line and prompt for natural-language request
@@ -11,6 +15,7 @@ _conch_trigger_bash() {
   [[ -z "$query" ]] && return
   export PWD="$PWD"
   export CONCH_OS_SHELL="$(uname -s) / $SHELL"
+  _conch_source_env_bash
   if (( CONCH_HISTORY_COUNT > 0 )) 2>/dev/null; then
     export CONCH_HISTORY="$(history 2>/dev/null | tail -n ${CONCH_HISTORY_COUNT:-5})"
   fi

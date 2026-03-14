@@ -70,6 +70,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "User-Agent": "conch/1.0",
         },
         method="POST",
     )
@@ -79,9 +80,12 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
     except Exception as exc:
         return {"content": f"[API error: {exc}]", "tool_calls": None}
     message = (data.get("choices") or [{}])[0].get("message", {})
+    content = (message.get("content") or "").strip()
+    if not content and message.get("reasoning"):
+        content = message["reasoning"].strip()
     return {
         "role": "assistant",
-        "content": (message.get("content") or "").strip(),
+        "content": content,
         "tool_calls": message.get("tool_calls"),
     }
 

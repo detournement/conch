@@ -178,6 +178,38 @@ def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
     return None
 
 
+
+def normalize_messages_for_provider(messages: list, provider: str) -> list:
+    """Flatten Anthropic-style structured messages for OpenAI-compatible providers."""
+    if provider == "anthropic":
+        return messages
+    normalized = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        text_parts.append(f"[Called tool: {block.get('name', '?')}]")
+                    elif block.get("type") == "tool_result":
+                        text_parts.append(f"[Tool result: {str(block.get('content', ''))[:200]}]")
+                else:
+                    text_parts.append(str(block))
+            flat_content = "\n".join(part for part in text_parts if part)
+            if not flat_content.strip():
+                continue
+            role = msg.get("role", "user")
+            if role == "user" and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                role = "user"
+            normalized.append({"role": role, "content": flat_content})
+        else:
+            normalized.append(msg)
+    return normalized
+
+
 def chat_turn(
     config: dict,
     provider: str,
@@ -199,8 +231,9 @@ def chat_turn(
         if len(compressed) < len(messages):
             messages.clear()
             messages.extend(compressed)
+        send_messages = normalize_messages_for_provider(messages, provider)
         with Spinner("Thinking"):
-            response = raw_fn(config, messages, tools if tools else None)
+            response = raw_fn(config, send_messages, tools if tools else None)
         tool_calls = response.get("tool_calls")
         if not tool_calls:
             recovered = extract_textual_tool_use_blocks(response.get("content", ""))

@@ -44,7 +44,7 @@ ok "Shell: ${USER_SHELL}"
 
 # ── Make scripts executable ──────────────────────────────────────────────────
 
-chmod +x "$CONCH_DIR/bin/conch-ask" "$CONCH_DIR/bin/conch-chat" "$CONCH_DIR/bin/conch-run-with-timeout" 2>/dev/null
+chmod +x "$CONCH_DIR/bin/conch" "$CONCH_DIR/bin/conch-ask" "$CONCH_DIR/bin/conch-chat" "$CONCH_DIR/bin/conch-run-with-timeout" 2>/dev/null
 ok "Scripts are executable"
 
 # ── API key ──────────────────────────────────────────────────────────────────
@@ -52,31 +52,31 @@ ok "Scripts are executable"
 ENV_FILE="$CONCH_DIR/.env"
 EXISTING_KEY=""
 if [[ -f "$ENV_FILE" ]]; then
-    EXISTING_KEY="$(grep 'OPENAI_API_KEY=' "$ENV_FILE" 2>/dev/null | sed 's/.*OPENAI_API_KEY="\{0,1\}\([^"]*\)"\{0,1\}/\1/' | head -1 || true)"
+    EXISTING_KEY="$(grep 'CEREBRAS_API_KEY=' "$ENV_FILE" 2>/dev/null | sed 's/.*CEREBRAS_API_KEY="\{0,1\}\([^"]*\)"\{0,1\}/\1/' | head -1 || true)"
 fi
 if [[ -z "$EXISTING_KEY" ]]; then
-    EXISTING_KEY="${OPENAI_API_KEY:-}"
+    EXISTING_KEY="${CEREBRAS_API_KEY:-}"
 fi
 
 if [[ -n "$EXISTING_KEY" ]]; then
     MASKED="${EXISTING_KEY:0:8}...${EXISTING_KEY: -4}"
-    ok "OpenAI API key found: ${MASKED}"
+    ok "Cerebras API key found: ${MASKED}"
     API_KEY="$EXISTING_KEY"
 else
     printf "\n"
-    info "Enter your OpenAI API key (or press Enter to skip):"
-    printf "  ${DIM}Get one at https://platform.openai.com/api-keys${RST}\n"
+    info "Enter your Cerebras API key (or press Enter to skip):"
+    printf "  ${DIM}Get one at https://inference.cerebras.ai${RST}\n"
     printf "  Key: "
     read -r API_KEY
     if [[ -z "$API_KEY" ]]; then
-        warn "No API key set. Set OPENAI_API_KEY later or edit ${ENV_FILE}"
+        warn "No API key set. Set CEREBRAS_API_KEY later or edit ${ENV_FILE}"
     fi
 fi
 
 if [[ -n "$API_KEY" ]]; then
     cat > "$ENV_FILE" <<ENVEOF
 # Conch API key (do not commit this file)
-export OPENAI_API_KEY="${API_KEY}"
+export CEREBRAS_API_KEY="${API_KEY}"
 ENVEOF
     chmod 600 "$ENV_FILE"
     ok "API key saved to ${ENV_FILE} (chmod 600)"

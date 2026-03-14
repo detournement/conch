@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -71,7 +71,9 @@ class Task:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Task":
-        return cls(**data)
+        valid_fields = {field.name for field in fields(cls)}
+        filtered = {key: value for key, value in data.items() if key in valid_fields}
+        return cls(**filtered)
 
 
 class Scheduler:

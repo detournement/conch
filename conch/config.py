@@ -55,3 +55,14 @@ def load_config() -> Dict[str, str]:
         config.setdefault("chat_model", config["model"])
     return config
 
+
+def get_bool(cfg: dict, key: str, default: bool = False) -> bool:
+    return str(cfg.get(key, str(default))).lower() in ("true", "1", "yes", "on")
+
+
+def get_int(cfg: dict, key: str, default: int = 0) -> int:
+    try:
+        return int(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+

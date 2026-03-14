@@ -74,6 +74,18 @@ class Conversation:
     @classmethod
     def load(cls, path: Path) -> "Conversation":
         data = json.loads(path.read_text())
+        if isinstance(data, list):
+            messages = data
+            return cls(
+                id=path.stem,
+                title=_extract_title(messages),
+                model="",
+                provider="",
+                messages=messages,
+                created_at=datetime.now().isoformat(),
+                updated_at=datetime.now().isoformat(),
+                schema_version=1,
+            )
         return cls(
             id=data["id"],
             title=data.get("title") or "New conversation",
@@ -92,7 +104,14 @@ class ConversationManager:
 
     def _load_index(self) -> Dict[str, Any]:
         try:
-            return json.loads(_index_path().read_text())
+            data = json.loads(_index_path().read_text())
+            if isinstance(data, list):
+                return {"schema_version": 1, "conversations": data}
+            if isinstance(data, dict):
+                data.setdefault("schema_version", SCHEMA_VERSION)
+                data.setdefault("conversations", [])
+                return data
+            return {"schema_version": SCHEMA_VERSION, "conversations": []}
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {"schema_version": SCHEMA_VERSION, "conversations": []}
 

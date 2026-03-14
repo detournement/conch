@@ -250,9 +250,30 @@ def chat_loop():
         chat_state.needs_tool_refresh = False
         print(f"  \033[1;32m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active\033[0m\n")
 
-    _print_conch_shell_art()
-    print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
-    print("\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
+    def _print_banner():
+        _print_conch_shell_art()
+        print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
+        if chat_state.all_tools:
+            if len(chat_state.tools) < len(chat_state.all_tools):
+                print(f"\033[2m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active (/tools to manage)\033[0m")
+            else:
+                print(f"\033[2m{len(chat_state.tools)} tools available\033[0m")
+        memory_count = len(memory.get_all())
+        if memory_count:
+            print(f"\033[2m{memory_count} memor{'y' if memory_count == 1 else 'ies'} loaded\033[0m")
+        user_msgs = [m for m in messages if m.get("role") == "user"
+                     and isinstance(m.get("content"), str)]
+        if user_msgs:
+            print(f"\033[2mResuming: {current_conv.title} ({len(user_msgs)} messages)\033[0m")
+        convos = conv_mgr.list_all()
+        if len(convos) > 1:
+            print(f"\033[2m{len(convos)} conversations (/convos to browse, /new for fresh)\033[0m")
+        active_tasks = [task for task in sched.list_tasks() if task.active]
+        if active_tasks:
+            print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
+        print("\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
+
+    _print_banner()
 
     last_interrupt = 0.0
     try:

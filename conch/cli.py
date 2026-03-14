@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import sys
 
-from .app import main as chat_main
+from .llm import ask
 
 
 def main():
-    """Fallback ask implementation.
-
-    For now this routes through chat's one-shot mode, which keeps installs simple
-    until a dedicated ask runtime is split out.
-    """
+    """Return one shell command for the given request."""
     if len(sys.argv) <= 1:
         print("conch-ask: provide a prompt", file=sys.stderr)
         sys.exit(1)
-    chat_main()
+    request = " ".join(sys.argv[1:]).strip()
+    if not request:
+        print("conch-ask: provide a prompt", file=sys.stderr)
+        sys.exit(1)
+    cmd = ask(request)
+    if not cmd:
+        print("conch: [no response]", file=sys.stderr)
+        sys.exit(1)
+    print(cmd)
 

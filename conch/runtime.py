@@ -236,7 +236,9 @@ def chat_turn(
             response = raw_fn(config, send_messages, tools if tools else None)
         tool_calls = response.get("tool_calls")
         if not tool_calls:
-            recovered = extract_textual_tool_use_blocks(response.get("content", ""))
+            recovered = None
+            if provider == "anthropic":
+                recovered = extract_textual_tool_use_blocks(response.get("content", ""))
             if not recovered:
                 return response.get("content", "")
             tool_calls = [{

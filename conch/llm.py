@@ -9,33 +9,101 @@ from typing import List, Optional, Tuple
 from .config import load_config, get_bool, get_int
 
 
-def extract_command(text: str) -> str:
-    """Extract a single shell command from LLM response or reasoning."""
-    if not text or not text.strip():
-        return ""
-    text = text.strip()
-    # Try fenced code blocks
+_SHELL_PREFIXES = (
+    "nmap","arp","avahi","dns-sd","lpstat","find","grep","ls","cat",
+    "curl","wget","docker","kubectl","helm","terraform","aws","git",
+    "npm","pip","python","ssh","scp","rsync","ping","traceroute",
+    "dig","nc","netstat","ss","lsof","ps","top","kill","chmod",
+    "chown","mkdir","rm","cp","mv","tar","zip","unzip","sed",
+    "awk","sort","head","tail","wc","du","df","mount","systemctl",
+    "brew","apt","yum","dnf","pacman","snap","flatpak","xargs",
+    "echo","touch","tee","env","export","source","which","whereis",
+)
+
+
+def _extract_from_fenced_blocks(text: str) -> str:
+    """Pull a command out of ```bash ... ``` fenced blocks."""
     for pattern in [r"```(?:bash|sh|zsh)?\s*\n?(.*?)```", r"```\n?(.*?)```"]:
         m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
         if m:
             cmd = m.group(1).strip().splitlines()[0].strip()
             if cmd:
                 return re.sub(r"^\s*[$%]\s*", "", cmd)
-    # Try inline backtick commands (common in reasoning output from Cerebras)
+    return ""
+
+
+def _extract_from_backticks(text: str) -> str:
+    """Pull a shell command from inline `backtick` snippets in reasoning text."""
     backtick_cmds = re.findall(r"`([^`]{4,})`", text)
-    prefixes = ("nmap","arp","avahi","dns-sd","lpstat","find","grep","ls","cat",
-        "curl","wget","docker","kubectl","helm","terraform","aws","git",
-        "npm","pip","python","ssh","scp","rsync","ping","traceroute",
-        "dig","nc","netstat","ss","lsof","ps","top","kill","chmod",
-        "chown","mkdir","rm","cp","mv","tar","zip","unzip","sed",
-        "awk","sort","head","tail","wc","du","df","mount","systemctl")
-    shell_cmds = [c for c in backtick_cmds if any(c.startswith(t) for t in prefixes)]
-    if shell_cmds:
-        return shell_cmds[-1]
-    # Fall back to first non-empty line
+    shell_cmds = [c for c in backtick_cmds if any(c.startswith(t) for t in _SHELL_PREFIXES)]
+    return shell_cmds[-1] if shell_cmds else ""
+
+
+def _extract_first_line(text: str) -> str:
+    """Take the first non-empty line, stripping prompt chars."""
     text = re.sub(r"^\s*[$%]\s*", "", text)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[0] if lines else ""
+
+
+def extract_command(text: str, provider: str = "") -> str:
+    """Extract a single shell command from LLM response.
+
+    Strategy varies by provider:
+    - anthropic/openai: models follow instructions well, so prefer first-line or fenced block.
+    - cerebras: model often puts answer in reasoning with backtick snippets.
+    - ollama: local models may wrap in markdown, so try fenced blocks first.
+    """
+    if not text or not text.strip():
+        return ""
+    text = text.strip()
+
+    # All providers: try fenced code blocks first
+    cmd = _extract_from_fenced_blocks(text)
+    if cmd:
+        return cmd
+
+    if provider == "cerebras":
+        # Cerebras reasoning often contains backtick-quoted commands
+        cmd = _extract_from_backticks(text)
+        if cmd:
+            return cmd
+
+    if provider in ("anthropic", "openai"):
+        # These models typically return clean single-line commands.
+        # Skip preamble lines like "Here is the command:" that aren't actual commands.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line in lines:
+            clean = re.sub(r"^\s*[$%]\s*", "", line)
+            if not clean:
+                continue
+            # Skip lines that look like English prose rather than commands
+            if clean.endswith(":") or clean.lower().startswith(("here ", "the ", "this ", "i ", "sure", "certainly")):
+                continue
+            # Skip lines that are just backtick-wrapped
+            stripped = clean.strip("`").strip()
+            if stripped and any(stripped.startswith(t) for t in _SHELL_PREFIXES):
+                return stripped
+            if not clean[0].isalpha():
+                return clean
+            # Accept if it looks like a command (starts with a known prefix)
+            if any(clean.startswith(t) for t in _SHELL_PREFIXES):
+                return clean
+        # Nothing matched known prefixes; fall back to first line
+        return _extract_first_line(text)
+
+    if provider == "ollama":
+        # Local models sometimes wrap in backticks inline
+        cmd = _extract_from_backticks(text)
+        if cmd:
+            return cmd
+        return _extract_first_line(text)
+
+    # Unknown provider: try everything
+    cmd = _extract_from_backticks(text)
+    if cmd:
+        return cmd
+    return _extract_first_line(text)
 
 
 
@@ -135,7 +203,7 @@ def call_cerebras(config: dict, messages: list) -> str:
     content = msg.get("content", "")
     if not content.strip() and msg.get("reasoning"):
         content = msg["reasoning"]
-    return extract_command(content)
+    return extract_command(content, provider="cerebras")
 
 
 def call_openai(config: dict, messages: list) -> str:
@@ -168,7 +236,7 @@ def call_openai(config: dict, messages: list) -> str:
         print(f"conch: API error: {e}", file=sys.stderr)
         sys.exit(1)
     content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    return extract_command(content)
+    return extract_command(content, provider="openai")
 
 
 def call_anthropic(config: dict, messages: list) -> str:
@@ -207,7 +275,7 @@ def call_anthropic(config: dict, messages: list) -> str:
     for b in data.get("content", []):
         if b.get("type") == "text":
             content += b.get("text", "")
-    return extract_command(content)
+    return extract_command(content, provider="anthropic")
 
 
 def call_ollama(config: dict, messages: list) -> str:
@@ -235,7 +303,7 @@ def call_ollama(config: dict, messages: list) -> str:
         print(f"conch: Ollama error: {e}", file=sys.stderr)
         sys.exit(1)
     content = (data.get("message") or {}).get("content", "")
-    return extract_command(content)
+    return extract_command(content, provider="ollama")
 
 
 def ask(user_request: str, context: Optional[dict] = None) -> str:

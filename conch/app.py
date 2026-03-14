@@ -168,10 +168,10 @@ def chat_loop():
         print(f"conch: unknown provider {provider}", file=sys.stderr)
         sys.exit(1)
 
+    model_name = config.get("chat_model", config.get("model", ""))
     from .prompts import get_chat_prompt
     base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
     system_prompt = _build_system_prompt(base_prompt)
-    model_name = config.get("chat_model", config.get("model", ""))
     memory = MemoryStore()
     builtin_clients = _make_builtin_clients(memory, interactive=True)
     mcp_clients, chat_state = _load_runtime_tools(builtin_clients)

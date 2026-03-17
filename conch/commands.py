@@ -57,6 +57,7 @@ def handle_slash_command(
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
+            "  \033[2mTip: type while the LLM is working — input is queued and runs next.\033[0m\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
         )
         return None

@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 import datetime
 import os
+import queue
 import readline
 import shutil
 import sys
+import threading
 import urllib.request
 from typing import Any, Dict, List
 
@@ -318,22 +320,52 @@ def chat_loop():
 
     _print_banner()
 
+    _input_queue: queue.Queue = queue.Queue()
+    _bg_input_active = threading.Event()
+
+    def _bg_input_reader():
+        """Background thread: read stdin lines while the LLM is working."""
+        while True:
+            if not _bg_input_active.is_set():
+                _bg_input_active.wait()
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                line = line.rstrip("\n")
+                if line.strip():
+                    _input_queue.put(line.strip())
+                    print(f"  \033[2m(queued: {line.strip()[:60]})\033[0m", file=sys.stderr)
+            except (EOFError, OSError):
+                break
+
     last_interrupt = 0.0
     try:
         while True:
+            # Check for queued input from background typing
+            queued = None
             try:
-                user_input = input("\033[1;33myou:\033[0m ")
-            except EOFError:
-                print("\n")
-                break
-            except KeyboardInterrupt:
-                now = datetime.datetime.now().timestamp()
-                if now - last_interrupt < 1.5:
+                queued = _input_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            if queued:
+                user_input = queued
+                print(f"\033[1;33myou:\033[0m \033[2m{queued}\033[0m")
+            else:
+                try:
+                    user_input = input("\033[1;33myou:\033[0m ")
+                except EOFError:
                     print("\n")
                     break
-                last_interrupt = now
-                print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
-                continue
+                except KeyboardInterrupt:
+                    now = datetime.datetime.now().timestamp()
+                    if now - last_interrupt < 1.5:
+                        print("\n")
+                        break
+                    last_interrupt = now
+                    print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
+                    continue
 
             stripped = user_input.strip()
             if not stripped:
@@ -396,6 +428,14 @@ def chat_loop():
             mem_context = memory.build_context(user_input)
             messages[0]["content"] = system_prompt + ("\n\n" + mem_context if mem_context else "")
             messages.append({"role": "user", "content": user_input})
+
+            # Enable background input while LLM is working
+            if sys.stdin.isatty():
+                _bg_input_active.set()
+                if not any(t.name == "conch_bg_input" for t in threading.enumerate()):
+                    _bg_thread = threading.Thread(target=_bg_input_reader, name="conch_bg_input", daemon=True)
+                    _bg_thread.start()
+
             try:
                 reply, turn_usage = chat_turn(
                     config,
@@ -412,7 +452,10 @@ def chat_loop():
                 print("\n\n  \033[33m⚠ Interrupted\033[0m\n")
                 messages.clear()
                 messages.extend(turn_snapshot)
+                _bg_input_active.clear()
                 continue
+
+            _bg_input_active.clear()
 
             if reply:
                 messages.append({"role": "assistant", "content": reply})

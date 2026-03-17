@@ -49,6 +49,31 @@ DEFAULT_API_KEY_ENVS = {
 }
 
 
+FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
+
+
+def get_available_fallbacks(current_provider: str) -> list:
+    """Return providers with API keys set, excluding the current one."""
+    fallbacks = []
+    for provider in FALLBACK_ORDER:
+        if provider == current_provider:
+            continue
+        key_env = DEFAULT_API_KEY_ENVS.get(provider, "")
+        if not key_env:
+            if provider == "ollama":
+                fallbacks.append(provider)
+            continue
+        if os.environ.get(key_env, "").strip():
+            fallbacks.append(provider)
+    return fallbacks
+
+
+def get_fallback_model(provider: str) -> str:
+    """Return the default model for a provider."""
+    models = KNOWN_MODELS.get(provider, [])
+    return models[0] if models else ""
+
+
 def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     api_key = os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), "").strip()
     if not api_key:

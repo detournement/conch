@@ -306,6 +306,16 @@ def call_ollama(config: dict, messages: list) -> str:
     return extract_command(content, provider="ollama")
 
 
+_ASK_CALLERS = {
+    "cerebras": call_cerebras,
+    "openai": call_openai,
+    "anthropic": call_anthropic,
+    "ollama": call_ollama,
+}
+
+_ASK_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
+
+
 def ask(user_request: str, context: Optional[dict] = None) -> str:
     """Main entry: build context, call configured provider, return one command line."""
     config = load_config()
@@ -321,13 +331,32 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
     messages, _ = build_messages(config, user_request, context)
     provider = (config.get("provider") or "openai").lower()
 
-    if provider == "cerebras":
-        return call_cerebras(config, messages)
-    if provider == "openai":
-        return call_openai(config, messages)
-    if provider == "anthropic":
-        return call_anthropic(config, messages)
-    if provider == "ollama":
-        return call_ollama(config, messages)
-    print(f"conch: unknown provider {provider}", file=sys.stderr)
-    sys.exit(1)
+    caller = _ASK_CALLERS.get(provider)
+    if not caller:
+        print(f"conch: unknown provider {provider}", file=sys.stderr)
+        sys.exit(1)
+
+    result = caller(config, messages)
+    if result:
+        return result
+
+    # Primary failed -- try fallbacks
+    from .providers import DEFAULT_API_KEY_ENVS
+    for fb_provider in _ASK_FALLBACK_ORDER:
+        if fb_provider == provider:
+            continue
+        key_env = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
+        if key_env and not os.environ.get(key_env, "").strip():
+            continue
+        fb_caller = _ASK_CALLERS.get(fb_provider)
+        if not fb_caller:
+            continue
+        print(f"conch: {provider} failed, trying {fb_provider}...", file=sys.stderr)
+        fb_config = dict(config)
+        fb_config["provider"] = fb_provider
+        fb_config["api_key_env"] = key_env
+        fb_messages, _ = build_messages(fb_config, user_request, context)
+        result = fb_caller(fb_config, fb_messages)
+        if result:
+            return result
+    return ""

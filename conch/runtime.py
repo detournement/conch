@@ -279,6 +279,27 @@ def chat_turn(
         send_messages = normalize_messages_for_provider(messages, provider)
         with Spinner("Thinking"):
             response = raw_fn(config, send_messages, tools if tools else None)
+        content = response.get("content", "")
+        if isinstance(content, str) and content.startswith("[API error:"):
+            from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_available_fallbacks, get_fallback_model
+            fallbacks = get_available_fallbacks(provider)
+            for fb_provider in fallbacks:
+                fb_fn = RAW_FNS.get(fb_provider)
+                if not fb_fn:
+                    continue
+                fb_model = get_fallback_model(fb_provider)
+                print(f"  \033[33m⚠ {provider} failed, falling back to {fb_provider}/{fb_model}\033[0m", file=sys.stderr)
+                fb_config = dict(config)
+                fb_config["provider"] = fb_provider
+                fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
+                fb_config["chat_model"] = fb_model
+                fb_config["model"] = fb_model
+                fb_messages = normalize_messages_for_provider(messages, fb_provider)
+                with Spinner(f"Retrying with {fb_provider}"):
+                    response = fb_fn(fb_config, fb_messages, tools if tools else None)
+                fb_content = response.get("content", "")
+                if not (isinstance(fb_content, str) and fb_content.startswith("[API error:")):
+                    break
         tool_calls = response.get("tool_calls")
         if not tool_calls:
             recovered = None

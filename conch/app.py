@@ -338,7 +338,15 @@ def chat_loop():
                 if isinstance(result, int):
                     max_tool_rounds = result
                 elif result is not None:
+                    old_provider = provider
                     provider, model_name, raw_fn = result
+                    if provider != old_provider:
+                        from .runtime import normalize_messages_on_switch
+                        normalize_messages_on_switch(messages, provider)
+                        from .prompts import get_chat_prompt
+                        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
+                        system_prompt = _build_system_prompt(base_prompt)
+                        messages[0]["content"] = system_prompt
                 continue
 
             turn_snapshot = copy.deepcopy(messages)

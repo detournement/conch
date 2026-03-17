@@ -210,6 +210,51 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
     return normalized
 
 
+def normalize_messages_on_switch(messages: list, new_provider: str):
+    """Normalize message history in-place when switching providers mid-conversation.
+
+    Strips provider-specific message formats so the new provider can accept the history.
+    """
+    system = messages[0] if messages and messages[0].get("role") == "system" else None
+    cleaned = []
+    if system:
+        cleaned.append(system)
+
+    for msg in messages[1 if system else 0:]:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        # Flatten structured content blocks to plain text
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        text_parts.append(f"[Called tool: {block.get('name', '?')}]")
+                    elif block.get("type") == "tool_result":
+                        text_parts.append(f"[Tool result: {str(block.get('content', ''))[:200]}]")
+                else:
+                    text_parts.append(str(block))
+            content = "\n".join(part for part in text_parts if part)
+            if not content.strip():
+                continue
+
+        # Drop OpenAI-style tool-role messages (Anthropic rejects them)
+        if role == "tool":
+            tool_id = msg.get("tool_call_id", "")
+            cleaned.append({"role": "user", "content": f"[Tool result ({tool_id}): {content[:500]}]"})
+            continue
+
+        # Drop tool_calls key from assistant messages (Anthropic rejects it)
+        clean_msg = {"role": role, "content": content}
+        cleaned.append(clean_msg)
+
+    messages.clear()
+    messages.extend(cleaned)
+
+
 def chat_turn(
     config: dict,
     provider: str,

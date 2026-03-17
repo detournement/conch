@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import json
 import sys
 from typing import Any, Dict, List, Optional
@@ -135,7 +136,44 @@ def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
     if not isinstance(text, str):
         return None
     raw = text.strip()
-    if not raw or "tool_use" not in raw:
+    if not raw:
+        return None
+
+    # Parse <tool_called name="..." args='...'/>  or  args="..." XML format
+    if "<tool_called" in raw:
+        normalized = []
+        for m in re.finditer(r'<tool_called[^>]+/?>', raw, re.DOTALL):
+            chunk = m.group(0)
+            name_m = re.search(r'name="([^"]+)"', chunk)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+            # Match args with either quote style
+            args_str = ""
+            for q in ("'", '"'):
+                marker = f"args={q}"
+                if marker in chunk:
+                    start = chunk.find(marker) + len(marker)
+                    end = chunk.find(q, start)
+                    if end > start:
+                        args_str = chunk[start:end]
+                    break
+            try:
+                tool_input = json.loads(args_str) if args_str.strip() else {}
+            except (json.JSONDecodeError, ValueError):
+                tool_input = {}
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            normalized.append({
+                "type": "tool_use",
+                "id": f"xml_tool_use_{len(normalized)+1}",
+                "name": name,
+                "input": tool_input,
+            })
+        if normalized:
+            return normalized
+
+    if "tool_use" not in raw:
         return None
     candidates = [raw]
     if raw.startswith("```") and raw.endswith("```"):
@@ -216,43 +254,70 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
 def normalize_messages_on_switch(messages: list, new_provider: str):
     """Normalize message history in-place when switching providers mid-conversation.
 
-    Strips provider-specific message formats so the new provider can accept the history.
+    Drops tool execution pairs entirely so the new provider gets clean text context
+    with no provider-specific artifacts the model might echo back.
     """
     system = messages[0] if messages and messages[0].get("role") == "system" else None
     cleaned = []
     if system:
         cleaned.append(system)
 
-    for msg in messages[1 if system else 0:]:
+    msgs = messages[1 if system else 0:]
+    i = 0
+    while i < len(msgs):
+        msg = msgs[i]
         role = msg.get("role", "user")
         content = msg.get("content", "")
 
-        # Flatten structured content blocks to plain text
-        if isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
-                        text_parts.append(f"[Called tool: {block.get('name', '?')}]")
-                    elif block.get("type") == "tool_result":
-                        text_parts.append(f"[Tool result: {str(block.get('content', ''))[:200]}]")
-                else:
-                    text_parts.append(str(block))
-            content = "\n".join(part for part in text_parts if part)
-            if not content.strip():
-                continue
-
-        # Drop OpenAI-style tool-role messages (Anthropic rejects them)
+        # Drop OpenAI-style tool-role messages entirely
         if role == "tool":
-            tool_id = msg.get("tool_call_id", "")
-            cleaned.append({"role": "user", "content": f"[Tool result ({tool_id}): {content[:500]}]"})
+            i += 1
             continue
 
-        # Drop tool_calls key from assistant messages (Anthropic rejects it)
-        clean_msg = {"role": role, "content": content}
-        cleaned.append(clean_msg)
+        # Handle structured content lists
+        if isinstance(content, list):
+            has_tool = any(
+                isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
+                for b in content
+            )
+            if has_tool:
+                # Extract only text parts
+                text_parts = [
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                content = "\n".join(p for p in text_parts if p).strip()
+                if not content:
+                    # Skip this message and the following tool_result user message if any
+                    i += 1
+                    if i < len(msgs):
+                        nxt = msgs[i]
+                        nxt_content = nxt.get("content", "")
+                        if isinstance(nxt_content, list) and any(
+                            isinstance(b, dict) and b.get("type") == "tool_result"
+                            for b in nxt_content
+                        ):
+                            i += 1
+                    continue
+            else:
+                text_parts = [
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                content = "\n".join(p for p in text_parts if p).strip()
+                if not content:
+                    i += 1
+                    continue
+
+        # Drop assistant messages that were pure tool calls (no text content)
+        if role == "assistant" and msg.get("tool_calls") and not str(content).strip():
+            i += 1
+            continue
+
+        cleaned.append({"role": role, "content": content})
+        i += 1
 
     messages.clear()
     messages.extend(cleaned)

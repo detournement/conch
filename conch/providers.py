@@ -49,6 +49,52 @@ DEFAULT_API_KEY_ENVS = {
 }
 
 
+# Per-1M-token pricing (input, output). $0 = free tier.
+MODEL_PRICING = {
+    "zai-glm-4.7":                 (0.00, 0.00),
+    "gpt-4.1":                     (2.00, 8.00),
+    "gpt-4.1-mini":                (0.40, 1.60),
+    "gpt-4.1-nano":                (0.10, 0.40),
+    "gpt-4o":                      (2.50, 10.00),
+    "gpt-4o-mini":                 (0.15, 0.60),
+    "o4-mini":                     (1.10, 4.40),
+    "o3":                          (2.00, 8.00),
+    "o3-mini":                     (1.10, 4.40),
+    "claude-sonnet-4-6":           (3.00, 15.00),
+    "claude-opus-4-6":             (15.00, 75.00),
+    "claude-haiku-4-5":            (0.80, 4.00),
+    "claude-sonnet-4-5-20250929":  (3.00, 15.00),
+}
+
+
+def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Return estimated cost in USD for a given token count."""
+    rate = MODEL_PRICING.get(model, (0.0, 0.0))
+    return (input_tokens * rate[0] + output_tokens * rate[1]) / 1_000_000
+
+
+def _normalize_usage(data: dict, provider: str) -> dict:
+    """Extract a uniform usage dict from any provider's raw API response."""
+    if provider in ("cerebras", "openai"):
+        usage = data.get("usage", {})
+        return {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        }
+    if provider == "anthropic":
+        usage = data.get("usage", {})
+        return {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        }
+    if provider == "ollama":
+        return {
+            "input_tokens": data.get("prompt_eval_count", 0),
+            "output_tokens": data.get("eval_count", 0),
+        }
+    return {"input_tokens": 0, "output_tokens": 0}
+
+
 CROSS_PROVIDER_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
 
 
@@ -137,6 +183,8 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
         "role": "assistant",
         "content": content,
         "tool_calls": message.get("tool_calls"),
+        "_usage": _normalize_usage(data, "cerebras"),
+        "_model": body["model"],
     }
 
 
@@ -171,6 +219,8 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         "role": "assistant",
         "content": (message.get("content") or "").strip(),
         "tool_calls": message.get("tool_calls"),
+        "_usage": _normalize_usage(data, "openai"),
+        "_model": body["model"],
     }
 
 
@@ -236,6 +286,8 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         "content": "\n".join(text_parts).strip(),
         "tool_calls": tool_calls if tool_calls else None,
         "_anthropic_content": raw_content,
+        "_usage": _normalize_usage(data, "anthropic"),
+        "_model": body["model"],
     }
 
 
@@ -278,6 +330,8 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         "role": "assistant",
         "content": message.get("content", "").strip(),
         "tool_calls": tool_calls,
+        "_usage": _normalize_usage(data, "ollama"),
+        "_model": body["model"],
     }
 
 

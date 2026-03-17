@@ -203,6 +203,7 @@ def chat_loop():
     sched.start()
 
     max_tool_rounds = MAX_TOOL_ROUNDS
+    session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
 
     conv_mgr = ConversationManager()
     current_conv = conv_mgr.get_most_recent()
@@ -245,6 +246,24 @@ def chat_loop():
     except (FileNotFoundError, OSError):
         pass
     readline.set_history_length(500)
+
+    _SLASH_COMMANDS = [
+        "/help", "/models", "/model", "/provider", "/remember", "/memories",
+        "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
+        "/agent", "/schedule", "/tasks", "/cancel", "/tools", "/enable",
+        "/disable", "/connect", "/apps", "/reload", "/rounds", "/cost",
+    ]
+
+    def _completer(text, state):
+        if text.startswith("/"):
+            matches = [c + " " for c in _SLASH_COMMANDS if c.startswith(text)]
+        else:
+            matches = []
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(_completer)
+    readline.set_completer_delims(" ")
+    readline.parse_and_bind("tab: complete")
 
     def _save_current():
         current_conv.messages = messages
@@ -339,6 +358,7 @@ def chat_loop():
                     sched=sched,
                     conv_mgr=conv_mgr,
                     current_conv=current_conv,
+                    session_usage=session_usage,
                 )
                 if result == "new_conversation":
                     _save_current()
@@ -377,7 +397,7 @@ def chat_loop():
             messages[0]["content"] = system_prompt + ("\n\n" + mem_context if mem_context else "")
             messages.append({"role": "user", "content": user_input})
             try:
-                reply = chat_turn(
+                reply, turn_usage = chat_turn(
                     config,
                     provider,
                     raw_fn,
@@ -399,9 +419,35 @@ def chat_loop():
                 print(f"\n\033[1;36massistant:\033[0m\n{highlight(reply)}\n")
             else:
                 print("\n\033[2m[no response]\033[0m\n")
+
+            # Display token/cost info
+            in_tok = turn_usage.get("input_tokens", 0)
+            out_tok = turn_usage.get("output_tokens", 0)
+            used_model = turn_usage.get("model", model_name)
+            if in_tok or out_tok:
+                from .providers import estimate_cost
+                cost = estimate_cost(used_model, in_tok, out_tok)
+                session_usage["input_tokens"] += in_tok
+                session_usage["output_tokens"] += out_tok
+                session_usage["cost"] += cost
+                session_usage["turns"] += 1
+                if cost > 0.0001:
+                    print(f"  \033[2m{in_tok:,} in / {out_tok:,} out  ~${cost:.4f}  ({used_model})\033[0m")
+                else:
+                    print(f"  \033[2m{in_tok:,} in / {out_tok:,} out  free  ({used_model})\033[0m")
+
             _save_current()
     finally:
         _save_current()
+        if session_usage["turns"] > 0:
+            total_in = session_usage["input_tokens"]
+            total_out = session_usage["output_tokens"]
+            total_cost = session_usage["cost"]
+            turns = session_usage["turns"]
+            if total_cost > 0.0001:
+                print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, ~${total_cost:.4f}\033[0m")
+            else:
+                print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, free\033[0m")
         _summarize_and_save(messages, config, raw_fn, memory)
         sched.stop()
         try:
@@ -429,7 +475,7 @@ def main():
         mcp_clients, chat_state = _load_runtime_tools(builtin_clients)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
         try:
-            reply = chat_turn(
+            reply, _usage = chat_turn(
                 config,
                 provider,
                 raw_fn,

@@ -362,7 +362,10 @@ def chat_turn(
     builtin_clients: Dict[str, Any],
     max_tool_rounds: int = 10,
     chat_state=None,
-) -> str:
+) -> tuple:
+    """Returns (reply_text, usage_info) where usage_info is a dict with
+    input_tokens, output_tokens, and model."""
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "model": ""}
     for _ in range(max_tool_rounds):
         if provider == "anthropic":
             sanitize_anthropic_messages(messages)
@@ -376,6 +379,10 @@ def chat_turn(
         send_messages = normalize_messages_for_provider(messages, provider)
         with Spinner("Thinking"):
             response = raw_fn(config, send_messages, tools if tools else None)
+        usage = response.get("_usage", {})
+        total_usage["input_tokens"] += usage.get("input_tokens", 0)
+        total_usage["output_tokens"] += usage.get("output_tokens", 0)
+        total_usage["model"] = response.get("_model", total_usage["model"])
         content = response.get("content", "")
         if isinstance(content, str) and content.startswith("[API error:"):
             from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_fallback_chain
@@ -403,7 +410,7 @@ def chat_turn(
         if not tool_calls:
             recovered = extract_textual_tool_use_blocks(response.get("content", ""))
             if not recovered:
-                return response.get("content", "")
+                return response.get("content", ""), total_usage
             tool_calls = [{
                 "id": str(block.get("id")),
                 "type": "function",
@@ -439,5 +446,5 @@ def chat_turn(
             append_results_anthropic(messages, response, results)
         else:
             append_results_openai(messages, response, results)
-    return "[max tool call rounds reached]"
+    return "[max tool call rounds reached]", total_usage
 

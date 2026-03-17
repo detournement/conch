@@ -26,6 +26,7 @@ def handle_slash_command(
     sched=None,
     conv_mgr=None,
     current_conv=None,
+    session_usage=None,
 ) -> Optional[tuple]:
     parts = cmd.strip().split(None, 1)
     command = parts[0].lower()
@@ -55,6 +56,7 @@ def handle_slash_command(
             "  \033[1m/connect <app>\033[0m       Connect a service\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
+            "  \033[1m/cost\033[0m                Show session token usage and cost\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
         )
         return None
@@ -337,6 +339,24 @@ def handle_slash_command(
             return None
         print(f"\n  \033[1;32m✓ Max tool rounds set to {n}\033[0m\n")
         return n
+
+    if command == "/cost":
+        if session_usage is None:
+            session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
+        total_in = session_usage.get("input_tokens", 0)
+        total_out = session_usage.get("output_tokens", 0)
+        total_cost = session_usage.get("cost", 0.0)
+        turns = session_usage.get("turns", 0)
+        print(f"\n  \033[1;36mSession usage:\033[0m")
+        print(f"    Turns:         {turns}")
+        print(f"    Input tokens:  {total_in:,}")
+        print(f"    Output tokens: {total_out:,}")
+        if total_cost > 0.0001:
+            print(f"    Est. cost:     ${total_cost:.4f}")
+        else:
+            print(f"    Est. cost:     free")
+        print()
+        return None
 
     if command == "/apps":
         if not composio_mod.is_available():

@@ -313,11 +313,10 @@ _ASK_CALLERS = {
     "ollama": call_ollama,
 }
 
-_ASK_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
-
-
 def ask(user_request: str, context: Optional[dict] = None) -> str:
     """Main entry: build context, call configured provider, return one command line."""
+    from .providers import get_fallback_chain, DEFAULT_API_KEY_ENVS, KNOWN_MODELS
+
     config = load_config()
     context = context or {}
     if get_bool(config, "send_cwd") and not context.get("cwd"):
@@ -328,33 +327,29 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
     if n and "history" not in context and os.environ.get("CONCH_HISTORY"):
         context["history"] = os.environ["CONCH_HISTORY"]
 
-    messages, _ = build_messages(config, user_request, context)
     provider = (config.get("provider") or "openai").lower()
+    current_model = config.get("model", KNOWN_MODELS.get(provider, [""])[0])
 
     caller = _ASK_CALLERS.get(provider)
     if not caller:
         print(f"conch: unknown provider {provider}", file=sys.stderr)
         sys.exit(1)
 
+    messages, _ = build_messages(config, user_request, context)
     result = caller(config, messages)
     if result:
         return result
 
-    # Primary failed -- try fallbacks
-    from .providers import DEFAULT_API_KEY_ENVS
-    for fb_provider in _ASK_FALLBACK_ORDER:
-        if fb_provider == provider:
-            continue
-        key_env = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
-        if key_env and not os.environ.get(key_env, "").strip():
-            continue
+    # Primary failed -- try fallbacks (same provider/other model first, then cross-provider)
+    for fb_provider, fb_model, _needs_ctx in get_fallback_chain(provider, current_model):
         fb_caller = _ASK_CALLERS.get(fb_provider)
         if not fb_caller:
             continue
-        print(f"conch: {provider} failed, trying {fb_provider}...", file=sys.stderr)
+        print(f"conch: {provider}/{current_model} failed, trying {fb_provider}/{fb_model}...", file=sys.stderr)
         fb_config = dict(config)
         fb_config["provider"] = fb_provider
-        fb_config["api_key_env"] = key_env
+        fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
+        fb_config["model"] = fb_model
         fb_messages, _ = build_messages(fb_config, user_request, context)
         result = fb_caller(fb_config, fb_messages)
         if result:

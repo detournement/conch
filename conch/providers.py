@@ -49,23 +49,48 @@ DEFAULT_API_KEY_ENVS = {
 }
 
 
-FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
+CROSS_PROVIDER_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
 
 
-def get_available_fallbacks(current_provider: str) -> list:
-    """Return providers with API keys set, excluding the current one."""
-    fallbacks = []
-    for provider in FALLBACK_ORDER:
+def _has_key(provider: str) -> bool:
+    key_env = DEFAULT_API_KEY_ENVS.get(provider, "")
+    if not key_env:
+        return provider == "ollama"
+    return bool(os.environ.get(key_env, "").strip())
+
+
+def get_fallback_chain(current_provider: str, current_model: str) -> list:
+    """Return ordered list of (provider, model, needs_context_switch) fallback candidates.
+
+    Strategy:
+    1. Same provider, next model in KNOWN_MODELS list (no context switch needed)
+    2. Other providers with valid API keys (context switch required)
+    """
+    chain = []
+
+    # Step 1: same-provider model fallbacks
+    same_models = KNOWN_MODELS.get(current_provider, [])
+    try:
+        idx = same_models.index(current_model)
+        for alt_model in same_models[idx + 1:]:
+            chain.append((current_provider, alt_model, False))
+    except ValueError:
+        # current model not in list; try all others in the provider
+        for alt_model in same_models:
+            if alt_model != current_model:
+                chain.append((current_provider, alt_model, False))
+
+    # Step 2: cross-provider fallbacks
+    for provider in CROSS_PROVIDER_FALLBACK_ORDER:
         if provider == current_provider:
             continue
-        key_env = DEFAULT_API_KEY_ENVS.get(provider, "")
-        if not key_env:
-            if provider == "ollama":
-                fallbacks.append(provider)
+        if not _has_key(provider):
             continue
-        if os.environ.get(key_env, "").strip():
-            fallbacks.append(provider)
-    return fallbacks
+        models = KNOWN_MODELS.get(provider, [])
+        if models:
+            chain.append((provider, models[0], True))
+
+    return chain
 
 
 def get_fallback_model(provider: str) -> str:

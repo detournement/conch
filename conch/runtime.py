@@ -193,9 +193,12 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_use":
-                        text_parts.append(f"[Called tool: {block.get('name', '?')}]")
+                        inp = block.get("input", {})
+                        import json as _json
+                        inp_str = _json.dumps(inp)[:100] if inp else ""
+                        text_parts.append(f"<tool_called name=\"{block.get('name', '?')}\" args=\"{inp_str}\"/>")
                     elif block.get("type") == "tool_result":
-                        text_parts.append(f"[Tool result: {str(block.get('content', ''))[:200]}]")
+                        text_parts.append(f"<tool_result>{str(block.get('content', ''))[:200]}</tool_result>")
                 else:
                     text_parts.append(str(block))
             flat_content = "\n".join(part for part in text_parts if part)
@@ -304,9 +307,7 @@ def chat_turn(
                     break
         tool_calls = response.get("tool_calls")
         if not tool_calls:
-            recovered = None
-            if provider == "anthropic":
-                recovered = extract_textual_tool_use_blocks(response.get("content", ""))
+            recovered = extract_textual_tool_use_blocks(response.get("content", ""))
             if not recovered:
                 return response.get("content", "")
             tool_calls = [{
@@ -320,7 +321,7 @@ def chat_turn(
             response["tool_calls"] = tool_calls
             if provider == "anthropic":
                 response["_anthropic_content"] = recovered
-                response["content"] = ""
+            response["content"] = ""
             print("  \033[2m(recovered textual tool call)\033[0m", file=sys.stderr)
         results = []
         for tool_call in tool_calls:

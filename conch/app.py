@@ -208,6 +208,27 @@ def chat_loop():
     current_conv = conv_mgr.get_most_recent()
     if current_conv and current_conv.messages:
         messages = current_conv.messages
+        # Strip any tool-call artifacts from saved history
+        _clean = []
+        for _m in messages:
+            _role = _m.get("role", "user")
+            _content = _m.get("content", "")
+            if _role == "tool":
+                continue
+            if isinstance(_content, list):
+                _tp = [b.get("text", "") for b in _content if isinstance(b, dict) and b.get("type") == "text"]
+                _content = "\n".join(t for t in _tp if t).strip()
+                if not _content:
+                    continue
+            if isinstance(_content, str):
+                _s = _content.strip()
+                if _s.startswith(("[Called tool:", "<tool_called", "[Tool result", "<tool_result")):
+                    continue
+            if _role == "assistant" and _m.get("tool_calls") and not str(_content).strip():
+                continue
+            _clean.append({"role": _role, "content": _content})
+        messages = _clean
+        current_conv.messages = messages
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = system_prompt
         if provider == "anthropic":

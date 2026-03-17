@@ -44,13 +44,15 @@ CHAT_SYSTEM_PROMPT = None  # resolved per-provider at startup
 MAX_TOOL_ROUNDS = 25  # default, adjustable via /rounds
 
 CONCH_SHELL_ART = [
-    "    __",
-    " .-'  `'-.",
-    "/  .--.    \\",
-    "| /    \\    |",
-    "| |  o  |   |",
-    "\\  '--'   ./'",
-    " `-.___.-'",
+    "      ,/",
+    "     //",
+    "    //  .-~~~-.",
+    "   //  /  (•)  \\",
+    "  //  |   /~~\\  |",
+    " //   |  | __ | |",
+    " \\    \\ \\____/ /",
+    "  \\    '------'",
+    "   \\___________)",
 ]
 
 

@@ -218,36 +218,65 @@ def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
 
 
 def normalize_messages_for_provider(messages: list, provider: str) -> list:
-    """Flatten Anthropic-style structured messages for OpenAI-compatible providers."""
+    """Flatten Anthropic-style structured messages for OpenAI-compatible providers.
+
+    Drops tool execution pairs entirely to prevent the model from echoing
+    tool-call artifacts. Only keeps text content from assistant messages.
+    """
     if provider == "anthropic":
         return messages
     normalized = []
-    for msg in messages:
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role", "user")
         content = msg.get("content", "")
+
+        # Drop OpenAI-style tool-role messages
+        if role == "tool":
+            i += 1
+            continue
+
         if isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
-                        inp = block.get("input", {})
-                        import json as _json
-                        inp_str = _json.dumps(inp)[:100] if inp else ""
-                        text_parts.append(f"<tool_called name=\"{block.get('name', '?')}\" args=\"{inp_str}\"/>")
-                    elif block.get("type") == "tool_result":
-                        text_parts.append(f"<tool_result>{str(block.get('content', ''))[:200]}</tool_result>")
-                else:
-                    text_parts.append(str(block))
-            flat_content = "\n".join(part for part in text_parts if part)
-            if not flat_content.strip():
+            has_tool = any(
+                isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
+                for b in content
+            )
+            # Extract only text parts
+            text_parts = [
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            text_content = "\n".join(p for p in text_parts if p).strip()
+
+            if has_tool and not text_content:
+                # Pure tool message with no text — skip it and its tool_result pair
+                i += 1
+                if i < len(messages):
+                    nxt = messages[i]
+                    nxt_c = nxt.get("content", "")
+                    if isinstance(nxt_c, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in nxt_c
+                    ):
+                        i += 1
                 continue
-            role = msg.get("role", "user")
-            if role == "user" and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-                role = "user"
-            normalized.append({"role": role, "content": flat_content})
+            elif text_content:
+                normalized.append({"role": role, "content": text_content})
+                i += 1
+                continue
+            else:
+                i += 1
+                continue
         else:
-            normalized.append(msg)
+            # Drop assistant messages that were pure tool calls
+            if role == "assistant" and msg.get("tool_calls") and not str(content).strip():
+                i += 1
+                continue
+            if str(content).strip():
+                normalized.append({"role": role, "content": content})
+        i += 1
     return normalized
 
 

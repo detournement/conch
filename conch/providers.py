@@ -342,3 +342,389 @@ RAW_FNS = {
     "ollama": raw_ollama,
 }
 
+
+# ---------------------------------------------------------------------------
+# Streaming provider functions
+# ---------------------------------------------------------------------------
+
+def _iter_sse(response):
+    """Yield parsed JSON payloads from an SSE response stream."""
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line or line.startswith(":"):
+            continue
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload.strip() == "[DONE]":
+            return
+        try:
+            yield json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+
+def _stream_openai_compat(
+    url: str,
+    headers: dict,
+    body: dict,
+    model: str,
+    provider: str,
+    on_token,
+) -> dict:
+    """Shared streaming implementation for OpenAI-compatible APIs."""
+    body["stream"] = True
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers=headers,
+        method="POST",
+    )
+
+    content_parts: list[str] = []
+    tool_calls_acc: dict[int, dict] = {}
+    usage = {"input_tokens": 0, "output_tokens": 0}
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            for chunk in _iter_sse(response):
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta", {})
+
+                text = delta.get("content") or ""
+                if not text and provider == "cerebras":
+                    text = delta.get("reasoning") or ""
+
+                if text:
+                    content_parts.append(text)
+                    if on_token:
+                        on_token(text)
+
+                for tc in delta.get("tool_calls", []):
+                    idx = tc.get("index", 0)
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc.get("id"):
+                        tool_calls_acc[idx]["id"] = tc["id"]
+                    fn = tc.get("function", {})
+                    if fn.get("name"):
+                        tool_calls_acc[idx]["name"] = fn["name"]
+                    if fn.get("arguments") is not None:
+                        tool_calls_acc[idx]["arguments"] += fn["arguments"]
+
+                if chunk.get("usage"):
+                    u = chunk["usage"]
+                    usage["input_tokens"] = u.get("prompt_tokens", 0)
+                    usage["output_tokens"] = u.get("completion_tokens", 0)
+    except Exception as exc:
+        return {"content": f"[API error: {exc}]", "tool_calls": None}
+
+    full_text = "".join(content_parts).strip()
+    tool_calls = None
+    if tool_calls_acc:
+        tool_calls = [
+            {
+                "id": info["id"],
+                "type": "function",
+                "function": {"name": info["name"], "arguments": info["arguments"]},
+            }
+            for info in [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+        ]
+
+    return {
+        "role": "assistant",
+        "content": full_text,
+        "tool_calls": tool_calls,
+        "_usage": usage,
+        "_model": model,
+    }
+
+
+def stream_cerebras(
+    config: dict, messages: list, tools=None, on_token=None
+) -> dict:
+    api_key = os.environ.get(
+        config.get("api_key_env", "CEREBRAS_API_KEY"), ""
+    ).strip()
+    if not api_key:
+        return {"content": "", "tool_calls": None}
+    base_url = (
+        config.get("base_url")
+        or os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
+    ).rstrip("/")
+    model = config.get("chat_model", config.get("model", "zai-glm-4.7"))
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_completion_tokens": 16384,
+        "clear_thinking": False,
+    }
+    if tools:
+        body["tools"] = tools
+    return _stream_openai_compat(
+        f"{base_url}/chat/completions",
+        {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "conch/1.0",
+        },
+        body,
+        model,
+        "cerebras",
+        on_token,
+    )
+
+
+def stream_openai(
+    config: dict, messages: list, tools=None, on_token=None
+) -> dict:
+    api_key = os.environ.get(
+        config.get("api_key_env", "OPENAI_API_KEY"), ""
+    ).strip()
+    if not api_key:
+        return {"content": "", "tool_calls": None}
+    model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 16384,
+        "stream_options": {"include_usage": True},
+    }
+    if tools:
+        body["tools"] = tools
+    return _stream_openai_compat(
+        "https://api.openai.com/v1/chat/completions",
+        {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        body,
+        model,
+        "openai",
+        on_token,
+    )
+
+
+def stream_anthropic(
+    config: dict, messages: list, tools=None, on_token=None
+) -> dict:
+    api_key = os.environ.get(
+        config.get("api_key_env", "ANTHROPIC_API_KEY"), ""
+    ).strip()
+    if not api_key:
+        return {"content": "", "tool_calls": None}
+
+    system = ""
+    user_messages: list[dict] = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system = msg["content"] if isinstance(msg["content"], str) else str(msg["content"])
+        else:
+            user_messages.append(msg)
+
+    model = config.get("chat_model", config.get("model", "claude-sonnet-4-6"))
+    body: Dict[str, Any] = {
+        "model": model,
+        "max_tokens": 16384,
+        "system": system,
+        "messages": user_messages,
+        "stream": True,
+    }
+    if tools:
+        body["tools"] = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "input_schema": t["function"].get(
+                    "parameters", {"type": "object", "properties": {}}
+                ),
+            }
+            for t in tools
+        ]
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+
+    text_parts: list[str] = []
+    anthropic_content: list[dict] = []
+    tool_calls: list[dict] = []
+    cur_block_type: Optional[str] = None
+    cur_block_meta: dict = {}
+    cur_text: list[str] = []
+    cur_json = ""
+    usage = {"input_tokens": 0, "output_tokens": 0}
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    data = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+
+                etype = data.get("type")
+
+                if etype == "message_start":
+                    mu = data.get("message", {}).get("usage", {})
+                    usage["input_tokens"] = mu.get("input_tokens", 0)
+
+                elif etype == "content_block_start":
+                    block = data.get("content_block", {})
+                    cur_block_type = block.get("type")
+                    cur_block_meta = block
+                    cur_text = []
+                    cur_json = ""
+
+                elif etype == "content_block_delta":
+                    delta = data.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        t = delta.get("text", "")
+                        cur_text.append(t)
+                        text_parts.append(t)
+                        if on_token:
+                            on_token(t)
+                    elif delta.get("type") == "input_json_delta":
+                        cur_json += delta.get("partial_json", "")
+
+                elif etype == "content_block_stop":
+                    if cur_block_type == "text":
+                        anthropic_content.append(
+                            {"type": "text", "text": "".join(cur_text)}
+                        )
+                    elif cur_block_type == "tool_use":
+                        try:
+                            inp = json.loads(cur_json) if cur_json else {}
+                        except json.JSONDecodeError:
+                            inp = {}
+                        anthropic_content.append({
+                            "type": "tool_use",
+                            "id": cur_block_meta.get("id", ""),
+                            "name": cur_block_meta.get("name", ""),
+                            "input": inp,
+                        })
+                        tool_calls.append({
+                            "id": cur_block_meta.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": cur_block_meta.get("name", ""),
+                                "arguments": json.dumps(inp),
+                            },
+                        })
+                    cur_block_type = None
+
+                elif etype == "message_delta":
+                    mu = data.get("usage", {})
+                    usage["output_tokens"] = mu.get("output_tokens", 0)
+    except Exception as exc:
+        return {"content": f"[API error: {exc}]", "tool_calls": None}
+
+    full_text = "".join(text_parts).strip()
+    if not anthropic_content and full_text:
+        anthropic_content = [{"type": "text", "text": full_text}]
+
+    return {
+        "role": "assistant",
+        "content": full_text,
+        "tool_calls": tool_calls if tool_calls else None,
+        "_anthropic_content": anthropic_content,
+        "_usage": usage,
+        "_model": model,
+    }
+
+
+def stream_ollama(
+    config: dict, messages: list, tools=None, on_token=None
+) -> dict:
+    base_url = (
+        config.get("base_url")
+        or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    ).rstrip("/")
+    model = config.get("chat_model", config.get("model", "llama3.3"))
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }
+    if tools:
+        body["tools"] = tools
+
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    content_parts: list[str] = []
+    final_data: dict = {}
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg = data.get("message", {})
+                if msg.get("content"):
+                    content_parts.append(msg["content"])
+                    if on_token:
+                        on_token(msg["content"])
+
+                if data.get("done"):
+                    final_data = data
+                    break
+    except Exception as exc:
+        return {"content": f"[Ollama error: {exc}]", "tool_calls": None}
+
+    full_text = "".join(content_parts).strip()
+    raw_tool_calls = final_data.get("message", {}).get("tool_calls")
+    tool_calls = None
+    if raw_tool_calls:
+        tool_calls = []
+        for i, tc in enumerate(raw_tool_calls):
+            fn = tc.get("function", {})
+            tool_calls.append({
+                "id": f"ollama_{i}",
+                "type": "function",
+                "function": {
+                    "name": fn.get("name", ""),
+                    "arguments": json.dumps(fn.get("arguments", {})),
+                },
+            })
+
+    return {
+        "role": "assistant",
+        "content": full_text,
+        "tool_calls": tool_calls,
+        "_usage": _normalize_usage(final_data, "ollama"),
+        "_model": model,
+    }
+
+
+STREAM_FNS = {
+    "cerebras": stream_cerebras,
+    "openai": stream_openai,
+    "anthropic": stream_anthropic,
+    "ollama": stream_ollama,
+}
+

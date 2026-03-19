@@ -11,7 +11,15 @@ from .browser import browse_conversations
 from . import composio as composio_mod
 from .providers import DEFAULT_API_KEY_ENVS, KNOWN_MODELS, RAW_FNS
 from .scheduler import _format_interval, _parse_interval
-from .tooling import get_agent_mode, group_tools, load_tool_prefs, save_tool_prefs
+from .tooling import (
+    activate_profile,
+    active_profile_name,
+    get_agent_mode,
+    group_tools,
+    list_profiles,
+    load_tool_prefs,
+    save_tool_prefs,
+)
 
 
 def handle_slash_command(
@@ -56,8 +64,10 @@ def handle_slash_command(
             "  \033[1m/connect <app>\033[0m       Connect a service\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
+            "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
-            "  \033[2mTip: type while the LLM is working — input is queued and runs next.\033[0m\n"
+            "  \033[1m/profile [name]\033[0m      Switch tool profile (minimal, dev, comms, full)\n"
+            "  \033[1m/profile [name]\033[0m      Switch tool profile (minimal, dev, comms, full)\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
         )
         return None
@@ -341,6 +351,17 @@ def handle_slash_command(
         print(f"\n  \033[1;32m✓ Max tool rounds set to {n}\033[0m\n")
         return n
 
+    if command == "/queue":
+        if arg in ("on", "true", "1"):
+            print("\n  \033[1;32m✓ Typeahead enabled\033[0m")
+            print("  \033[2mType while the LLM is working — input runs next.\033[0m\n")
+            return "queue_on"
+        if arg in ("off", "false", "0"):
+            print("\n  \033[1;32m✓ Typeahead disabled\033[0m\n")
+            return "queue_off"
+        print("\n  \033[2mUsage: /queue on | /queue off  (on by default)\033[0m\n")
+        return None
+
     if command == "/cost":
         if session_usage is None:
             session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
@@ -369,6 +390,25 @@ def handle_slash_command(
             print(f"    \033[1m{slug:<20}\033[0m \033[2m{desc}\033[0m")
         print()
         return None
+
+    if command in ("/profile", "/profiles") and all_tools is not None and tool_map is not None:
+        profiles = list_profiles()
+        if not arg:
+            current = active_profile_name()
+            print("\n  \033[1;36mTool profiles:\033[0m")
+            for name, info in sorted(profiles.items()):
+                marker = " \033[1;33m\u2190 active\033[0m" if name == current else ""
+                desc = info.get("description", "")
+                print(f"    \033[1m{name:<12}\033[0m \033[2m{desc}\033[0m{marker}")
+            print("\n  \033[2mUsage: /profile <name>\033[0m\n")
+            return None
+        new_tools, desc = activate_profile(arg.lower(), all_tools, tool_map)
+        if not new_tools and desc.startswith("Unknown"):
+            print(f"\n  \033[31m{desc}\033[0m\n")
+            return None
+        print(f"\n  \033[1;32m\u2713 Profile \'{arg.lower()}\' activated\033[0m \u2014 {desc}")
+        print(f"  \033[2m{len(new_tools)} tools active\033[0m\n")
+        return "reload_tools"
 
     if command == "/reload":
         return "reload_tools"

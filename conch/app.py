@@ -5,11 +5,13 @@ from __future__ import annotations
 import copy
 import datetime
 import os
-import queue
 import readline
+import select
 import shutil
 import sys
+import termios
 import threading
+import tty
 import urllib.request
 from typing import Any, Dict, List
 
@@ -18,7 +20,7 @@ from .config import load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
 from .providers import RAW_FNS
-from .render import highlight
+from .render import highlight, StreamPrinter
 from .runtime import chat_turn, sanitize_anthropic_messages
 from .scheduler import Scheduler
 from .tooling import (
@@ -164,6 +166,85 @@ def _print_conch_shell_art():
         print(f"{prefix}\033[2;36m{line}\033[0m")
 
 
+class TypeaheadBuffer:
+    """Capture keystrokes in cbreak mode while the LLM is working.
+
+    Uses a single reader thread with select() + cbreak so there is never
+    a second thread blocked on stdin.  Readline's input() owns stdin at
+    all other times.
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._queued: list[str] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._old_settings = None
+
+    def start(self):
+        if not sys.stdin.isatty():
+            return
+        self._stop.clear()
+        self._buffer = ""
+        try:
+            self._old_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        except termios.error:
+            self._old_settings = None
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> str:
+        """Stop capturing and restore terminal. Returns un-entered partial text."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+        if self._old_settings is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+            except termios.error:
+                pass
+            self._old_settings = None
+        partial = self._buffer
+        self._buffer = ""
+        return partial
+
+    def get_queued(self) -> list[str]:
+        lines = list(self._queued)
+        self._queued.clear()
+        return lines
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not ready or self._stop.is_set():
+                    continue
+                ch = sys.stdin.read(1)
+                if not ch:
+                    break
+                if ch in ("\r", "\n"):
+                    if self._buffer:
+                        self._queued.append(self._buffer)
+                        sys.stderr.write(
+                            f"\r\033[K  \033[2m(queued: {self._buffer[:60]})\033[0m\n"
+                        )
+                        sys.stderr.flush()
+                        self._buffer = ""
+                elif ch in ("\x7f", "\x08"):
+                    if self._buffer:
+                        self._buffer = self._buffer[:-1]
+                elif ch == "\x03":
+                    self._buffer = ""
+                    self._stop.set()
+                elif ch >= " ":
+                    self._buffer += ch
+            except (EOFError, OSError, ValueError):
+                break
+
+
 def chat_loop():
     config = load_config()
     provider = (config.get("provider") or "openai").lower()
@@ -254,6 +335,8 @@ def chat_loop():
         "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
         "/agent", "/schedule", "/tasks", "/cancel", "/tools", "/enable",
         "/disable", "/connect", "/apps", "/reload", "/rounds", "/cost",
+        "/profile", "/profiles",
+        "/queue",
     ]
 
     def _completer(text, state):
@@ -320,39 +403,22 @@ def chat_loop():
 
     _print_banner()
 
-    _input_queue: queue.Queue = queue.Queue()
-    _bg_input_active = threading.Event()
-
-    def _bg_input_reader():
-        """Background thread: read stdin lines while the LLM is working."""
-        while True:
-            if not _bg_input_active.is_set():
-                _bg_input_active.wait()
-            try:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-                line = line.rstrip("\n")
-                if line.strip():
-                    _input_queue.put(line.strip())
-                    print(f"  \033[2m(queued: {line.strip()[:60]})\033[0m", file=sys.stderr)
-            except (EOFError, OSError):
-                break
+    _typeahead = TypeaheadBuffer()
+    _typeahead_enabled = True
+    _typeahead_queued: list[str] = []
+    _typeahead_partial = ""
 
     last_interrupt = 0.0
     try:
         while True:
-            # Check for queued input from background typing
-            queued = None
-            try:
-                queued = _input_queue.get_nowait()
-            except queue.Empty:
-                pass
-
-            if queued:
-                user_input = queued
-                print(f"\033[1;33myou:\033[0m \033[2m{queued}\033[0m")
+            if _typeahead_queued:
+                user_input = _typeahead_queued.pop(0)
+                print(f"\033[1;33myou:\033[0m \033[2m{user_input}\033[0m")
             else:
+                if _typeahead_partial:
+                    prefill = _typeahead_partial
+                    _typeahead_partial = ""
+                    readline.set_startup_hook(lambda: readline.insert_text(prefill))
                 try:
                     user_input = input("\033[1;33myou:\033[0m ")
                 except EOFError:
@@ -366,6 +432,8 @@ def chat_loop():
                     last_interrupt = now
                     print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
                     continue
+                finally:
+                    readline.set_startup_hook()
 
             stripped = user_input.strip()
             if not stripped:
@@ -410,7 +478,11 @@ def chat_loop():
                 if result == "reload_tools":
                     _reload_tools()
                     continue
-                if isinstance(result, int):
+                if result == "queue_on":
+                    _typeahead_enabled = True
+                elif result == "queue_off":
+                    _typeahead_enabled = False
+                elif isinstance(result, int):
                     max_tool_rounds = result
                 elif result is not None:
                     old_provider = provider
@@ -429,12 +501,14 @@ def chat_loop():
             messages[0]["content"] = system_prompt + ("\n\n" + mem_context if mem_context else "")
             messages.append({"role": "user", "content": user_input})
 
-            # Enable background input while LLM is working
-            if sys.stdin.isatty():
-                _bg_input_active.set()
-                if not any(t.name == "conch_bg_input" for t in threading.enumerate()):
-                    _bg_thread = threading.Thread(target=_bg_input_reader, name="conch_bg_input", daemon=True)
-                    _bg_thread.start()
+            if _typeahead_enabled:
+                _typeahead.start()
+
+            _use_streaming = sys.stdout.isatty()
+            _printer = StreamPrinter() if _use_streaming else None
+
+            if _use_streaming:
+                print(f"\n\033[1;36massistant:\033[0m")
 
             try:
                 reply, turn_usage = chat_turn(
@@ -447,20 +521,27 @@ def chat_loop():
                     builtin_clients,
                     max_tool_rounds=max_tool_rounds,
                     chat_state=chat_state,
+                    on_token=_printer.feed if _printer else None,
                 )
             except KeyboardInterrupt:
-                print("\n\n  \033[33m⚠ Interrupted\033[0m\n")
+                _typeahead.stop()
+                print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
                 messages.clear()
                 messages.extend(turn_snapshot)
-                _bg_input_active.clear()
                 continue
 
-            _bg_input_active.clear()
+            _typeahead_partial = _typeahead.stop()
+            _typeahead_queued.extend(_typeahead.get_queued())
 
             if reply:
                 messages.append({"role": "assistant", "content": reply})
-                print(f"\n\033[1;36massistant:\033[0m\n{highlight(reply)}\n")
+                if _printer:
+                    _printer.flush()
+                else:
+                    print(f"\n\033[1;36massistant:\033[0m\n{highlight(reply)}\n")
             else:
+                if _printer:
+                    _printer.flush()
                 print("\n\033[2m[no response]\033[0m\n")
 
             # Display token/cost info

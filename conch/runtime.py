@@ -362,9 +362,16 @@ def chat_turn(
     builtin_clients: Dict[str, Any],
     max_tool_rounds: int = 10,
     chat_state=None,
+    on_token=None,
 ) -> tuple:
     """Returns (reply_text, usage_info) where usage_info is a dict with
-    input_tokens, output_tokens, and model."""
+    input_tokens, output_tokens, and model.
+
+    When *on_token* is a callable, the reply is streamed token-by-token
+    through that callback instead of blocking behind a spinner.
+    """
+    from .providers import STREAM_FNS
+
     total_usage = {"input_tokens": 0, "output_tokens": 0, "model": ""}
     for _ in range(max_tool_rounds):
         if provider == "anthropic":
@@ -377,8 +384,14 @@ def chat_turn(
             messages.clear()
             messages.extend(compressed)
         send_messages = normalize_messages_for_provider(messages, provider)
-        with Spinner("Thinking"):
-            response = raw_fn(config, send_messages, tools if tools else None)
+
+        stream_fn = STREAM_FNS.get(provider) if on_token else None
+        if stream_fn:
+            response = stream_fn(config, send_messages, tools if tools else None, on_token)
+        else:
+            with Spinner("Thinking"):
+                response = raw_fn(config, send_messages, tools if tools else None)
+
         usage = response.get("_usage", {})
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)

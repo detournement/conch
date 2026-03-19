@@ -101,6 +101,80 @@ def auto_disable_oversized_groups(all_tools: List[dict], tool_map: dict, prefs: 
     return prefs, auto_disabled
 
 
+# ---------------------------------------------------------------------------
+# Tool profiles — named presets for which tool groups are enabled
+# ---------------------------------------------------------------------------
+
+BUILTIN_PROFILES: Dict[str, Dict[str, Any]] = {
+    "minimal": {
+        "description": "Shell tools only",
+        "groups": None,
+    },
+    "dev": {
+        "description": "Development tools (GitHub, Jira)",
+        "groups": {"github", "jira"},
+    },
+    "comms": {
+        "description": "Communication tools (Gmail, Slack)",
+        "groups": {"gmail", "slack"},
+    },
+    "full": {
+        "description": "All tools enabled",
+        "groups": "__all__",
+    },
+}
+
+
+def list_profiles() -> Dict[str, Dict[str, Any]]:
+    """Return builtin + user-defined profiles."""
+    prefs = load_tool_prefs()
+    custom = prefs.get("custom_profiles", {})
+    merged = dict(BUILTIN_PROFILES)
+    merged.update(custom)
+    return merged
+
+
+def active_profile_name() -> str:
+    prefs = load_tool_prefs()
+    return prefs.get("active_profile", "")
+
+
+def activate_profile(
+    name: str,
+    all_tools: List[dict],
+    tool_map: Dict[str, Any],
+) -> tuple[List[dict], str]:
+    """Activate a profile and return (filtered_tools, description).
+
+    Sets disabled_groups in prefs so that only the profile's groups (plus
+    pinned tools) are active.  Returns the new active tool list.
+    """
+    profiles = list_profiles()
+    profile = profiles.get(name)
+    if not profile:
+        return [], f"Unknown profile '{name}'. Use /profiles to list."
+
+    prefs = load_tool_prefs()
+    all_groups = set(group_tools(all_tools, tool_map).keys())
+
+    wanted = profile.get("groups")
+    if wanted == "__all__":
+        prefs["disabled_groups"] = []
+    elif wanted is None:
+        prefs["disabled_groups"] = sorted(all_groups - PINNED_TOOL_NAMES)
+    else:
+        if isinstance(wanted, list):
+            wanted = set(wanted)
+        prefs["disabled_groups"] = sorted(
+            all_groups - wanted - PINNED_TOOL_NAMES
+        )
+
+    prefs["active_profile"] = name
+    save_tool_prefs(prefs)
+    tools = cap_tools(apply_filter(all_tools, tool_map, prefs))
+    return tools, profile.get("description", name)
+
+
 @dataclass
 class ToolRuntimeState:
     all_tools: List[dict]

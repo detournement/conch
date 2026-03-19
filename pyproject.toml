@@ -8,6 +8,12 @@ version = "0.2.0"
 description = "LLM-assisted shell with chat, MCP tools, memory, and scheduling."
 readme = "README.md"
 requires-python = ">=3.9"
+dependencies = [
+    "pygments>=2.0",
+]
+dependencies = [
+    "pygments>=2.0",
+]
 
 [project.scripts]
 conch = "conch.app:main"

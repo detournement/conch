@@ -75,10 +75,9 @@ def _detect_location() -> str:
         return ""
 
 
-def _build_system_prompt(base_prompt: str) -> str:
+def _build_system_prompt(base_prompt: str, location: str = "") -> str:
     now = datetime.datetime.now()
     tz_name = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
-    location = _detect_location()
     parts = [f"Current date and time: {now.strftime('%A, %B %d, %Y %I:%M %p')} (timezone: {tz_name})."]
     if location:
         parts.append(f"User location: {location}.")
@@ -107,9 +106,31 @@ def _make_builtin_clients(memory: MemoryStore, interactive: bool = True) -> Dict
     }
 
 
-def _load_runtime_tools(builtin_clients: Dict[str, Any]):
+def _load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False):
+    if use_cache:
+        cached = mcp_mod.load_cached_tools()
+        if cached is not None:
+            mcp_clients = mcp_mod.create_clients()
+            all_tools = list(cached)
+            tool_map: Dict[str, Any] = {}
+            # Map cached tools to clients by server name
+            for client in mcp_clients.values():
+                try:
+                    live = client.list_tools()
+                except Exception:
+                    live = []
+                for t in live:
+                    tool_map[t["function"]["name"]] = client
+            inject_builtin_tools(all_tools, tool_map, builtin_clients)
+            prefs = load_tool_prefs()
+            prefs, _ = auto_disable_oversized_groups(all_tools, tool_map, prefs)
+            tools = cap_tools(apply_filter(all_tools, tool_map, prefs))
+            state = ToolRuntimeState(all_tools=all_tools, tool_map=tool_map, tools=tools)
+            builtin_clients["manage_tools"].bind(state)
+            return mcp_clients, state
     mcp_clients = mcp_mod.create_clients()
     all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+    mcp_mod.save_tool_cache(all_tools)
     inject_builtin_tools(all_tools, tool_map, builtin_clients)
     prefs = load_tool_prefs()
     prefs, auto_disabled = auto_disable_oversized_groups(all_tools, tool_map, prefs)
@@ -256,10 +277,32 @@ def chat_loop():
     model_name = config.get("chat_model", config.get("model", ""))
     from .prompts import get_chat_prompt
     base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
+
+    # Detect location in background — inject into prompt when ready
+    _location_result = [""]
+    def _bg_location():
+        _location_result[0] = _detect_location()
+    _loc_thread = threading.Thread(target=_bg_location, daemon=True)
+    _loc_thread.start()
+
     system_prompt = _build_system_prompt(base_prompt)
     memory = MemoryStore()
     builtin_clients = _make_builtin_clients(memory, interactive=True)
-    mcp_clients, chat_state = _load_runtime_tools(builtin_clients)
+
+    # Load tools in background; show prompt immediately
+    _tools_ready = threading.Event()
+    _bg_mcp_clients: list = [None]
+    _bg_chat_state: list = [None]
+
+    def _bg_load_tools():
+        mc, cs = _load_runtime_tools(builtin_clients)
+        _bg_mcp_clients[0] = mc
+        _bg_chat_state[0] = cs
+        _tools_ready.set()
+
+    _tools_thread = threading.Thread(target=_bg_load_tools, daemon=True)
+    _tools_thread.start()
+
     sched = Scheduler()
 
     def _scheduled_executor(prompt: str, _task):
@@ -401,6 +444,21 @@ def chat_loop():
             print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
         print("\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
 
+    # Wait for background tool loading (with a brief spinner if needed)
+    if not _tools_ready.is_set():
+        from .render import Spinner
+        with Spinner("Loading tools"):
+            _tools_ready.wait(timeout=30)
+    mcp_clients = _bg_mcp_clients[0] or {}
+    chat_state = _bg_chat_state[0] or ToolRuntimeState(all_tools=[], tool_map={}, tools=[])
+
+    # Inject location now that background thread has had time
+    _loc_thread.join(timeout=0.1)
+    if _location_result[0]:
+        system_prompt = _build_system_prompt(base_prompt, _location_result[0])
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_prompt
+
     _print_banner()
 
     _typeahead = TypeaheadBuffer()
@@ -492,7 +550,7 @@ def chat_loop():
                         normalize_messages_on_switch(messages, provider)
                         from .prompts import get_chat_prompt
                         base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
-                        system_prompt = _build_system_prompt(base_prompt)
+                        system_prompt = _build_system_prompt(base_prompt, _location_result[0])
                         messages[0]["content"] = system_prompt
                 continue
 
@@ -589,7 +647,7 @@ def main():
         if not raw_fn:
             print(f"conch: unknown provider {provider}", file=sys.stderr)
             sys.exit(1)
-        system_prompt = _build_system_prompt(config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT))
+        system_prompt = _build_system_prompt(config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT), _detect_location())
         user_text = " ".join(sys.argv[1:])
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)

@@ -5,13 +5,19 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch" / "mcp.json"
+
+_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch"
+_TOOL_CACHE_PATH = _STATE_DIR / "tool_cache.json"
+_CACHE_TTL = 1800  # 30 minutes
 
 
 @dataclass
@@ -118,17 +124,47 @@ def create_clients() -> Dict[str, Any]:
 
 
 def collect_tools(clients: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
+    """Collect tools from all MCP clients in parallel."""
     tools: List[dict] = []
     tool_map: Dict[str, Any] = {}
-    for client in clients.values():
+    if not clients:
+        return tools, tool_map
+
+    def _load_one(name, client):
         try:
-            client_tools = client.list_tools()
+            return name, client, client.list_tools()
         except Exception:
-            client_tools = []
-        for tool in client_tools:
-            tools.append(tool)
-            tool_map[tool["function"]["name"]] = client
+            return name, client, []
+
+    with ThreadPoolExecutor(max_workers=max(len(clients), 1)) as pool:
+        futures = [pool.submit(_load_one, n, c) for n, c in clients.items()]
+        for future in as_completed(futures):
+            name, client, client_tools = future.result()
+            for tool in client_tools:
+                tools.append(tool)
+                tool_map[tool["function"]["name"]] = client
     return tools, tool_map
+
+
+def load_cached_tools() -> Optional[List[dict]]:
+    """Load tool definitions from disk cache if still fresh."""
+    try:
+        data = json.loads(_TOOL_CACHE_PATH.read_text())
+        if time.time() - data.get("ts", 0) < _CACHE_TTL:
+            return data.get("tools", [])
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def save_tool_cache(tools: List[dict]):
+    """Save tool definitions to disk cache."""
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        defs = [{"type": t.get("type", "function"), "function": t["function"]} for t in tools]
+        _TOOL_CACHE_PATH.write_text(json.dumps({"ts": time.time(), "tools": defs}))
+    except (OSError, TypeError):
+        pass
 
 
 def execute_tool_result(tool_map: Dict[str, Any], name: str, arguments: dict) -> ToolExecutionResult:

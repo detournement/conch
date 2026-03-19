@@ -1,236 +1,192 @@
-"""Composio integration — connect authenticated services (Gmail, Slack, etc.).
+"""Composio integration -- real OAuth connection flow."""
 
-When the user asks for a service that isn't connected yet, Conch can use the
-Composio API to initiate an OAuth flow, open the browser, and update the MCP
-server so the new tools appear on the next chat session.
+from __future__ import annotations
 
-Requires COMPOSIO_API_KEY in the environment.
-"""
 import json
 import os
-import re
-import subprocess
-import sys
-import time
 import urllib.request
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import webbrowser
+from typing import Any, Dict, List, Optional, Tuple
 
-BASE_URL = "https://backend.composio.dev/api/v3"
-
-POPULAR_APPS = [
-    ("gmail", "Gmail — read, send, search email"),
-    ("slack", "Slack — messages, channels, reactions"),
-    ("github", "GitHub — repos, issues, PRs, actions"),
-    ("google_calendar", "Google Calendar — events, scheduling"),
-    ("google_drive", "Google Drive — files, folders, sharing"),
-    ("google_sheets", "Google Sheets — read, write spreadsheets"),
-    ("notion", "Notion — pages, databases, search"),
-    ("linear", "Linear — issues, projects, teams"),
-    ("discord", "Discord — messages, channels, servers"),
-    ("spotify", "Spotify — playback, playlists, search"),
-    ("twitter", "Twitter/X — tweets, search, timeline"),
-    ("trello", "Trello — boards, cards, lists"),
-    ("asana", "Asana — tasks, projects, workspaces"),
-    ("hubspot", "HubSpot — CRM, contacts, deals"),
-    ("salesforce", "Salesforce — CRM, leads, opportunities"),
-]
+_BASE = "https://backend.composio.dev"
+_HEADERS_CACHE: Dict[str, str] = {}
 
 
-def _api_key() -> str:
-    key = os.environ.get("COMPOSIO_API_KEY", "").strip()
-    if not key:
-        env_path = Path(os.environ.get("CONCH_DIR", os.path.expanduser("~/conch"))) / ".env"
-        if env_path.is_file():
-            with open(env_path) as f:
-                for line in f:
-                    m = re.match(r'^export\s+COMPOSIO_API_KEY=["\']?([^"\'\s]+)', line.strip())
-                    if m:
-                        key = m.group(1)
-                        break
-    return key
+def _headers() -> Dict[str, str]:
+    if not _HEADERS_CACHE:
+        api_key = os.environ.get("COMPOSIO_API_KEY", "").strip()
+        _HEADERS_CACHE.update({
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "User-Agent": "conch/1.0",
+        })
+    return dict(_HEADERS_CACHE)
 
 
-def _request(method: str, path: str, body: dict = None,
-             params: dict = None) -> Tuple[dict, int]:
-    key = _api_key()
-    if not key:
-        return {"error": "COMPOSIO_API_KEY not set"}, 0
-
-    url = f"{BASE_URL}{path}"
+def _api_get(path: str, params: Optional[Dict[str, str]] = None) -> Any:
+    url = _BASE + path
     if params:
-        qs = "&".join(f"{k}={urllib.request.quote(str(v))}" for k, v in params.items())
-        url = f"{url}?{qs}"
-
-    headers = {
-        "x-api-key": key,
-        "Content-Type": "application/json",
-        "User-Agent": "conch/1.0",
-    }
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode()), r.status
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = json.loads(e.read().decode())
-        except Exception:
-            err_body = {"error": str(e)}
-        return err_body, e.code
-    except Exception as e:
-        return {"error": str(e)}, 0
+        qs = "&".join(f"{k}={urllib.request.quote(str(v))}" for k, v in params.items() if v)
+        url += "?" + qs
+    req = urllib.request.Request(url, headers=_headers())
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
 
 
-def _get_mcp_config() -> Tuple[Optional[str], str]:
-    """Extract the Composio MCP server ID and user_id from mcp.json."""
-    mcp_path = Path(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-    ) / "conch" / "mcp.json"
-    if not mcp_path.is_file():
-        return None, "default"
-    try:
-        with open(mcp_path) as f:
-            cfg = json.load(f)
-        url = cfg.get("mcpServers", {}).get("composio", {}).get("url", "")
-        sid_match = re.search(r"/mcp/([a-f0-9-]+)", url)
-        uid_match = re.search(r"[?&]user_id=([^&]+)", url)
-        server_id = sid_match.group(1) if sid_match else None
-        user_id = uid_match.group(1) if uid_match else "default"
-        return server_id, user_id
-    except Exception:
-        return None, "default"
+def _api_post(path: str, body: dict) -> Any:
+    req = urllib.request.Request(
+        _BASE + path,
+        data=json.dumps(body).encode(),
+        headers=_headers(),
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
 
 
 def is_available() -> bool:
-    """Check if Composio API key is configured."""
-    return bool(_api_key())
+    return bool(os.environ.get("COMPOSIO_API_KEY", "").strip())
 
 
 def list_apps() -> List[Tuple[str, str]]:
-    return POPULAR_APPS
+    """List available Composio apps from the API, with fallback."""
+    if not is_available():
+        return _FALLBACK_APPS
 
-
-def get_auth_config(app_slug: str) -> Optional[dict]:
-    """Get the Composio-managed auth config for an app."""
-    data, status = _request("GET", "/auth_configs", params={
-        "toolkit_slug": app_slug,
-        "is_composio_managed": "true",
-    })
-    items = data.get("items", data.get("results", []))
-    if isinstance(items, list) and items:
-        return items[0]
-    return None
-
-
-def check_connection(app_slug: str) -> Optional[dict]:
-    """Check if the user already has an active connection for an app."""
-    _, user_id = _get_mcp_config()
-    data, status = _request("GET", "/connected_accounts", params={
-        "toolkit_slugs": app_slug,
-        "status": "ACTIVE",
-        "user_id": user_id,
-    })
-    items = data.get("items", data.get("results", []))
-    if isinstance(items, list) and items:
-        return items[0]
-    return None
-
-
-def initiate_connection(app_slug: str) -> Tuple[Optional[str], Optional[str]]:
-    """Start an OAuth flow for an app. Returns (redirect_url, error)."""
-    auth_cfg = get_auth_config(app_slug)
-    if not auth_cfg:
-        return None, f"No Composio auth config found for '{app_slug}'"
-
-    auth_config_id = auth_cfg.get("id", "")
-
-    _, user_id = _get_mcp_config()
-    data, status = _request("POST", "/connected_accounts", body={
-        "auth_config": {"id": auth_config_id},
-        "connection": {"state": {"authScheme": "OAUTH2"}},
-        "user_id": user_id,
-    })
-
-    redirect_url = data.get("redirectUrl") or data.get("redirect_url")
-    if redirect_url:
-        return redirect_url, None
-
-    error = data.get("error") or data.get("message") or "Unknown error initiating connection"
-    return None, str(error)
-
-
-def update_mcp_server(app_slug: str) -> Tuple[bool, str]:
-    """Add an app's auth config and toolkit to the MCP server so its tools appear."""
-    server_id, _ = _get_mcp_config()
-    if not server_id:
-        return False, "Could not find Composio MCP server ID in mcp.json"
-
-    auth_cfg = get_auth_config(app_slug)
-    if not auth_cfg:
-        return False, f"No auth config found for '{app_slug}'"
-
-    data, status = _request("GET", f"/mcp/{server_id}")
-    current_ids = data.get("auth_config_ids", [])
-    current_toolkits = data.get("toolkits", [])
-
-    auth_id = auth_cfg.get("id", "")
-    changed = False
-
-    if auth_id not in current_ids:
-        current_ids.append(auth_id)
-        changed = True
-
-    if app_slug not in current_toolkits:
-        current_toolkits.append(app_slug)
-        changed = True
-
-    if not changed:
-        return True, "Already configured"
-
-    patch_data, patch_status = _request("PATCH", f"/mcp/{server_id}", body={
-        "auth_config_ids": current_ids,
-        "toolkits": current_toolkits,
-    })
-
-    if patch_status in (200, 204):
-        return True, "MCP server updated"
-    return False, patch_data.get("error", f"HTTP {patch_status}")
-
-
-def open_browser(url: str):
-    """Open a URL in the user's default browser."""
     try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif sys.platform.startswith("linux"):
-            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        data = _api_get("/api/v1/apps", {"limit": "100"})
+        items = data.get("items", data) if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return _FALLBACK_APPS
+        apps = []
+        for app in items:
+            slug = (app.get("key") or app.get("name") or "").lower()
+            desc = (app.get("description") or app.get("displayName") or "")[:60]
+            if slug:
+                apps.append((slug, desc))
+        return apps if apps else _FALLBACK_APPS
     except Exception:
-        pass
+        return _FALLBACK_APPS
+
+
+def check_connection(app_slug: str) -> Tuple[bool, str]:
+    """Check if an app is already connected."""
+    if not is_available():
+        return False, "COMPOSIO_API_KEY not set"
+    try:
+        data = _api_get("/api/v1/connectedAccounts", {"appNames": app_slug})
+        items = data.get("items", []) if isinstance(data, dict) else []
+        for item in items:
+            status = (item.get("status") or item.get("connectionStatus") or "").upper()
+            if status == "ACTIVE":
+                return True, f"{app_slug} is connected (account: {item.get('id', 'unknown')[:12]})"
+        return False, f"{app_slug} has no active connection"
+    except Exception as exc:
+        return False, f"Failed to check connection: {exc}"
 
 
 def connect(app_slug: str) -> Tuple[bool, str]:
-    """Full connection flow: update MCP server, initiate OAuth, reload.
+    """Initiate an OAuth connection for a Composio app.
 
-    Returns (success, message_for_user).
+    1. Look up the auth config for the app
+    2. POST to create a connected account (initiates OAuth)
+    3. Open the browser to the redirect URL
     """
-    # Always ensure the toolkit is on the MCP server
-    update_mcp_server(app_slug)
+    if not is_available():
+        return False, "COMPOSIO_API_KEY not set"
 
-    # Initiate a new OAuth connection for the current user_id.
-    # Even if a connection exists, it may be for a different entity;
-    # Composio will reuse the existing one if it matches.
-    redirect_url, error = initiate_connection(app_slug)
-    if error:
-        return False, error
-    if not redirect_url:
-        return False, "No redirect URL returned"
+    # Check if already connected
+    connected, msg = check_connection(app_slug)
+    if connected:
+        return True, msg + ". Use /reload to refresh tools."
 
-    open_browser(redirect_url)
+    # Step 1: Find auth config for this app
+    auth_config_id = None
+    try:
+        data = _api_get("/api/v3/auth_configs", {
+            "toolkit_slug": app_slug,
+            "is_composio_managed": "true",
+            "limit": "5",
+        })
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if items:
+            auth_config_id = items[0].get("id")
+    except Exception:
+        pass
 
-    return True, (
-        f"Opening browser for {app_slug} authentication...\n"
-        f"  Complete the sign-in in your browser, then type \033[1m/reload\033[0m to load the new tools."
+    if not auth_config_id:
+        # Try v1 integrations as fallback
+        try:
+            data = _api_get("/api/v1/integrations", {"appName": app_slug})
+            items = data.get("items", data) if isinstance(data, dict) else data
+            if isinstance(items, list) and items:
+                auth_config_id = items[0].get("id")
+        except Exception:
+            pass
+
+    if not auth_config_id:
+        return False, (
+            f"No auth config found for '{app_slug}'. "
+            "Use /apps to see available services."
+        )
+
+    # Step 2: Initiate connection
+    try:
+        # Try v3 endpoint first
+        result = _api_post("/api/v3/connected_accounts", {
+            "auth_config": {"id": auth_config_id},
+            "connection": {
+                "state": {"authScheme": "OAUTH2", "val": {}},
+            },
+        })
+    except Exception:
+        try:
+            # Fall back to v1 endpoint
+            result = _api_post("/api/v1/connectedAccounts", {
+                "integrationId": auth_config_id,
+            })
+        except Exception as exc:
+            return False, f"Failed to initiate connection: {exc}"
+
+    redirect_url = (
+        result.get("redirectUrl")
+        or result.get("redirect_url")
+        or result.get("redirectURL")
     )
+    if redirect_url:
+        try:
+            webbrowser.open(redirect_url)
+        except Exception:
+            return True, (
+                f"Open this URL to authenticate {app_slug}:\n"
+                f"  {redirect_url}\n"
+                "Then /reload to load new tools."
+            )
+        return True, (
+            f"Opening browser for {app_slug} authentication...\n"
+            "  Complete the sign-in, then /reload to load new tools."
+        )
+
+    status = (
+        result.get("connectionStatus")
+        or result.get("status")
+        or "unknown"
+    )
+    if status.upper() == "ACTIVE":
+        return True, f"{app_slug} connected successfully. /reload to load tools."
+
+    return True, f"Connection initiated for {app_slug} (status: {status}). /reload when ready."
+
+
+_FALLBACK_APPS: List[Tuple[str, str]] = [
+    ("gmail", "Google Mail"),
+    ("github", "GitHub"),
+    ("slack", "Slack"),
+    ("serpapi", "Web search"),
+    ("google_calendar", "Google Calendar"),
+    ("notion", "Notion"),
+    ("linear", "Linear"),
+    ("discord", "Discord"),
+    ("google_drive", "Google Drive"),
+    ("trello", "Trello"),
+]

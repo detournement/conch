@@ -1,1 +1,2 @@
-# Conch: LLM-assisted shell
+"""Conch package."""
+

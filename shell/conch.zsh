@@ -4,6 +4,10 @@
 : "${CONCH_DIR:=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
 : "${CONCH_ASK_CMD:=conch-ask}"
 
+_conch_source_env() {
+  [[ -f "${CONCH_DIR}/.env" ]] && source "${CONCH_DIR}/.env"
+}
+
 # Single widget: prompt for request, call LLM, put result in buffer.
 # No keymap manipulation — Enter/Escape/Tab all work normally after.
 conch-trigger() {
@@ -27,6 +31,7 @@ conch-trigger() {
 
   errfile="${TMPDIR:-/tmp}/conch-$$.err"
   export CONCH_OS_SHELL="$(uname -s) / $SHELL"
+  _conch_source_env
 
   cmd="$(python3 "$runner" 15 "$request" 2>"$errfile")"
 
@@ -72,6 +77,7 @@ ask() {
   [[ -f "$runner" ]] || runner="${CONCH_DIR}/bin/conch-run-with-timeout"
   errfile="${TMPDIR:-/tmp}/conch-$$.err"
   export CONCH_OS_SHELL="$(uname -s) / $SHELL"
+  _conch_source_env
   # Start animated spinner (suppress job control messages)
   {
     _conch_spinner &
@@ -99,6 +105,7 @@ chat() {
   chat_cmd="${_conch_bin}/conch-chat"
   [[ -x "$chat_cmd" ]] || chat_cmd="$(command -v conch-chat 2>/dev/null)"
   [[ -x "$chat_cmd" ]] || chat_cmd="${CONCH_DIR}/bin/conch-chat"
+  _conch_source_env
   if [[ $# -gt 0 ]]; then
     python3 "$chat_cmd" "$@"
   else

@@ -579,6 +579,13 @@ def stream_anthropic(
 
                 etype = data.get("type")
 
+                if etype == "error":
+                    err = data.get("error", {})
+                    return {
+                        "content": "[API error: %s]" % err.get("message", "unknown stream error"),
+                        "tool_calls": None,
+                    }
+
                 if etype == "message_start":
                     mu = data.get("message", {}).get("usage", {})
                     usage["input_tokens"] = mu.get("input_tokens", 0)

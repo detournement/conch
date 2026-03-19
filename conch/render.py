@@ -101,6 +101,8 @@ class StreamPrinter:
 
     Buffers code blocks until complete so they can be syntax-highlighted.
     Applies inline markdown formatting to regular lines as they arrive.
+    Partial lines are shown immediately (raw) then re-drawn with
+    formatting once a newline arrives.
     """
 
     def __init__(self):
@@ -109,18 +111,35 @@ class StreamPrinter:
         self._code_buf: list[str] = []
         self._line_buf = ""
         self._full_text = ""
+        self._partial_written = 0
 
     def feed(self, chunk: str):
         self._full_text += chunk
         self._line_buf += chunk
+
         while "\n" in self._line_buf:
+            # Clear raw partial text before writing formatted version
+            if self._partial_written:
+                sys.stdout.write("\r\033[2K")
+                self._partial_written = 0
             line, self._line_buf = self._line_buf.split("\n", 1)
             self._emit_line(line)
             sys.stdout.write("\n")
+
+        # Show partial line immediately so tokens are visible at once
+        if self._line_buf and not self._in_code:
+            new_text = self._line_buf[self._partial_written:]
+            if new_text:
+                sys.stdout.write(new_text)
+                self._partial_written = len(self._line_buf)
+
         sys.stdout.flush()
 
     def flush(self) -> str:
         """Flush remaining buffer and return accumulated full text."""
+        if self._partial_written:
+            sys.stdout.write("\r\033[2K")
+            self._partial_written = 0
         if self._line_buf:
             self._emit_line(self._line_buf)
             self._line_buf = ""
@@ -139,6 +158,7 @@ class StreamPrinter:
         self._code_buf.clear()
         self._line_buf = ""
         self._full_text = ""
+        self._partial_written = 0
 
     def _emit_line(self, line: str):
         if not self._in_code and line.startswith("```"):

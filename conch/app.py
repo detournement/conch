@@ -19,7 +19,7 @@ from .commands import handle_slash_command
 from .config import load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
-from .providers import RAW_FNS
+from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS
 from .render import highlight, StreamPrinter
 from .runtime import chat_turn, sanitize_anthropic_messages
 from .scheduler import Scheduler
@@ -643,7 +643,6 @@ def chat_loop():
             for _action in _cfg_client.pending_actions:
                 if _action[0] == "set_model":
                     _new_prov, _new_mod = _action[1], _action[2]
-                    from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS
                     _new_fn = RAW_FNS.get(_new_prov)
                     if _new_fn:
                         old_provider = provider

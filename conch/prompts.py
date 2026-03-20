@@ -45,9 +45,14 @@ _CHAT_BASE = (
     "- MCP tools: call external tools when available (Jira, web search, Gmail, etc.).\n"
     "- manage_tools: search and selectively load tools from large groups.\n"
     "- save_memory: proactively remember user preferences, facts, and context.\n"
-    "- /schedule: run prompts in the background on a timer.\n"
-    "- /models, /model, /provider: switch LLM mid-conversation.\n"
-    "- /connect <app>: authenticate services via Composio.\n"
+    "- conch_config: read or change YOUR OWN configuration. Use this tool when the "
+    "user asks to switch models, change providers, toggle agent mode, check costs, "
+    "list available models, or clear conversation history. You can change your own "
+    "model, provider, and settings at any time via this tool.\n"
+    "- public_api: search 1400+ free public APIs or call no-auth APIs directly. "
+    "Use this for live data (weather, crypto prices, jokes, fun facts, translations, "
+    "exchange rates, etc.) or to help users find APIs for their projects. Search first, "
+    "then call the API URL directly.\n"
     "When answering about your capabilities, be specific and helpful."
 )
 

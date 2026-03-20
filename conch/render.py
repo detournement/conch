@@ -105,15 +105,25 @@ class StreamPrinter:
     formatting once a newline arrives.
     """
 
-    def __init__(self):
+    def __init__(self, show_waiting: bool = True):
         self._in_code = False
         self._code_lang = ""
         self._code_buf: list[str] = []
         self._line_buf = ""
         self._full_text = ""
         self._partial_written = 0
+        self._started = False
+        self._spinner = None
+        if show_waiting and sys.stderr.isatty():
+            self._spinner = Spinner("Waiting for response")
+            self._spinner.__enter__()
 
     def feed(self, chunk: str):
+        if not self._started:
+            self._started = True
+            if self._spinner:
+                self._spinner.__exit__(None, None, None)
+                self._spinner = None
         self._full_text += chunk
         self._line_buf += chunk
 
@@ -137,6 +147,9 @@ class StreamPrinter:
 
     def flush(self) -> str:
         """Flush remaining buffer and return accumulated full text."""
+        if self._spinner:
+            self._spinner.__exit__(None, None, None)
+            self._spinner = None
         if self._partial_written:
             sys.stdout.write("\r\033[2K")
             self._partial_written = 0

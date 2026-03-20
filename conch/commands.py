@@ -67,7 +67,7 @@ def handle_slash_command(
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
             "  \033[1m/profile [name]\033[0m      Switch tool profile (minimal, dev, comms, full)\n"
-            "  \033[1m/profile [name]\033[0m      Switch tool profile (minimal, dev, comms, full)\n"
+            "  \033[1m/clear\033[0m               Wipe conversation history (keep conversation)\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
         )
         return None
@@ -94,6 +94,9 @@ def handle_slash_command(
         if result and result != current_id:
             return ("switch_conversation", result)
         return None
+
+    if command == "/clear":
+        return "clear_conversation"
 
     if command == "/new" and conv_mgr is not None:
         return "new_conversation"

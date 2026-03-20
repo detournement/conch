@@ -19,11 +19,13 @@ from .commands import handle_slash_command
 from .config import load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
-from .providers import RAW_FNS
+from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS
 from .render import highlight, StreamPrinter
 from .runtime import chat_turn, sanitize_anthropic_messages
 from .scheduler import Scheduler
 from .tooling import (
+    ConchConfigClient,
+    PublicApiClient,
     LocalShellClient,
     LocalShellPolicy,
     ManageToolsClient,
@@ -75,12 +77,14 @@ def _detect_location() -> str:
         return ""
 
 
-def _build_system_prompt(base_prompt: str, location: str = "") -> str:
+def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "", model: str = "") -> str:
     now = datetime.datetime.now()
     tz_name = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
     parts = [f"Current date and time: {now.strftime('%A, %B %d, %Y %I:%M %p')} (timezone: {tz_name})."]
     if location:
         parts.append(f"User location: {location}.")
+    if provider and model:
+        parts.append(f"You are currently running as {provider}/{model}.")
     parts.append("Use this for any time-sensitive or location-relevant requests.")
     return base_prompt + "\n\n" + " ".join(parts)
 
@@ -99,10 +103,14 @@ def _make_builtin_clients(memory: MemoryStore, interactive: bool = True) -> Dict
     manage_tools = ManageToolsClient()
     save_memory = SaveMemoryClient()
     save_memory.bind(memory)
+    conch_config = ConchConfigClient()
+    public_api = PublicApiClient()
     return {
         "local_shell": local_shell,
         "manage_tools": manage_tools,
         "save_memory": save_memory,
+        "conch_config": conch_config,
+        "public_api": public_api,
     }
 
 
@@ -285,7 +293,7 @@ def chat_loop():
     _loc_thread = threading.Thread(target=_bg_location, daemon=True)
     _loc_thread.start()
 
-    system_prompt = _build_system_prompt(base_prompt)
+    system_prompt = _build_system_prompt(base_prompt, provider=provider, model=model_name)
     memory = MemoryStore()
     builtin_clients = _make_builtin_clients(memory, interactive=True)
 
@@ -378,7 +386,7 @@ def chat_loop():
         "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
         "/agent", "/schedule", "/tasks", "/cancel", "/tools", "/enable",
         "/disable", "/connect", "/apps", "/reload", "/rounds", "/cost",
-        "/profile", "/profiles",
+        "/profile", "/profiles", "/clear",
         "/queue",
     ]
 
@@ -455,9 +463,12 @@ def chat_loop():
     # Inject location now that background thread has had time
     _loc_thread.join(timeout=0.1)
     if _location_result[0]:
-        system_prompt = _build_system_prompt(base_prompt, _location_result[0])
+        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name)
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = system_prompt
+
+    # Bind config client with current state
+    builtin_clients["conch_config"].bind(provider, model_name, session_usage)
 
     _print_banner()
 
@@ -526,6 +537,14 @@ def chat_loop():
                     current_conv.messages = messages
                     print("\n  \033[1;32m✓ New conversation started\033[0m\n")
                     continue
+                if result == "clear_conversation":
+                    old_count = len([m for m in messages if m.get("role") == "user"])
+                    messages.clear()
+                    messages.append({"role": "system", "content": system_prompt})
+                    current_conv.messages = messages
+                    _save_current()
+                    print(f"\n  \033[1;32m\u2713 Cleared {old_count} messages\033[0m\n")
+                    continue
                 if isinstance(result, tuple) and result[0] == "switch_conversation":
                     conv = conv_mgr.load(result[1])
                     if conv:
@@ -550,9 +569,13 @@ def chat_loop():
                         normalize_messages_on_switch(messages, provider)
                         from .prompts import get_chat_prompt
                         base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
-                        system_prompt = _build_system_prompt(base_prompt, _location_result[0])
+                        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name)
                         messages[0]["content"] = system_prompt
                 continue
+
+            # Set title from first user message immediately
+            if current_conv.title == "New conversation":
+                current_conv.title = user_input.strip().splitlines()[0][:60] or "New conversation"
 
             turn_snapshot = copy.deepcopy(messages)
             mem_context = memory.build_context(user_input)
@@ -618,6 +641,45 @@ def chat_loop():
                 else:
                     print(f"  \033[2m{in_tok:,} in / {out_tok:,} out  free  ({used_model})\033[0m")
 
+            # Process any config changes made by the LLM via conch_config tool
+            _cfg_client = builtin_clients["conch_config"]
+            for _action in _cfg_client.pending_actions:
+                if _action[0] == "set_model":
+                    _new_prov, _new_mod = _action[1], _action[2]
+                    _new_fn = RAW_FNS.get(_new_prov)
+                    if _new_fn:
+                        old_provider = provider
+                        provider = _new_prov
+                        model_name = _new_mod
+                        raw_fn = _new_fn
+                        config["provider"] = _new_prov
+                        config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(_new_prov, "")
+                        config["chat_model"] = _new_mod
+                        config["model"] = _new_mod
+                        if provider != old_provider:
+                            from .runtime import normalize_messages_on_switch
+                            normalize_messages_on_switch(messages, provider)
+                            base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
+                            system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name)
+                            messages[0]["content"] = system_prompt
+                        _cfg_client.update(provider, model_name)
+                        print(f"  \033[1;32m\u2713 Now using {provider}/{model_name}\033[0m")
+                elif _action[0] == "set_rounds":
+                    max_tool_rounds = _action[1]
+                elif _action[0] == "clear_history":
+                    old_count = len([m for m in messages if m.get("role") == "user"])
+                    messages.clear()
+                    messages.append({"role": "system", "content": system_prompt})
+                    current_conv.messages = messages
+                    print(f"  \033[1;32m\u2713 Cleared {old_count} messages\033[0m")
+                elif _action[0] == "new_conversation":
+                    _save_current()
+                    current_conv = conv_mgr.create(model=model_name, provider=provider)
+                    messages = [{"role": "system", "content": system_prompt}]
+                    current_conv.messages = messages
+                    print("  \033[1;32m\u2713 New conversation started\033[0m")
+            _cfg_client.pending_actions.clear()
+
             _save_current()
     finally:
         _save_current()
@@ -647,7 +709,7 @@ def main():
         if not raw_fn:
             print(f"conch: unknown provider {provider}", file=sys.stderr)
             sys.exit(1)
-        system_prompt = _build_system_prompt(config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT), _detect_location())
+        system_prompt = _build_system_prompt(config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT), _detect_location(), provider, config.get("chat_model", ""))
         user_text = " ".join(sys.argv[1:])
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)

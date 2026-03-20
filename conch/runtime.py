@@ -6,6 +6,7 @@ import ast
 import re
 import json
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 from . import mcp as mcp_mod
@@ -398,27 +399,43 @@ def chat_turn(
         total_usage["model"] = response.get("_model", total_usage["model"])
         content = response.get("content", "")
         if isinstance(content, str) and content.startswith("[API error:"):
-            from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_fallback_chain
-            current_model = config.get("chat_model", config.get("model", ""))
-            fallback_chain = get_fallback_chain(provider, current_model)
-            for fb_provider, fb_model, needs_ctx_switch in fallback_chain:
-                fb_fn = RAW_FNS.get(fb_provider)
-                if not fb_fn:
-                    continue
-                print(f"  \033[33m⚠ {provider}/{current_model} failed, trying {fb_provider}/{fb_model}\033[0m", file=sys.stderr)
-                fb_config = dict(config)
-                fb_config["provider"] = fb_provider
-                fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
-                fb_config["chat_model"] = fb_model
-                fb_config["model"] = fb_model
-                if needs_ctx_switch:
-                    normalize_messages_on_switch(messages, fb_provider)
-                fb_messages = normalize_messages_for_provider(messages, fb_provider)
-                with Spinner(f"Retrying with {fb_provider}/{fb_model}"):
-                    response = fb_fn(fb_config, fb_messages, tools if tools else None)
-                fb_content = response.get("content", "")
-                if not (isinstance(fb_content, str) and fb_content.startswith("[API error:")):
-                    break
+            # Retry once on same provider with 1s backoff (transient 429/5xx)
+            err_lower = content.lower()
+            is_transient = any(s in err_lower for s in ("429", "500", "502", "503", "504", "overloaded", "rate"))
+            if is_transient:
+                print(f"  \033[33m\u26a0 Transient error, retrying in 1s...\033[0m", file=sys.stderr)
+                time.sleep(1)
+                if stream_fn:
+                    response = stream_fn(config, send_messages, tools if tools else None, on_token)
+                else:
+                    with Spinner("Retrying"):
+                        response = raw_fn(config, send_messages, tools if tools else None)
+                content = response.get("content", "")
+                usage = response.get("_usage", {})
+                total_usage["input_tokens"] += usage.get("input_tokens", 0)
+                total_usage["output_tokens"] += usage.get("output_tokens", 0)
+            if isinstance(content, str) and content.startswith("[API error:"):
+                from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_fallback_chain
+                current_model = config.get("chat_model", config.get("model", ""))
+                fallback_chain = get_fallback_chain(provider, current_model)
+                for fb_provider, fb_model, needs_ctx_switch in fallback_chain:
+                    fb_fn = RAW_FNS.get(fb_provider)
+                    if not fb_fn:
+                        continue
+                    print(f"  \033[33m⚠ {provider}/{current_model} failed, trying {fb_provider}/{fb_model}\033[0m", file=sys.stderr)
+                    fb_config = dict(config)
+                    fb_config["provider"] = fb_provider
+                    fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
+                    fb_config["chat_model"] = fb_model
+                    fb_config["model"] = fb_model
+                    if needs_ctx_switch:
+                        normalize_messages_on_switch(messages, fb_provider)
+                    fb_messages = normalize_messages_for_provider(messages, fb_provider)
+                    with Spinner(f"Retrying with {fb_provider}/{fb_model}"):
+                        response = fb_fn(fb_config, fb_messages, tools if tools else None)
+                    fb_content = response.get("content", "")
+                    if not (isinstance(fb_content, str) and fb_content.startswith("[API error:")):
+                        break
         tool_calls = response.get("tool_calls")
         if not tool_calls:
             recovered = extract_textual_tool_use_blocks(response.get("content", ""))

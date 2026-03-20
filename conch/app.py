@@ -25,6 +25,7 @@ from .runtime import chat_turn, sanitize_anthropic_messages
 from .scheduler import Scheduler
 from .tooling import (
     ConchConfigClient,
+    PublicApiClient,
     LocalShellClient,
     LocalShellPolicy,
     ManageToolsClient,
@@ -103,11 +104,13 @@ def _make_builtin_clients(memory: MemoryStore, interactive: bool = True) -> Dict
     save_memory = SaveMemoryClient()
     save_memory.bind(memory)
     conch_config = ConchConfigClient()
+    public_api = PublicApiClient()
     return {
         "local_shell": local_shell,
         "manage_tools": manage_tools,
         "save_memory": save_memory,
         "conch_config": conch_config,
+        "public_api": public_api,
     }
 
 

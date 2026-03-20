@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 MAX_GROUP_TOOLS = 200
 MAX_ACTIVE_TOOLS = 300
-PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory"}
+PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api"}
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
 
@@ -386,7 +386,7 @@ class SaveMemoryClient:
 
 
 def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], clients: Dict[str, Any]):
-    builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL]
+    builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL, PUBLIC_API_TOOL]
     if "conch_config" in clients:
         builtin.append(CONCH_CONFIG_TOOL)
     all_tools.extend(builtin)
@@ -553,5 +553,113 @@ class ConchConfigClient:
         if action == "new_conversation":
             self.pending_actions.append(("new_conversation",))
             return self._text("New conversation started.")
+
+        return self._text(f"Unknown action: {action}")
+
+
+# ---------------------------------------------------------------------------
+# public_api — search ~1400 free APIs and call no-auth ones directly
+# ---------------------------------------------------------------------------
+
+PUBLIC_API_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "public_api",
+        "description": (
+            "Search 1400+ free public APIs or call no-auth APIs directly. "
+            "Use for discovering APIs, getting live data (weather, crypto, "
+            "jokes, facts, translations, etc.), or helping users find APIs."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["search", "categories", "call"],
+                    "description": "search: find APIs by keyword. categories: list all categories. call: make an HTTP request.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search keywords (for search action)",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Filter by category name",
+                },
+                "auth": {
+                    "type": "string",
+                    "enum": ["any", "none", "apiKey", "OAuth"],
+                    "description": "Filter by auth type (default: any)",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL to call (for call action)",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST"],
+                    "description": "HTTP method (default GET)",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Query parameters or POST body",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class PublicApiClient:
+    """Built-in tool for searching and calling public APIs."""
+
+    name = "public_api"
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        from . import public_apis
+
+        action = arguments.get("action", "search")
+
+        if action == "categories":
+            cats = public_apis.get_categories()
+            if not cats:
+                return self._text("Failed to load API catalog. Try again later.")
+            lines = [f"Public API categories ({sum(cats.values())} APIs total):\n"]
+            for cat, count in cats.items():
+                lines.append(f"  {cat}: {count}")
+            return self._text("\n".join(lines))
+
+        if action == "search":
+            query = arguments.get("query", "")
+            auth = arguments.get("auth", "any")
+            category = arguments.get("category", "")
+            results = public_apis.search(
+                query=query,
+                auth_filter=auth,
+                category_filter=category,
+            )
+            if not results:
+                return self._text(f"No APIs found matching '{query}'.")
+            lines = [f"Found {len(results)} APIs:\n"]
+            for api in results:
+                auth_tag = f" [auth: {api['auth']}]" if api["auth"] != "none" else " [no auth]"
+                lines.append(
+                    f"  {api['name']} -- {api['description']}\n"
+                    f"    {api['url']}{auth_tag}  ({api['category']})"
+                )
+            return self._text("\n".join(lines))
+
+        if action == "call":
+            url = arguments.get("url", "")
+            method = arguments.get("method", "GET")
+            params = arguments.get("params")
+            if not url:
+                return self._text("Error: 'url' is required for the call action.")
+            result = public_apis.call_api(url, method, params)
+            return self._text(result)
 
         return self._text(f"Unknown action: {action}")

@@ -49,6 +49,10 @@ _CHAT_BASE = (
     "user asks to switch models, change providers, toggle agent mode, check costs, "
     "list available models, or clear conversation history. You can change your own "
     "model, provider, and settings at any time via this tool.\n"
+    "- public_api: search 1400+ free public APIs or call no-auth APIs directly. "
+    "Use this for live data (weather, crypto prices, jokes, fun facts, translations, "
+    "exchange rates, etc.) or to help users find APIs for their projects. Search first, "
+    "then call the API URL directly.\n"
     "When answering about your capabilities, be specific and helpful."
 )
 

@@ -378,7 +378,7 @@ def chat_loop():
         "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
         "/agent", "/schedule", "/tasks", "/cancel", "/tools", "/enable",
         "/disable", "/connect", "/apps", "/reload", "/rounds", "/cost",
-        "/profile", "/profiles",
+        "/profile", "/profiles", "/clear",
         "/queue",
     ]
 
@@ -526,6 +526,14 @@ def chat_loop():
                     current_conv.messages = messages
                     print("\n  \033[1;32m✓ New conversation started\033[0m\n")
                     continue
+                if result == "clear_conversation":
+                    old_count = len([m for m in messages if m.get("role") == "user"])
+                    messages.clear()
+                    messages.append({"role": "system", "content": system_prompt})
+                    current_conv.messages = messages
+                    _save_current()
+                    print(f"\n  \033[1;32m\u2713 Cleared {old_count} messages\033[0m\n")
+                    continue
                 if isinstance(result, tuple) and result[0] == "switch_conversation":
                     conv = conv_mgr.load(result[1])
                     if conv:
@@ -553,6 +561,10 @@ def chat_loop():
                         system_prompt = _build_system_prompt(base_prompt, _location_result[0])
                         messages[0]["content"] = system_prompt
                 continue
+
+            # Set title from first user message immediately
+            if current_conv.title == "New conversation":
+                current_conv.title = user_input.strip().splitlines()[0][:60] or "New conversation"
 
             turn_snapshot = copy.deepcopy(messages)
             mem_context = memory.build_context(user_input)

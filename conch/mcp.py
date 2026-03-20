@@ -29,28 +29,58 @@ class ToolExecutionResult:
 
 
 class HttpMcpClient:
+    """MCP client that communicates over HTTP using JSON-RPC."""
+
     name = "http"
 
     def __init__(self, client_name: str, url: str):
         self.name = client_name
         self.url = url.rstrip("/")
+        self._next_request_id = 1
 
-    def list_tools(self) -> List[dict]:
-        return []
-
-    def call_tool(self, tool_name: str, arguments: dict) -> dict:
-        payload = {"tool_name": tool_name, "arguments": arguments}
+    def _rpc(self, method: str, params: Optional[dict] = None) -> dict:
+        """Send a JSON-RPC request to the MCP HTTP server."""
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
         req = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": "conch/1.0"},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 return json.loads(response.read().decode())
         except Exception as exc:
-            return {"content": [{"type": "text", "text": f"MCP HTTP error: {exc}"}]}
+            return {"error": {"message": str(exc)}}
+
+    def list_tools(self) -> List[dict]:
+        """Query the server for available tools via JSON-RPC."""
+        response = self._rpc("tools/list")
+        raw_tools = response.get("result", {}).get("tools", [])
+        tools = []
+        for tool in raw_tools:
+            name = tool.get("name", "")
+            if not name:
+                continue
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
+                },
+            })
+        return tools
+
+    def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        response = self._rpc("tools/call", {"name": tool_name, "arguments": arguments})
+        if "error" in response:
+            return {"content": [{"type": "text", "text": f"MCP HTTP error: {response['error'].get('message', 'unknown')}"}]}
+        return response.get("result", {"content": [{"type": "text", "text": "(no result)"}]})
 
     def close(self):
         return None

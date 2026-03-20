@@ -3,13 +3,23 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "conch"
-version = "0.2.0"
+name = "conch-shell"
+version = "0.3.0"
 description = "LLM-assisted shell with chat, MCP tools, memory, and scheduling."
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [
-    "pygments>=2.0",
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "pygments>=2.0",
@@ -19,6 +29,10 @@ dependencies = [
 conch = "conch.app:main"
 conch-chat = "conch.app:main"
 conch-ask = "conch.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/detournement/conch"
+Repository = "https://github.com/detournement/conch"
 
 [tool.setuptools.packages.find]
 where = ["."]

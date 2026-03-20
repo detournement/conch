@@ -702,7 +702,11 @@ def chat_loop():
 
 
 def main():
-    if len(sys.argv) > 1:
+    if "--slack" in sys.argv:
+        from .slack import main as slack_main
+        slack_main()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] != "--slack":
         config = load_config()
         provider = (config.get("provider") or "openai").lower()
         raw_fn = RAW_FNS.get(provider)

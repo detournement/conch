@@ -386,8 +386,172 @@ class SaveMemoryClient:
 
 
 def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], clients: Dict[str, Any]):
-    all_tools.extend([LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL])
-    tool_map["local_shell"] = clients["local_shell"]
-    tool_map["manage_tools"] = clients["manage_tools"]
-    tool_map["save_memory"] = clients["save_memory"]
+    builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL]
+    if "conch_config" in clients:
+        builtin.append(CONCH_CONFIG_TOOL)
+    all_tools.extend(builtin)
+    for tool_def in builtin:
+        name = tool_def["function"]["name"]
+        if name in clients:
+            tool_map[name] = clients[name]
 
+
+
+# ---------------------------------------------------------------------------
+# conch_config — lets the LLM inspect and change its own configuration
+# ---------------------------------------------------------------------------
+
+CONCH_CONFIG_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "conch_config",
+        "description": (
+            "Read or change Conch's own configuration. Use this when the user "
+            "asks to switch models, change providers, toggle agent mode, clear "
+            "history, or asks about current settings, costs, or available models."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "get",
+                        "list_models",
+                        "set_model",
+                        "set_provider",
+                        "set_agent_mode",
+                        "set_rounds",
+                        "clear_history",
+                        "new_conversation",
+                    ],
+                    "description": "The config action to perform",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "The value to set (model name, provider name, on/off, number)",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class ConchConfigClient:
+    """Built-in tool that lets the LLM read and modify Conch's own config."""
+
+    name = "conch_config"
+
+    def __init__(self):
+        self._provider = ""
+        self._model = ""
+        self._session_usage = {}
+        self.pending_actions: List[tuple] = []
+
+    def bind(self, provider: str, model: str, session_usage: dict):
+        self._provider = provider
+        self._model = model
+        self._session_usage = session_usage
+
+    def update(self, provider: str, model: str):
+        self._provider = provider
+        self._model = model
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        from .providers import KNOWN_MODELS, MODEL_PRICING, DEFAULT_API_KEY_ENVS
+        import os
+
+        action = arguments.get("action", "get")
+        value = arguments.get("value", "").strip()
+
+        if action == "get":
+            agent = "ON" if get_agent_mode() else "OFF"
+            lines = [
+                f"provider: {self._provider}",
+                f"model: {self._model}",
+                f"agent_mode: {agent}",
+            ]
+            u = self._session_usage
+            if u.get("turns"):
+                lines.append(f"session_turns: {u['turns']}")
+                lines.append(f"session_input_tokens: {u.get('input_tokens', 0):,}")
+                lines.append(f"session_output_tokens: {u.get('output_tokens', 0):,}")
+                cost = u.get("cost", 0)
+                lines.append(f"session_cost: ${cost:.4f}" if cost > 0.0001 else "session_cost: free")
+            return self._text("\n".join(lines))
+
+        if action == "list_models":
+            lines = []
+            for prov, models in KNOWN_MODELS.items():
+                key_env = DEFAULT_API_KEY_ENVS.get(prov, "")
+                available = not key_env or bool(os.environ.get(key_env, "").strip())
+                status = "available" if available else "no API key"
+                lines.append(f"\n{prov} ({status}):")
+                for m in models:
+                    price = MODEL_PRICING.get(m, (0, 0))
+                    current = " <-- current" if m == self._model else ""
+                    if price[0] == 0 and price[1] == 0:
+                        lines.append(f"  {m}  free{current}")
+                    else:
+                        lines.append(f"  {m}  ${price[0]:.2f}/${price[1]:.2f} per 1M tok (in/out){current}")
+            return self._text("\n".join(lines))
+
+        if action == "set_model":
+            if not value:
+                return self._text("Error: provide a model name in 'value'")
+            target_provider = None
+            for prov, models in KNOWN_MODELS.items():
+                if value in models:
+                    target_provider = prov
+                    break
+            if not target_provider:
+                return self._text(f"Unknown model '{value}'. Use action=list_models to see options.")
+            key_env = DEFAULT_API_KEY_ENVS.get(target_provider, "")
+            if key_env and not os.environ.get(key_env, "").strip():
+                return self._text(f"Cannot switch to {target_provider}/{value}: {key_env} not set.")
+            self.pending_actions.append(("set_model", target_provider, value))
+            price = MODEL_PRICING.get(value, (0, 0))
+            cost_str = "free" if price == (0, 0) else f"${price[0]:.2f}/${price[1]:.2f} per 1M tokens"
+            return self._text(f"Switched to {target_provider}/{value} ({cost_str}).")
+
+        if action == "set_provider":
+            if not value:
+                return self._text("Error: provide a provider name in 'value'")
+            value = value.lower()
+            if value not in KNOWN_MODELS:
+                return self._text(f"Unknown provider '{value}'. Options: {', '.join(KNOWN_MODELS)}")
+            key_env = DEFAULT_API_KEY_ENVS.get(value, "")
+            if key_env and not os.environ.get(key_env, "").strip():
+                return self._text(f"Cannot switch to {value}: {key_env} not set.")
+            default_model = KNOWN_MODELS[value][0]
+            self.pending_actions.append(("set_model", value, default_model))
+            return self._text(f"Switched to {value}/{default_model}.")
+
+        if action == "set_agent_mode":
+            enabled = value.lower() in ("on", "true", "1", "yes")
+            set_agent_mode(enabled)
+            return self._text(f"Agent mode {'ON' if enabled else 'OFF'}.")
+
+        if action == "set_rounds":
+            try:
+                n = int(value)
+                if n < 1:
+                    raise ValueError
+            except (ValueError, TypeError):
+                return self._text(f"Invalid number: '{value}'")
+            self.pending_actions.append(("set_rounds", n))
+            return self._text(f"Max tool rounds set to {n}.")
+
+        if action == "clear_history":
+            self.pending_actions.append(("clear_history",))
+            return self._text("Conversation history cleared.")
+
+        if action == "new_conversation":
+            self.pending_actions.append(("new_conversation",))
+            return self._text("New conversation started.")
+
+        return self._text(f"Unknown action: {action}")

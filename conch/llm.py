@@ -322,7 +322,12 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
     if get_bool(config, "send_cwd") and not context.get("cwd"):
         context["cwd"] = os.getcwd()
     if get_bool(config, "send_os_shell") and not context.get("os_shell"):
-        context["os_shell"] = f"{os.uname().sysname} / {os.environ.get('SHELL', 'sh')}"
+        try:
+            sysname = os.uname().sysname
+        except AttributeError:
+            import platform
+            sysname = platform.system()
+        context["os_shell"] = sysname + " / " + os.environ.get("SHELL", os.environ.get("COMSPEC", "sh"))
     n = get_int(config, "send_history_count")
     if n and "history" not in context and os.environ.get("CONCH_HISTORY"):
         context["history"] = os.environ["CONCH_HISTORY"]

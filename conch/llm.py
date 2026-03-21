@@ -207,19 +207,23 @@ def call_cerebras(config: dict, messages: list) -> str:
 
 
 def call_openai(config: dict, messages: list) -> str:
+    import urllib.error
     import urllib.request
+
+    from .providers import build_openai_chat_request_body, format_http_api_error
 
     api_key = os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), "").strip()
     if not api_key:
         print("conch: OPENAI_API_KEY not set", file=sys.stderr)
         sys.exit(1)
     url = "https://api.openai.com/v1/chat/completions"
-    body = {
-        "model": config.get("model", "gpt-4o-mini"),
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 2048,
-    }
+    model = config.get("model", "gpt-4o-mini")
+    body = build_openai_chat_request_body(
+        model,
+        messages,
+        temperature=0.2,
+        max_completion_tokens=2048,
+    )
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
@@ -232,10 +236,21 @@ def call_openai(config: dict, messages: list) -> str:
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"conch: API error: {format_http_api_error(e)}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"conch: API error: {e}", file=sys.stderr)
         sys.exit(1)
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        msg = err.get("message", json.dumps(err)) if isinstance(err, dict) else str(err)
+        print(f"conch: API error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    msg = (data.get("choices") or [{}])[0].get("message", {})
+    content = msg.get("content") or ""
+    if not (content or "").strip() and msg.get("reasoning"):
+        content = msg["reasoning"]
     return extract_command(content, provider="openai")
 
 
@@ -341,11 +356,15 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
         return result
 
     # Primary failed -- try fallbacks (same provider/other model first, then cross-provider)
+    attempt_provider, attempt_model = provider, current_model
     for fb_provider, fb_model, _needs_ctx in get_fallback_chain(provider, current_model):
         fb_caller = _ASK_CALLERS.get(fb_provider)
         if not fb_caller:
             continue
-        print(f"conch: {provider}/{current_model} failed, trying {fb_provider}/{fb_model}...", file=sys.stderr)
+        print(
+            f"conch: {attempt_provider}/{attempt_model} failed, trying {fb_provider}/{fb_model}...",
+            file=sys.stderr,
+        )
         fb_config = dict(config)
         fb_config["provider"] = fb_provider
         fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
@@ -354,4 +373,5 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
         result = fb_caller(fb_config, fb_messages)
         if result:
             return result
+        attempt_provider, attempt_model = fb_provider, fb_model
     return ""

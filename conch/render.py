@@ -118,6 +118,12 @@ class StreamPrinter:
             self._spinner = Spinner("Waiting for response")
             self._spinner.__enter__()
 
+    def end_waiting(self) -> None:
+        """Stop the stderr spinner when no tokens will arrive (API errors, empty stream)."""
+        if self._spinner:
+            self._spinner.__exit__(None, None, None)
+            self._spinner = None
+
     def feed(self, chunk: str):
         if not self._started:
             self._started = True
@@ -147,9 +153,7 @@ class StreamPrinter:
 
     def flush(self) -> str:
         """Flush remaining buffer and return accumulated full text."""
-        if self._spinner:
-            self._spinner.__exit__(None, None, None)
-            self._spinner = None
+        self.end_waiting()
         if self._partial_written:
             sys.stdout.write("\r\033[2K")
             self._partial_written = 0
@@ -228,6 +232,7 @@ class Spinner:
         if self._thread:
             self._stop.set()
             self._thread.join(timeout=0.2)
-            sys.stderr.write("\r               \r")
+            clear_width = len(self.label) + 6
+            sys.stderr.write("\r" + " " * clear_width + "\r")
             sys.stderr.flush()
         return False

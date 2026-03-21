@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +15,11 @@ KNOWN_MODELS = {
         "zai-glm-4.7",
     ],
     "openai": [
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5-mini",
+        "gpt-5-nano",
         "gpt-4.1",
         "gpt-4.1-mini",
         "gpt-4.1-nano",
@@ -21,6 +28,11 @@ KNOWN_MODELS = {
         "o4-mini",
         "o3",
         "o3-mini",
+        "o1",
+        "o1-mini",
+        "o3-pro",
+        "o1-pro",
+        "gpt-5.4-pro",
     ],
     "anthropic": [
         "claude-sonnet-4-6",
@@ -48,10 +60,54 @@ DEFAULT_API_KEY_ENVS = {
     "ollama": "",
 }
 
+PROVIDER_TOOL_LIMITS = {
+    "openai": 128,
+    "cerebras": 128,
+}
+
+# Used for `/provider` and tool `set_provider` — stable defaults, not KNOWN_MODELS[0].
+DEFAULT_CHAT_MODEL_BY_PROVIDER = {
+    "cerebras": "zai-glm-4.7",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-6",
+    "ollama": "llama3.3",
+}
+
+
+def format_http_api_error(exc: BaseException) -> str:
+    """Pull OpenAI-style JSON error.message from HTTPError bodies when present."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            err = data.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or raw[:500]
+                typ = err.get("type")
+                code = err.get("param") or err.get("code")
+                parts = [str(msg).strip()]
+                if typ:
+                    parts.append(f"type={typ}")
+                if code:
+                    parts.append(f"code={code}")
+                return " — ".join(parts)
+            if err is not None:
+                return str(err)
+        except Exception:
+            pass
+        return str(exc)
+    return str(exc)
+
 
 # Per-1M-token pricing (input, output). $0 = free tier.
 MODEL_PRICING = {
     "zai-glm-4.7":                 (0.00, 0.00),
+    "gpt-5.4":                     (2.50, 15.00),
+    "gpt-5.4-pro":                 (15.00, 120.00),
+    "gpt-5.4-mini":                (0.75, 4.50),
+    "gpt-5.4-nano":                (0.20, 1.25),
+    "gpt-5-mini":                  (0.75, 4.50),
+    "gpt-5-nano":                  (0.20, 1.25),
     "gpt-4.1":                     (2.00, 8.00),
     "gpt-4.1-mini":                (0.40, 1.60),
     "gpt-4.1-nano":                (0.10, 0.40),
@@ -60,11 +116,72 @@ MODEL_PRICING = {
     "o4-mini":                     (1.10, 4.40),
     "o3":                          (2.00, 8.00),
     "o3-mini":                     (1.10, 4.40),
+    "o3-pro":                      (20.00, 80.00),
+    "o1":                          (15.00, 60.00),
+    "o1-mini":                     (1.10, 4.40),
+    "o1-pro":                      (150.00, 600.00),
     "claude-sonnet-4-6":           (3.00, 15.00),
     "claude-opus-4-6":             (15.00, 75.00),
     "claude-haiku-4-5":            (0.80, 4.00),
     "claude-sonnet-4-5-20250929":  (3.00, 15.00),
 }
+
+
+def _openai_is_strict_reasoning_model(model: str) -> bool:
+    """OpenAI o-series models reject custom sampling params; use max_completion_tokens only."""
+    return bool(re.match(r"^o\d", model.lower().strip()))
+
+
+def _fix_tool_schema(schema: Any) -> Any:
+    """Recursively patch JSON Schema issues that OpenAI rejects.
+
+    Known fixes:
+    - array types missing ``items`` (OpenAI requires it; Anthropic does not).
+    """
+    if not isinstance(schema, dict):
+        return schema
+    if schema.get("type") == "array" and "items" not in schema:
+        schema["items"] = {}
+    for val in schema.values():
+        if isinstance(val, dict):
+            _fix_tool_schema(val)
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    _fix_tool_schema(item)
+    return schema
+
+
+def _sanitize_tools_for_openai(tools: List[dict]) -> List[dict]:
+    """Return a copy of *tools* with schemas fixed for OpenAI's stricter validation."""
+    import copy
+    sanitized = copy.deepcopy(tools)
+    for tool in sanitized:
+        params = tool.get("function", {}).get("parameters")
+        if params:
+            _fix_tool_schema(params)
+    return sanitized
+
+
+def build_openai_chat_request_body(
+    model: str,
+    messages: List[dict],
+    *,
+    temperature: float,
+    max_completion_tokens: int,
+    tools: Optional[List[dict]] = None,
+) -> Dict[str, Any]:
+    """Build a Chat Completions body that works across GPT and o-series models."""
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": max_completion_tokens,
+    }
+    if not _openai_is_strict_reasoning_model(model):
+        body["temperature"] = temperature
+    if tools:
+        body["tools"] = _sanitize_tools_for_openai(tools)
+    return body
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
@@ -141,6 +258,8 @@ def get_fallback_chain(current_provider: str, current_model: str) -> list:
 
 def get_fallback_model(provider: str) -> str:
     """Return the default model for a provider."""
+    if provider in DEFAULT_CHAT_MODEL_BY_PROVIDER:
+        return DEFAULT_CHAT_MODEL_BY_PROVIDER[provider]
     models = KNOWN_MODELS.get(provider, [])
     return models[0] if models else ""
 
@@ -192,14 +311,14 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     api_key = os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), "").strip()
     if not api_key:
         return {"content": "", "tool_calls": None}
-    body: Dict[str, Any] = {
-        "model": config.get("chat_model", config.get("model", "gpt-4o-mini")),
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 16384,
-    }
-    if tools:
-        body["tools"] = tools
+    model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
+    body = build_openai_chat_request_body(
+        model,
+        messages,
+        temperature=0.7,
+        max_completion_tokens=16384,
+        tools=tools,
+    )
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
         data=json.dumps(body).encode(),
@@ -212,12 +331,21 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
     except Exception as exc:
         return {"content": f"[API error: {exc}]", "tool_calls": None}
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        msg = err.get("message", json.dumps(err)) if isinstance(err, dict) else str(err)
+        return {"content": f"[API error: {msg}]", "tool_calls": None}
     message = (data.get("choices") or [{}])[0].get("message", {})
+    content = (message.get("content") or "").strip()
+    if not content and message.get("reasoning"):
+        content = str(message["reasoning"]).strip()
     return {
         "role": "assistant",
-        "content": (message.get("content") or "").strip(),
+        "content": content,
         "tool_calls": message.get("tool_calls"),
         "_usage": _normalize_usage(data, "openai"),
         "_model": body["model"],
@@ -382,18 +510,27 @@ def _stream_openai_compat(
     )
 
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls_acc: dict[int, dict] = {}
     usage = {"input_tokens": 0, "output_tokens": 0}
 
     try:
         with urllib.request.urlopen(req, timeout=120) as response:
             for chunk in _iter_sse(response):
+                if chunk.get("error"):
+                    err = chunk["error"]
+                    if isinstance(err, dict):
+                        msg = err.get("message") or json.dumps(err)
+                    else:
+                        msg = str(err)
+                    return {"content": f"[API error: {msg}]", "tool_calls": None}
                 choice = (chunk.get("choices") or [{}])[0]
                 delta = choice.get("delta", {})
 
                 text = delta.get("content") or ""
-                if not text and provider == "cerebras":
-                    text = delta.get("reasoning") or ""
+                reasoning = delta.get("reasoning") or ""
+                if reasoning:
+                    reasoning_parts.append(reasoning)
 
                 if text:
                     content_parts.append(text)
@@ -416,10 +553,14 @@ def _stream_openai_compat(
                     u = chunk["usage"]
                     usage["input_tokens"] = u.get("prompt_tokens", 0)
                     usage["output_tokens"] = u.get("completion_tokens", 0)
+    except urllib.error.HTTPError as exc:
+        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
     except Exception as exc:
         return {"content": f"[API error: {exc}]", "tool_calls": None}
 
     full_text = "".join(content_parts).strip()
+    if not full_text and reasoning_parts:
+        full_text = "".join(reasoning_parts).strip()
     tool_calls = None
     if tool_calls_acc:
         tool_calls = [
@@ -485,15 +626,14 @@ def stream_openai(
     if not api_key:
         return {"content": "", "tool_calls": None}
     model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
-    body: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 16384,
-        "stream_options": {"include_usage": True},
-    }
-    if tools:
-        body["tools"] = tools
+    body = build_openai_chat_request_body(
+        model,
+        messages,
+        temperature=0.7,
+        max_completion_tokens=16384,
+        tools=tools,
+    )
+    body["stream_options"] = {"include_usage": True}
     return _stream_openai_compat(
         "https://api.openai.com/v1/chat/completions",
         {

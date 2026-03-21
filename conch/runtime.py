@@ -10,7 +10,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import mcp as mcp_mod
-from .render import Spinner
+from .render import Spinner, StreamPrinter
 
 
 CHARS_PER_TOKEN = 3.5
@@ -371,7 +371,7 @@ def chat_turn(
     When *on_token* is a callable, the reply is streamed token-by-token
     through that callback instead of blocking behind a spinner.
     """
-    from .providers import STREAM_FNS
+    from .providers import STREAM_FNS, PROVIDER_TOOL_LIMITS
 
     total_usage = {"input_tokens": 0, "output_tokens": 0, "model": ""}
     for _ in range(max_tool_rounds):
@@ -386,18 +386,34 @@ def chat_turn(
             messages.extend(compressed)
         send_messages = normalize_messages_for_provider(messages, provider)
 
+        send_tools = tools
+        tool_limit = PROVIDER_TOOL_LIMITS.get(provider)
+        if tool_limit and send_tools and len(send_tools) > tool_limit:
+            from .tooling import PINNED_TOOL_NAMES
+            pinned = [t for t in send_tools if t.get("function", {}).get("name") in PINNED_TOOL_NAMES]
+            others = [t for t in send_tools if t.get("function", {}).get("name") not in PINNED_TOOL_NAMES]
+            send_tools = others[: tool_limit - len(pinned)] + pinned
+
         stream_fn = STREAM_FNS.get(provider) if on_token else None
         if stream_fn:
-            response = stream_fn(config, send_messages, tools if tools else None, on_token)
+            response = stream_fn(config, send_messages, send_tools if send_tools else None, on_token)
         else:
             with Spinner("Thinking"):
-                response = raw_fn(config, send_messages, tools if tools else None)
+                response = raw_fn(config, send_messages, send_tools if send_tools else None)
 
         usage = response.get("_usage", {})
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)
         total_usage["model"] = response.get("_model", total_usage["model"])
         content = response.get("content", "")
+        if (
+            isinstance(content, str)
+            and content.startswith("[API error:")
+            and on_token is not None
+        ):
+            sp = getattr(on_token, "__self__", None)
+            if isinstance(sp, StreamPrinter):
+                sp.end_waiting()
         if isinstance(content, str) and content.startswith("[API error:"):
             # Retry once on same provider with 1s backoff (transient 429/5xx)
             err_lower = content.lower()
@@ -415,14 +431,33 @@ def chat_turn(
                 total_usage["input_tokens"] += usage.get("input_tokens", 0)
                 total_usage["output_tokens"] += usage.get("output_tokens", 0)
             if isinstance(content, str) and content.startswith("[API error:"):
+                err_detail = content[len("[API error: "):-1] if content.endswith("]") else content
+                print(f"  \033[33m⚠ {err_detail}\033[0m", file=sys.stderr)
                 from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_fallback_chain
+                # Structural errors (invalid request shape, auth) won't be fixed
+                # by switching to another model on the same provider.
+                _err_lc = err_detail.lower()
+                _structural = any(k in _err_lc for k in (
+                    "invalid_request", "invalid request",
+                    "authentication", "invalid api key",
+                    "invalid x-api-key",
+                ))
                 current_model = config.get("chat_model", config.get("model", ""))
                 fallback_chain = get_fallback_chain(provider, current_model)
+                if _structural:
+                    fallback_chain = [
+                        (p, m, s) for p, m, s in fallback_chain if p != provider
+                    ]
+                failed_provider = provider
+                failed_model = current_model
                 for fb_provider, fb_model, needs_ctx_switch in fallback_chain:
                     fb_fn = RAW_FNS.get(fb_provider)
                     if not fb_fn:
                         continue
-                    print(f"  \033[33m⚠ {provider}/{current_model} failed, trying {fb_provider}/{fb_model}\033[0m", file=sys.stderr)
+                    print(
+                        f"  \033[33m⚠ {failed_provider}/{failed_model} failed, trying {fb_provider}/{fb_model}\033[0m",
+                        file=sys.stderr,
+                    )
                     fb_config = dict(config)
                     fb_config["provider"] = fb_provider
                     fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
@@ -431,11 +466,26 @@ def chat_turn(
                     if needs_ctx_switch:
                         normalize_messages_on_switch(messages, fb_provider)
                     fb_messages = normalize_messages_for_provider(messages, fb_provider)
+                    fb_tool_limit = PROVIDER_TOOL_LIMITS.get(fb_provider)
+                    fb_tools = tools
+                    if fb_tool_limit and fb_tools and len(fb_tools) > fb_tool_limit:
+                        from .tooling import PINNED_TOOL_NAMES as _PIN
+                        _pinned = [t for t in fb_tools if t.get("function", {}).get("name") in _PIN]
+                        _others = [t for t in fb_tools if t.get("function", {}).get("name") not in _PIN]
+                        fb_tools = _others[: fb_tool_limit - len(_pinned)] + _pinned
                     with Spinner(f"Retrying with {fb_provider}/{fb_model}"):
-                        response = fb_fn(fb_config, fb_messages, tools if tools else None)
+                        response = fb_fn(fb_config, fb_messages, fb_tools if fb_tools else None)
                     fb_content = response.get("content", "")
                     if not (isinstance(fb_content, str) and fb_content.startswith("[API error:")):
+                        provider = fb_provider
+                        config["provider"] = fb_provider
+                        config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
+                        config["chat_model"] = fb_model
+                        config["model"] = fb_model
+                        stream_fn = STREAM_FNS.get(provider) if on_token else None
+                        raw_fn = RAW_FNS.get(provider)
                         break
+                    failed_provider, failed_model = fb_provider, fb_model
         tool_calls = response.get("tool_calls")
         if not tool_calls:
             recovered = extract_textual_tool_use_blocks(response.get("content", ""))

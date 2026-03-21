@@ -614,13 +614,24 @@ def chat_loop():
                 messages.extend(turn_snapshot)
                 continue
 
+            # API fallback inside chat_turn may switch provider/model via config only
+            provider = (config.get("provider") or provider).lower()
+            model_name = config.get("chat_model") or config.get("model") or model_name
+            _sync_fn = RAW_FNS.get(provider)
+            if _sync_fn:
+                raw_fn = _sync_fn
+            builtin_clients["conch_config"].update(provider, model_name)
+
             _typeahead_partial = _typeahead.stop()
             _typeahead_queued.extend(_typeahead.get_queued())
 
             if reply:
                 messages.append({"role": "assistant", "content": reply})
                 if _printer:
-                    _printer.flush()
+                    streamed = _printer.flush()
+                    if not streamed.strip():
+                        print(highlight(reply))
+                        print()
                 else:
                     print(f"\n\033[1;36massistant:\033[0m\n{highlight(reply)}\n")
             else:

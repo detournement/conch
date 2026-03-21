@@ -9,7 +9,12 @@ from typing import Any, Dict, List, Optional
 
 from .browser import browse_conversations
 from . import composio as composio_mod
-from .providers import DEFAULT_API_KEY_ENVS, KNOWN_MODELS, RAW_FNS
+from .providers import (
+    DEFAULT_API_KEY_ENVS,
+    DEFAULT_CHAT_MODEL_BY_PROVIDER,
+    KNOWN_MODELS,
+    RAW_FNS,
+)
 from .scheduler import _format_interval, _parse_interval
 from .tooling import (
     activate_profile,
@@ -291,7 +296,9 @@ def handle_slash_command(
         if key_env and not os.environ.get(key_env, "").strip():
             print(f"\n  \033[31m{key_env} not set — cannot switch to {new_provider}\033[0m\n")
             return None
-        new_model = KNOWN_MODELS[new_provider][0]
+        new_model = DEFAULT_CHAT_MODEL_BY_PROVIDER.get(new_provider) or (
+            KNOWN_MODELS[new_provider][0] if KNOWN_MODELS.get(new_provider) else ""
+        )
         config["provider"] = new_provider
         config["api_key_env"] = key_env
         config["chat_model"] = new_model

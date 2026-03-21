@@ -75,7 +75,7 @@ def compress_context(messages: List[dict], tools: Optional[List[dict]], provider
 
 
 def append_results_openai(messages: List[dict], response: dict, results: List[dict]):
-    assistant_message: Dict[str, Any] = {"role": "assistant", "content": response.get("content") or None}
+    assistant_message: Dict[str, Any] = {"role": "assistant", "content": response.get("content") or ""}
     if response.get("tool_calls"):
         assistant_message["tool_calls"] = response["tool_calls"]
     messages.append(assistant_message)
@@ -271,11 +271,13 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
                 i += 1
                 continue
         else:
+            if content is None:
+                content = ""
             # Drop assistant messages that were pure tool calls
-            if role == "assistant" and msg.get("tool_calls") and not str(content).strip():
+            if role == "assistant" and msg.get("tool_calls") and not content.strip():
                 i += 1
                 continue
-            if str(content).strip():
+            if content.strip():
                 normalized.append({"role": role, "content": content})
         i += 1
     return normalized
@@ -341,8 +343,14 @@ def normalize_messages_on_switch(messages: list, new_provider: str):
                     i += 1
                     continue
 
+        if content is None:
+            content = ""
         # Drop assistant messages that were pure tool calls (no text content)
-        if role == "assistant" and msg.get("tool_calls") and not str(content).strip():
+        if role == "assistant" and msg.get("tool_calls") and not content.strip():
+            i += 1
+            continue
+
+        if not content.strip():
             i += 1
             continue
 

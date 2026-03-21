@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 MAX_GROUP_TOOLS = 200
 MAX_ACTIVE_TOOLS = 300
-PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api"}
+PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api", "conch_config"}
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
 

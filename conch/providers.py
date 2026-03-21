@@ -370,11 +370,14 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         "messages": user_messages,
     }
     if tools:
+        import copy
         body["tools"] = [
             {
                 "name": tool["function"]["name"],
                 "description": tool["function"].get("description", ""),
-                "input_schema": tool["function"].get("parameters", {"type": "object", "properties": {}}),
+                "input_schema": _fix_tool_schema(copy.deepcopy(
+                    tool["function"].get("parameters", {"type": "object", "properties": {}})
+                )),
             }
             for tool in tools
         ]
@@ -391,6 +394,8 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
     except Exception as exc:
         return {"content": f"[API error: {exc}]", "tool_calls": None}
 
@@ -673,13 +678,14 @@ def stream_anthropic(
         "stream": True,
     }
     if tools:
+        import copy
         body["tools"] = [
             {
                 "name": t["function"]["name"],
                 "description": t["function"].get("description", ""),
-                "input_schema": t["function"].get(
-                    "parameters", {"type": "object", "properties": {}}
-                ),
+                "input_schema": _fix_tool_schema(copy.deepcopy(
+                    t["function"].get("parameters", {"type": "object", "properties": {}})
+                )),
             }
             for t in tools
         ]
@@ -777,6 +783,8 @@ def stream_anthropic(
                 elif etype == "message_delta":
                     mu = data.get("usage", {})
                     usage["output_tokens"] = mu.get("output_tokens", 0)
+    except urllib.error.HTTPError as exc:
+        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
     except Exception as exc:
         return {"content": f"[API error: {exc}]", "tool_calls": None}
 

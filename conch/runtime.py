@@ -225,6 +225,9 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
     tool-call artifacts. Only keeps text content from assistant messages.
     """
     if provider == "anthropic":
+        for msg in messages:
+            if msg.get("content") is None:
+                msg["content"] = ""
         return messages
     normalized = []
     i = 0

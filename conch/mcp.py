@@ -39,7 +39,11 @@ class HttpMcpClient:
         self._next_request_id = 1
 
     def _rpc(self, method: str, params: Optional[dict] = None) -> dict:
-        """Send a JSON-RPC request to the MCP HTTP server."""
+        """Send a JSON-RPC request to the MCP HTTP server.
+
+        Supports both plain JSON and SSE (Streamable HTTP) responses,
+        as required by the MCP HTTP transport spec.
+        """
         request_id = self._next_request_id
         self._next_request_id += 1
         payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
@@ -48,12 +52,26 @@ class HttpMcpClient:
         req = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", "User-Agent": "conch/1.0"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "User-Agent": "conch/1.0",
+            },
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
-                return json.loads(response.read().decode())
+                ct = response.headers.get("Content-Type", "")
+                body = response.read().decode("utf-8", errors="replace")
+                if "event-stream" in ct:
+                    for line in body.split("\n"):
+                        if line.startswith("data: "):
+                            try:
+                                return json.loads(line[6:])
+                            except json.JSONDecodeError:
+                                continue
+                    return {"error": {"message": "No valid SSE data received"}}
+                return json.loads(body)
         except Exception as exc:
             return {"error": {"message": str(exc)}}
 
@@ -79,7 +97,8 @@ class HttpMcpClient:
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
         response = self._rpc("tools/call", {"name": tool_name, "arguments": arguments})
         if "error" in response:
-            return {"content": [{"type": "text", "text": f"MCP HTTP error: {response['error'].get('message', 'unknown')}"}]}
+            msg = response["error"].get("message", "unknown")
+            return {"content": [{"type": "text", "text": "MCP HTTP error: " + msg}]}
         return response.get("result", {"content": [{"type": "text", "text": "(no result)"}]})
 
     def close(self):

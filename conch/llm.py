@@ -170,7 +170,7 @@ def build_messages(config: dict, user_request: str, context: dict) -> Tuple[List
 def call_cerebras(config: dict, messages: list) -> str:
     import urllib.request
 
-    api_key = os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), "").strip()
+    api_key = _clean_key(os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), ""))
     if not api_key:
         print("conch: CEREBRAS_API_KEY not set", file=sys.stderr)
         sys.exit(1)
@@ -209,7 +209,7 @@ def call_cerebras(config: dict, messages: list) -> str:
 def call_openai(config: dict, messages: list) -> str:
     import urllib.request
 
-    api_key = os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), "").strip()
+    api_key = _clean_key(os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), ""))
     if not api_key:
         print("conch: OPENAI_API_KEY not set", file=sys.stderr)
         sys.exit(1)
@@ -242,7 +242,7 @@ def call_openai(config: dict, messages: list) -> str:
 def call_anthropic(config: dict, messages: list) -> str:
     import urllib.request
 
-    api_key = os.environ.get(config.get("api_key_env", "ANTHROPIC_API_KEY"), "").strip()
+    api_key = _clean_key(os.environ.get(config.get("api_key_env", "ANTHROPIC_API_KEY"), ""))
     if not api_key:
         print("conch: ANTHROPIC_API_KEY not set", file=sys.stderr)
         sys.exit(1)

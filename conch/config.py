@@ -24,7 +24,7 @@ def _parse_config_file(path: Path) -> Dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        data[key.strip()] = value.strip().strip("'\"")
+        data[key.strip()] = value.strip().strip("'\"\u201c\u201d\u2018\u2019")
     return data
 
 

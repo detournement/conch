@@ -15,7 +15,7 @@ pipx install conch-shell
 pip install conch-shell
 ```
 
-### From source (macOS / Linux)
+### From source
 
 ```bash
 git clone https://github.com/detournement/conch.git
@@ -23,15 +23,7 @@ cd conch
 ./install.sh
 ```
 
-### From source (Windows)
-
-```powershell
-git clone https://github.com/detournement/conch.git
-cd conch
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
-
-The installer configures your API keys, installs the package, and sets up shell integration.
+The installer configures your API keys and shell integration (`ask` / `conch` aliases).
 
 ## Configuration
 

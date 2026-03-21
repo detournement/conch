@@ -3,20 +3,10 @@
 from __future__ import annotations
 
 import itertools
-import os
 import re
 import sys
 import threading
 import time
-
-# Enable ANSI escape codes on Windows 10+ cmd.exe
-if os.name == "nt":
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-    except Exception:
-        pass
 
 try:
     from pygments import highlight as _pyg_highlight

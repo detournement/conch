@@ -8,11 +8,6 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 
-def _clean_key(val: str) -> str:
-    """Strip smart quotes and non-ASCII chars from API keys."""
-    return val.strip().strip("\u201c\u201d\u2018\u2019\u0022\u0027").strip()
-
-
 KNOWN_MODELS = {
     "cerebras": [
         "zai-glm-4.7",
@@ -151,7 +146,7 @@ def get_fallback_model(provider: str) -> str:
 
 
 def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
-    api_key = _clean_key(os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), ""))
+    api_key = os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), "").strip()
     if not api_key:
         return {"content": "", "tool_calls": None}
     base_url = (config.get("base_url") or os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")).rstrip("/")
@@ -194,7 +189,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
 
 
 def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
-    api_key = _clean_key(os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), ""))
+    api_key = os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), "").strip()
     if not api_key:
         return {"content": "", "tool_calls": None}
     body: Dict[str, Any] = {
@@ -230,7 +225,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
 
 
 def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
-    api_key = _clean_key(os.environ.get(config.get("api_key_env", "ANTHROPIC_API_KEY"), ""))
+    api_key = os.environ.get(config.get("api_key_env", "ANTHROPIC_API_KEY"), "").strip()
     if not api_key:
         return {"content": "", "tool_calls": None}
     system = ""
@@ -448,9 +443,9 @@ def _stream_openai_compat(
 def stream_cerebras(
     config: dict, messages: list, tools=None, on_token=None
 ) -> dict:
-    api_key = _clean_key(os.environ.get(
+    api_key = os.environ.get(
         config.get("api_key_env", "CEREBRAS_API_KEY"), ""
-    ))
+    ).strip()
     if not api_key:
         return {"content": "", "tool_calls": None}
     base_url = (
@@ -484,9 +479,9 @@ def stream_cerebras(
 def stream_openai(
     config: dict, messages: list, tools=None, on_token=None
 ) -> dict:
-    api_key = _clean_key(os.environ.get(
+    api_key = os.environ.get(
         config.get("api_key_env", "OPENAI_API_KEY"), ""
-    ))
+    ).strip()
     if not api_key:
         return {"content": "", "tool_calls": None}
     model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
@@ -515,9 +510,9 @@ def stream_openai(
 def stream_anthropic(
     config: dict, messages: list, tools=None, on_token=None
 ) -> dict:
-    api_key = _clean_key(os.environ.get(
+    api_key = os.environ.get(
         config.get("api_key_env", "ANTHROPIC_API_KEY"), ""
-    ))
+    ).strip()
     if not api_key:
         return {"content": "", "tool_calls": None}
 

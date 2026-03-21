@@ -5,22 +5,13 @@ from __future__ import annotations
 import copy
 import datetime
 import os
+import readline
+import select
 import shutil
 import sys
+import termios
 import threading
-
-try:
-    import readline
-except ImportError:
-    readline = None
-
-try:
-    import select
-    import termios
-    import tty
-    _HAS_TERMIOS = True
-except ImportError:
-    _HAS_TERMIOS = False
+import tty
 import urllib.request
 from typing import Any, Dict, List
 
@@ -220,14 +211,14 @@ class TypeaheadBuffer:
         self._old_settings = None
 
     def start(self):
-        if not sys.stdin.isatty() or not _HAS_TERMIOS:
+        if not sys.stdin.isatty():
             return
         self._stop.clear()
         self._buffer = ""
         try:
             self._old_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
-        except (termios.error, OSError):
+        except termios.error:
             self._old_settings = None
             return
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -239,10 +230,10 @@ class TypeaheadBuffer:
         if self._thread:
             self._thread.join(timeout=0.5)
             self._thread = None
-        if self._old_settings is not None and _HAS_TERMIOS:
+        if self._old_settings is not None:
             try:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
-            except (termios.error, OSError):
+            except termios.error:
                 pass
             self._old_settings = None
         partial = self._buffer
@@ -384,12 +375,11 @@ def chat_loop():
 
     history_file = _history_path()
     os.makedirs(os.path.dirname(history_file), exist_ok=True)
-    if readline:
-        try:
-            readline.read_history_file(history_file)
-        except (FileNotFoundError, OSError):
-            pass
-        readline.set_history_length(500)
+    try:
+        readline.read_history_file(history_file)
+    except (FileNotFoundError, OSError):
+        pass
+    readline.set_history_length(500)
 
     _SLASH_COMMANDS = [
         "/help", "/models", "/model", "/provider", "/remember", "/memories",
@@ -407,10 +397,9 @@ def chat_loop():
             matches = []
         return matches[state] if state < len(matches) else None
 
-    if readline:
-        readline.set_completer(_completer)
-        readline.set_completer_delims(" ")
-        readline.parse_and_bind("tab: complete")
+    readline.set_completer(_completer)
+    readline.set_completer_delims(" ")
+    readline.parse_and_bind("tab: complete")
 
     def _save_current():
         current_conv.messages = messages
@@ -498,8 +487,7 @@ def chat_loop():
                 if _typeahead_partial:
                     prefill = _typeahead_partial
                     _typeahead_partial = ""
-                    if readline:
-                        readline.set_startup_hook(lambda: readline.insert_text(prefill))
+                    readline.set_startup_hook(lambda: readline.insert_text(prefill))
                 try:
                     user_input = input("\033[1;33myou:\033[0m ")
                 except EOFError:
@@ -514,8 +502,7 @@ def chat_loop():
                     print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
                     continue
                 finally:
-                    if readline:
-                        readline.set_startup_hook()
+                    readline.set_startup_hook()
 
             stripped = user_input.strip()
             if not stripped:
@@ -707,11 +694,10 @@ def chat_loop():
                 print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, free\033[0m")
         _summarize_and_save(messages, config, raw_fn, memory)
         sched.stop()
-        if readline:
-            try:
-                readline.write_history_file(history_file)
-            except OSError:
-                pass
+        try:
+            readline.write_history_file(history_file)
+        except OSError:
+            pass
         mcp_mod.close_all(mcp_clients)
 
 

@@ -605,6 +605,9 @@ def chat_loop():
                     on_token=_printer.feed if _printer else None,
                 )
             except KeyboardInterrupt:
+                if _printer and _printer._spinner:
+                    _printer._spinner.__exit__(None, None, None)
+                    _printer._spinner = None
                 _typeahead.stop()
                 print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
                 messages.clear()
@@ -692,7 +695,10 @@ def chat_loop():
                 print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, ~${total_cost:.4f}\033[0m")
             else:
                 print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, free\033[0m")
-        _summarize_and_save(messages, config, raw_fn, memory)
+        try:
+            _summarize_and_save(messages, config, raw_fn, memory)
+        except KeyboardInterrupt:
+            pass
         sched.stop()
         try:
             readline.write_history_file(history_file)

@@ -25,14 +25,10 @@ dependencies = [
     "pygments>=2.0",
 ]
 
-[project.optional-dependencies]
-slack = ["slack-bolt>=1.18", "slack-sdk>=3.21"]
-
 [project.scripts]
 conch = "conch.app:main"
 conch-chat = "conch.app:main"
 conch-ask = "conch.cli:main"
-conch-slack = "conch.slack:main"
 
 [project.urls]
 Homepage = "https://github.com/detournement/conch"

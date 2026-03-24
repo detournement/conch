@@ -266,7 +266,7 @@ class TestNullContent(unittest.TestCase):
         append_results_openai(messages, response, [{"id": "1", "content": "ok"}])
         self.assertEqual(messages[0]["content"], "")
 
-    def test_normalize_for_openai_drops_none_content_assistant(self):
+    def test_normalize_for_openai_fixes_none_content_on_tool_call(self):
         msgs = [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
@@ -276,7 +276,11 @@ class TestNullContent(unittest.TestCase):
         result = normalize_messages_for_provider(msgs, "openai")
         for msg in result:
             self.assertIsNotNone(msg["content"])
-            self.assertNotEqual(msg["content"], "None")
+            self.assertIsInstance(msg["content"], str)
+        # Tool call messages should be preserved for multi-turn tool use
+        self.assertEqual(len(result), 4)
+        self.assertEqual(result[1]["content"], "")
+        self.assertIn("tool_calls", result[1])
 
     def test_normalize_for_anthropic_fixes_none_content(self):
         msgs = [
@@ -286,6 +290,30 @@ class TestNullContent(unittest.TestCase):
         result = normalize_messages_for_provider(msgs, "anthropic")
         for msg in result:
             self.assertIsNotNone(msg["content"])
+
+    def test_openai_multi_turn_tool_use_preserved(self):
+        """After a tool call, assistant+tool_calls and tool results must
+        remain in the message list so the model sees them on the next round."""
+        msgs = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "make a map"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "web_search", "arguments": '{"q":"map"}'}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "search results here"},
+            {"role": "assistant", "content": "Here's step 1. Now doing step 2.", "tool_calls": [
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "web_search", "arguments": '{"q":"step2"}'}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "more results"},
+        ]
+        result = normalize_messages_for_provider(msgs, "openai")
+        roles = [m["role"] for m in result]
+        self.assertEqual(roles.count("tool"), 2, "tool results must be kept")
+        self.assertEqual(roles.count("assistant"), 2, "tool-call assistants must be kept")
+        tc_msgs = [m for m in result if m.get("tool_calls")]
+        self.assertEqual(len(tc_msgs), 2, "tool_calls must be preserved")
 
     def test_normalize_on_switch_drops_none_content(self):
         msgs = [

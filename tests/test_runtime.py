@@ -65,14 +65,14 @@ class TestNormalizeMessagesForProvider(unittest.TestCase):
         result = normalize_messages_for_provider(msgs, "anthropic")
         self.assertIs(result, msgs)
 
-    def test_drops_tool_role(self):
+    def test_keeps_openai_tool_role(self):
         msgs = [
             {"role": "user", "content": "hi"},
             {"role": "tool", "tool_call_id": "1", "content": "result"},
         ]
         result = normalize_messages_for_provider(msgs, "openai")
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["content"], "hi")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[1]["role"], "tool")
 
     def test_drops_empty_tool_use_blocks(self):
         msgs = [
@@ -93,12 +93,14 @@ class TestNormalizeMessagesForProvider(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["content"], "Here is the answer")
 
-    def test_drops_empty_assistant_with_tool_calls(self):
+    def test_keeps_assistant_with_tool_calls(self):
         msgs = [
             {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
         ]
         result = normalize_messages_for_provider(msgs, "openai")
-        self.assertEqual(len(result), 0)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["content"], "")
+        self.assertIn("tool_calls", result[0])
 
 
 class TestNormalizeMessagesOnSwitch(unittest.TestCase):

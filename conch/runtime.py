@@ -219,16 +219,19 @@ def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
 
 
 def normalize_messages_for_provider(messages: list, provider: str) -> list:
-    """Flatten Anthropic-style structured messages for OpenAI-compatible providers.
+    """Prepare messages for the target provider.
 
-    Drops tool execution pairs entirely to prevent the model from echoing
-    tool-call artifacts. Only keeps text content from assistant messages.
+    For Anthropic: pass through as-is (fix None content).
+    For OpenAI-compatible: keep native OpenAI tool messages (role=tool,
+    assistant+tool_calls) intact so multi-turn tool use works.  Only
+    convert Anthropic-style structured content blocks to plain text.
     """
     if provider == "anthropic":
         for msg in messages:
             if msg.get("content") is None:
                 msg["content"] = ""
         return messages
+
     normalized = []
     i = 0
     while i < len(messages):
@@ -236,17 +239,18 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
         role = msg.get("role", "user")
         content = msg.get("content", "")
 
-        # Drop OpenAI-style tool-role messages
+        # Keep OpenAI-format tool result messages as-is
         if role == "tool":
+            normalized.append(msg)
             i += 1
             continue
 
+        # Handle Anthropic-style structured content (list of blocks)
         if isinstance(content, list):
             has_tool = any(
                 isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
                 for b in content
             )
-            # Extract only text parts
             text_parts = [
                 b.get("text", "")
                 for b in content
@@ -255,7 +259,7 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
             text_content = "\n".join(p for p in text_parts if p).strip()
 
             if has_tool and not text_content:
-                # Pure tool message with no text — skip it and its tool_result pair
+                # Pure Anthropic tool block — skip it and its tool_result pair
                 i += 1
                 if i < len(messages):
                     nxt = messages[i]
@@ -273,15 +277,21 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
             else:
                 i += 1
                 continue
-        else:
-            if content is None:
-                content = ""
-            # Drop assistant messages that were pure tool calls
-            if role == "assistant" and msg.get("tool_calls") and not content.strip():
-                i += 1
-                continue
-            if content.strip():
-                normalized.append({"role": role, "content": content})
+
+        # Keep assistant messages with tool_calls (OpenAI native format)
+        if role == "assistant" and msg.get("tool_calls"):
+            clean = dict(msg)
+            if clean.get("content") is None:
+                clean["content"] = ""
+            normalized.append(clean)
+            i += 1
+            continue
+
+        # Regular text messages
+        if content is None:
+            content = ""
+        if content.strip():
+            normalized.append({"role": role, "content": content})
         i += 1
     return normalized
 

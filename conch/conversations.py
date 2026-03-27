@@ -1,4 +1,4 @@
-"""Conversation persistence with structured messages."""
+"""Conversation persistence with structured messages and full-text search."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 SCHEMA_VERSION = 2
@@ -177,4 +177,84 @@ class ConversationManager:
         if not conversations:
             return None
         return self.load(conversations[0]["id"])
+
+    def search(
+        self, query: str, *, max_results: int = 20, context_chars: int = 120
+    ) -> List[Dict[str, Any]]:
+        """Search all conversations for a query string. Returns matches with
+        context snippets, sorted by relevance (match count)."""
+        if not query.strip():
+            return []
+
+        keywords = query.lower().split()
+        results: List[Tuple[int, Dict[str, Any]]] = []
+
+        for entry in self.list_all():
+            conv = self.load(entry["id"])
+            if not conv:
+                continue
+            matches: List[Dict[str, Any]] = []
+            score = 0
+
+            if any(kw in conv.title.lower() for kw in keywords):
+                score += 5
+
+            for i, msg in enumerate(conv.messages):
+                content = msg.get("content", "")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                role = msg.get("role", "")
+                if role == "system":
+                    continue
+                content_lower = content.lower()
+                hit_count = sum(content_lower.count(kw) for kw in keywords)
+                if not hit_count:
+                    continue
+                score += hit_count
+                snippet = _extract_snippet(content, keywords, context_chars)
+                matches.append({
+                    "role": role,
+                    "message_index": i,
+                    "snippet": snippet,
+                    "hits": hit_count,
+                })
+
+            if score > 0:
+                results.append((score, {
+                    "id": conv.id,
+                    "title": conv.title,
+                    "score": score,
+                    "updated_at": conv.updated_at,
+                    "message_count": len(conv.messages),
+                    "matches": matches[:8],
+                }))
+
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [r[1] for r in results[:max_results]]
+
+
+def _extract_snippet(text: str, keywords: List[str], context_chars: int = 120) -> str:
+    """Find the best snippet around the first keyword match."""
+    text_lower = text.lower()
+    best_pos = len(text)
+    for kw in keywords:
+        pos = text_lower.find(kw)
+        if pos != -1 and pos < best_pos:
+            best_pos = pos
+
+    if best_pos == len(text):
+        return text[:context_chars].strip()
+
+    start = max(0, best_pos - context_chars // 3)
+    end = min(len(text), best_pos + context_chars)
+
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+
+    snippet = snippet.replace("\n", " ")
+    snippet = re.sub(r"\s+", " ", snippet)
+    return snippet
 

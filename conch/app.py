@@ -30,6 +30,7 @@ from .tooling import (
     LocalShellPolicy,
     ManageToolsClient,
     SaveMemoryClient,
+    SearchConversationsClient,
     ToolRuntimeState,
     apply_filter,
     auto_disable_oversized_groups,
@@ -105,12 +106,14 @@ def _make_builtin_clients(memory: MemoryStore, interactive: bool = True) -> Dict
     save_memory.bind(memory)
     conch_config = ConchConfigClient()
     public_api = PublicApiClient()
+    search_convos = SearchConversationsClient()
     return {
         "local_shell": local_shell,
         "manage_tools": manage_tools,
         "save_memory": save_memory,
         "conch_config": conch_config,
         "public_api": public_api,
+        "search_conversations": search_convos,
     }
 
 
@@ -469,6 +472,7 @@ def chat_loop():
 
     # Bind config client with current state
     builtin_clients["conch_config"].bind(provider, model_name, session_usage)
+    builtin_clients["search_conversations"].bind(conv_mgr)
 
     _print_banner()
 

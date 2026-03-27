@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 MAX_GROUP_TOOLS = 200
 MAX_ACTIVE_TOOLS = 300
-PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api", "conch_config"}
+PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api", "conch_config", "search_conversations"}
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
 
@@ -385,8 +385,64 @@ class SaveMemoryClient:
         return {"content": [{"type": "text", "text": f"Saved memory #{entry['id']}: {content}"}]}
 
 
+SEARCH_CONVERSATIONS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_conversations",
+        "description": (
+            "Search through all past conversations for specific topics, commands, "
+            "or information discussed previously. Returns matching snippets with context. "
+            "Use this when the user asks 'what did we talk about', 'find that conversation "
+            "where...', 'what was the command for...', or any recall question."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search terms (space-separated keywords)",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum conversations to return (default 10)",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+class SearchConversationsClient:
+    name = "search_conversations"
+
+    def __init__(self):
+        self._conv_mgr = None
+
+    def bind(self, conv_mgr):
+        self._conv_mgr = conv_mgr
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        if not self._conv_mgr:
+            return {"content": [{"type": "text", "text": "Error: conversation manager not initialized"}]}
+        query = arguments.get("query", "").strip()
+        if not query:
+            return {"content": [{"type": "text", "text": "Error: empty search query"}]}
+        max_results = int(arguments.get("max_results", 10))
+        results = self._conv_mgr.search(query, max_results=max_results)
+        if not results:
+            return {"content": [{"type": "text", "text": f"No conversations found matching '{query}'."}]}
+        lines = [f"Found {len(results)} conversation(s) matching '{query}':\n"]
+        for r in results:
+            lines.append(f"### {r['title']} (id: {r['id']}, {r['message_count']} msgs)")
+            for m in r["matches"][:5]:
+                lines.append(f"  [{m['role']}]: {m['snippet']}")
+            lines.append("")
+        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
 def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], clients: Dict[str, Any]):
-    builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL, PUBLIC_API_TOOL]
+    builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL, PUBLIC_API_TOOL, SEARCH_CONVERSATIONS_TOOL]
     if "conch_config" in clients:
         builtin.append(CONCH_CONFIG_TOOL)
     all_tools.extend(builtin)

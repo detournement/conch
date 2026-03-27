@@ -54,6 +54,7 @@ def handle_slash_command(
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory\n"
+            "  \033[1m/search <query>\033[0m      Search all conversations\n"
             "  \033[1m/browse\033[0m              Browse conversations\n"
             "  \033[1m/new\033[0m                 Start a new conversation\n"
             "  \033[1m/convos\033[0m              List past conversations\n"
@@ -89,6 +90,33 @@ def handle_slash_command(
         if get_agent_mode():
             print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
         print()
+        return None
+
+    if command in ("/search", "/s", "/find", "/grep") and conv_mgr is not None:
+        if not arg:
+            print("\n  \033[2mUsage: /search <query>\033[0m\n")
+            return None
+        results = conv_mgr.search(arg)
+        if not results:
+            print(f"\n  \033[2mNo results for '{arg}'.\033[0m\n")
+            return None
+        print(f"\n  \033[1;36mSearch results for '{arg}' ({len(results)} conversations):\033[0m\n")
+        for r in results:
+            current = " \033[1;33m← current\033[0m" if current_conv and r["id"] == current_conv.id else ""
+            print(f"  \033[1m{r['id']}\033[0m  {r['title']}  \033[2m({r['message_count']} msgs, score:{r['score']})\033[0m{current}")
+            for m in r["matches"][:3]:
+                role_color = "\033[33m" if m["role"] == "user" else "\033[36m"
+                snippet = m["snippet"]
+                for kw in arg.lower().split():
+                    import re as _re
+                    snippet = _re.sub(
+                        f"({_re.escape(kw)})",
+                        "\033[1;33m\\1\033[0m",
+                        snippet,
+                        flags=_re.IGNORECASE,
+                    )
+                print(f"    {role_color}{m['role']}\033[0m: {snippet}")
+            print()
         return None
 
     if command in ("/browse", "/b") and conv_mgr is not None:

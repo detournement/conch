@@ -24,6 +24,7 @@ from .render import highlight, StreamPrinter
 from .runtime import chat_turn, sanitize_anthropic_messages
 from .scheduler import Scheduler
 from .tooling import (
+    ApiLayerClient,
     ConchConfigClient,
     PublicApiClient,
     LocalShellClient,
@@ -78,6 +79,51 @@ def _detect_location() -> str:
         return ""
 
 
+def _load_config_credentials() -> str:
+    """Read tokens, API keys, URLs, and usernames from ~/.config/conch/* files."""
+    import json as _json
+    config_dir = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "conch",
+    )
+    if not os.path.isdir(config_dir):
+        return ""
+
+    creds: List[str] = []
+    _CRED_PATTERNS = ("token", "key", "url", "username", "password", "secret", "credential")
+
+    config_path = os.path.join(config_dir, "config")
+    if os.path.isfile(config_path):
+        try:
+            for line in open(config_path).read().splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                lhs = stripped.split("=", 1)[0].strip().lower()
+                if any(p in lhs for p in _CRED_PATTERNS):
+                    creds.append(stripped)
+        except OSError:
+            pass
+
+    mcp_path = os.path.join(config_dir, "mcp.json")
+    if os.path.isfile(mcp_path):
+        try:
+            mcp_data = _json.loads(open(mcp_path).read())
+            servers = mcp_data.get("mcpServers", {})
+            for server_name, server_cfg in servers.items():
+                env = server_cfg.get("env", {})
+                if not env:
+                    continue
+                for k, v in env.items():
+                    creds.append(f"{server_name}: {k} = {v}")
+        except (OSError, _json.JSONDecodeError, AttributeError):
+            pass
+
+    if not creds:
+        return ""
+    return "Available credentials and tokens (from ~/.config/conch/):\n" + "\n".join(f"- {c}" for c in creds)
+
+
 def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "", model: str = "") -> str:
     now = datetime.datetime.now()
     tz_name = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
@@ -87,7 +133,13 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
     if provider and model:
         parts.append(f"You are currently running as {provider}/{model}.")
     parts.append("Use this for any time-sensitive or location-relevant requests.")
-    return base_prompt + "\n\n" + " ".join(parts)
+    prompt = base_prompt + "\n\n" + " ".join(parts)
+
+    creds = _load_config_credentials()
+    if creds:
+        prompt += "\n\n" + creds
+
+    return prompt
 
 
 def _history_path() -> str:
@@ -98,7 +150,7 @@ def _history_path() -> str:
     )
 
 
-def _make_builtin_clients(memory: MemoryStore, interactive: bool = True) -> Dict[str, Any]:
+def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool = True) -> Dict[str, Any]:
     local_shell = LocalShellClient()
     local_shell.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=get_agent_mode()))
     manage_tools = ManageToolsClient()
@@ -107,7 +159,7 @@ def _make_builtin_clients(memory: MemoryStore, interactive: bool = True) -> Dict
     conch_config = ConchConfigClient()
     public_api = PublicApiClient()
     search_convos = SearchConversationsClient()
-    return {
+    clients: Dict[str, Any] = {
         "local_shell": local_shell,
         "manage_tools": manage_tools,
         "save_memory": save_memory,
@@ -115,6 +167,12 @@ def _make_builtin_clients(memory: MemoryStore, interactive: bool = True) -> Dict
         "public_api": public_api,
         "search_conversations": search_convos,
     }
+    api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")
+    if api_layer_key:
+        api_layer = ApiLayerClient()
+        api_layer.bind(api_layer_key)
+        clients["api_layer"] = api_layer
+    return clients
 
 
 def _load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False):
@@ -298,7 +356,7 @@ def chat_loop():
 
     system_prompt = _build_system_prompt(base_prompt, provider=provider, model=model_name)
     memory = MemoryStore()
-    builtin_clients = _make_builtin_clients(memory, interactive=True)
+    builtin_clients = _make_builtin_clients(memory, config, interactive=True)
 
     # Load tools in background; show prompt immediately
     _tools_ready = threading.Event()
@@ -318,7 +376,7 @@ def chat_loop():
 
     def _scheduled_executor(prompt: str, _task):
         scheduled_memory = MemoryStore()
-        scheduled_builtins = _make_builtin_clients(scheduled_memory, interactive=False)
+        scheduled_builtins = _make_builtin_clients(scheduled_memory, config, interactive=False)
         scheduled_clients, scheduled_state = _load_runtime_tools(scheduled_builtins)
         try:
             scheduled_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
@@ -345,26 +403,18 @@ def chat_loop():
     conv_mgr = ConversationManager()
     current_conv = conv_mgr.get_most_recent()
     if current_conv and current_conv.messages:
-        messages = current_conv.messages
-        # Strip any tool-call artifacts from saved history
+        messages = list(current_conv.messages)
+        # Only strip textual tool-call artifacts (model-emitted junk);
+        # preserve real tool messages, tool_calls, and list content so
+        # they remain searchable on disk.
         _clean = []
         for _m in messages:
-            _role = _m.get("role", "user")
             _content = _m.get("content", "")
-            if _role == "tool":
-                continue
-            if isinstance(_content, list):
-                _tp = [b.get("text", "") for b in _content if isinstance(b, dict) and b.get("type") == "text"]
-                _content = "\n".join(t for t in _tp if t).strip()
-                if not _content:
-                    continue
             if isinstance(_content, str):
                 _s = _content.strip()
                 if _s.startswith(("[Called tool:", "<tool_called", "[Tool result", "<tool_result")):
                     continue
-            if _role == "assistant" and _m.get("tool_calls") and not str(_content).strip():
-                continue
-            _clean.append({"role": _role, "content": _content})
+            _clean.append(_m)
         messages = _clean
         current_conv.messages = messages
         if messages and messages[0].get("role") == "system":
@@ -472,7 +522,7 @@ def chat_loop():
 
     # Bind config client with current state
     builtin_clients["conch_config"].bind(provider, model_name, session_usage)
-    builtin_clients["search_conversations"].bind(conv_mgr)
+    builtin_clients["search_conversations"].bind(conv_mgr, memory=memory)
 
     _print_banner()
 
@@ -736,7 +786,7 @@ def main():
         mem_context = memory.build_context(user_text)
         if mem_context:
             system_prompt += "\n\n" + mem_context
-        builtin_clients = _make_builtin_clients(memory, interactive=True)
+        builtin_clients = _make_builtin_clients(memory, config, interactive=True)
         mcp_clients, chat_state = _load_runtime_tools(builtin_clients)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
         try:

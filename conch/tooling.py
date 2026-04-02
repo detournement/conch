@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 MAX_GROUP_TOOLS = 200
 MAX_ACTIVE_TOOLS = 300
-PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api", "conch_config", "search_conversations"}
+PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api", "conch_config", "search_conversations", "api_layer"}
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
 
@@ -227,7 +227,7 @@ SAVE_MEMORY_TOOL = {
     "type": "function",
     "function": {
         "name": "save_memory",
-        "description": "Persist a fact or preference to memory.",
+        "description": "Persist a fact, preference, token, API key, credential, or URL to memory so it can be recalled later.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -390,10 +390,12 @@ SEARCH_CONVERSATIONS_TOOL = {
     "function": {
         "name": "search_conversations",
         "description": (
-            "Search through all past conversations for specific topics, commands, "
+            "Search through all past conversations, saved memories, and Conch config "
+            "files (~/.config/conch/*) for specific topics, commands, tokens, credentials, "
             "or information discussed previously. Returns matching snippets with context. "
             "Use this when the user asks 'what did we talk about', 'find that conversation "
-            "where...', 'what was the command for...', or any recall question."
+            "where...', 'what was the command for...', 'find my token/key', or any recall question. "
+            "Config files (config, mcp.json) are always searched automatically."
         ),
         "parameters": {
             "type": "object",
@@ -413,14 +415,50 @@ SEARCH_CONVERSATIONS_TOOL = {
 }
 
 
+def _config_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch"
+
+
+def _search_config_files(keywords: List[str]) -> List[dict]:
+    """Search all files in ~/.config/conch/ for keyword matches."""
+    config_dir = _config_dir()
+    if not config_dir.is_dir():
+        return []
+    hits: List[dict] = []
+    for path in sorted(config_dir.iterdir()):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        text_lower = text.lower()
+        hit_count = sum(text_lower.count(kw) for kw in keywords)
+        if not hit_count:
+            continue
+        matching_lines = []
+        for line in text.splitlines():
+            if any(kw in line.lower() for kw in keywords):
+                matching_lines.append(line.strip())
+        hits.append({
+            "file": path.name,
+            "path": str(path),
+            "hits": hit_count,
+            "lines": matching_lines[:10],
+        })
+    return hits
+
+
 class SearchConversationsClient:
     name = "search_conversations"
 
     def __init__(self):
         self._conv_mgr = None
+        self._memory = None
 
-    def bind(self, conv_mgr):
+    def bind(self, conv_mgr, memory=None):
         self._conv_mgr = conv_mgr
+        self._memory = memory
 
     def call_tool(self, name: str, arguments: dict) -> dict:
         if not self._conv_mgr:
@@ -428,23 +466,57 @@ class SearchConversationsClient:
         query = arguments.get("query", "").strip()
         if not query:
             return {"content": [{"type": "text", "text": "Error: empty search query"}]}
+        keywords = query.lower().split()
         max_results = int(arguments.get("max_results", 10))
+
+        sections: List[str] = []
+
+        config_hits = _search_config_files(keywords)
+        if config_hits:
+            sections.append("## Config files (~/.config/conch/)\n")
+            for h in config_hits:
+                sections.append(f"**{h['file']}** ({h['hits']} matches):")
+                for line in h["lines"]:
+                    sections.append(f"  {line}")
+                sections.append("")
+
+        if self._memory:
+            mem_entries = self._memory.get_all()
+            mem_hits = []
+            for entry in mem_entries:
+                content = str(entry.get("content", ""))
+                content_lower = content.lower()
+                count = sum(content_lower.count(kw) for kw in keywords)
+                if count:
+                    mem_hits.append((count, entry))
+            if mem_hits:
+                mem_hits.sort(key=lambda x: x[0], reverse=True)
+                sections.append("## Memories\n")
+                for _, entry in mem_hits[:5]:
+                    sections.append(f"  #{entry['id']}: {entry['content']}")
+                sections.append("")
+
         results = self._conv_mgr.search(query, max_results=max_results)
-        if not results:
-            return {"content": [{"type": "text", "text": f"No conversations found matching '{query}'."}]}
-        lines = [f"Found {len(results)} conversation(s) matching '{query}':\n"]
-        for r in results:
-            lines.append(f"### {r['title']} (id: {r['id']}, {r['message_count']} msgs)")
-            for m in r["matches"][:5]:
-                lines.append(f"  [{m['role']}]: {m['snippet']}")
-            lines.append("")
-        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+        if results:
+            sections.append(f"## Conversations ({len(results)} match{'es' if len(results) != 1 else ''})\n")
+            for r in results:
+                sections.append(f"### {r['title']} (id: {r['id']}, {r['message_count']} msgs)")
+                for m in r["matches"][:5]:
+                    sections.append(f"  [{m['role']}]: {m['snippet']}")
+                sections.append("")
+
+        if not sections:
+            return {"content": [{"type": "text", "text": f"No results found matching '{query}' in conversations, memories, or config files."}]}
+        header = f"Search results for '{query}':\n\n"
+        return {"content": [{"type": "text", "text": header + "\n".join(sections)}]}
 
 
 def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], clients: Dict[str, Any]):
     builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL, PUBLIC_API_TOOL, SEARCH_CONVERSATIONS_TOOL]
     if "conch_config" in clients:
         builtin.append(CONCH_CONFIG_TOOL)
+    if "api_layer" in clients:
+        builtin.append(API_LAYER_TOOL)
     all_tools.extend(builtin)
     for tool_def in builtin:
         name = tool_def["function"]["name"]
@@ -737,6 +809,148 @@ class PublicApiClient:
             if not url:
                 return self._text("Error: 'url' is required for the call action.")
             result = public_apis.call_api(url, method, params)
+            return self._text(result)
+
+        return self._text(f"Unknown action: {action}")
+
+
+# ---------------------------------------------------------------------------
+# api_layer — authenticated access to APILayer marketplace APIs
+# ---------------------------------------------------------------------------
+
+_APILAYER_APIS = {
+    "exchangerates_data": {
+        "desc": "Exchange rates & currency conversion (170+ currencies)",
+        "endpoints": "/latest, /convert, /symbols, /{date}, /timeseries, /fluctuation",
+    },
+    "fixer": {
+        "desc": "Foreign exchange rates (Fixer)",
+        "endpoints": "/latest, /convert, /symbols, /{date}, /timeseries, /fluctuation",
+    },
+    "currency_data": {
+        "desc": "Currency data & conversion",
+        "endpoints": "/live, /convert, /historical, /timeframe, /change, /list",
+    },
+    "number_verification": {
+        "desc": "Phone number validation & lookup",
+        "endpoints": "/validate?number=<number>",
+    },
+    "bad_words": {
+        "desc": "Profanity/content moderation filter",
+        "endpoints": "/bad_words?text=<text>",
+    },
+    "ip_to_location": {
+        "desc": "IP address geolocation",
+        "endpoints": "/check, /check?ip=<ip>",
+    },
+    "weatherstack": {
+        "desc": "Weather data (current, historical, forecast)",
+        "endpoints": "/current?query=<city>, /historical, /forecast",
+    },
+    "mediastack": {
+        "desc": "Live news & headlines",
+        "endpoints": "/news?keywords=<q>&languages=en",
+    },
+    "aviationstack": {
+        "desc": "Flight tracking & aviation data",
+        "endpoints": "/flights, /airports, /airlines",
+    },
+    "countrylayer": {
+        "desc": "Country information (capital, population, languages)",
+        "endpoints": "/name/{name}, /alpha/{code}, /all",
+    },
+    "vat_layer": {
+        "desc": "EU VAT number validation",
+        "endpoints": "/validate?vat_number=<number>",
+    },
+}
+
+API_LAYER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "api_layer",
+        "description": (
+            "Call APILayer marketplace APIs (authenticated). Available APIs: "
+            "exchangerates_data (currency rates/conversion), fixer (forex), "
+            "currency_data, number_verification (phone lookup), bad_words "
+            "(content moderation), ip_to_location (IP geolocation), weatherstack "
+            "(weather), mediastack (news), aviationstack (flights), countrylayer "
+            "(country info), vat_layer (EU VAT). Use 'list' to see all APIs and "
+            "endpoints, or 'call' to make an authenticated request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "call"],
+                    "description": "list: show available APIs and endpoints. call: make an API request.",
+                },
+                "api": {
+                    "type": "string",
+                    "description": "API name (e.g. 'exchangerates_data', 'weatherstack'). For call action.",
+                },
+                "endpoint": {
+                    "type": "string",
+                    "description": "API endpoint path (e.g. '/latest', '/convert'). For call action.",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Query parameters as key-value pairs (e.g. {\"from\": \"USD\", \"to\": \"EUR\", \"amount\": 100})",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class ApiLayerClient:
+    """Built-in tool for calling APILayer marketplace APIs."""
+
+    name = "api_layer"
+
+    def __init__(self):
+        self._api_key = ""
+
+    def bind(self, api_key: str):
+        self._api_key = api_key
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        from . import public_apis
+
+        action = arguments.get("action", "list")
+
+        if action == "list":
+            lines = ["APILayer APIs available:\n"]
+            for api_name, info in _APILAYER_APIS.items():
+                lines.append(f"  {api_name}")
+                lines.append(f"    {info['desc']}")
+                lines.append(f"    Endpoints: {info['endpoints']}")
+                lines.append(f"    Base: https://api.apilayer.com/{api_name}")
+                lines.append("")
+            lines.append("Use action='call' with api=<name> endpoint=<path> params={...}")
+            return self._text("\n".join(lines))
+
+        if action == "call":
+            if not self._api_key:
+                return self._text("Error: API_LAYER_KEY not configured. Add it to ~/.config/conch/config")
+            api = arguments.get("api", "").strip()
+            endpoint = arguments.get("endpoint", "").strip()
+            params = arguments.get("params")
+            if not api:
+                return self._text("Error: 'api' is required (e.g. 'exchangerates_data')")
+            if not endpoint:
+                return self._text("Error: 'endpoint' is required (e.g. '/latest')")
+            if not endpoint.startswith("/"):
+                endpoint = "/" + endpoint
+
+            url = f"https://api.apilayer.com/{api}{endpoint}"
+            headers = {"apikey": self._api_key}
+            result = public_apis.call_api(url, "GET", params, headers=headers)
             return self._text(result)
 
         return self._text(f"Unknown action: {action}")

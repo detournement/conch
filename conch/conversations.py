@@ -200,18 +200,18 @@ class ConversationManager:
                 score += 5
 
             for i, msg in enumerate(conv.messages):
-                content = msg.get("content", "")
-                if not isinstance(content, str) or not content.strip():
-                    continue
                 role = msg.get("role", "")
                 if role == "system":
                     continue
-                content_lower = content.lower()
-                hit_count = sum(content_lower.count(kw) for kw in keywords)
+                text = _extract_searchable_text(msg)
+                if not text.strip():
+                    continue
+                text_lower = text.lower()
+                hit_count = sum(text_lower.count(kw) for kw in keywords)
                 if not hit_count:
                     continue
                 score += hit_count
-                snippet = _extract_snippet(content, keywords, context_chars)
+                snippet = _extract_snippet(text, keywords, context_chars)
                 matches.append({
                     "role": role,
                     "message_index": i,
@@ -231,6 +231,52 @@ class ConversationManager:
 
         results.sort(key=lambda x: x[0], reverse=True)
         return [r[1] for r in results[:max_results]]
+
+
+def _extract_searchable_text(msg: Dict[str, Any]) -> str:
+    """Extract all searchable text from a message regardless of format.
+
+    Handles plain string content, Anthropic-style list content (text/tool_use/
+    tool_result blocks), and OpenAI-style tool_calls arrays.
+    """
+    parts: List[str] = []
+    content = msg.get("content", "")
+
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                parts.append(block.get("name", ""))
+                tool_input = block.get("input")
+                if isinstance(tool_input, dict):
+                    parts.append(json.dumps(tool_input, ensure_ascii=False))
+                elif isinstance(tool_input, str):
+                    parts.append(tool_input)
+            elif btype == "tool_result":
+                rc = block.get("content", "")
+                if isinstance(rc, str):
+                    parts.append(rc)
+                elif isinstance(rc, list):
+                    for rb in rc:
+                        if isinstance(rb, dict) and rb.get("type") == "text":
+                            parts.append(rb.get("text", ""))
+
+    for tc in msg.get("tool_calls", []):
+        fn = tc.get("function", {})
+        parts.append(fn.get("name", ""))
+        args = fn.get("arguments", "")
+        if isinstance(args, str):
+            parts.append(args)
+        elif isinstance(args, dict):
+            parts.append(json.dumps(args, ensure_ascii=False))
+
+    return "\n".join(p for p in parts if p)
 
 
 def _extract_snippet(text: str, keywords: List[str], context_chars: int = 120) -> str:

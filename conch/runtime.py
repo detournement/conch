@@ -416,6 +416,8 @@ def chat_turn(
         if len(compressed) < len(messages):
             messages.clear()
             messages.extend(compressed)
+            if provider == "anthropic":
+                sanitize_anthropic_messages(messages)
         send_messages = normalize_messages_for_provider(messages, provider)
 
         send_tools = tools

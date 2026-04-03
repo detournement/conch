@@ -227,10 +227,21 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
     convert Anthropic-style structured content blocks to plain text.
     """
     if provider == "anthropic":
+        cleaned = []
         for msg in messages:
-            if msg.get("content") is None:
-                msg["content"] = ""
-        return messages
+            role = msg.get("role", "user")
+            if role == "tool":
+                continue
+            if role == "assistant" and msg.get("tool_calls") and not str(msg.get("content", "")).strip():
+                continue
+            if role == "assistant" and msg.get("tool_calls"):
+                cleaned.append({"role": "assistant", "content": msg.get("content", "")})
+                continue
+            out = dict(msg)
+            if out.get("content") is None:
+                out["content"] = ""
+            cleaned.append(out)
+        return cleaned
 
     normalized = []
     i = 0

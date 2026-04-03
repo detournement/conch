@@ -63,7 +63,23 @@ class TestNormalizeMessagesForProvider(unittest.TestCase):
     def test_anthropic_passthrough(self):
         msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         result = normalize_messages_for_provider(msgs, "anthropic")
-        self.assertIs(result, msgs)
+        self.assertEqual(result, msgs)
+
+    def test_anthropic_strips_openai_tool_messages(self):
+        msgs = [
+            {"role": "user", "content": "create a ticket"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "jira", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "done"},
+            {"role": "assistant", "content": "Created the ticket."},
+        ]
+        result = normalize_messages_for_provider(msgs, "anthropic")
+        roles = [m["role"] for m in result]
+        self.assertNotIn("tool", roles)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["content"], "create a ticket")
+        self.assertEqual(result[1]["content"], "Created the ticket.")
 
     def test_keeps_openai_tool_role(self):
         msgs = [

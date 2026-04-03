@@ -486,10 +486,24 @@ def chat_turn(
                     fb_fn = RAW_FNS.get(fb_provider)
                     if not fb_fn:
                         continue
-                    print(
-                        f"  \033[33m⚠ {failed_provider}/{failed_model} failed, trying {fb_provider}/{fb_model}\033[0m",
-                        file=sys.stderr,
-                    )
+                    if needs_ctx_switch and sys.stdin.isatty():
+                        print(
+                            f"  \033[1;33m⚠ {failed_provider}/{failed_model} failed.\033[0m",
+                            file=sys.stderr,
+                        )
+                        try:
+                            answer = input(
+                                f"  \033[1;33mSwitch to {fb_provider}/{fb_model}? [y/N]\033[0m "
+                            ).strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            answer = ""
+                        if answer not in ("y", "yes"):
+                            continue
+                    else:
+                        print(
+                            f"  \033[33m⚠ {failed_provider}/{failed_model} failed, trying {fb_provider}/{fb_model}\033[0m",
+                            file=sys.stderr,
+                        )
                     fb_config = dict(config)
                     fb_config["provider"] = fb_provider
                     fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")

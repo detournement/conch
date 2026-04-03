@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import datetime
 import os
 import readline
@@ -631,7 +630,6 @@ def chat_loop():
             if current_conv.title == "New conversation":
                 current_conv.title = user_input.strip().splitlines()[0][:60] or "New conversation"
 
-            turn_snapshot = copy.deepcopy(messages)
             mem_context = memory.build_context(user_input)
             messages[0]["content"] = system_prompt + ("\n\n" + mem_context if mem_context else "")
             messages.append({"role": "user", "content": user_input})
@@ -664,8 +662,7 @@ def chat_loop():
                     _printer._spinner = None
                 _typeahead.stop()
                 print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
-                messages.clear()
-                messages.extend(turn_snapshot)
+                _save_current()
                 continue
 
             # API fallback inside chat_turn may switch provider/model via config only

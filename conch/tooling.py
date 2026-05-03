@@ -308,11 +308,23 @@ class LocalShellClient:
                 return self._run_command(cmd, timeout)
 
             _input = self.policy.input_fn or input
-            try:
-                sys.stdout.flush()
-                answer = _input("  \033[1;33mExecute? [y/n/e/a/A]\033[0m ").strip()
-            except (EOFError, KeyboardInterrupt):
-                answer = ""
+            while True:
+                try:
+                    sys.stdout.flush()
+                    answer = _input("  \033[1;33mExecute? [y/n/e/a/A/?]\033[0m ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+
+                if answer == "?":
+                    print(
+                        "    \033[1my\033[0m / \033[1mEnter\033[0m  Run this command\n"
+                        "    \033[1mn\033[0m          Decline (with optional feedback to the LLM)\n"
+                        "    \033[1me\033[0m          Edit the command before running\n"
+                        "    \033[1ma\033[0m          Always allow this exact command (session)\n"
+                        "    \033[1mA\033[0m          Turn on agent mode (auto-execute everything)"
+                    )
+                    continue
+                break
 
             if answer.lower() in ("", "y", "yes"):
                 return self._run_command(cmd, timeout)
@@ -323,16 +335,21 @@ class LocalShellClient:
 
             if answer == "A":
                 set_agent_mode(True)
+                self.policy = LocalShellPolicy(
+                    interactive=self.policy.interactive,
+                    allow_auto_execute=True,
+                    input_fn=self.policy.input_fn,
+                )
                 print("  \033[1;32mAgent mode: ON\033[0m \u2014 all commands will auto-execute")
                 return self._run_command(cmd, timeout)
 
-            if answer in ("e", "edit"):
+            if answer.lower() in ("e", "edit"):
                 try:
                     edited = _input("  \033[1;33mCommand:\033[0m ").strip()
                 except (EOFError, KeyboardInterrupt):
                     edited = ""
                 cmd = edited or cmd
-                print(f"  \033[2m→ {cmd}\033[0m")
+                print(f"  \033[2m\u2192 {cmd}\033[0m")
                 return self._run_command(cmd, timeout)
 
             # n / anything else = decline; ask for optional feedback

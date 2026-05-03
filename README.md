@@ -30,21 +30,21 @@ The installer configures your API keys and shell integration (`ask` / `conch` al
 Conch reads config from `~/.config/conch/config`:
 
 ```ini
-provider=cerebras
-model=zai-glm-4.7
-chat_model=zai-glm-4.7
-api_key_env=CEREBRAS_API_KEY
+provider=anthropic
+model=claude-sonnet-4-6
+chat_model=claude-sonnet-4-6
+api_key_env=ANTHROPIC_API_KEY
 ```
 
-Switch providers at any time in chat with `/provider openai`, `/provider anthropic`, or `/provider ollama`.
+Switch providers at any time in chat with `/provider cerebras`, `/provider openai`, `/provider anthropic`, or `/provider ollama`.
 
 ### Supported providers
 
 | Provider | Models | Cost |
 |----------|--------|------|
+| Anthropic | claude-sonnet-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 | Paid |
+| OpenAI | gpt-5.4, gpt-5.4-mini, gpt-4.1, gpt-4o, o3, o4-mini | Paid |
 | Cerebras | zai-glm-4.7 | Free |
-| OpenAI | gpt-4.1, gpt-4.1-mini, gpt-4o, o3, o4-mini | Paid |
-| Anthropic | claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 | Paid |
 | Ollama | llama4, llama3.3, deepseek-r1, qwen3, mistral | Free (local) |
 
 ## Features
@@ -90,12 +90,14 @@ Transient API errors (429, 5xx) are retried once with a 1-second backoff before 
 | `/models` | List available models |
 | `/model <name>` | Switch model |
 | `/provider <name>` | Switch provider |
-| `/agent` | Toggle agent mode (auto-execute shell) |
+| `/agent` / `/yolo` | Toggle agent mode (auto-execute shell) |
 | `/new` | Start a new conversation |
 | `/clear` | Wipe history (keep conversation) |
 | `/convos` | List conversations |
 | `/switch <id>` | Switch conversation |
 | `/delete <id>` | Delete conversation |
+| `/search <query>` | Search across conversations and memories |
+| `/browse` | Interactive conversation browser |
 | `/remember <text>` | Save a memory |
 | `/memories` | List saved memories |
 | `/forget <id>` | Delete a memory |
@@ -109,9 +111,22 @@ Transient API errors (429, 5xx) are retried once with a 1-second backoff before 
 | `/tasks` | List scheduled tasks |
 | `/cancel <id>` | Cancel a task |
 | `/cost` | Show session token usage |
-| `/rounds <n>` | Set max tool call rounds |
+| `/rounds <n>` | Set max tool call rounds (default 25) |
 | `/queue` | Toggle typeahead input |
 | `/reload` | Reload MCP tools |
+| `/verbose` | Toggle showing tool args + output |
+
+### Shell command approval
+
+When the LLM proposes a local shell command, you can:
+
+| Key | Action |
+|-----|--------|
+| `y` / Enter | Run once |
+| `n` | Decline (prompts for optional feedback) |
+| `e` | Edit the command before running |
+| `a` | Always allow this command for the rest of the session |
+| `Ctrl+C` (during a tool) | Cancel the running command, keep the conversation |
 
 ## Development
 

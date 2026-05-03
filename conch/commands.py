@@ -54,31 +54,32 @@ def handle_slash_command(
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory\n"
-            "  \033[1m/search <query>\033[0m      Search all conversations\n"
-            "  \033[1m/browse\033[0m              Browse conversations\n"
+            "  \033[1m/search <query>\033[0m      Search conversations, memories, and config\n"
+            "  \033[1m/browse\033[0m              Interactive conversation browser\n"
             "  \033[1m/new\033[0m                 Start a new conversation\n"
             "  \033[1m/convos\033[0m              List past conversations\n"
             "  \033[1m/switch <id>\033[0m         Switch conversation\n"
             "  \033[1m/delete <id>\033[0m         Delete conversation\n"
-            "  \033[1m/agent\033[0m               Toggle agent mode\n"
+            "  \033[1m/clear\033[0m               Wipe conversation history (keep conversation)\n"
+            "  \033[1m/agent\033[0m, \033[1m/yolo\033[0m       Toggle agent mode (auto-execute shell)\n"
+            "  \033[1m/verbose\033[0m             Toggle showing tool args + output\n"
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
             "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
             "  \033[1m/tools\033[0m               List tool groups\n"
             "  \033[1m/enable <group>\033[0m      Enable a tool group\n"
             "  \033[1m/disable <group>\033[0m     Disable a tool group\n"
+            "  \033[1m/profile [name]\033[0m      Switch tool profile (minimal, dev, comms, full)\n"
             "  \033[1m/connect <app>\033[0m       Connect a service\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
-            "  \033[1m/profile [name]\033[0m      Switch tool profile (minimal, dev, comms, full)\n"
-            "  \033[1m/clear\033[0m               Wipe conversation history (keep conversation)\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
         )
         return None
 
-    if command == "/agent":
+    if command in ("/agent", "/yolo"):
         if arg in ("on", "true", "1"):
             set_agent_mode(True)
         elif arg in ("off", "false", "0"):
@@ -86,11 +87,19 @@ def handle_slash_command(
         else:
             set_agent_mode(not get_agent_mode())
         status = "\033[1;32mON\033[0m" if get_agent_mode() else "\033[31mOFF\033[0m"
-        print(f"\n  Agent mode: {status}")
+        label = "YOLO mode" if command == "/yolo" else "Agent mode"
+        print(f"\n  {label}: {status}")
         if get_agent_mode():
             print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
         print()
-        return None
+        return "agent_mode_changed"
+
+    if command == "/verbose":
+        if arg in ("on", "true", "1"):
+            return "verbose_on"
+        if arg in ("off", "false", "0"):
+            return "verbose_off"
+        return "verbose_toggle"
 
     if command in ("/search", "/s", "/find", "/grep") and conv_mgr is not None:
         if not arg:

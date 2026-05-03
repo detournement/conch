@@ -310,15 +310,20 @@ class LocalShellClient:
             _input = self.policy.input_fn or input
             try:
                 sys.stdout.flush()
-                answer = _input("  \033[1;33mExecute? [y/n/e/a]\033[0m ").strip().lower()
+                answer = _input("  \033[1;33mExecute? [y/n/e/a/A]\033[0m ").strip()
             except (EOFError, KeyboardInterrupt):
                 answer = ""
 
-            if answer in ("", "y", "yes"):
+            if answer.lower() in ("", "y", "yes"):
                 return self._run_command(cmd, timeout)
 
-            if answer in ("a", "always"):
+            if answer.lower() in ("a", "always"):
                 self._allowed_commands.add(cmd)
+                return self._run_command(cmd, timeout)
+
+            if answer == "A":
+                set_agent_mode(True)
+                print("  \033[1;32mAgent mode: ON\033[0m \u2014 all commands will auto-execute")
                 return self._run_command(cmd, timeout)
 
             if answer in ("e", "edit"):

@@ -530,6 +530,15 @@ def chat_loop():
     _typeahead_queued: list[str] = []
     _typeahead_partial = ""
 
+    def _safe_input(prompt):
+        """Pause typeahead so input() can read stdin normally."""
+        _typeahead.stop()
+        try:
+            return input(prompt)
+        finally:
+            if _typeahead_enabled:
+                _typeahead.start()
+
     last_interrupt = 0.0
     try:
         while True:
@@ -564,7 +573,7 @@ def chat_loop():
                 break
 
             builtin_clients["local_shell"].set_policy(
-                LocalShellPolicy(interactive=True, allow_auto_execute=get_agent_mode())
+                LocalShellPolicy(interactive=True, allow_auto_execute=get_agent_mode(), input_fn=_safe_input)
             )
 
             if stripped.startswith("/"):
@@ -655,6 +664,7 @@ def chat_loop():
                     max_tool_rounds=max_tool_rounds,
                     chat_state=chat_state,
                     on_token=_printer.feed if _printer else None,
+                    input_fn=_safe_input,
                 )
             except KeyboardInterrupt:
                 if _printer and _printer._spinner:
@@ -777,7 +787,9 @@ def main():
         if not raw_fn:
             print(f"conch: unknown provider {provider}", file=sys.stderr)
             sys.exit(1)
-        system_prompt = _build_system_prompt(config.get("chat_system_prompt", CHAT_SYSTEM_PROMPT), _detect_location(), provider, config.get("chat_model", ""))
+        model_name = config.get("chat_model", config.get("model", ""))
+        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
+        system_prompt = _build_system_prompt(base_prompt, _detect_location(), provider, model_name)
         user_text = " ".join(sys.argv[1:])
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)

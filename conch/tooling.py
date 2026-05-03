@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -187,6 +188,7 @@ class ToolRuntimeState:
 class LocalShellPolicy:
     interactive: bool = True
     allow_auto_execute: bool = False
+    input_fn: Any = None
 
 
 LOCAL_SHELL_TOOL = {
@@ -254,11 +256,15 @@ class LocalShellClient:
         if not cmd:
             return {"content": [{"type": "text", "text": "Error: empty command"}]}
 
-        print(f"\n  \033[1;33m⚠ Run locally:\033[0m \033[1m{cmd}\033[0m")
+        sys.stderr.write("\r" + " " * 60 + "\r")
+        sys.stderr.flush()
+        print(f"\n  \033[1;33m⚠ Run locally:\033[0m \033[1m{cmd}\033[0m", flush=True)
         auto_execute = self.policy.allow_auto_execute or get_agent_mode()
         if self.policy.interactive and not auto_execute:
+            _input = self.policy.input_fn or input
             try:
-                answer = input("  \033[1;33mExecute? [y/N]\033[0m ").strip().lower()
+                sys.stdout.flush()
+                answer = _input("  \033[1;33mExecute? [y/N]\033[0m ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 answer = ""
             if answer not in ("y", "yes"):

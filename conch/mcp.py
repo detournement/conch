@@ -144,7 +144,21 @@ class StdioMcpClient:
 
     def list_tools(self) -> List[dict]:
         response = self._send("tools/list")
-        return response.get("result", {}).get("tools", [])
+        raw_tools = response.get("result", {}).get("tools", [])
+        tools = []
+        for tool in raw_tools:
+            name = tool.get("name", "")
+            if not name:
+                continue
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
+                },
+            })
+        return tools
 
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
         response = self._send("tools/call", {"name": tool_name, "arguments": arguments})

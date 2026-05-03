@@ -35,6 +35,7 @@ KNOWN_MODELS = {
         "gpt-5.4-pro",
     ],
     "anthropic": [
+        "claude-sonnet-4-7",
         "claude-sonnet-4-6",
         "claude-opus-4-6",
         "claude-haiku-4-5",
@@ -63,6 +64,7 @@ DEFAULT_API_KEY_ENVS = {
 PROVIDER_TOOL_LIMITS = {
     "openai": 128,
     "cerebras": 128,
+    "ollama": 32,
 }
 
 # Used for `/provider` and tool `set_provider` — stable defaults, not KNOWN_MODELS[0].
@@ -124,6 +126,7 @@ MODEL_PRICING = {
     "claude-opus-4-6":             (15.00, 75.00),
     "claude-haiku-4-5":            (0.80, 4.00),
     "claude-sonnet-4-5-20250929":  (3.00, 15.00),
+    "claude-sonnet-4-7":           (3.00, 15.00),
 }
 
 

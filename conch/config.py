@@ -8,10 +8,10 @@ from typing import Dict
 
 
 DEFAULT_CONFIG: Dict[str, str] = {
-    "provider": "cerebras",
-    "model": "zai-glm-4.7",
-    "chat_model": "zai-glm-4.7",
-    "api_key_env": "CEREBRAS_API_KEY",
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "chat_model": "claude-sonnet-4-6",
+    "api_key_env": "ANTHROPIC_API_KEY",
 }
 
 

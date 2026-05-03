@@ -396,6 +396,7 @@ def chat_turn(
     max_tool_rounds: int = 10,
     chat_state=None,
     on_token=None,
+    input_fn=None,
 ) -> tuple:
     """Returns (reply_text, usage_info) where usage_info is a dict with
     input_tokens, output_tokens, and model.
@@ -493,8 +494,9 @@ def chat_turn(
                             f"  \033[1;33m⚠ {failed_provider}/{failed_model} failed.\033[0m",
                             file=sys.stderr,
                         )
+                        _input = input_fn or input
                         try:
-                            answer = input(
+                            answer = _input(
                                 f"  \033[1;33mSwitch to {fb_provider}/{fb_model}? [y/N]\033[0m "
                             ).strip().lower()
                         except (EOFError, KeyboardInterrupt):
@@ -535,6 +537,10 @@ def chat_turn(
                         break
                     failed_provider, failed_model = fb_provider, fb_model
         tool_calls = response.get("tool_calls")
+        if on_token is not None:
+            sp = getattr(on_token, "__self__", None)
+            if hasattr(sp, "end_waiting"):
+                sp.end_waiting()
         if not tool_calls:
             recovered = extract_textual_tool_use_blocks(response.get("content", ""))
             if not recovered:

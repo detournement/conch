@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import re
+import shutil
 import sys
 import threading
 import time
@@ -124,6 +125,17 @@ class StreamPrinter:
             self._spinner.__exit__(None, None, None)
             self._spinner = None
 
+    def _clear_partial(self):
+        """Erase the raw partial text, including any lines from terminal wrapping."""
+        if not self._partial_written:
+            return
+        cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        wrapped = self._partial_written // max(cols, 1)
+        for _ in range(wrapped):
+            sys.stdout.write("\033[A\033[2K")
+        sys.stdout.write("\r\033[2K")
+        self._partial_written = 0
+
     def feed(self, chunk: str):
         if not self._started:
             self._started = True
@@ -134,10 +146,7 @@ class StreamPrinter:
         self._line_buf += chunk
 
         while "\n" in self._line_buf:
-            # Clear raw partial text before writing formatted version
-            if self._partial_written:
-                sys.stdout.write("\r\033[2K")
-                self._partial_written = 0
+            self._clear_partial()
             line, self._line_buf = self._line_buf.split("\n", 1)
             self._emit_line(line)
             sys.stdout.write("\n")
@@ -154,9 +163,7 @@ class StreamPrinter:
     def flush(self) -> str:
         """Flush remaining buffer and return accumulated full text."""
         self.end_waiting()
-        if self._partial_written:
-            sys.stdout.write("\r\033[2K")
-            self._partial_written = 0
+        self._clear_partial()
         if self._line_buf:
             self._emit_line(self._line_buf)
             self._line_buf = ""

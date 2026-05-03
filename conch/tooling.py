@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -190,23 +189,18 @@ class LocalShellPolicy:
     interactive: bool = True
     allow_auto_execute: bool = False
     input_fn: Any = None
-    always_allow: Optional[set] = None  # set of cmd strings approved for the session
 
 
 LOCAL_SHELL_TOOL = {
     "type": "function",
     "function": {
         "name": "local_shell",
-        "description": (
-            "Execute a shell command on the user's machine and return its "
-            "combined stdout/stderr. Output streams to the user terminal "
-            "live as it is produced."
-        ),
+        "description": "Execute a shell command on the user's machine and return stdout/stderr.",
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute"},
-                "timeout": {"type": "integer", "description": "Max seconds to wait (default 120). Use 0 for no timeout."},
+                "timeout": {"type": "integer", "description": "Max seconds to wait (default 60)"},
             },
             "required": ["command"],
         },
@@ -251,156 +245,106 @@ class LocalShellClient:
     name = "local_shell"
 
     def __init__(self):
-        self.policy = LocalShellPolicy(always_allow=set())
+        self.policy = LocalShellPolicy()
+        self._allowed_commands: set[str] = set()
 
     def set_policy(self, policy: LocalShellPolicy):
-        if policy.always_allow is None:
-            preserved = self.policy.always_allow if self.policy.always_allow is not None else set()
-            policy.always_allow = preserved
         self.policy = policy
 
-    def _prompt_approval(self, cmd: str) -> tuple[str, str]:
-        """Return (decision, value).
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
 
-        decision in {"run", "deny", "edit"}. For "run" the value is the
-        (possibly edited) command; for "deny" it's optional user feedback.
-        """
-        _input = self.policy.input_fn or input
-        sys.stdout.flush()
+    def _run_command(self, cmd: str, timeout: int) -> dict:
+        effective_timeout = timeout if timeout > 0 else None
         try:
-            answer = _input(
-                "  \033[1;33mExecute?\033[0m \033[2m[y]es / [n]o / [e]dit / [a]lways\033[0m \033[1;33m> \033[0m"
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return ("deny", "")
-
-        if answer in ("y", "yes", ""):
-            return ("run", cmd)
-        if answer in ("a", "always"):
-            if self.policy.always_allow is None:
-                self.policy.always_allow = set()
-            self.policy.always_allow.add(cmd)
-            print(f"  \033[2m(approved this exact command for the rest of the session)\033[0m")
-            return ("run", cmd)
-        if answer in ("e", "edit"):
+            proc = subprocess.Popen(
+                cmd, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout_parts: list[str] = []
             try:
-                edited = _input(f"  \033[1;33medit:\033[0m {cmd}\n  \033[1;33m>\033[0m ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return ("deny", "")
-            if not edited:
-                edited = cmd
-            print(f"  \033[2mrunning edited:\033[0m \033[1m{edited}\033[0m")
-            return ("run", edited)
-
-        feedback = ""
-        try:
-            feedback = _input("  \033[2mwhy not? (optional, gives the LLM context):\033[0m ").strip()
-        except (EOFError, KeyboardInterrupt):
-            feedback = ""
-        return ("deny", feedback)
-
-    def _run_streaming(self, cmd: str, timeout: int) -> tuple[str, int, bool]:
-        """Run *cmd* with live output. Returns (combined_output, exit_code, timed_out).
-
-        Output is streamed to stderr as it arrives so the user sees what's
-        happening. The full text is also captured for the LLM transcript.
-        Ctrl+C terminates the child but is re-raised so the caller can
-        decide whether to cancel the whole turn.
-        """
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        captured: List[str] = []
-        deadline = time.monotonic() + timeout if timeout > 0 else None
-        timed_out = False
-        cancelled = False
-        try:
-            assert proc.stdout is not None
-            while True:
-                line = proc.stdout.readline()
-                if line == "" and proc.poll() is not None:
-                    break
-                if line:
-                    captured.append(line)
-                    sys.stderr.write("    \033[2m" + line.rstrip("\n") + "\033[0m\n")
+                for line in proc.stdout:
+                    stdout_parts.append(line)
+                    sys.stderr.write(f"    \033[2m{line.rstrip()}\033[0m\n")
                     sys.stderr.flush()
-                if deadline is not None and time.monotonic() > deadline:
-                    timed_out = True
-                    break
-        except KeyboardInterrupt:
-            cancelled = True
-        finally:
-            if proc.poll() is None:
-                try:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                except Exception:
-                    pass
-            if proc.stdout is not None:
-                try:
-                    rest = proc.stdout.read()
-                    if rest:
-                        captured.append(rest)
-                        sys.stderr.write("    \033[2m" + rest.rstrip("\n") + "\033[0m\n")
-                        sys.stderr.flush()
-                except Exception:
-                    pass
+            except KeyboardInterrupt:
+                proc.kill()
+                return self._text("Command interrupted by user.")
+            proc.wait(timeout=effective_timeout)
+            stdout = "".join(stdout_parts)
+            stderr = proc.stderr.read() if proc.stderr else ""
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return self._text(f"Command timed out after {timeout}s")
+        except Exception as exc:
+            return self._text(f"Error: {exc}")
 
-        if cancelled:
-            raise KeyboardInterrupt
-        return "".join(captured), proc.returncode if proc.returncode is not None else -1, timed_out
+        output = stdout
+        if stderr:
+            output += ("\n--- stderr ---\n" + stderr) if output else stderr
+        if not output:
+            output = f"(no output, exit code {proc.returncode})"
+        elif proc.returncode != 0:
+            output += f"\n(exit code {proc.returncode})"
+        if len(output) > 15000:
+            output = output[:15000] + "\n... (truncated)"
+        return self._text(output)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
         cmd = arguments.get("command", "")
-        timeout = int(arguments.get("timeout", 120))
+        timeout = int(arguments.get("timeout", 60))
         if not cmd:
-            return {"content": [{"type": "text", "text": "Error: empty command"}]}
+            return self._text("Error: empty command")
 
         from .render import clear_active_spinners
         clear_active_spinners()
-        print(f"\n  \033[1;33m⚠ Run locally:\033[0m \033[1m{cmd}\033[0m", flush=True)
+        print(f"\n  \033[1;33m\u26a0 Run locally:\033[0m \033[1m{cmd}\033[0m", flush=True)
+
         auto_execute = self.policy.allow_auto_execute or get_agent_mode()
-        always_allow = self.policy.always_allow or set()
-        pre_approved = cmd in always_allow
+        if self.policy.interactive and not auto_execute:
+            if cmd in self._allowed_commands:
+                print("  \033[2m(always-allowed)\033[0m")
+                return self._run_command(cmd, timeout)
 
-        if pre_approved:
-            print("  \033[2m(pre-approved this session — auto-executing)\033[0m")
-        elif self.policy.interactive and not auto_execute:
-            decision, value = self._prompt_approval(cmd)
-            if decision == "deny":
-                if value:
-                    return {"content": [{"type": "text", "text": f"User declined to execute the command. Feedback: {value}"}]}
-                return {"content": [{"type": "text", "text": "User declined to execute the command."}]}
-            cmd = value
+            _input = self.policy.input_fn or input
+            try:
+                sys.stdout.flush()
+                answer = _input("  \033[1;33mExecute? [y/n/e/a]\033[0m ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+
+            if answer in ("", "y", "yes"):
+                return self._run_command(cmd, timeout)
+
+            if answer in ("a", "always"):
+                self._allowed_commands.add(cmd)
+                return self._run_command(cmd, timeout)
+
+            if answer in ("e", "edit"):
+                try:
+                    edited = _input("  \033[1;33mCommand:\033[0m ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    edited = ""
+                cmd = edited or cmd
+                print(f"  \033[2m→ {cmd}\033[0m")
+                return self._run_command(cmd, timeout)
+
+            # n / anything else = decline; ask for optional feedback
+            try:
+                feedback = _input("  \033[2mReason (optional):\033[0m ").strip()
+            except (EOFError, KeyboardInterrupt):
+                feedback = ""
+            msg = "User declined to execute the command."
+            if feedback:
+                msg += f" Feedback: {feedback}"
+            return self._text(msg)
+
         elif not self.policy.interactive and not auto_execute:
-            return {"content": [{"type": "text", "text": "Background tasks cannot prompt for local command confirmation."}]}
+            return self._text("Background tasks cannot prompt for local command confirmation.")
         else:
-            print("  \033[2m(agent mode — auto-executing)\033[0m")
-
-        try:
-            output, exit_code, timed_out = self._run_streaming(cmd, timeout)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            return {"content": [{"type": "text", "text": f"Error: {exc}"}]}
-
-        if timed_out:
-            output += f"\n(timed out after {timeout}s, process killed)"
-        elif not output:
-            output = f"(no output, exit code {exit_code})"
-        elif exit_code != 0:
-            output += f"\n(exit code {exit_code})"
-        if len(output) > 15000:
-            output = output[:15000] + "\n... (truncated)"
-        return {"content": [{"type": "text", "text": output}]}
+            print("  \033[2m(agent mode \u2014 auto-executing)\033[0m")
+            return self._run_command(cmd, timeout)
 
 
 class ManageToolsClient:

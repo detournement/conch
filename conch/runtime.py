@@ -13,74 +13,79 @@ from . import mcp as mcp_mod
 from .render import Spinner, StreamPrinter, clear_active_spinners
 
 
+# ---------------------------------------------------------------------------
+# Tool-execution visibility helpers
+# ---------------------------------------------------------------------------
+
+def _summarize_args(arguments: dict) -> str:
+    """One-line summary of tool arguments for display."""
+    if not arguments:
+        return ""
+    if "command" in arguments and len(arguments) == 1 or (
+        len(arguments) == 2 and "timeout" in arguments
+    ):
+        cmd = str(arguments["command"])
+        cmd = cmd.replace("\n", " \u23ce ")
+        if len(cmd) > 79:
+            cmd = cmd[:79] + "\u2026"
+        return cmd
+    raw = json.dumps(arguments, ensure_ascii=False)
+    raw = raw.replace("\n", " \u23ce ")
+    if len(raw) > 79:
+        raw = raw[:79] + "\u2026"
+    return raw
+
+
+def _summarize_result(
+    text: str, *, max_lines: int = 6, max_chars: int = 400
+) -> str:
+    """Compact summary of a tool result for the user."""
+    if not text:
+        return "(empty)"
+    lines = text.split("\n")
+    if len(lines) > max_lines:
+        kept = lines[:max_lines]
+        remaining = len(lines) - max_lines
+        kept.append(f"  ... ({remaining} more lines)")
+        text = "\n".join(kept)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\u2026"
+    return text
+
+
+def _print_tool_preview(
+    name: str, arguments: dict, *, verbose: bool = True
+) -> None:
+    """Print tool name (and optionally args) to stderr."""
+    clear_active_spinners()
+    summary = _summarize_args(arguments)
+    if verbose and summary:
+        print(f"  \033[2m\u26a1 {name}\033[0m \033[2m{summary}\033[0m", file=sys.stderr)
+    else:
+        print(f"  \033[2m\u26a1 {name}\033[0m", file=sys.stderr)
+
+
+def _print_tool_result(
+    text: str, *, verbose: bool = True, error: bool = False
+) -> None:
+    """Print a summarized tool result to stderr when verbose or on errors."""
+    if error:
+        summary = _summarize_result(text, max_lines=3, max_chars=200)
+        print(f"    \033[31m\u2717 {summary}\033[0m", file=sys.stderr)
+        return
+    if not verbose:
+        return
+    summary = _summarize_result(text)
+    for line in summary.split("\n"):
+        print(f"    \033[2m{line}\033[0m", file=sys.stderr)
+
+
 CHARS_PER_TOKEN = 3.5
 CONTEXT_LIMITS = {
     "openai": 120000,
     "anthropic": 180000,
     "ollama": 28000,
 }
-
-
-class ToolCancelled(Exception):
-    """Raised when the user interrupts a single tool call (Ctrl+C).
-
-    The conversation is preserved; the cancelled tool returns a synthetic
-    'cancelled by user' result so the LLM can react.
-    """
-
-
-def _summarize_args(arguments: dict, max_len: int = 80) -> str:
-    """Return a one-line preview of tool arguments suitable for display."""
-    if not arguments:
-        return ""
-    if "command" in arguments and isinstance(arguments["command"], str):
-        cmd = arguments["command"].strip().replace("\n", " ⏎ ")
-        return cmd if len(cmd) <= max_len else cmd[: max_len - 1] + "…"
-    try:
-        rendered = json.dumps(arguments, ensure_ascii=False)
-    except (TypeError, ValueError):
-        rendered = str(arguments)
-    rendered = rendered.replace("\n", " ")
-    return rendered if len(rendered) <= max_len else rendered[: max_len - 1] + "…"
-
-
-def _summarize_result(result_text: str, max_lines: int = 6, max_chars: int = 400) -> str:
-    """Return a short preview of a tool result for the user."""
-    if not result_text:
-        return "(empty)"
-    text = result_text.rstrip()
-    lines = text.splitlines()
-    if len(lines) > max_lines:
-        head = "\n".join(lines[:max_lines])
-        text = f"{head}\n… ({len(lines) - max_lines} more line{'s' if len(lines) - max_lines != 1 else ''})"
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "…"
-    return text
-
-
-def _print_tool_preview(name: str, arguments: dict, verbose: bool) -> None:
-    clear_active_spinners()
-    args_preview = _summarize_args(arguments) if verbose else ""
-    if args_preview:
-        print(
-            f"  \033[2m⚡ {name}\033[0m \033[2;36m{args_preview}\033[0m",
-            file=sys.stderr,
-        )
-    else:
-        print(f"  \033[2m⚡ {name}\033[0m", file=sys.stderr)
-
-
-def _print_tool_result(result_text: str, verbose: bool, error: bool = False) -> None:
-    if not verbose and not error:
-        return
-    if not result_text:
-        return
-    clear_active_spinners()
-    color = "\033[31m" if error else "\033[2m"
-    preview = _summarize_result(result_text)
-    indent = "    "
-    for line in preview.splitlines() or [""]:
-        print(f"{indent}{color}{line}\033[0m", file=sys.stderr)
 
 
 def estimate_tokens(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
@@ -459,7 +464,6 @@ def chat_turn(
     chat_state=None,
     on_token=None,
     input_fn=None,
-    verbose: bool = False,
 ) -> tuple:
     """Returns (reply_text, usage_info) where usage_info is a dict with
     input_tokens, output_tokens, and model.
@@ -629,8 +633,7 @@ def chat_turn(
                 arguments = json.loads(fn.get("arguments", "{}"))
             except (json.JSONDecodeError, TypeError):
                 arguments = {}
-            _print_tool_preview(name, arguments, verbose)
-            cancelled = False
+            _print_tool_preview(name, arguments)
             try:
                 if name in builtin_clients:
                     raw_result = builtin_clients[name].call_tool(name, arguments)
@@ -639,27 +642,12 @@ def chat_turn(
                     with Spinner(f"Running {name}"):
                         result_text = mcp_mod.execute_tool(tool_map, name, arguments)
             except KeyboardInterrupt:
-                cancelled = True
-                result_text = (
-                    f"[Tool '{name}' cancelled by user — they pressed Ctrl+C "
-                    "during execution. Stop, ask the user what to do next.]"
-                )
-                clear_active_spinners()
-                print(
-                    f"\n  \033[33m⚠ Cancelled {name}\033[0m",
-                    file=sys.stderr,
-                )
-            looks_like_error = (
-                isinstance(result_text, str)
-                and (
-                    result_text.startswith(("Error:", "[Error", "[API error", "[Tool '"))
-                    or "(exit code" in result_text
-                )
-            )
+                result_text = "Tool execution cancelled by user."
+                print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
+            is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
+            _print_tool_result(result_text, error=is_error)
             if len(result_text) > 8000:
                 result_text = result_text[:8000] + "\n... (truncated — result too large)"
-            if not cancelled:
-                _print_tool_result(result_text, verbose, error=looks_like_error)
             results.append({"id": tool_call.get("id", ""), "content": result_text})
         if provider == "anthropic":
             append_results_anthropic(messages, response, results)

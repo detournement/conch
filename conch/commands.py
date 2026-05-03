@@ -76,6 +76,7 @@ def handle_slash_command(
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
+            "\n  Shell approval: \033[1my\033[0m/\033[1mEnter\033[0m=run  \033[1mn\033[0m=decline  \033[1me\033[0m=edit  \033[1ma\033[0m=always allow\n"
         )
         return None
 

@@ -398,7 +398,6 @@ def chat_loop():
 
     max_tool_rounds = MAX_TOOL_ROUNDS
     session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
-    verbose_mode = False
 
     conv_mgr = ConversationManager()
     current_conv = conv_mgr.get_most_recent()
@@ -436,10 +435,11 @@ def chat_loop():
 
     _SLASH_COMMANDS = [
         "/help", "/models", "/model", "/provider", "/remember", "/memories",
-        "/forget", "/search", "/browse", "/new", "/convos", "/switch", "/delete",
-        "/agent", "/yolo", "/verbose", "/schedule", "/tasks", "/cancel",
-        "/tools", "/enable", "/disable", "/connect", "/apps", "/reload",
-        "/rounds", "/cost", "/profile", "/profiles", "/clear", "/queue",
+        "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
+        "/agent", "/schedule", "/tasks", "/cancel", "/tools", "/enable",
+        "/disable", "/connect", "/apps", "/reload", "/rounds", "/cost",
+        "/profile", "/profiles", "/clear",
+        "/queue",
     ]
 
     def _completer(text, state):
@@ -617,23 +617,14 @@ def chat_loop():
                 if result == "reload_tools":
                     _reload_tools()
                     continue
-                if result == "queue_on":
+                if result == "agent_mode_changed":
+                    builtin_clients["local_shell"].set_policy(
+                        LocalShellPolicy(interactive=True, allow_auto_execute=get_agent_mode(), input_fn=_safe_input)
+                    )
+                elif result == "queue_on":
                     _typeahead_enabled = True
                 elif result == "queue_off":
                     _typeahead_enabled = False
-                elif result == "verbose_on":
-                    verbose_mode = True
-                    print("\n  \033[1;32m✓ Verbose mode ON\033[0m \033[2m(showing tool args + output)\033[0m\n")
-                elif result == "verbose_off":
-                    verbose_mode = False
-                    print("\n  \033[1;32m✓ Verbose mode OFF\033[0m\n")
-                elif result == "verbose_toggle":
-                    verbose_mode = not verbose_mode
-                    state = "ON" if verbose_mode else "OFF"
-                    extra = " \033[2m(showing tool args + output)\033[0m" if verbose_mode else ""
-                    print(f"\n  \033[1;32m✓ Verbose mode {state}\033[0m{extra}\n")
-                elif result == "agent_mode_changed":
-                    pass
                 elif isinstance(result, int):
                     max_tool_rounds = result
                 elif result is not None:
@@ -678,7 +669,6 @@ def chat_loop():
                     chat_state=chat_state,
                     on_token=_printer.feed if _printer else None,
                     input_fn=_safe_input,
-                    verbose=verbose_mode,
                 )
             except KeyboardInterrupt:
                 if _printer and _printer._spinner:

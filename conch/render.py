@@ -201,25 +201,13 @@ class StreamPrinter:
         sys.stdout.write(_format_line(line))
 
 
-_active_spinners: list = []
-_spinner_lock = threading.Lock()
+_active_spinners: list["Spinner"] = []
 
 
-def clear_active_spinners() -> None:
-    """Force-clear any spinner currently drawing to stderr.
-
-    Call this before any direct print to stdout/stderr to prevent the
-    spinner from leaving artifacts mid-line. Spinners auto-resume on
-    their next tick.
-    """
-    with _spinner_lock:
-        if not _active_spinners:
-            return
-        if not sys.stderr.isatty():
-            return
-        max_width = max((len(s.label) for s in _active_spinners), default=0) + 8
-        sys.stderr.write("\r" + " " * max_width + "\r")
-        sys.stderr.flush()
+def clear_active_spinners():
+    """Force-clear the visual output of all active spinners."""
+    for spinner in list(_active_spinners):
+        spinner._clear_line()
 
 
 class Spinner:
@@ -231,13 +219,17 @@ class Spinner:
         self._thread: threading.Thread | None = None
         self._registered = False
 
+    def _clear_line(self):
+        clear_width = len(self.label) + 6
+        sys.stderr.write("\r" + " " * clear_width + "\r")
+        sys.stderr.flush()
+
     def __enter__(self):
         if not sys.stderr.isatty():
             return self
 
-        with _spinner_lock:
-            _active_spinners.append(self)
-            self._registered = True
+        _active_spinners.append(self)
+        self._registered = True
 
         def _run():
             for frame in itertools.cycle("\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"):
@@ -258,14 +250,11 @@ class Spinner:
         if self._thread:
             self._stop.set()
             self._thread.join(timeout=0.2)
-            clear_width = len(self.label) + 8
-            sys.stderr.write("\r" + " " * clear_width + "\r")
-            sys.stderr.flush()
+            self._clear_line()
         if self._registered:
-            with _spinner_lock:
-                try:
-                    _active_spinners.remove(self)
-                except ValueError:
-                    pass
+            try:
+                _active_spinners.remove(self)
+            except ValueError:
+                pass
             self._registered = False
         return False

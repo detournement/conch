@@ -329,10 +329,6 @@ class LocalShellClient:
             if answer.lower() in ("", "y", "yes"):
                 return self._run_command(cmd, timeout)
 
-            if answer.lower() in ("a", "always"):
-                self._allowed_commands.add(cmd)
-                return self._run_command(cmd, timeout)
-
             if answer == "A":
                 set_agent_mode(True)
                 self.policy = LocalShellPolicy(
@@ -341,6 +337,10 @@ class LocalShellClient:
                     input_fn=self.policy.input_fn,
                 )
                 print("  \033[1;32mAgent mode: ON\033[0m \u2014 all commands will auto-execute")
+                return self._run_command(cmd, timeout)
+
+            if answer.lower() in ("a", "always"):
+                self._allowed_commands.add(cmd)
                 return self._run_command(cmd, timeout)
 
             if answer.lower() in ("e", "edit"):

@@ -436,9 +436,9 @@ def chat_loop():
     _SLASH_COMMANDS = [
         "/help", "/models", "/model", "/provider", "/remember", "/memories",
         "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
-        "/agent", "/schedule", "/tasks", "/cancel", "/tools", "/enable",
-        "/disable", "/connect", "/apps", "/reload", "/rounds", "/cost",
-        "/profile", "/profiles", "/clear",
+        "/search", "/agent", "/yolo", "/verbose", "/schedule", "/tasks",
+        "/cancel", "/tools", "/enable", "/disable", "/connect", "/apps",
+        "/reload", "/rounds", "/cost", "/profile", "/profiles", "/clear",
         "/queue",
     ]
 
@@ -621,6 +621,16 @@ def chat_loop():
                     builtin_clients["local_shell"].set_policy(
                         LocalShellPolicy(interactive=True, allow_auto_execute=get_agent_mode(), input_fn=_safe_input)
                     )
+                elif result in ("verbose_on", "verbose_off", "verbose_toggle"):
+                    from .runtime import get_verbose_tools, set_verbose_tools
+                    if result == "verbose_on":
+                        set_verbose_tools(True)
+                    elif result == "verbose_off":
+                        set_verbose_tools(False)
+                    else:
+                        set_verbose_tools(not get_verbose_tools())
+                    status = "\033[1;32mON\033[0m" if get_verbose_tools() else "\033[31mOFF\033[0m"
+                    print(f"\n  Verbose tool output: {status}\n")
                 elif result == "queue_on":
                     _typeahead_enabled = True
                 elif result == "queue_off":

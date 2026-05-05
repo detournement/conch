@@ -17,6 +17,17 @@ from .render import Spinner, StreamPrinter, clear_active_spinners
 # Tool-execution visibility helpers
 # ---------------------------------------------------------------------------
 
+_verbose_tools = True
+
+
+def set_verbose_tools(enabled: bool):
+    global _verbose_tools
+    _verbose_tools = enabled
+
+
+def get_verbose_tools() -> bool:
+    return _verbose_tools
+
 def _summarize_args(arguments: dict) -> str:
     """One-line summary of tool arguments for display."""
     if not arguments:
@@ -633,7 +644,7 @@ def chat_turn(
                 arguments = json.loads(fn.get("arguments", "{}"))
             except (json.JSONDecodeError, TypeError):
                 arguments = {}
-            _print_tool_preview(name, arguments)
+            _print_tool_preview(name, arguments, verbose=_verbose_tools)
             try:
                 if name in builtin_clients:
                     raw_result = builtin_clients[name].call_tool(name, arguments)
@@ -645,7 +656,7 @@ def chat_turn(
                 result_text = "Tool execution cancelled by user."
                 print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
             is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
-            _print_tool_result(result_text, error=is_error)
+            _print_tool_result(result_text, verbose=_verbose_tools, error=is_error)
             if len(result_text) > 8000:
                 result_text = result_text[:8000] + "\n... (truncated — result too large)"
             results.append({"id": tool_call.get("id", ""), "content": result_text})

@@ -255,34 +255,81 @@ class LocalShellClient:
         return {"content": [{"type": "text", "text": msg}]}
 
     def _run_command(self, cmd: str, timeout: int) -> dict:
-        effective_timeout = timeout if timeout > 0 else None
+        import os, pty, select, errno, re as _re
+        effective_timeout = timeout if timeout > 0 else 60
+
+        # Use a PTY so interactive programs (sudo, passwd, ssh, expect) get a
+        # real terminal — prevents dropped characters and hanging prompts.
+        master_fd, slave_fd = pty.openpty()
+        output_parts: list[str] = []
         try:
             proc = subprocess.Popen(
                 cmd, shell=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True,
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                close_fds=True,
+                preexec_fn=os.setsid,
             )
-            stdout_parts: list[str] = []
+            os.close(slave_fd)
+            slave_fd = -1
+            deadline = time.time() + effective_timeout
             try:
-                for line in proc.stdout:
-                    stdout_parts.append(line)
-                    sys.stderr.write(f"    \033[2m{line.rstrip()}\033[0m\n")
-                    sys.stderr.flush()
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        proc.kill()
+                        output_parts.append(f"\nCommand timed out after {effective_timeout}s")
+                        break
+                    try:
+                        rlist, _, _ = select.select([master_fd], [], [], min(remaining, 0.5))
+                    except (select.error, ValueError):
+                        break
+                    if master_fd in rlist:
+                        try:
+                            data = os.read(master_fd, 4096)
+                        except OSError as e:
+                            if e.errno in (errno.EIO, errno.EBADF):
+                                break
+                            raise
+                        if not data:
+                            break
+                        chunk = data.decode("utf-8", errors="replace")
+                        output_parts.append(chunk)
+                        sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
+                        sys.stderr.flush()
+                    if proc.poll() is not None:
+                        try:
+                            while True:
+                                r2, _, _ = select.select([master_fd], [], [], 0.1)
+                                if not r2:
+                                    break
+                                data = os.read(master_fd, 4096)
+                                if not data:
+                                    break
+                                chunk = data.decode("utf-8", errors="replace")
+                                output_parts.append(chunk)
+                        except OSError:
+                            pass
+                        break
             except KeyboardInterrupt:
                 proc.kill()
                 return self._text("Command interrupted by user.")
-            proc.wait(timeout=effective_timeout)
-            stdout = "".join(stdout_parts)
-            stderr = proc.stderr.read() if proc.stderr else ""
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            return self._text(f"Command timed out after {timeout}s")
-        except Exception as exc:
-            return self._text(f"Error: {exc}")
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            if slave_fd != -1:
+                try:
+                    os.close(slave_fd)
+                except OSError:
+                    pass
 
-        output = stdout
-        if stderr:
-            output += ("\n--- stderr ---\n" + stderr) if output else stderr
+        proc.wait()
+        output = "".join(output_parts)
+        output = _re.sub(r"\r", "\n", output)
+        output = _re.sub(r"\x1b\[[0-9;]*[mABCDEFGHJKLMSTfhilnprsu]", "", output)
+        output = _re.sub(r"\n{3,}", "\n\n", output).strip()
+
         if not output:
             output = f"(no output, exit code {proc.returncode})"
         elif proc.returncode != 0:

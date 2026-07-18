@@ -336,6 +336,50 @@ class TypeaheadBuffer:
                 break
 
 
+def resolve_ollama_startup_model(config: dict, model_name: str) -> tuple:
+    """Verify the configured Ollama model at startup, substituting one that
+    exists on the server when possible.
+
+    Returns (model_name, warnings). Never raises and never dead-ends: an
+    unreachable server, a missing configured model, or an empty server all
+    degrade to a warning so the session still starts.
+    """
+    from .providers import (
+        get_fallback_model,
+        get_ollama_base_url,
+        list_ollama_models,
+        ollama_model_matches,
+    )
+
+    live_models = list_ollama_models(config)
+    if live_models is None:
+        return model_name, [
+            f"Ollama server unreachable at {get_ollama_base_url(config)} — "
+            f"model '{model_name}' unverified"
+        ]
+    if ollama_model_matches(model_name, live_models):
+        return model_name, []
+    replacement = get_fallback_model("ollama", config)
+    if replacement:
+        return replacement, [
+            f"Model '{model_name}' is not available/tool-capable on the "
+            f"Ollama server — using '{replacement}' instead"
+        ]
+    installed = list_ollama_models(config, tool_capable_only=False) or []
+    if installed:
+        warning = (
+            "No tool-capable models installed on the Ollama server — chat "
+            "needs tool support (try `ollama pull qwen2.5`, or /provider to "
+            "switch)"
+        )
+    else:
+        warning = (
+            "No models installed on the Ollama server — pull one (e.g. "
+            "`ollama pull qwen2.5`) or /provider to switch"
+        )
+    return model_name, [warning]
+
+
 def chat_loop():
     config = load_config()
     agent_mode_from_config = apply_agent_mode_from_config(config)
@@ -350,35 +394,13 @@ def chat_loop():
     # Don't blindly trust a configured/default Ollama model — verify it exists
     # on the server (and supports tools); otherwise pick one that does.
     if provider == "ollama":
-        from .providers import (
-            get_fallback_model,
-            get_ollama_base_url,
-            list_ollama_models,
-            ollama_model_matches,
-        )
-        live_models = list_ollama_models(config)
-        if live_models is None:
-            print(
-                f"\033[33m  ⚠ Ollama server unreachable at {get_ollama_base_url(config)} — "
-                f"model '{model_name}' unverified\033[0m",
-                file=sys.stderr,
-            )
-        elif not ollama_model_matches(model_name, live_models):
-            replacement = get_fallback_model("ollama", config)
-            if replacement:
-                print(
-                    f"\033[33m  ⚠ Model '{model_name}' is not available/tool-capable on the "
-                    f"Ollama server — using '{replacement}' instead\033[0m",
-                    file=sys.stderr,
-                )
-                model_name = replacement
-                config["model"] = replacement
-                config["chat_model"] = replacement
-            else:
-                print(
-                    "\033[33m  ⚠ No tool-capable models installed on the Ollama server\033[0m",
-                    file=sys.stderr,
-                )
+        resolved, warnings = resolve_ollama_startup_model(config, model_name)
+        for warning in warnings:
+            print(f"\033[33m  ⚠ {warning}\033[0m", file=sys.stderr)
+        if resolved != model_name:
+            model_name = resolved
+            config["model"] = resolved
+            config["chat_model"] = resolved
 
     from .prompts import get_chat_prompt
     base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)

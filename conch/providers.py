@@ -146,6 +146,20 @@ def get_ollama_base_url(config: Optional[dict] = None) -> str:
     return base.rstrip("/")
 
 
+def _ollama_show(model: str, base_url: str, timeout: float) -> dict:
+    """POST /api/show for *model*. Sends both ``model`` and ``name`` keys:
+    newer servers read ``model``, servers from before the name→model rename
+    only read ``name`` — sending both works everywhere."""
+    req = urllib.request.Request(
+        f"{base_url}/api/show",
+        data=json.dumps({"model": model, "name": model}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode())
+
+
 def ollama_model_supports_tools(
     model: str,
     config: Optional[dict] = None,
@@ -166,15 +180,8 @@ def ollama_model_supports_tools(
         checked_at, supports = cached
         if supports is not None or now - checked_at < _OLLAMA_TAGS_TTL_FAIL:
             return supports
-    req = urllib.request.Request(
-        f"{base_url}/api/show",
-        data=json.dumps({"model": model}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            data = json.loads(response.read().decode())
+        data = _ollama_show(model, base_url, timeout)
         caps = data.get("capabilities")
         if isinstance(caps, list):
             supports = "tools" in caps
@@ -209,16 +216,10 @@ def get_ollama_context_length(
         checked_at, ctx = cached
         if ctx is not None or now - checked_at < _OLLAMA_TAGS_TTL_FAIL:
             return ctx
-    req = urllib.request.Request(
-        f"{base_url}/api/show",
-        data=json.dumps({"model": model}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     ctx = None
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            data = json.loads(response.read().decode())
+        data = _ollama_show(model, base_url, timeout)
+        # Older servers don't return model_info at all — treated as unknown.
         model_info = data.get("model_info") or {}
         for info_key, value in model_info.items():
             if info_key.endswith(".context_length") and isinstance(value, int) and value > 0:
@@ -234,22 +235,32 @@ def get_ollama_context_length(
 # Ollama silently defaults to a small window (4k under 24 GiB VRAM) and
 # truncates from the top, evicting the system prompt and tool schemas.
 DEFAULT_OLLAMA_NUM_CTX = 32768
+# Conservative default when the model's max context is unknown (older server
+# without model_info, or /api/show unreachable): a blind 32k num_ctx can make
+# the model fail to load or thrash on a modest machine, so don't gamble.
+DEFAULT_OLLAMA_NUM_CTX_UNKNOWN = 8192
 # keep_alive keeps the model loaded between turns so the KV cache survives.
 DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
 
 
 def get_ollama_num_ctx(model: str, config: Optional[dict] = None) -> int:
-    """The num_ctx actually sent on Ollama requests: config ``ollama_num_ctx``
-    (default 32768), clamped to the model's max context when the server can
-    report it. The runtime context window derives from this same number so
-    the token budget always matches what requests run with."""
+    """The num_ctx actually sent on Ollama requests.
+
+    An explicit config ``ollama_num_ctx`` always wins (clamped to the model's
+    max context when the server reports it). Without config, the default is
+    min(32768, model max) — or a conservative 8192 when the model's max is
+    unknown, so an old/small local setup isn't asked for more KV cache than
+    it can handle. The runtime context window derives from this same number
+    so the token budget always matches what requests run with.
+    """
     try:
         num_ctx = int((config or {}).get("ollama_num_ctx", 0) or 0)
     except (TypeError, ValueError):
         num_ctx = 0
-    if num_ctx <= 0:
-        num_ctx = DEFAULT_OLLAMA_NUM_CTX
+    explicit = num_ctx > 0
     model_max = get_ollama_context_length(model, config)
+    if not explicit:
+        num_ctx = DEFAULT_OLLAMA_NUM_CTX if model_max else DEFAULT_OLLAMA_NUM_CTX_UNKNOWN
     if model_max:
         num_ctx = min(num_ctx, model_max)
     return num_ctx
@@ -287,10 +298,14 @@ def list_ollama_models(
 ) -> Optional[List[str]]:
     """Return model names installed on the Ollama server, or None if unreachable.
 
-    By default only models that support tool calling (per /api/show
-    capabilities) are returned, since Conch requires tool support. Results
-    (including failures) are cached briefly per base URL so repeated UI
-    actions don't re-hit the network.
+    By default models known NOT to support tool calling (per /api/show
+    capabilities) are excluded, since Conch requires tool support. Models
+    whose support can't be determined (per-model /api/show failure on an
+    otherwise reachable server) are kept: wrongly filtering everything out
+    would make Conch unusable, while a wrongly kept model just fails one
+    request with a clear server error. Results (including failures) are
+    cached briefly per base URL so repeated UI actions don't re-hit the
+    network.
     """
     base_url = get_ollama_base_url(config)
     now = time.monotonic()
@@ -317,7 +332,7 @@ def list_ollama_models(
     if tool_capable_only:
         models = [
             m for m in models
-            if ollama_model_supports_tools(m, config, timeout=timeout) is True
+            if ollama_model_supports_tools(m, config, timeout=timeout) is not False
         ]
     return models
 

@@ -256,9 +256,14 @@ def call_anthropic(config: dict, messages: list) -> str:
 
 
 def call_ollama(config: dict, messages: list) -> str:
+    import urllib.error
     import urllib.request
 
-    from .providers import apply_ollama_request_options, get_ollama_base_url
+    from .providers import (
+        apply_ollama_request_options,
+        format_http_api_error,
+        get_ollama_base_url,
+    )
 
     base = get_ollama_base_url(config)
     url = f"{base}/api/chat"
@@ -271,15 +276,34 @@ def call_ollama(config: dict, messages: list) -> str:
         "format": COMMAND_SCHEMA,
     }
     apply_ollama_request_options(body, config, model)
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
+
+    def _post(payload):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read().decode())
+            return json.loads(r.read().decode())
+
+    try:
+        data = _post(body)
+    except urllib.error.HTTPError as e:
+        detail = format_http_api_error(e)
+        # Ollama < 0.5 rejects a JSON-schema format ("cannot unmarshal object
+        # into ... format of type string"); retry with the legacy "json" mode
+        # (the system prompt already demands the {"command": ...} shape).
+        if "format" in detail.lower():
+            body["format"] = "json"
+            try:
+                data = _post(body)
+            except Exception as retry_exc:
+                print(f"conch: Ollama error: {retry_exc}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"conch: Ollama error: {detail}", file=sys.stderr)
+            sys.exit(1)
     except Exception as e:
         print(f"conch: Ollama error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -143,6 +143,58 @@ class TestCallOllamaStructured(unittest.TestCase):
             cmd = call_ollama({"provider": "ollama", "model": "qwen3"}, MESSAGES)
         self.assertEqual(cmd, "", "free text must not be scraped for commands")
 
+    def test_old_server_schema_format_rejected_falls_back_to_json(self):
+        # Ollama < 0.5 only accepts format="json" — a schema object gets a
+        # 400 unmarshal error. Ask mode must retry with the legacy mode
+        # instead of dying with sys.exit.
+        import io
+        import urllib.error
+
+        bodies = []
+
+        def side_effect(req, timeout=None):
+            url = _req_url(req)
+            if url.endswith("/api/show"):
+                return _FakeHTTPResponse({"model_info": {}})
+            if url.endswith("/api/chat"):
+                body = json.loads(req.data.decode())
+                bodies.append(body)
+                if isinstance(body.get("format"), dict):
+                    raise urllib.error.HTTPError(
+                        url, 400,
+                        "json: cannot unmarshal object into Go struct field "
+                        "ChatRequest.format of type string",
+                        {},
+                        io.BytesIO(json.dumps({"error": (
+                            "json: cannot unmarshal object into Go struct "
+                            "field ChatRequest.format of type string"
+                        )}).encode()),
+                    )
+                return _FakeHTTPResponse({"message": {"content": '{"command": "ls"}'}})
+            raise AssertionError(f"unexpected URL {url}")
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            cmd = call_ollama({"provider": "ollama", "model": "qwen2.5:3b"}, MESSAGES)
+        self.assertEqual(cmd, "ls")
+        self.assertEqual(bodies[-1]["format"], "json")
+
+    def test_non_format_http_error_still_exits(self):
+        import io
+        import urllib.error
+
+        def side_effect(req, timeout=None):
+            url = _req_url(req)
+            if url.endswith("/api/show"):
+                return _FakeHTTPResponse({"model_info": {}})
+            raise urllib.error.HTTPError(
+                url, 500, "boom", {},
+                io.BytesIO(json.dumps({"error": "server exploded"}).encode()),
+            )
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            with self.assertRaises(SystemExit):
+                call_ollama({"provider": "ollama", "model": "qwen2.5:3b"}, MESSAGES)
+
 
 # ---------------------------------------------------------------------------
 # OpenAI / Cerebras: forced tool call

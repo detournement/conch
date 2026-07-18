@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -14,6 +15,8 @@ KNOWN_MODELS = {
     "cerebras": [
         "zai-glm-4.7",
     ],
+    # Conch requires tool calling, so only tool-capable models are listed
+    # (e.g. o1-mini is excluded: it supports neither tools nor system messages).
     "openai": [
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -29,7 +32,6 @@ KNOWN_MODELS = {
         "o3",
         "o3-mini",
         "o1",
-        "o1-mini",
         "o3-pro",
         "o1-pro",
         "gpt-5.4-pro",
@@ -42,17 +44,9 @@ KNOWN_MODELS = {
         "claude-haiku-4-5",
         "claude-sonnet-4-5-20250929",
     ],
-    "ollama": [
-        "llama4",
-        "llama3.3",
-        "deepseek-r1",
-        "deepseek-v3",
-        "qwen3",
-        "qwen2.5-coder",
-        "mistral",
-        "gemma3",
-        "phi4",
-    ],
+    # Ollama models are discovered live from the server's /api/tags
+    # (see list_ollama_models); no hardcoded list.
+    "ollama": [],
 }
 
 DEFAULT_API_KEY_ENVS = {
@@ -65,16 +59,329 @@ DEFAULT_API_KEY_ENVS = {
 PROVIDER_TOOL_LIMITS = {
     "openai": 128,
     "cerebras": 128,
-    "ollama": 32,
+    # Local models drown in large tool lists: cap hard and select the most
+    # relevant tools per turn (see tooling.select_relevant_tools).
+    "ollama": 12,
 }
 
 # Used for `/provider` and tool `set_provider` — stable defaults, not KNOWN_MODELS[0].
+# The ollama entry is only a *preference*: it is used when the model actually
+# exists on the configured server (see get_fallback_model).
 DEFAULT_CHAT_MODEL_BY_PROVIDER = {
     "cerebras": "zai-glm-4.7",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-6",
     "ollama": "llama3.3",
 }
+
+
+# Known context windows (tokens) for cloud models. Ollama windows are
+# discovered live from the server instead (see get_ollama_context_length).
+MODEL_CONTEXT_WINDOWS = {
+    # cerebras
+    "zai-glm-4.7": 131072,
+    # openai
+    "gpt-5.4": 400000,
+    "gpt-5.4-pro": 400000,
+    "gpt-5.4-mini": 400000,
+    "gpt-5.4-nano": 400000,
+    "gpt-5-mini": 400000,
+    "gpt-5-nano": 400000,
+    "gpt-4.1": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4.1-nano": 1047576,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "o4-mini": 200000,
+    "o3": 200000,
+    "o3-mini": 200000,
+    "o3-pro": 200000,
+    "o1": 200000,
+    "o1-mini": 128000,
+    "o1-pro": 200000,
+    # anthropic
+    "claude-opus-4-8": 200000,
+    "claude-sonnet-4-7": 200000,
+    "claude-sonnet-4-6": 200000,
+    "claude-opus-4-6": 200000,
+    "claude-haiku-4-5": 200000,
+    "claude-sonnet-4-5-20250929": 200000,
+}
+
+# Conservative fallbacks when a model isn't in the table. (Ollama windows
+# derive from the num_ctx sent on requests instead — see get_ollama_num_ctx;
+# the entry here documents the server's own default when num_ctx is omitted.)
+PROVIDER_DEFAULT_CONTEXT_WINDOWS = {
+    "cerebras": 131072,
+    "openai": 128000,
+    "anthropic": 200000,
+    "ollama": 4096,
+}
+
+
+# ---------------------------------------------------------------------------
+# Ollama model discovery (live from the server's /api/tags)
+# ---------------------------------------------------------------------------
+
+OLLAMA_TAGS_TIMEOUT = 2.0  # short so the UI never hangs on an unreachable server
+_OLLAMA_TAGS_TTL_OK = 30.0
+_OLLAMA_TAGS_TTL_FAIL = 5.0
+_ollama_tags_cache: Dict[str, tuple] = {}  # base_url -> (fetched_at, models-or-None)
+_ollama_caps_cache: Dict[tuple, tuple] = {}  # (base_url, model) -> (checked_at, supports_tools-or-None)
+_ollama_ctx_cache: Dict[tuple, tuple] = {}  # (base_url, model) -> (checked_at, context_length-or-None)
+
+
+def get_ollama_base_url(config: Optional[dict] = None) -> str:
+    """Resolve the Ollama base URL: config base_url (when provider is ollama),
+    then OLLAMA_HOST, then localhost."""
+    config = config or {}
+    base = (config.get("ollama_base_url") or "").strip()
+    if not base and (config.get("provider") or "").lower() == "ollama":
+        # base_url is a shared config key; only trust it when it belongs to ollama
+        base = (config.get("base_url") or "").strip()
+    if not base:
+        base = os.environ.get("OLLAMA_HOST", "").strip() or "http://localhost:11434"
+    if "://" not in base:
+        base = "http://" + base
+    return base.rstrip("/")
+
+
+def ollama_model_supports_tools(
+    model: str,
+    config: Optional[dict] = None,
+    *,
+    timeout: float = OLLAMA_TAGS_TIMEOUT,
+) -> Optional[bool]:
+    """Check via POST /api/show whether *model* advertises the "tools" capability.
+
+    Returns None when the server can't be asked. Positive/negative answers are
+    cached for the session (capabilities don't change for an installed model);
+    failures are retried after a short TTL.
+    """
+    base_url = get_ollama_base_url(config)
+    key = (base_url, model)
+    now = time.monotonic()
+    cached = _ollama_caps_cache.get(key)
+    if cached is not None:
+        checked_at, supports = cached
+        if supports is not None or now - checked_at < _OLLAMA_TAGS_TTL_FAIL:
+            return supports
+    req = urllib.request.Request(
+        f"{base_url}/api/show",
+        data=json.dumps({"model": model}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode())
+        caps = data.get("capabilities")
+        if isinstance(caps, list):
+            supports = "tools" in caps
+        else:
+            # Older Ollama servers don't report capabilities; fall back to
+            # checking whether the model's template renders tools.
+            supports = ".Tools" in (data.get("template") or "")
+    except Exception:
+        supports = None
+    _ollama_caps_cache[key] = (now, supports)
+    return supports
+
+
+def get_ollama_context_length(
+    model: str,
+    config: Optional[dict] = None,
+    *,
+    timeout: float = OLLAMA_TAGS_TIMEOUT,
+) -> Optional[int]:
+    """Return the model's maximum context length via POST /api/show.
+
+    The value lives in model_info under "<arch>.context_length" (e.g.
+    "llama.context_length"). Returns None when the server can't be asked.
+    Successful answers are cached for the session; failures retry after a
+    short TTL, mirroring ollama_model_supports_tools.
+    """
+    base_url = get_ollama_base_url(config)
+    key = (base_url, model)
+    now = time.monotonic()
+    cached = _ollama_ctx_cache.get(key)
+    if cached is not None:
+        checked_at, ctx = cached
+        if ctx is not None or now - checked_at < _OLLAMA_TAGS_TTL_FAIL:
+            return ctx
+    req = urllib.request.Request(
+        f"{base_url}/api/show",
+        data=json.dumps({"model": model}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    ctx = None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode())
+        model_info = data.get("model_info") or {}
+        for info_key, value in model_info.items():
+            if info_key.endswith(".context_length") and isinstance(value, int) and value > 0:
+                ctx = value
+                break
+    except Exception:
+        ctx = None
+    _ollama_ctx_cache[key] = (now, ctx)
+    return ctx
+
+
+# Default num_ctx sent on every Ollama request. Without an explicit num_ctx
+# Ollama silently defaults to a small window (4k under 24 GiB VRAM) and
+# truncates from the top, evicting the system prompt and tool schemas.
+DEFAULT_OLLAMA_NUM_CTX = 32768
+# keep_alive keeps the model loaded between turns so the KV cache survives.
+DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
+
+
+def get_ollama_num_ctx(model: str, config: Optional[dict] = None) -> int:
+    """The num_ctx actually sent on Ollama requests: config ``ollama_num_ctx``
+    (default 32768), clamped to the model's max context when the server can
+    report it. The runtime context window derives from this same number so
+    the token budget always matches what requests run with."""
+    try:
+        num_ctx = int((config or {}).get("ollama_num_ctx", 0) or 0)
+    except (TypeError, ValueError):
+        num_ctx = 0
+    if num_ctx <= 0:
+        num_ctx = DEFAULT_OLLAMA_NUM_CTX
+    model_max = get_ollama_context_length(model, config)
+    if model_max:
+        num_ctx = min(num_ctx, model_max)
+    return num_ctx
+
+
+def apply_ollama_request_options(body: Dict[str, Any], config: dict, model: str) -> None:
+    """Set options.num_ctx and keep_alive on an /api/chat request body."""
+    options = body.setdefault("options", {})
+    options["num_ctx"] = get_ollama_num_ctx(model, config)
+    keep_alive = str((config or {}).get("ollama_keep_alive", "") or "").strip()
+    body["keep_alive"] = keep_alive or DEFAULT_OLLAMA_KEEP_ALIVE
+
+
+def get_context_window(provider: str, model: str, config: Optional[dict] = None) -> int:
+    """Best-known context window (tokens) for *model* on *provider*.
+
+    Cloud providers use the static MODEL_CONTEXT_WINDOWS table. For Ollama
+    the effective window is whatever num_ctx requests run with (see
+    get_ollama_num_ctx), not the model's theoretical max.
+    """
+    provider = (provider or "").lower()
+    if provider == "ollama":
+        return get_ollama_num_ctx(model, config)
+    if model in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[model]
+    return PROVIDER_DEFAULT_CONTEXT_WINDOWS.get(provider, 128000)
+
+
+def list_ollama_models(
+    config: Optional[dict] = None,
+    *,
+    timeout: float = OLLAMA_TAGS_TIMEOUT,
+    force_refresh: bool = False,
+    tool_capable_only: bool = True,
+) -> Optional[List[str]]:
+    """Return model names installed on the Ollama server, or None if unreachable.
+
+    By default only models that support tool calling (per /api/show
+    capabilities) are returned, since Conch requires tool support. Results
+    (including failures) are cached briefly per base URL so repeated UI
+    actions don't re-hit the network.
+    """
+    base_url = get_ollama_base_url(config)
+    now = time.monotonic()
+    cached = _ollama_tags_cache.get(base_url)
+    if cached is not None and not force_refresh:
+        fetched_at, models = cached
+        ttl = _OLLAMA_TAGS_TTL_OK if models is not None else _OLLAMA_TAGS_TTL_FAIL
+        if now - fetched_at >= ttl:
+            cached = None
+    else:
+        cached = None
+    if cached is None:
+        try:
+            with urllib.request.urlopen(f"{base_url}/api/tags", timeout=timeout) as response:
+                data = json.loads(response.read().decode())
+            models = [m["name"] for m in data.get("models", []) if isinstance(m, dict) and m.get("name")]
+        except Exception:
+            models = None
+        _ollama_tags_cache[base_url] = (now, models)
+    else:
+        models = cached[1]
+    if models is None:
+        return None
+    if tool_capable_only:
+        models = [
+            m for m in models
+            if ollama_model_supports_tools(m, config, timeout=timeout) is True
+        ]
+    return models
+
+
+def ollama_model_matches(model: str, available: List[str]) -> bool:
+    """True if *model* refers to one of the server's models.
+
+    Server names carry tags ("llama3.3:latest"); a bare name like "llama3.3"
+    matches any tag of that model, mirroring Ollama's own resolution.
+    """
+    if not model:
+        return False
+    if model in available:
+        return True
+    if ":" not in model:
+        return any(name.split(":", 1)[0] == model for name in available)
+    return False
+
+
+def ollama_model_available(model: str, config: Optional[dict] = None) -> Optional[bool]:
+    """True/False if the server is reachable, None if it isn't.
+
+    A model counts as available only if it is installed AND supports tools.
+    """
+    models = list_ollama_models(config)
+    if models is None:
+        return None
+    return ollama_model_matches(model, models)
+
+
+def validate_ollama_model(model: str, config: Optional[dict] = None) -> tuple:
+    """Validate a proposed Ollama model switch.
+
+    Returns (ok, reason): ok is True when the model is usable, False when it
+    must be rejected, None when the server is unreachable. *reason* explains
+    rejections.
+    """
+    installed = list_ollama_models(config, tool_capable_only=False)
+    if installed is None:
+        return None, f"Ollama server unreachable at {get_ollama_base_url(config)}"
+    if not ollama_model_matches(model, installed):
+        return False, f"model '{model}' is not installed on the Ollama server"
+    resolved = model if model in installed else next(
+        (name for name in installed if name.split(":", 1)[0] == model), model
+    )
+    if ollama_model_supports_tools(resolved, config) is False:
+        return False, f"model '{model}' doesn't support tool calling"
+    return True, ""
+
+
+def error_response(message: str) -> dict:
+    """Uniform provider error result.
+
+    Every provider (including Ollama) signals failure the same way: a single
+    ``[API error: ...]`` content prefix plus a structured ``_error`` flag so
+    the runtime can detect errors without string matching — and never persist
+    the text into history or memory.
+    """
+    return {
+        "role": "assistant",
+        "content": f"[API error: {message}]",
+        "tool_calls": None,
+        "_error": True,
+    }
 
 
 def format_http_api_error(exc: BaseException) -> str:
@@ -227,17 +534,28 @@ def _has_key(provider: str) -> bool:
     return bool(os.environ.get(key_env, "").strip())
 
 
-def get_fallback_chain(current_provider: str, current_model: str) -> list:
+def _provider_models(provider: str, config: Optional[dict] = None) -> List[str]:
+    """Models known to actually exist for *provider* (live list for ollama)."""
+    if provider == "ollama":
+        return list_ollama_models(config) or []
+    return KNOWN_MODELS.get(provider, [])
+
+
+def get_fallback_chain(current_provider: str, current_model: str, config: Optional[dict] = None) -> list:
     """Return ordered list of (provider, model, needs_context_switch) fallback candidates.
 
     Strategy:
-    1. Same provider, next model in KNOWN_MODELS list (no context switch needed)
+    1. Same provider, next model in its model list (no context switch needed)
     2. Other providers with valid API keys (context switch required)
+
+    Ollama models come from the live server list (using the configured base
+    URL when *config* is given), so an unreachable server (or one with no
+    tool-capable models) simply contributes no candidates.
     """
     chain = []
 
     # Step 1: same-provider model fallbacks
-    same_models = KNOWN_MODELS.get(current_provider, [])
+    same_models = _provider_models(current_provider, config)
     try:
         idx = same_models.index(current_model)
         for alt_model in same_models[idx + 1:]:
@@ -254,15 +572,26 @@ def get_fallback_chain(current_provider: str, current_model: str) -> list:
             continue
         if not _has_key(provider):
             continue
-        models = KNOWN_MODELS.get(provider, [])
-        if models:
-            chain.append((provider, models[0], True))
+        fb_model = get_fallback_model(provider, config)
+        if fb_model:
+            chain.append((provider, fb_model, True))
 
     return chain
 
 
-def get_fallback_model(provider: str) -> str:
-    """Return the default model for a provider."""
+def get_fallback_model(provider: str, config: Optional[dict] = None) -> str:
+    """Return the default model for a provider.
+
+    For Ollama the preferred default is only used when it actually exists on
+    the server; otherwise the first available (tool-capable) model is used,
+    or "" when the server is unreachable/empty.
+    """
+    if provider == "ollama":
+        available = list_ollama_models(config) or []
+        preferred = DEFAULT_CHAT_MODEL_BY_PROVIDER.get("ollama", "")
+        if preferred and ollama_model_matches(preferred, available):
+            return preferred
+        return available[0] if available else ""
     if provider in DEFAULT_CHAT_MODEL_BY_PROVIDER:
         return DEFAULT_CHAT_MODEL_BY_PROVIDER[provider]
     models = KNOWN_MODELS.get(provider, [])
@@ -298,7 +627,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
     except Exception as exc:
-        return {"content": f"[API error: {exc}]", "tool_calls": None}
+        return error_response(str(exc))
     message = (data.get("choices") or [{}])[0].get("message", {})
     content = (message.get("content") or "").strip()
     if not content and message.get("reasoning"):
@@ -337,13 +666,13 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
+        return error_response(format_http_api_error(exc))
     except Exception as exc:
-        return {"content": f"[API error: {exc}]", "tool_calls": None}
+        return error_response(str(exc))
     if isinstance(data, dict) and data.get("error"):
         err = data["error"]
         msg = err.get("message", json.dumps(err)) if isinstance(err, dict) else str(err)
-        return {"content": f"[API error: {msg}]", "tool_calls": None}
+        return error_response(msg)
     message = (data.get("choices") or [{}])[0].get("message", {})
     content = (message.get("content") or "").strip()
     if not content and message.get("reasoning"):
@@ -400,9 +729,9 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
+        return error_response(format_http_api_error(exc))
     except Exception as exc:
-        return {"content": f"[API error: {exc}]", "tool_calls": None}
+        return error_response(str(exc))
 
     text_parts: List[str] = []
     tool_calls: List[dict] = []
@@ -429,13 +758,57 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
     }
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks that qwen3 (and other
+    reasoning models) embed in message content."""
+    if not text or "<think>" not in text:
+        return text
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    # Unterminated <think> (stream cut off mid-thought): drop the tail.
+    if "<think>" in cleaned:
+        cleaned = cleaned.split("<think>", 1)[0]
+    return cleaned.strip()
+
+
+def _convert_ollama_tool_calls(raw_tool_calls: list) -> Optional[List[dict]]:
+    """Convert Ollama-native tool_calls to the OpenAI shape used internally.
+
+    Ollama returns ``function.arguments`` as a dict; some models/versions
+    return a JSON string instead — handle both without double-encoding.
+    """
+    if not raw_tool_calls:
+        return None
+    tool_calls = []
+    for i, tool_call in enumerate(raw_tool_calls):
+        fn = (tool_call or {}).get("function", {})
+        arguments = fn.get("arguments", {})
+        if isinstance(arguments, str):
+            args_str = arguments if arguments.strip() else "{}"
+        else:
+            args_str = json.dumps(arguments)
+        tool_calls.append({
+            "id": f"ollama_{i}",
+            "type": "function",
+            "function": {
+                "name": fn.get("name", ""),
+                "arguments": args_str,
+            },
+        })
+    return tool_calls or None
+
+
 def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
-    base_url = (config.get("base_url") or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+    base_url = get_ollama_base_url(config)
+    model = config.get("chat_model", config.get("model", "llama3.3"))
     body: Dict[str, Any] = {
-        "model": config.get("chat_model", config.get("model", "llama3.3")),
+        "model": model,
         "messages": messages,
         "stream": False,
     }
+    apply_ollama_request_options(body, config, model)
     if tools:
         body["tools"] = tools
     req = urllib.request.Request(
@@ -448,26 +821,12 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         with urllib.request.urlopen(req, timeout=120) as response:
             data = json.loads(response.read().decode())
     except Exception as exc:
-        return {"content": f"[Ollama error: {exc}]", "tool_calls": None}
+        return error_response(str(exc))
     message = data.get("message", {})
-    raw_tool_calls = message.get("tool_calls")
-    tool_calls = None
-    if raw_tool_calls:
-        tool_calls = []
-        for i, tool_call in enumerate(raw_tool_calls):
-            fn = tool_call.get("function", {})
-            tool_calls.append({
-                "id": f"ollama_{i}",
-                "type": "function",
-                "function": {
-                    "name": fn.get("name", ""),
-                    "arguments": json.dumps(fn.get("arguments", {})),
-                },
-            })
     return {
         "role": "assistant",
-        "content": message.get("content", "").strip(),
-        "tool_calls": tool_calls,
+        "content": strip_think_blocks((message.get("content") or "").strip()),
+        "tool_calls": _convert_ollama_tool_calls(message.get("tool_calls")),
         "_usage": _normalize_usage(data, "ollama"),
         "_model": body["model"],
     }
@@ -533,7 +892,7 @@ def _stream_openai_compat(
                         msg = err.get("message") or json.dumps(err)
                     else:
                         msg = str(err)
-                    return {"content": f"[API error: {msg}]", "tool_calls": None}
+                    return error_response(msg)
                 choice = (chunk.get("choices") or [{}])[0]
                 delta = choice.get("delta", {})
 
@@ -564,9 +923,9 @@ def _stream_openai_compat(
                     usage["input_tokens"] = u.get("prompt_tokens", 0)
                     usage["output_tokens"] = u.get("completion_tokens", 0)
     except urllib.error.HTTPError as exc:
-        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
+        return error_response(format_http_api_error(exc))
     except Exception as exc:
-        return {"content": f"[API error: {exc}]", "tool_calls": None}
+        return error_response(str(exc))
 
     full_text = "".join(content_parts).strip()
     if not full_text and reasoning_parts:
@@ -732,10 +1091,7 @@ def stream_anthropic(
 
                 if etype == "error":
                     err = data.get("error", {})
-                    return {
-                        "content": "[API error: %s]" % err.get("message", "unknown stream error"),
-                        "tool_calls": None,
-                    }
+                    return error_response(err.get("message", "unknown stream error"))
 
                 if etype == "message_start":
                     mu = data.get("message", {}).get("usage", {})
@@ -789,9 +1145,9 @@ def stream_anthropic(
                     mu = data.get("usage", {})
                     usage["output_tokens"] = mu.get("output_tokens", 0)
     except urllib.error.HTTPError as exc:
-        return {"content": f"[API error: {format_http_api_error(exc)}]", "tool_calls": None}
+        return error_response(format_http_api_error(exc))
     except Exception as exc:
-        return {"content": f"[API error: {exc}]", "tool_calls": None}
+        return error_response(str(exc))
 
     full_text = "".join(text_parts).strip()
     if not anthropic_content and full_text:
@@ -810,16 +1166,14 @@ def stream_anthropic(
 def stream_ollama(
     config: dict, messages: list, tools=None, on_token=None
 ) -> dict:
-    base_url = (
-        config.get("base_url")
-        or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-    ).rstrip("/")
+    base_url = get_ollama_base_url(config)
     model = config.get("chat_model", config.get("model", "llama3.3"))
     body: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": True,
     }
+    apply_ollama_request_options(body, config, model)
     if tools:
         body["tools"] = tools
 
@@ -831,6 +1185,7 @@ def stream_ollama(
     )
 
     content_parts: list[str] = []
+    raw_tool_calls: list = []
     final_data: dict = {}
 
     try:
@@ -844,7 +1199,16 @@ def stream_ollama(
                 except json.JSONDecodeError:
                     continue
 
+                if data.get("error"):
+                    return error_response(str(data['error']))
+
                 msg = data.get("message", {})
+                # Tool calls arrive in intermediate chunks (done:false), NOT in
+                # the final done chunk — accumulate them across the stream.
+                if msg.get("tool_calls"):
+                    raw_tool_calls.extend(msg["tool_calls"])
+                # Skip msg.get("thinking") tokens (qwen3 et al.) — reasoning is
+                # not part of the reply.
                 if msg.get("content"):
                     content_parts.append(msg["content"])
                     if on_token:
@@ -854,28 +1218,14 @@ def stream_ollama(
                     final_data = data
                     break
     except Exception as exc:
-        return {"content": f"[Ollama error: {exc}]", "tool_calls": None}
+        return error_response(str(exc))
 
-    full_text = "".join(content_parts).strip()
-    raw_tool_calls = final_data.get("message", {}).get("tool_calls")
-    tool_calls = None
-    if raw_tool_calls:
-        tool_calls = []
-        for i, tc in enumerate(raw_tool_calls):
-            fn = tc.get("function", {})
-            tool_calls.append({
-                "id": f"ollama_{i}",
-                "type": "function",
-                "function": {
-                    "name": fn.get("name", ""),
-                    "arguments": json.dumps(fn.get("arguments", {})),
-                },
-            })
+    full_text = strip_think_blocks("".join(content_parts).strip())
 
     return {
         "role": "assistant",
         "content": full_text,
-        "tool_calls": tool_calls,
+        "tool_calls": _convert_ollama_tool_calls(raw_tool_calls),
         "_usage": _normalize_usage(final_data, "ollama"),
         "_model": model,
     }

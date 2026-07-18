@@ -343,6 +343,13 @@ class TestNullContent(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestFallbackChain(unittest.TestCase):
+    def setUp(self):
+        # Ollama model discovery is live; keep these tests network-free by
+        # simulating an unreachable server.
+        patcher = patch("conch.providers.list_ollama_models", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_same_provider_models_first(self):
         chain = get_fallback_chain("openai", "gpt-5.4")
         same_provider = [(p, m) for p, m, _ in chain if p == "openai"]
@@ -536,6 +543,8 @@ class TestModelCatalog(unittest.TestCase):
 
     def test_default_models_exist_in_catalog(self):
         for provider, model in DEFAULT_CHAT_MODEL_BY_PROVIDER.items():
+            if provider == "ollama":
+                continue  # ollama models are discovered live from the server
             self.assertIn(
                 model, KNOWN_MODELS[provider],
                 f"default {provider} model '{model}' not in KNOWN_MODELS",

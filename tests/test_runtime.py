@@ -168,11 +168,20 @@ class TestExtractTextualToolUse(unittest.TestCase):
     def test_returns_none_for_plain_text(self):
         self.assertIsNone(extract_textual_tool_use_blocks("just text"))
 
-    def test_parses_xml_format(self):
+    def test_xml_format_no_longer_recovered(self):
+        # Plan 0.5: the regex/XML recovery path was removed; only guarded
+        # JSON recovery remains (see tests/test_ollama.py).
         text = '<tool_called name="local_shell" args=\'{"command": "ls"}\'  />'
-        result = extract_textual_tool_use_blocks(text)
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0]["name"], "local_shell")
+        self.assertIsNone(extract_textual_tool_use_blocks(text))
+
+    def test_python_literal_tool_use_no_longer_recovered(self):
+        # The ast.literal_eval path was removed with plan 0.5.
+        text = "{'type': 'tool_use', 'name': 'local_shell', 'input': {'command': 'ls'}}"
+        self.assertIsNone(extract_textual_tool_use_blocks(text))
+
+    def test_quoted_tool_call_in_prose_not_executed(self):
+        text = 'To call a tool the model would emit {"type": "tool_use", "name": "x"} as text.'
+        self.assertIsNone(extract_textual_tool_use_blocks(text))
 
     def test_returns_none_for_empty(self):
         self.assertIsNone(extract_textual_tool_use_blocks(""))

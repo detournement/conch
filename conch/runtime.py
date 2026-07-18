@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import re
 import json
 import sys
@@ -91,15 +90,116 @@ def _print_tool_result(
         print(f"    \033[2m{line}\033[0m", file=sys.stderr)
 
 
-CHARS_PER_TOKEN = 3.5
+# ---------------------------------------------------------------------------
+# Provider error signaling (single [API error: ...] prefix + _error flag)
+# ---------------------------------------------------------------------------
+
+_TRANSIENT_ERROR_MARKERS = (
+    # rate limits / server-side blips
+    "429", "500", "502", "503", "504", "overloaded", "rate",
+    # network-level failures (dead/unreachable server, DNS, timeouts)
+    "connection refused", "connection reset", "timed out", "timeout",
+    "unreachable", "getaddrinfo", "name or service not known",
+    # missing model on the server (404) — recoverable via fallback chain
+    "404",
+)
+
+_STRUCTURAL_ERROR_MARKERS = (
+    "invalid_request", "invalid request",
+    "authentication", "invalid api key", "invalid x-api-key",
+)
+
+_CONNECTION_ERROR_MARKERS = (
+    "connection refused", "connection reset", "timed out", "timeout",
+    "unreachable", "getaddrinfo", "name or service not known", "errno 61",
+    "errno 111",
+)
+
+
+def is_error_response(response: dict) -> bool:
+    """True when a provider result signals failure (structured flag first,
+    content prefix as fallback for anything that missed the helper)."""
+    if response.get("_error"):
+        return True
+    content = response.get("content", "")
+    return isinstance(content, str) and content.startswith("[API error:")
+
+
+def error_detail(response: dict) -> str:
+    """Human-readable error message from a failed provider result."""
+    content = response.get("content", "")
+    if not isinstance(content, str):
+        return str(content)
+    if content.startswith("[API error: ") and content.endswith("]"):
+        return content[len("[API error: "):-1]
+    return content
+
+
+def is_transient_error(message: str) -> bool:
+    lower = message.lower()
+    return any(marker in lower for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def is_structural_error(message: str) -> bool:
+    lower = message.lower()
+    return any(marker in lower for marker in _STRUCTURAL_ERROR_MARKERS)
+
+
+def is_connection_error(message: str) -> bool:
+    lower = message.lower()
+    return any(marker in lower for marker in _CONNECTION_ERROR_MARKERS)
+
+
+CHARS_PER_TOKEN = 3.5  # default until calibrated against real usage counts
+# Legacy fallback limits, used only when no config is available to look up the
+# active model's real context window (see get_context_limit).
 CONTEXT_LIMITS = {
     "openai": 120000,
     "anthropic": 180000,
     "ollama": 28000,
 }
 
+# Running (chars sent, prompt tokens reported) totals. Ollama returns
+# prompt_eval_count on every response, so the chars-per-token estimate can be
+# calibrated to the active model's real tokenizer instead of the 3.5 guess.
+_token_calibration = {"chars": 0.0, "tokens": 0}
+_CALIBRATION_MIN_TOKENS = 200  # don't trust tiny samples
+_CALIBRATION_CLAMP = (1.5, 8.0)
 
-def estimate_tokens(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
+
+def record_token_calibration(char_count: int, token_count: int) -> None:
+    if char_count <= 0 or token_count <= 0:
+        return
+    _token_calibration["chars"] += char_count
+    _token_calibration["tokens"] += token_count
+
+
+def reset_token_calibration() -> None:
+    _token_calibration["chars"] = 0.0
+    _token_calibration["tokens"] = 0
+
+
+def get_chars_per_token() -> float:
+    if _token_calibration["tokens"] >= _CALIBRATION_MIN_TOKENS:
+        ratio = _token_calibration["chars"] / _token_calibration["tokens"]
+        low, high = _CALIBRATION_CLAMP
+        return max(low, min(high, ratio))
+    return CHARS_PER_TOKEN
+
+
+def get_context_limit(provider: str, config: Optional[dict] = None) -> int:
+    """Token budget for the conversation: the active model's real context
+    window (per providers.get_context_window) minus ~10% headroom for the
+    model's reply. Falls back to CONTEXT_LIMITS when config is missing."""
+    if config is None:
+        return CONTEXT_LIMITS.get(provider, 120000)
+    from .providers import get_context_window
+    model = config.get("chat_model", config.get("model", ""))
+    window = get_context_window(provider, model, config)
+    return max(2048, int(window * 0.9))
+
+
+def char_count(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
     total = 0
     for message in messages:
         content = message.get("content", "")
@@ -110,7 +210,149 @@ def estimate_tokens(messages: List[dict], tools: Optional[List[dict]] = None) ->
                 total += len(json.dumps(block)) if isinstance(block, dict) else len(str(block))
     if tools:
         total += len(json.dumps(tools))
-    return int(total / CHARS_PER_TOKEN)
+    return total
+
+
+def estimate_tokens(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
+    return int(char_count(messages, tools) / get_chars_per_token())
+
+
+def format_context_gauge(used_tokens: int, window: int) -> str:
+    """Compact colored context-usage gauge for the per-turn usage line."""
+    if window <= 0:
+        return ""
+    pct = used_tokens / window * 100
+    color = "\033[31m" if pct >= 80 else "\033[33m" if pct >= 60 else "\033[32m"
+    return f"ctx {color}{pct:.0f}%\033[0m"
+
+
+# ---------------------------------------------------------------------------
+# Tool-result truncation: budget scaled to the context window (plan 1.5)
+# ---------------------------------------------------------------------------
+
+TOOL_RESULT_BUDGET_FRACTION = 0.10  # ≤10% of the context budget per result
+_TOOL_RESULT_MIN_TOKENS = 500
+
+
+def truncate_middle(text: str, budget_chars: int) -> str:
+    """Cap *text* to ~budget_chars keeping head and tail (the useful parts of
+    command output are usually at both ends)."""
+    if budget_chars <= 0 or len(text) <= budget_chars:
+        return text
+    head = int(budget_chars * 0.67)
+    tail = max(0, budget_chars - head)
+    omitted = len(text) - head - tail
+    return (
+        text[:head]
+        + f"\n... [truncated {omitted:,} chars — head and tail kept] ...\n"
+        + (text[-tail:] if tail else "")
+    )
+
+
+def tool_result_char_budget(provider: str, config: Optional[dict] = None) -> int:
+    """Char budget for a single tool result, scaled to the model's window."""
+    limit = get_context_limit(provider, config)
+    tokens = max(_TOOL_RESULT_MIN_TOKENS, int(limit * TOOL_RESULT_BUDGET_FRACTION))
+    return int(tokens * get_chars_per_token())
+
+
+def truncate_tool_result(text: str, provider: str, config: Optional[dict] = None) -> str:
+    return truncate_middle(text, tool_result_char_budget(provider, config))
+
+
+# ---------------------------------------------------------------------------
+# Model-generated compaction (plan 1.4)
+# ---------------------------------------------------------------------------
+
+AUTO_COMPACT_THRESHOLD = 0.7  # of the context budget
+AUTO_COMPACT_KEEP_RECENT = 6  # messages kept verbatim
+
+_COMPACT_SYSTEM_PROMPT = (
+    "You compress conversation history. Summarize the transcript into a "
+    "concise brief that preserves: established facts, decisions made, open "
+    "tasks, and important file paths, commands, and results. Use short plain "
+    "bullet points. No preamble."
+)
+
+
+def _message_as_text(message: dict) -> str:
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = " ".join(
+            block.get("text", "") for block in content if isinstance(block, dict)
+        )
+    if not isinstance(content, str):
+        content = str(content)
+    return content.strip()
+
+
+def auto_compact(
+    messages: List[dict],
+    tools: Optional[List[dict]],
+    provider: str,
+    config: Optional[dict],
+    raw_fn,
+) -> bool:
+    """LLM-generated compaction: at ~70% of the context budget, replace older
+    history with a single model-written summary, keeping the system prompt
+    and the last few messages verbatim.
+
+    Returns True when history was compacted. On any failure (summary call
+    errors, empty summary) leaves messages untouched — the cheap char-capping
+    compress_context still runs afterwards as a backstop.
+    """
+    limit = get_context_limit(provider, config)
+    if estimate_tokens(messages, tools) < limit * AUTO_COMPACT_THRESHOLD:
+        return False
+    has_system = bool(messages) and messages[0].get("role") == "system"
+    start = 1 if has_system else 0
+    cut = len(messages) - AUTO_COMPACT_KEEP_RECENT
+    # Never split an assistant tool_call from its tool results.
+    while cut > start and (
+        messages[cut].get("role") == "tool" or is_anthropic_tool_result(messages[cut])
+    ):
+        cut -= 1
+    if cut - start < 4:
+        return False  # too little old history to be worth an LLM call
+    old = messages[start:cut]
+
+    lines = []
+    for message in old:
+        text = _message_as_text(message)
+        if not text:
+            continue
+        role = message.get("role", "")
+        role = "tool result" if role == "tool" else role
+        lines.append(f"{role}: {text[:2000]}")
+    transcript = "\n".join(lines)
+    if not transcript.strip():
+        return False
+    # Keep the summary request itself well inside the window.
+    transcript = truncate_middle(transcript, int(limit * 2))
+
+    summary_messages = [
+        {"role": "system", "content": _COMPACT_SYSTEM_PROMPT},
+        {"role": "user", "content": transcript},
+    ]
+    try:
+        response = raw_fn(config, summary_messages, None)
+    except Exception:
+        return False
+    if is_error_response(response):
+        return False
+    summary = (response.get("content") or "").strip()
+    if not summary:
+        return False
+
+    note = {
+        "role": "system",
+        "content": f"[Earlier conversation summarized]\n{summary}",
+    }
+    kept_recent = messages[cut:]
+    new_messages = ([messages[0]] if has_system else []) + [note] + kept_recent
+    messages.clear()
+    messages.extend(new_messages)
+    return True
 
 
 def summarize_message(message: dict) -> dict:
@@ -131,8 +373,13 @@ def summarize_message(message: dict) -> dict:
     return message
 
 
-def compress_context(messages: List[dict], tools: Optional[List[dict]], provider: str) -> List[dict]:
-    limit = CONTEXT_LIMITS.get(provider, 120000)
+def compress_context(
+    messages: List[dict],
+    tools: Optional[List[dict]],
+    provider: str,
+    config: Optional[dict] = None,
+) -> List[dict]:
+    limit = get_context_limit(provider, config)
     if estimate_tokens(messages, tools) <= limit:
         return messages
     if len(messages) <= 5:
@@ -211,72 +458,95 @@ def sanitize_anthropic_messages(messages: List[dict]):
         messages.extend(cleaned)
 
 
+def _tool_call_from_json_payload(payload, idx: int) -> Optional[dict]:
+    """Build a tool_use block from a {"name": ..., "arguments": ...} dict.
+
+    Returns None unless the payload looks exactly like a tool call (string
+    name, only tool-call keys) so ordinary JSON replies aren't executed.
+    """
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    if not ("arguments" in payload or "parameters" in payload):
+        return None
+    if not set(payload) <= {"name", "arguments", "parameters", "id"}:
+        return None
+    tool_input = payload.get("arguments", payload.get("parameters", {}))
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            tool_input = {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    return {
+        "type": "tool_use",
+        "id": str(payload.get("id") or f"json_tool_call_{idx}"),
+        "name": name,
+        "input": tool_input,
+    }
+
+
 def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
+    """Guarded JSON-only recovery of tool calls the serving layer failed to
+    parse into structured tool_calls.
+
+    Live testing showed qwen2.5-coder via Ollama emitting calls either as
+    bare JSON content ({"name": ..., "arguments": {...}}) or inside
+    <tool_call>...</tool_call> tags. Both paths require strict JSON and a
+    tool-call-shaped payload, so quoted prose or ordinary JSON answers are
+    never executed. The old regex/XML/ast.literal_eval recovery paths were
+    removed (plan 0.5) — native tool_calls plus these two JSON recoveries
+    are the only accepted forms.
+    """
     if not isinstance(text, str):
         return None
     raw = text.strip()
     if not raw:
         return None
 
-    # Parse <tool_called name="..." args='...'/>  or  args="..." XML format
-    if "<tool_called" in raw:
+    # Bare JSON tool call: qwen2.5 via Ollama often emits the call as the
+    # entire message content — {"name": ..., "arguments": {...}} — with no
+    # wrapper tags, and Ollama passes it through unparsed.
+    bare = raw
+    if bare.startswith("```") and bare.endswith("```"):
+        bare = bare.strip("`").strip()
+        if "\n" in bare and bare.split("\n", 1)[0].strip().lower() in ("json", ""):
+            bare = bare.split("\n", 1)[1].strip()
+    if bare.startswith("{") and bare.endswith("}") or bare.startswith("[") and bare.endswith("]"):
+        try:
+            payload = json.loads(bare)
+        except json.JSONDecodeError:
+            payload = None
+        candidates = payload if isinstance(payload, list) else [payload]
         normalized = []
-        for m in re.finditer(r'<tool_called[^>]+/?>', raw, re.DOTALL):
-            chunk = m.group(0)
-            name_m = re.search(r'name="([^"]+)"', chunk)
-            if not name_m:
-                continue
-            name = name_m.group(1)
-            # Match args with either quote style
-            args_str = ""
-            for q in ("'", '"'):
-                marker = f"args={q}"
-                if marker in chunk:
-                    start = chunk.find(marker) + len(marker)
-                    end = chunk.find(q, start)
-                    if end > start:
-                        args_str = chunk[start:end]
-                    break
-            try:
-                tool_input = json.loads(args_str) if args_str.strip() else {}
-            except (json.JSONDecodeError, ValueError):
-                tool_input = {}
-            if not isinstance(tool_input, dict):
-                tool_input = {}
-            normalized.append({
-                "type": "tool_use",
-                "id": f"xml_tool_use_{len(normalized)+1}",
-                "name": name,
-                "input": tool_input,
-            })
+        for candidate in candidates:
+            block = _tool_call_from_json_payload(candidate, len(normalized) + 1)
+            if block is None:
+                normalized = []
+                break
+            normalized.append(block)
         if normalized:
             return normalized
 
-    if "tool_use" not in raw:
-        return None
-    candidates = [raw]
-    if raw.startswith("```") and raw.endswith("```"):
-        fenced = raw.strip("`").strip()
-        candidates.append(fenced.split("\n", 1)[1].strip() if "\n" in fenced else fenced)
-    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
-        start = raw.find(opener)
-        end = raw.rfind(closer)
-        if start != -1 and end > start:
-            candidates.append(raw[start : end + 1])
-    for candidate in candidates:
-        try:
-            parsed = ast.literal_eval(candidate)
-        except (ValueError, SyntaxError):
-            continue
-        blocks = [parsed] if isinstance(parsed, dict) else [block for block in parsed if isinstance(block, dict)] if isinstance(parsed, (list, tuple)) else []
+    # Parse qwen2.5/qwen3-style <tool_call>{"name": ..., "arguments": ...}</tool_call>
+    # blocks. Qwen models emit these as plain text when the serving layer
+    # fails to parse them into structured tool calls.
+    if "<tool_call>" in raw:
         normalized = []
-        for idx, block in enumerate(blocks, start=1):
-            if block.get("type") != "tool_use":
+        for m in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", raw, re.DOTALL):
+            try:
+                payload = json.loads(m.group(1))
+            except json.JSONDecodeError:
                 continue
-            name = block.get("name")
+            if not isinstance(payload, dict):
+                continue
+            name = payload.get("name")
             if not isinstance(name, str) or not name:
                 continue
-            tool_input = block.get("input", {})
+            tool_input = payload.get("arguments", payload.get("parameters", {}))
             if isinstance(tool_input, str):
                 try:
                     tool_input = json.loads(tool_input)
@@ -286,14 +556,39 @@ def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
                 tool_input = {}
             normalized.append({
                 "type": "tool_use",
-                "id": str(block.get("id") or f"text_tool_use_{idx}"),
+                "id": f"qwen_tool_call_{len(normalized) + 1}",
                 "name": name,
                 "input": tool_input,
             })
         if normalized:
             return normalized
+
     return None
 
+
+
+def _ollama_wire_tool_calls(tool_calls: list) -> list:
+    """Convert internal OpenAI-shaped tool_calls to Ollama's wire format.
+
+    Ollama's /api/chat expects ``function.arguments`` to be a JSON *object*;
+    sending the OpenAI-style JSON string makes the request fail to decode
+    (or the model re-reads its own calls as garbage on the next round).
+    """
+    wire = []
+    for tc in tool_calls or []:
+        fn = (tc or {}).get("function", {})
+        arguments = fn.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments.strip() else {}
+            except json.JSONDecodeError:
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        wire.append({
+            "function": {"name": fn.get("name", ""), "arguments": arguments},
+        })
+    return wire
 
 
 def normalize_messages_for_provider(messages: list, provider: str) -> list:
@@ -303,6 +598,8 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
     For OpenAI-compatible: keep native OpenAI tool messages (role=tool,
     assistant+tool_calls) intact so multi-turn tool use works.  Only
     convert Anthropic-style structured content blocks to plain text.
+    For Ollama: additionally convert tool_calls arguments back to JSON
+    objects and link tool results via tool_name.
     """
     if provider == "anthropic":
         cleaned = []
@@ -322,6 +619,7 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
         return cleaned
 
     normalized = []
+    tool_names_by_id: dict = {}
     i = 0
     while i < len(messages):
         msg = messages[i]
@@ -330,7 +628,14 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
 
         # Keep OpenAI-format tool result messages as-is
         if role == "tool":
-            normalized.append(msg)
+            if provider == "ollama":
+                out = {"role": "tool", "content": msg.get("content") or ""}
+                tool_name = tool_names_by_id.get(msg.get("tool_call_id", ""), "")
+                if tool_name:
+                    out["tool_name"] = tool_name
+                normalized.append(out)
+            else:
+                normalized.append(msg)
             i += 1
             continue
 
@@ -372,6 +677,12 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
             clean = dict(msg)
             if clean.get("content") is None:
                 clean["content"] = ""
+            for tc in clean["tool_calls"]:
+                fn = (tc or {}).get("function", {})
+                if tc.get("id") and fn.get("name"):
+                    tool_names_by_id[tc["id"]] = fn["name"]
+            if provider == "ollama":
+                clean["tool_calls"] = _ollama_wire_tool_calls(clean["tool_calls"])
             normalized.append(clean)
             i += 1
             continue
@@ -491,7 +802,15 @@ def chat_turn(
         if chat_state and getattr(chat_state, "needs_tool_refresh", False):
             tools = chat_state.tools
             chat_state.needs_tool_refresh = False
-        compressed = compress_context(messages, tools, provider)
+        # Model-generated compaction first (plan 1.4); char-capping
+        # compress_context stays as the cheap backstop below.
+        if raw_fn is not None:
+            try:
+                if auto_compact(messages, tools, provider, config, raw_fn):
+                    print("  \033[2m(older history auto-compacted)\033[0m", file=sys.stderr)
+            except Exception:
+                pass
+        compressed = compress_context(messages, tools, provider, config)
         if len(compressed) < len(messages):
             messages.clear()
             messages.extend(compressed)
@@ -502,10 +821,15 @@ def chat_turn(
         send_tools = tools
         tool_limit = PROVIDER_TOOL_LIMITS.get(provider)
         if tool_limit and send_tools and len(send_tools) > tool_limit:
-            from .tooling import PINNED_TOOL_NAMES
-            pinned = [t for t in send_tools if t.get("function", {}).get("name") in PINNED_TOOL_NAMES]
-            others = [t for t in send_tools if t.get("function", {}).get("name") not in PINNED_TOOL_NAMES]
-            send_tools = others[: tool_limit - len(pinned)] + pinned
+            # Over the provider cap: keep pinned tools and fill the rest by
+            # relevance to the current user turn (plan 1.6), not list order.
+            from .tooling import select_relevant_tools
+            user_text = next(
+                (m.get("content", "") for m in reversed(messages)
+                 if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                "",
+            )
+            send_tools = select_relevant_tools(send_tools, user_text, tool_limit)
 
         stream_fn = STREAM_FNS.get(provider) if on_token else None
         if stream_fn:
@@ -518,20 +842,21 @@ def chat_turn(
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)
         total_usage["model"] = response.get("_model", total_usage["model"])
+        # Calibrate char->token estimates against the provider's real prompt
+        # token count (Ollama reports prompt_eval_count on every response).
+        if usage.get("input_tokens"):
+            record_token_calibration(
+                char_count(send_messages, send_tools), usage["input_tokens"]
+            )
         content = response.get("content", "")
-        if (
-            isinstance(content, str)
-            and content.startswith("[API error:")
-            and on_token is not None
-        ):
+        if is_error_response(response) and on_token is not None:
             sp = getattr(on_token, "__self__", None)
             if isinstance(sp, StreamPrinter):
                 sp.end_waiting()
-        if isinstance(content, str) and content.startswith("[API error:"):
-            # Retry once on same provider with 1s backoff (transient 429/5xx)
-            err_lower = content.lower()
-            is_transient = any(s in err_lower for s in ("429", "500", "502", "503", "504", "overloaded", "rate"))
-            if is_transient:
+        if is_error_response(response):
+            # Retry once on same provider with 1s backoff (transient errors:
+            # rate limits, 5xx, connection refused/timeout, missing model)
+            if is_transient_error(error_detail(response)):
                 print(f"  \033[33m\u26a0 Transient error, retrying in 1s...\033[0m", file=sys.stderr)
                 time.sleep(1)
                 if stream_fn:
@@ -539,24 +864,18 @@ def chat_turn(
                 else:
                     with Spinner("Retrying"):
                         response = raw_fn(config, send_messages, tools if tools else None)
-                content = response.get("content", "")
                 usage = response.get("_usage", {})
                 total_usage["input_tokens"] += usage.get("input_tokens", 0)
                 total_usage["output_tokens"] += usage.get("output_tokens", 0)
-            if isinstance(content, str) and content.startswith("[API error:"):
-                err_detail = content[len("[API error: "):-1] if content.endswith("]") else content
+            if is_error_response(response):
+                err_detail = error_detail(response)
                 print(f"  \033[33m⚠ {err_detail}\033[0m", file=sys.stderr)
                 from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_fallback_chain
                 # Structural errors (invalid request shape, auth) won't be fixed
                 # by switching to another model on the same provider.
-                _err_lc = err_detail.lower()
-                _structural = any(k in _err_lc for k in (
-                    "invalid_request", "invalid request",
-                    "authentication", "invalid api key",
-                    "invalid x-api-key",
-                ))
+                _structural = is_structural_error(err_detail)
                 current_model = config.get("chat_model", config.get("model", ""))
-                fallback_chain = get_fallback_chain(provider, current_model)
+                fallback_chain = get_fallback_chain(provider, current_model, config)
                 if _structural:
                     fallback_chain = [
                         (p, m, s) for p, m, s in fallback_chain if p != provider
@@ -597,14 +916,16 @@ def chat_turn(
                     fb_tool_limit = PROVIDER_TOOL_LIMITS.get(fb_provider)
                     fb_tools = tools
                     if fb_tool_limit and fb_tools and len(fb_tools) > fb_tool_limit:
-                        from .tooling import PINNED_TOOL_NAMES as _PIN
-                        _pinned = [t for t in fb_tools if t.get("function", {}).get("name") in _PIN]
-                        _others = [t for t in fb_tools if t.get("function", {}).get("name") not in _PIN]
-                        fb_tools = _others[: fb_tool_limit - len(_pinned)] + _pinned
+                        from .tooling import select_relevant_tools as _select
+                        _user_text = next(
+                            (m.get("content", "") for m in reversed(messages)
+                             if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                            "",
+                        )
+                        fb_tools = _select(fb_tools, _user_text, fb_tool_limit)
                     with Spinner(f"Retrying with {fb_provider}/{fb_model}"):
                         response = fb_fn(fb_config, fb_messages, fb_tools if fb_tools else None)
-                    fb_content = response.get("content", "")
-                    if not (isinstance(fb_content, str) and fb_content.startswith("[API error:")):
+                    if not is_error_response(response):
                         provider = fb_provider
                         config["provider"] = fb_provider
                         config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
@@ -614,6 +935,25 @@ def chat_turn(
                         raw_fn = RAW_FNS.get(provider)
                         break
                     failed_provider, failed_model = fb_provider, fb_model
+            if is_error_response(response):
+                # Retry and every fallback failed. Never persist the error
+                # text: report it and keep the session alive for a retry.
+                final_detail = error_detail(response)
+                if provider == "ollama" and is_connection_error(final_detail):
+                    from .providers import get_ollama_base_url
+                    print(
+                        f"  \033[31m✗ Ollama server unreachable at "
+                        f"{get_ollama_base_url(config)} — check the server, then "
+                        f"send your message again\033[0m",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"  \033[31m✗ {provider} request failed: {final_detail}\033[0m\n"
+                        f"  \033[2m(nothing saved — send your message again to retry)\033[0m",
+                        file=sys.stderr,
+                    )
+                return "", total_usage
         tool_calls = response.get("tool_calls")
         if on_token is not None:
             sp = getattr(on_token, "__self__", None)
@@ -657,8 +997,9 @@ def chat_turn(
                 print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
             is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
             _print_tool_result(result_text, verbose=_verbose_tools, error=is_error)
-            if len(result_text) > 8000:
-                result_text = result_text[:8000] + "\n... (truncated — result too large)"
+            # Budget scaled to the model's context window (plan 1.5), not a
+            # fixed char cap; keeps head + tail of oversized output.
+            result_text = truncate_tool_result(result_text, provider, config)
             results.append({"id": tool_call.get("id", ""), "content": result_text})
         if provider == "anthropic":
             append_results_anthropic(messages, response, results)

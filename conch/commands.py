@@ -5,15 +5,20 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .browser import browse_conversations
 from . import composio as composio_mod
 from .providers import (
     DEFAULT_API_KEY_ENVS,
-    DEFAULT_CHAT_MODEL_BY_PROVIDER,
     KNOWN_MODELS,
     RAW_FNS,
+    get_fallback_model,
+    get_ollama_base_url,
+    list_ollama_models,
+    ollama_model_matches,
+    validate_ollama_model,
 )
 from .scheduler import _format_interval, _parse_interval
 from .tooling import (
@@ -25,6 +30,47 @@ from .tooling import (
     load_tool_prefs,
     save_tool_prefs,
 )
+
+
+# ---------------------------------------------------------------------------
+# User-defined slash commands (plan 1.7): markdown files in
+# ~/.config/conch/commands/ become /name commands; the file body is a prompt
+# template with $ARGUMENTS interpolation.
+# ---------------------------------------------------------------------------
+
+_USER_COMMAND_NAME_RE = re.compile(r"[a-z0-9_-]+")
+
+
+def user_commands_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch" / "commands"
+
+
+def load_user_commands() -> Dict[str, str]:
+    """Return {name: prompt template} for every *.md file in the commands dir."""
+    commands: Dict[str, str] = {}
+    directory = user_commands_dir()
+    if not directory.is_dir():
+        return commands
+    for path in sorted(directory.glob("*.md")):
+        name = path.stem.strip().lower()
+        if not name or not _USER_COMMAND_NAME_RE.fullmatch(name):
+            continue
+        try:
+            body = path.read_text().strip()
+        except OSError:
+            continue
+        if body:
+            commands[name] = body
+    return commands
+
+
+def render_user_command(template: str, arguments: str) -> str:
+    """Interpolate $ARGUMENTS; append trailing args when no placeholder."""
+    if "$ARGUMENTS" in template:
+        return template.replace("$ARGUMENTS", arguments)
+    if arguments:
+        return template + "\n\n" + arguments
+    return template
 
 
 def handle_slash_command(
@@ -40,6 +86,7 @@ def handle_slash_command(
     conv_mgr=None,
     current_conv=None,
     session_usage=None,
+    messages=None,
 ) -> Optional[tuple]:
     parts = cmd.strip().split(None, 1)
     command = parts[0].lower()
@@ -74,6 +121,7 @@ def handle_slash_command(
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
+            "  \033[1m/status\033[0m              Show provider, model, context window, and config\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
             "\n  Shell approval: \033[1my\033[0m/\033[1mEnter\033[0m=run  \033[1mn\033[0m=decline  \033[1me\033[0m=edit  \033[1ma\033[0m=always allow  \033[1mA\033[0m=agent mode on\n"
@@ -288,11 +336,24 @@ def handle_slash_command(
     if command in ("/models", "/ls"):
         print()
         for provider_name, models in KNOWN_MODELS.items():
+            if provider_name == "ollama":
+                models = list_ollama_models(config)
             marker = " \033[1;33m← active\033[0m" if provider_name == provider else ""
             print(f"  \033[1;36m{provider_name}\033[0m{marker}")
+            if provider_name == "ollama":
+                if models is None:
+                    print(f"    \033[2m(unreachable at {get_ollama_base_url(config)})\033[0m")
+                    continue
+                if not models:
+                    print("    \033[2m(no tool-capable models installed)\033[0m")
+                    continue
             for model in models:
-                prefix = "\033[1;32m●\033[0m" if model == model_name else "\033[2m○\033[0m"
-                suffix = "  \033[2m(current)\033[0m" if model == model_name else ""
+                current = model == model_name or (
+                    provider_name == "ollama" and provider == "ollama"
+                    and ollama_model_matches(model_name, [model])
+                )
+                prefix = "\033[1;32m●\033[0m" if current else "\033[2m○\033[0m"
+                suffix = "  \033[2m(current)\033[0m" if current else ""
                 print(f"    {prefix} {model}{suffix}")
         print()
         return None
@@ -302,11 +363,32 @@ def handle_slash_command(
             print(f"\n  \033[2mCurrent model:\033[0m \033[1m{model_name}\033[0m ({provider})\n")
             return None
         new_model = arg
-        new_provider = provider
+        new_provider = None
         for provider_name, models in KNOWN_MODELS.items():
-            if new_model in models:
+            if provider_name != "ollama" and new_model in models:
                 new_provider = provider_name
                 break
+        if new_provider is None:
+            ollama_models = list_ollama_models(config)
+            if ollama_models and ollama_model_matches(new_model, ollama_models):
+                new_provider = "ollama"
+        if new_provider is None:
+            # Not in any catalog — assume the current provider, but for Ollama
+            # the model must actually exist on the server and support tools.
+            new_provider = provider
+        if new_provider == "ollama":
+            ok, reason = validate_ollama_model(new_model, config)
+            if ok is None:
+                print(f"\n  \033[31m{reason} — cannot verify model '{new_model}'\033[0m\n")
+                return None
+            if not ok:
+                print(f"\n  \033[31mCannot switch: {reason}\033[0m")
+                available = list_ollama_models(config) or []
+                if available:
+                    print(f"  \033[2mAvailable: {', '.join(available)}\033[0m\n")
+                else:
+                    print("  \033[2mNo tool-capable models installed on the server.\033[0m\n")
+                return None
         new_fn = RAW_FNS.get(new_provider)
         if not new_fn:
             print(f"\n  \033[31mUnknown provider for model '{new_model}'\033[0m\n")
@@ -334,9 +416,13 @@ def handle_slash_command(
         if key_env and not os.environ.get(key_env, "").strip():
             print(f"\n  \033[31m{key_env} not set — cannot switch to {new_provider}\033[0m\n")
             return None
-        new_model = DEFAULT_CHAT_MODEL_BY_PROVIDER.get(new_provider) or (
-            KNOWN_MODELS[new_provider][0] if KNOWN_MODELS.get(new_provider) else ""
-        )
+        new_model = get_fallback_model(new_provider, config)
+        if new_provider == "ollama" and not new_model:
+            if list_ollama_models(config) is None:
+                print(f"\n  \033[31mOllama server unreachable at {get_ollama_base_url(config)} — cannot switch\033[0m\n")
+            else:
+                print("\n  \033[31mNo tool-capable models installed on the Ollama server — cannot switch\033[0m\n")
+            return None
         config["provider"] = new_provider
         config["api_key_env"] = key_env
         config["chat_model"] = new_model
@@ -410,6 +496,49 @@ def handle_slash_command(
         print("\n  \033[2mUsage: /queue on | /queue off  (on by default)\033[0m\n")
         return None
 
+    if command == "/status":
+        from .config import get_config_path
+        from .providers import get_context_window
+        from .runtime import estimate_tokens
+
+        window = get_context_window(provider, model_name, config)
+        print(f"\n  \033[1;36mConch status:\033[0m")
+        print(f"    Provider:       {provider}")
+        print(f"    Model:          {model_name}")
+        print(f"    Context window: {window:,} tokens")
+        if messages is not None:
+            used = estimate_tokens(messages)
+            pct = (used / window * 100) if window else 0
+            bar_color = "\033[31m" if pct >= 80 else "\033[33m" if pct >= 60 else "\033[32m"
+            print(f"    Context used:   ~{used:,} tokens ({bar_color}{pct:.0f}%\033[0m of window, estimated)")
+        if session_usage:
+            total_in = session_usage.get("input_tokens", 0)
+            total_out = session_usage.get("output_tokens", 0)
+            turns = session_usage.get("turns", 0)
+            print(f"    Session:        {turns} turns, {total_in:,} in / {total_out:,} out tokens")
+        agent_status = "on" if get_agent_mode() else "off"
+        print(f"    Agent mode:     {agent_status}")
+        config_path = get_config_path()
+        exists = "" if os.path.isfile(config_path) else "  \033[2m(not created yet — using defaults)\033[0m"
+        print(f"    Config file:    {config_path}{exists}")
+        if provider == "ollama":
+            print(f"    Ollama server:  {get_ollama_base_url(config)}")
+        _skip_keys = {"provider", "model", "chat_model"}
+        _hide = ("token", "key", "password", "secret", "credential")
+
+        def _is_secret(k: str) -> bool:
+            # api_key_env holds an env var *name*, not a secret value
+            return not k.endswith("_env") and any(h in k.lower() for h in _hide)
+
+        extras = [
+            f"{k}={v}" for k, v in sorted(config.items())
+            if k not in _skip_keys and not _is_secret(k)
+        ]
+        if extras:
+            print(f"    Settings:       \033[2m{', '.join(extras)}\033[0m")
+        print()
+        return None
+
     if command == "/cost":
         if session_usage is None:
             session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
@@ -440,7 +569,7 @@ def handle_slash_command(
         return None
 
     if command in ("/profile", "/profiles") and all_tools is not None and tool_map is not None:
-        profiles = list_profiles()
+        profiles = list_profiles(config)
         if not arg:
             current = active_profile_name()
             print("\n  \033[1;36mTool profiles:\033[0m")
@@ -450,7 +579,7 @@ def handle_slash_command(
                 print(f"    \033[1m{name:<12}\033[0m \033[2m{desc}\033[0m{marker}")
             print("\n  \033[2mUsage: /profile <name>\033[0m\n")
             return None
-        new_tools, desc = activate_profile(arg.lower(), all_tools, tool_map)
+        new_tools, desc = activate_profile(arg.lower(), all_tools, tool_map, config)
         if not new_tools and desc.startswith("Unknown"):
             print(f"\n  \033[31m{desc}\033[0m\n")
             return None
@@ -473,6 +602,12 @@ def handle_slash_command(
         prefix = "✓" if success else "✗"
         print(f"\n  {color}{prefix} {message}\033[0m\n")
         return None
+
+    # User-defined slash commands (builtins above always take precedence)
+    user_commands = load_user_commands()
+    custom_name = command.lstrip("/")
+    if custom_name in user_commands:
+        return ("user_prompt", render_user_command(user_commands[custom_name], arg))
 
     return None
 

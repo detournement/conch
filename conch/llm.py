@@ -1,109 +1,67 @@
-"""LLM clients: OpenAI, Anthropic, Cerebras, Ollama. Return single command string."""
+"""LLM clients: OpenAI, Anthropic, Cerebras, Ollama. Return single command string.
+
+Ask mode uses structured output everywhere (plan 0.6): Ollama gets a JSON
+schema via the ``format`` parameter; OpenAI, Anthropic, and Cerebras get a
+forced single ``shell_command`` tool call. There is no free-text command
+scraping — no regexes, no shell-prefix heuristics.
+"""
 import datetime
 import json
 import os
-import re
 import sys
 from typing import List, Optional, Tuple
 
 from .config import load_config, get_bool, get_int
 
 
-_SHELL_PREFIXES = (
-    "nmap","arp","avahi","dns-sd","lpstat","find","grep","ls","cat",
-    "curl","wget","docker","kubectl","helm","terraform","aws","git",
-    "npm","pip","python","ssh","scp","rsync","ping","traceroute",
-    "dig","nc","netstat","ss","lsof","ps","top","kill","chmod",
-    "chown","mkdir","rm","cp","mv","tar","zip","unzip","sed",
-    "awk","sort","head","tail","wc","du","df","mount","systemctl",
-    "brew","apt","yum","dnf","pacman","snap","flatpak","xargs",
-    "echo","touch","tee","env","export","source","which","whereis",
-)
+# JSON schema for the one piece of data ask mode needs back.
+COMMAND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "command": {
+            "type": "string",
+            "description": "The single shell command to run",
+        },
+    },
+    "required": ["command"],
+}
+
+# Forced tool call used on providers with native tool calling.
+SHELL_COMMAND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shell_command",
+        "description": "Return the single shell command that satisfies the user's request.",
+        "parameters": COMMAND_SCHEMA,
+    },
+}
 
 
-def _extract_from_fenced_blocks(text: str) -> str:
-    """Pull a command out of ```bash ... ``` fenced blocks."""
-    for pattern in [r"```(?:bash|sh|zsh)?\s*\n?(.*?)```", r"```\n?(.*?)```"]:
-        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        if m:
-            cmd = m.group(1).strip().splitlines()[0].strip()
-            if cmd:
-                return re.sub(r"^\s*[$%]\s*", "", cmd)
+def parse_command_json(text: str) -> str:
+    """Extract the command from a structured ``{"command": ...}`` response."""
+    if not text or not text.strip():
+        return ""
+    try:
+        data = json.loads(text.strip())
+    except json.JSONDecodeError:
+        return ""
+    if isinstance(data, dict) and isinstance(data.get("command"), str):
+        return data["command"].strip()
     return ""
 
 
-def _extract_from_backticks(text: str) -> str:
-    """Pull a shell command from inline `backtick` snippets in reasoning text."""
-    backtick_cmds = re.findall(r"`([^`]{4,})`", text)
-    shell_cmds = [c for c in backtick_cmds if any(c.startswith(t) for t in _SHELL_PREFIXES)]
-    return shell_cmds[-1] if shell_cmds else ""
-
-
-def _extract_first_line(text: str) -> str:
-    """Take the first non-empty line, stripping prompt chars."""
-    text = re.sub(r"^\s*[$%]\s*", "", text)
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return lines[0] if lines else ""
-
-
-def extract_command(text: str, provider: str = "") -> str:
-    """Extract a single shell command from LLM response.
-
-    Strategy varies by provider:
-    - anthropic/openai: models follow instructions well, so prefer first-line or fenced block.
-    - cerebras: model often puts answer in reasoning with backtick snippets.
-    - ollama: local models may wrap in markdown, so try fenced blocks first.
-    """
-    if not text or not text.strip():
-        return ""
-    text = text.strip()
-
-    # All providers: try fenced code blocks first
-    cmd = _extract_from_fenced_blocks(text)
-    if cmd:
-        return cmd
-
-    if provider == "cerebras":
-        # Cerebras reasoning often contains backtick-quoted commands
-        cmd = _extract_from_backticks(text)
-        if cmd:
-            return cmd
-
-    if provider in ("anthropic", "openai"):
-        # These models typically return clean single-line commands.
-        # Skip preamble lines like "Here is the command:" that aren't actual commands.
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        for line in lines:
-            clean = re.sub(r"^\s*[$%]\s*", "", line)
-            if not clean:
-                continue
-            # Skip lines that look like English prose rather than commands
-            if clean.endswith(":") or clean.lower().startswith(("here ", "the ", "this ", "i ", "sure", "certainly")):
-                continue
-            # Skip lines that are just backtick-wrapped
-            stripped = clean.strip("`").strip()
-            if stripped and any(stripped.startswith(t) for t in _SHELL_PREFIXES):
-                return stripped
-            if not clean[0].isalpha():
-                return clean
-            # Accept if it looks like a command (starts with a known prefix)
-            if any(clean.startswith(t) for t in _SHELL_PREFIXES):
-                return clean
-        # Nothing matched known prefixes; fall back to first line
-        return _extract_first_line(text)
-
-    if provider == "ollama":
-        # Local models sometimes wrap in backticks inline
-        cmd = _extract_from_backticks(text)
-        if cmd:
-            return cmd
-        return _extract_first_line(text)
-
-    # Unknown provider: try everything
-    cmd = _extract_from_backticks(text)
-    if cmd:
-        return cmd
-    return _extract_first_line(text)
+def command_from_tool_calls(message: dict) -> str:
+    """Extract the command from an OpenAI-shaped forced tool call response."""
+    for tc in message.get("tool_calls") or []:
+        fn = (tc or {}).get("function", {})
+        if fn.get("name") != "shell_command":
+            continue
+        arguments = fn.get("arguments", "")
+        if isinstance(arguments, dict):
+            cmd = arguments.get("command", "")
+            return cmd.strip() if isinstance(cmd, str) else ""
+        return parse_command_json(arguments)
+    return ""
 
 
 
@@ -150,7 +108,7 @@ def build_messages(config: dict, user_request: str, context: dict) -> Tuple[List
     from .prompts import get_ask_prompt
     provider = (config.get("provider") or "openai").lower()
     model = config.get("model", "")
-    system = config.get("system_prompt") or get_ask_prompt(provider, model)
+    system = config.get("system_prompt") or get_ask_prompt(provider, model, config)
     parts = [user_request]
     now = datetime.datetime.now()
     parts.append(f"(Current date/time: {now.strftime('%Y-%m-%d %H:%M %Z').strip()})")
@@ -182,6 +140,8 @@ def call_cerebras(config: dict, messages: list) -> str:
         "temperature": 0.2,
         "max_completion_tokens": 2048,
         "clear_thinking": True,
+        "tools": [SHELL_COMMAND_TOOL],
+        "tool_choice": {"type": "function", "function": {"name": "shell_command"}},
     }
     req = urllib.request.Request(
         f"{base}/chat/completions",
@@ -200,10 +160,7 @@ def call_cerebras(config: dict, messages: list) -> str:
         print(f"conch: API error: {e}", file=sys.stderr)
         sys.exit(1)
     msg = (data.get("choices") or [{}])[0].get("message", {})
-    content = msg.get("content", "")
-    if not content.strip() and msg.get("reasoning"):
-        content = msg["reasoning"]
-    return extract_command(content, provider="cerebras")
+    return command_from_tool_calls(msg)
 
 
 def call_openai(config: dict, messages: list) -> str:
@@ -223,7 +180,9 @@ def call_openai(config: dict, messages: list) -> str:
         messages,
         temperature=0.2,
         max_completion_tokens=2048,
+        tools=[SHELL_COMMAND_TOOL],
     )
+    body["tool_choice"] = {"type": "function", "function": {"name": "shell_command"}}
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
@@ -248,10 +207,7 @@ def call_openai(config: dict, messages: list) -> str:
         print(f"conch: API error: {msg}", file=sys.stderr)
         sys.exit(1)
     msg = (data.get("choices") or [{}])[0].get("message", {})
-    content = msg.get("content") or ""
-    if not (content or "").strip() and msg.get("reasoning"):
-        content = msg["reasoning"]
-    return extract_command(content, provider="openai")
+    return command_from_tool_calls(msg)
 
 
 def call_anthropic(config: dict, messages: list) -> str:
@@ -269,6 +225,12 @@ def call_anthropic(config: dict, messages: list) -> str:
         "max_tokens": 2048,
         "system": system,
         "messages": [{"role": "user", "content": user_content}],
+        "tools": [{
+            "name": "shell_command",
+            "description": SHELL_COMMAND_TOOL["function"]["description"],
+            "input_schema": COMMAND_SCHEMA,
+        }],
+        "tool_choice": {"type": "tool", "name": "shell_command"},
     }
     req = urllib.request.Request(
         url,
@@ -286,25 +248,29 @@ def call_anthropic(config: dict, messages: list) -> str:
     except Exception as e:
         print(f"conch: API error: {e}", file=sys.stderr)
         sys.exit(1)
-    content = ""
     for b in data.get("content", []):
-        if b.get("type") == "text":
-            content += b.get("text", "")
-    return extract_command(content, provider="anthropic")
+        if b.get("type") == "tool_use" and b.get("name") == "shell_command":
+            cmd = (b.get("input") or {}).get("command", "")
+            return cmd.strip() if isinstance(cmd, str) else ""
+    return ""
 
 
 def call_ollama(config: dict, messages: list) -> str:
     import urllib.request
 
-    base = (config.get("base_url") or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+    from .providers import apply_ollama_request_options, get_ollama_base_url
+
+    base = get_ollama_base_url(config)
     url = f"{base}/api/chat"
-    # Ollama wants prompt; we concatenate system + user
-    prompt = "\n\n".join(m["content"] for m in messages)
+    model = config.get("model", "llama3.3")
     body = {
-        "model": config.get("model", "llama3.2"),
-        "messages": [{"role": "user", "content": prompt}],
+        "model": model,
+        "messages": messages,  # proper system + user roles, not a flattened prompt
         "stream": False,
+        # Structured output: Ollama constrains generation to this schema.
+        "format": COMMAND_SCHEMA,
     }
+    apply_ollama_request_options(body, config, model)
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
@@ -318,7 +284,7 @@ def call_ollama(config: dict, messages: list) -> str:
         print(f"conch: Ollama error: {e}", file=sys.stderr)
         sys.exit(1)
     content = (data.get("message") or {}).get("content", "")
-    return extract_command(content, provider="ollama")
+    return parse_command_json(content)
 
 
 _ASK_CALLERS = {
@@ -330,7 +296,7 @@ _ASK_CALLERS = {
 
 def ask(user_request: str, context: Optional[dict] = None) -> str:
     """Main entry: build context, call configured provider, return one command line."""
-    from .providers import get_fallback_chain, DEFAULT_API_KEY_ENVS, KNOWN_MODELS
+    from .providers import get_fallback_chain, get_fallback_model, DEFAULT_API_KEY_ENVS
 
     config = load_config()
     context = context or {}
@@ -343,7 +309,7 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
         context["history"] = os.environ["CONCH_HISTORY"]
 
     provider = (config.get("provider") or "openai").lower()
-    current_model = config.get("model", KNOWN_MODELS.get(provider, [""])[0])
+    current_model = config.get("model") or get_fallback_model(provider, config)
 
     caller = _ASK_CALLERS.get(provider)
     if not caller:
@@ -357,7 +323,7 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
 
     # Primary failed -- try fallbacks (same provider/other model first, then cross-provider)
     attempt_provider, attempt_model = provider, current_model
-    for fb_provider, fb_model, _needs_ctx in get_fallback_chain(provider, current_model):
+    for fb_provider, fb_model, _needs_ctx in get_fallback_chain(provider, current_model, config):
         fb_caller = _ASK_CALLERS.get(fb_provider)
         if not fb_caller:
             continue

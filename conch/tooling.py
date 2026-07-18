@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import sys
@@ -90,6 +91,35 @@ def cap_tools(tools: List[dict], max_tools: int = MAX_ACTIVE_TOOLS) -> List[dict
     return others[: max_tools - len(pinned)] + pinned
 
 
+def select_relevant_tools(tools: List[dict], query: str, limit: int) -> List[dict]:
+    """Pick at most *limit* tools, ranked by relevance to the user's turn.
+
+    Pinned tools always survive; the remaining slots go to tools whose
+    name/description overlaps the query's keywords (ties keep original
+    order). Replaces the old order-based truncation, which kept whatever
+    happened to be first in the list.
+    """
+    if limit <= 0 or len(tools) <= limit:
+        return tools
+    pinned: List[dict] = []
+    others: List[dict] = []
+    for tool in tools:
+        name = tool.get("function", {}).get("name", "")
+        (pinned if name in PINNED_TOOL_NAMES else others).append(tool)
+    slots = limit - len(pinned)
+    if slots <= 0:
+        return pinned[:limit]
+    words = {w for w in re.split(r"[^a-z0-9]+", (query or "").lower()) if len(w) > 2}
+    scored = []
+    for idx, tool in enumerate(others):
+        fn = tool.get("function", {})
+        haystack = (fn.get("name", "") + " " + fn.get("description", "")).lower()
+        score = sum(1 for w in words if w in haystack)
+        scored.append((-score, idx, tool))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [tool for _, _, tool in scored[:slots]] + pinned
+
+
 def auto_disable_oversized_groups(all_tools: List[dict], tool_map: dict, prefs: dict) -> tuple[dict, List[tuple[str, int]]]:
     disabled = set(prefs.get("disabled_groups", []))
     auto_disabled = []
@@ -127,12 +157,30 @@ BUILTIN_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 
-def list_profiles() -> Dict[str, Dict[str, Any]]:
-    """Return builtin + user-defined profiles."""
+def config_profiles(config: Optional[dict]) -> Dict[str, Dict[str, Any]]:
+    """Profiles defined in ~/.config/conch/config as ``profile_<name> =
+    group1, group2`` lines (plan 1.6: user-definable named group sets)."""
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for key, value in (config or {}).items():
+        if not key.startswith("profile_"):
+            continue
+        name = key[len("profile_"):].strip().lower()
+        if not name:
+            continue
+        groups = {g.strip().lower() for g in str(value).split(",") if g.strip()}
+        profiles[name] = {
+            "description": f"Config-defined ({', '.join(sorted(groups)) or 'no groups'})",
+            "groups": groups,
+        }
+    return profiles
+
+
+def list_profiles(config: Optional[dict] = None) -> Dict[str, Dict[str, Any]]:
+    """Return builtin + config-defined + prefs-defined profiles."""
     prefs = load_tool_prefs()
-    custom = prefs.get("custom_profiles", {})
     merged = dict(BUILTIN_PROFILES)
-    merged.update(custom)
+    merged.update(config_profiles(config))
+    merged.update(prefs.get("custom_profiles", {}))
     return merged
 
 
@@ -141,36 +189,59 @@ def active_profile_name() -> str:
     return prefs.get("active_profile", "")
 
 
+def _profile_disabled_groups(profile: Dict[str, Any], all_groups: set) -> List[str]:
+    wanted = profile.get("groups")
+    if wanted == "__all__":
+        return []
+    if wanted is None:
+        return sorted(all_groups - PINNED_TOOL_NAMES)
+    if isinstance(wanted, list):
+        wanted = set(wanted)
+    return sorted(all_groups - wanted - PINNED_TOOL_NAMES)
+
+
+def profile_tool_filter(
+    name: str,
+    all_tools: List[dict],
+    tool_map: Dict[str, Any],
+    config: Optional[dict] = None,
+) -> tuple[Optional[List[dict]], str]:
+    """Compute the tool list a profile would produce, without persisting
+    prefs. Returns (tools, description) or (None, error message).
+
+    Used for session-only activation (the ollama minimal default and the
+    ``tool_profile`` config key) so an automatic choice never overwrites the
+    user's saved preferences.
+    """
+    profiles = list_profiles(config)
+    profile = profiles.get(name)
+    if not profile:
+        return None, f"Unknown profile '{name}'. Use /profiles to list."
+    all_groups = set(group_tools(all_tools, tool_map).keys())
+    prefs = {"disabled_groups": _profile_disabled_groups(profile, all_groups)}
+    tools = cap_tools(apply_filter(all_tools, tool_map, prefs))
+    return tools, profile.get("description", name)
+
+
 def activate_profile(
     name: str,
     all_tools: List[dict],
     tool_map: Dict[str, Any],
+    config: Optional[dict] = None,
 ) -> tuple[List[dict], str]:
     """Activate a profile and return (filtered_tools, description).
 
     Sets disabled_groups in prefs so that only the profile's groups (plus
     pinned tools) are active.  Returns the new active tool list.
     """
-    profiles = list_profiles()
+    profiles = list_profiles(config)
     profile = profiles.get(name)
     if not profile:
         return [], f"Unknown profile '{name}'. Use /profiles to list."
 
     prefs = load_tool_prefs()
     all_groups = set(group_tools(all_tools, tool_map).keys())
-
-    wanted = profile.get("groups")
-    if wanted == "__all__":
-        prefs["disabled_groups"] = []
-    elif wanted is None:
-        prefs["disabled_groups"] = sorted(all_groups - PINNED_TOOL_NAMES)
-    else:
-        if isinstance(wanted, list):
-            wanted = set(wanted)
-        prefs["disabled_groups"] = sorted(
-            all_groups - wanted - PINNED_TOOL_NAMES
-        )
-
+    prefs["disabled_groups"] = _profile_disabled_groups(profile, all_groups)
     prefs["active_profile"] = name
     save_tool_prefs(prefs)
     tools = cap_tools(apply_filter(all_tools, tool_map, prefs))
@@ -230,7 +301,7 @@ SAVE_MEMORY_TOOL = {
     "type": "function",
     "function": {
         "name": "save_memory",
-        "description": "Persist a fact, preference, token, API key, credential, or URL to memory so it can be recalled later.",
+        "description": "Persist a durable fact, user preference, or piece of context to memory so it can be recalled in later sessions.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -245,12 +316,21 @@ SAVE_MEMORY_TOOL = {
 class LocalShellClient:
     name = "local_shell"
 
+    # Default char budget for command output handed to the LLM; app.py scales
+    # this to the active model's context window (see set_result_budget).
+    DEFAULT_RESULT_BUDGET = 15000
+
     def __init__(self):
         self.policy = LocalShellPolicy()
         self._allowed_commands: set[str] = set()
+        self._result_budget = self.DEFAULT_RESULT_BUDGET
 
     def set_policy(self, policy: LocalShellPolicy):
         self.policy = policy
+
+    def set_result_budget(self, budget_chars: int):
+        if budget_chars > 0:
+            self._result_budget = budget_chars
 
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
@@ -335,8 +415,9 @@ class LocalShellClient:
             output = f"(no output, exit code {proc.returncode})"
         elif proc.returncode != 0:
             output += f"\n(exit code {proc.returncode})"
-        if len(output) > 15000:
-            output = output[:15000] + "\n... (truncated)"
+        if len(output) > self._result_budget:
+            from .runtime import truncate_middle
+            output = truncate_middle(output, self._result_budget)
         return self._text(output)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
@@ -705,12 +786,15 @@ class ConchConfigClient:
         self._provider = ""
         self._model = ""
         self._session_usage = {}
+        self._config: dict = {}
         self.pending_actions: List[tuple] = []
 
-    def bind(self, provider: str, model: str, session_usage: dict):
+    def bind(self, provider: str, model: str, session_usage: dict, config: Optional[dict] = None):
         self._provider = provider
         self._model = model
         self._session_usage = session_usage
+        if config is not None:
+            self._config = config
 
     def update(self, provider: str, model: str):
         self._provider = provider
@@ -724,7 +808,11 @@ class ConchConfigClient:
             KNOWN_MODELS,
             MODEL_PRICING,
             DEFAULT_API_KEY_ENVS,
-            DEFAULT_CHAT_MODEL_BY_PROVIDER,
+            get_fallback_model,
+            get_ollama_base_url,
+            list_ollama_models,
+            ollama_model_matches,
+            validate_ollama_model,
         )
         import os
 
@@ -732,12 +820,18 @@ class ConchConfigClient:
         value = arguments.get("value", "").strip()
 
         if action == "get":
+            from .config import get_config_path
+            from .providers import get_context_window
             agent = "ON" if get_agent_mode() else "OFF"
             lines = [
                 f"provider: {self._provider}",
                 f"model: {self._model}",
+                f"context_window: {get_context_window(self._provider, self._model, self._config):,} tokens",
                 f"agent_mode: {agent}",
+                f"config_file: {get_config_path()}",
             ]
+            if self._provider == "ollama":
+                lines.append(f"ollama_base_url: {get_ollama_base_url(self._config)}")
             u = self._session_usage
             if u.get("turns"):
                 lines.append(f"session_turns: {u['turns']}")
@@ -753,10 +847,22 @@ class ConchConfigClient:
                 key_env = DEFAULT_API_KEY_ENVS.get(prov, "")
                 available = not key_env or bool(os.environ.get(key_env, "").strip())
                 status = "available" if available else "no API key"
+                if prov == "ollama":
+                    models = list_ollama_models(self._config)
+                    if models is None:
+                        lines.append(f"\nollama (unreachable at {get_ollama_base_url(self._config)}): no models")
+                        continue
+                    if not models:
+                        lines.append("\nollama (reachable): no tool-capable models installed")
+                        continue
                 lines.append(f"\n{prov} ({status}):")
                 for m in models:
                     price = MODEL_PRICING.get(m, (0, 0))
-                    current = " <-- current" if m == self._model else ""
+                    is_current = m == self._model or (
+                        prov == "ollama" and self._provider == "ollama"
+                        and ollama_model_matches(self._model, [m])
+                    )
+                    current = " <-- current" if is_current else ""
                     if price[0] == 0 and price[1] == 0:
                         lines.append(f"  {m}  free{current}")
                     else:
@@ -768,9 +874,19 @@ class ConchConfigClient:
                 return self._text("Error: provide a model name in 'value'")
             target_provider = None
             for prov, models in KNOWN_MODELS.items():
-                if value in models:
+                if prov != "ollama" and value in models:
                     target_provider = prov
                     break
+            if not target_provider:
+                ok, reason = validate_ollama_model(value, self._config)
+                if ok:
+                    target_provider = "ollama"
+                elif ok is False and "tool calling" in reason:
+                    return self._text(f"Cannot switch: {reason}.")
+                elif self._provider == "ollama":
+                    if ok is None:
+                        return self._text(f"Cannot verify model '{value}': {reason}.")
+                    return self._text(f"Cannot switch: {reason}. Use action=list_models to see options.")
             if not target_provider:
                 return self._text(f"Unknown model '{value}'. Use action=list_models to see options.")
             if value == self._model and target_provider == self._provider:
@@ -799,9 +915,13 @@ class ConchConfigClient:
             key_env = DEFAULT_API_KEY_ENVS.get(value, "")
             if key_env and not os.environ.get(key_env, "").strip():
                 return self._text(f"Cannot switch to {value}: {key_env} not set.")
-            default_model = DEFAULT_CHAT_MODEL_BY_PROVIDER.get(value) or (
-                KNOWN_MODELS[value][0] if KNOWN_MODELS.get(value) else ""
-            )
+            default_model = get_fallback_model(value, self._config)
+            if value == "ollama" and not default_model:
+                if list_ollama_models(self._config) is None:
+                    return self._text(
+                        f"Cannot switch to ollama: server unreachable at {get_ollama_base_url(self._config)}."
+                    )
+                return self._text("Cannot switch to ollama: no tool-capable models installed on the server.")
             self.pending_actions.append(("set_model", value, default_model))
             return self._text(
                 f"Provider switch to {value}/{default_model} is queued. "

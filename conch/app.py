@@ -15,7 +15,7 @@ import urllib.request
 from typing import Any, Dict, List
 
 from .commands import handle_slash_command
-from .config import load_config
+from .config import get_bool, load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
 from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS
@@ -50,6 +50,24 @@ CHAT_SYSTEM_PROMPT = None  # resolved per-provider at startup
 
 MAX_TOOL_ROUNDS = 25  # default, adjustable via /rounds
 
+AGENT_MODE_CONFIG_NOTICE = (
+    "agent mode is ON by default (shell commands run without confirmation) — "
+    "/agent to turn it off, or remove agent_mode from ~/.config/conch/config"
+)
+
+
+def apply_agent_mode_from_config(config: dict) -> bool:
+    """Enable agent mode when the config file asks for it.
+
+    Returns True only when agent mode was turned on by the config default,
+    so the caller knows to show the startup notice (manual /agent toggles
+    mid-session never go through here).
+    """
+    if get_bool(config, "agent_mode"):
+        set_agent_mode(True)
+        return True
+    return False
+
 CONCH_SHELL_ART = [
     "      ,/",
     "     //",
@@ -78,67 +96,43 @@ def _detect_location() -> str:
         return ""
 
 
-def _load_config_credentials() -> str:
-    """Read tokens, API keys, URLs, and usernames from ~/.config/conch/* files."""
-    import json as _json
-    config_dir = os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        "conch",
-    )
-    if not os.path.isdir(config_dir):
-        return ""
+def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "", model: str = "", config: dict = None) -> str:
+    """Build the session system prompt.
 
-    creds: List[str] = []
-    _CRED_PATTERNS = ("token", "key", "url", "username", "password", "secret", "credential")
-
-    config_path = os.path.join(config_dir, "config")
-    if os.path.isfile(config_path):
-        try:
-            for line in open(config_path).read().splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#") or "=" not in stripped:
-                    continue
-                lhs = stripped.split("=", 1)[0].strip().lower()
-                if any(p in lhs for p in _CRED_PATTERNS):
-                    creds.append(stripped)
-        except OSError:
-            pass
-
-    mcp_path = os.path.join(config_dir, "mcp.json")
-    if os.path.isfile(mcp_path):
-        try:
-            mcp_data = _json.loads(open(mcp_path).read())
-            servers = mcp_data.get("mcpServers", {})
-            for server_name, server_cfg in servers.items():
-                env = server_cfg.get("env", {})
-                if not env:
-                    continue
-                for k, v in env.items():
-                    creds.append(f"{server_name}: {k} = {v}")
-        except (OSError, _json.JSONDecodeError, AttributeError):
-            pass
-
-    if not creds:
-        return ""
-    return "Available credentials and tokens (from ~/.config/conch/):\n" + "\n".join(f"- {c}" for c in creds)
-
-
-def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "", model: str = "") -> str:
-    now = datetime.datetime.now()
-    tz_name = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
-    parts = [f"Current date and time: {now.strftime('%A, %B %d, %Y %I:%M %p')} (timezone: {tz_name})."]
+    Deliberately contains nothing volatile (no timestamp, no per-turn memory
+    context): the system prompt must stay byte-stable within a session so
+    Ollama's KV prefix cache survives between turns. Per-turn context rides
+    on the user message instead (see _augment_user_message).
+    """
+    parts = []
     if location:
         parts.append(f"User location: {location}.")
     if provider and model:
-        parts.append(f"You are currently running as {provider}/{model}.")
-    parts.append("Use this for any time-sensitive or location-relevant requests.")
-    prompt = base_prompt + "\n\n" + " ".join(parts)
-
-    creds = _load_config_credentials()
-    if creds:
-        prompt += "\n\n" + creds
-
+        from .prompts import build_self_description
+        parts.append(build_self_description(provider, model, config))
+    prompt = base_prompt + "\n\n" + " ".join(parts) if parts else base_prompt
+    # Project-level instructions (CONCH.md / AGENTS.md, plan 1.8) are
+    # persistent context that lives outside compactable history.
+    from .config import load_project_context
+    project_ctx = load_project_context()
+    if project_ctx:
+        prompt += "\n\n" + project_ctx
     return prompt
+
+
+def _augment_user_message(user_input: str, mem_context: str = "") -> str:
+    """Attach per-turn volatile context (timestamp, recalled memories) to the
+    user message so the system prompt can stay byte-stable (KV-cache reuse)."""
+    now = datetime.datetime.now()
+    tz_name = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
+    parts = [
+        user_input,
+        "",
+        f"[context] Current date/time: {now.strftime('%A, %B %d, %Y %I:%M %p')} ({tz_name})",
+    ]
+    if mem_context:
+        parts.append(mem_context)
+    return "\n".join(parts)
 
 
 def _history_path() -> str:
@@ -152,6 +146,11 @@ def _history_path() -> str:
 def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool = True) -> Dict[str, Any]:
     local_shell = LocalShellClient()
     local_shell.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=get_agent_mode()))
+    # Scale shell-output budget to the active model's context window (plan 1.5)
+    from .runtime import tool_result_char_budget
+    local_shell.set_result_budget(
+        tool_result_char_budget((config.get("provider") or "").lower(), config)
+    )
     manage_tools = ManageToolsClient()
     save_memory = SaveMemoryClient()
     save_memory.bind(memory)
@@ -227,6 +226,9 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
                 summary_messages.append({"role": message["role"], "content": message["content"][:500]})
         summary_messages.append({"role": "user", "content": summary_prompt})
         response = raw_fn(config, summary_messages, None)
+        from .runtime import is_error_response
+        if is_error_response(response):
+            return  # never save provider errors as permanent memories
         summary = response.get("content", "").strip()
         if summary:
             memory.add(f"[Session summary] {summary}", source="summary")
@@ -336,6 +338,7 @@ class TypeaheadBuffer:
 
 def chat_loop():
     config = load_config()
+    agent_mode_from_config = apply_agent_mode_from_config(config)
     provider = (config.get("provider") or "openai").lower()
     raw_fn = RAW_FNS.get(provider)
     if not raw_fn:
@@ -343,8 +346,42 @@ def chat_loop():
         sys.exit(1)
 
     model_name = config.get("chat_model", config.get("model", ""))
+
+    # Don't blindly trust a configured/default Ollama model — verify it exists
+    # on the server (and supports tools); otherwise pick one that does.
+    if provider == "ollama":
+        from .providers import (
+            get_fallback_model,
+            get_ollama_base_url,
+            list_ollama_models,
+            ollama_model_matches,
+        )
+        live_models = list_ollama_models(config)
+        if live_models is None:
+            print(
+                f"\033[33m  ⚠ Ollama server unreachable at {get_ollama_base_url(config)} — "
+                f"model '{model_name}' unverified\033[0m",
+                file=sys.stderr,
+            )
+        elif not ollama_model_matches(model_name, live_models):
+            replacement = get_fallback_model("ollama", config)
+            if replacement:
+                print(
+                    f"\033[33m  ⚠ Model '{model_name}' is not available/tool-capable on the "
+                    f"Ollama server — using '{replacement}' instead\033[0m",
+                    file=sys.stderr,
+                )
+                model_name = replacement
+                config["model"] = replacement
+                config["chat_model"] = replacement
+            else:
+                print(
+                    "\033[33m  ⚠ No tool-capable models installed on the Ollama server\033[0m",
+                    file=sys.stderr,
+                )
+
     from .prompts import get_chat_prompt
-    base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
+    base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
 
     # Detect location in background — inject into prompt when ready
     _location_result = [""]
@@ -353,7 +390,7 @@ def chat_loop():
     _loc_thread = threading.Thread(target=_bg_location, daemon=True)
     _loc_thread.start()
 
-    system_prompt = _build_system_prompt(base_prompt, provider=provider, model=model_name)
+    system_prompt = _build_system_prompt(base_prompt, provider=provider, model=model_name, config=config)
     memory = MemoryStore()
     builtin_clients = _make_builtin_clients(memory, config, interactive=True)
 
@@ -438,9 +475,14 @@ def chat_loop():
         "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
         "/search", "/agent", "/yolo", "/verbose", "/schedule", "/tasks",
         "/cancel", "/tools", "/enable", "/disable", "/connect", "/apps",
-        "/reload", "/rounds", "/cost", "/profile", "/profiles", "/clear",
-        "/queue",
+        "/reload", "/rounds", "/cost", "/status", "/profile", "/profiles",
+        "/clear", "/queue",
     ]
+    # User-defined commands (~/.config/conch/commands/*.md) complete too
+    from .commands import load_user_commands
+    _SLASH_COMMANDS += sorted(
+        "/" + name for name in load_user_commands() if "/" + name not in _SLASH_COMMANDS
+    )
 
     def _completer(text, state):
         if text.startswith("/"):
@@ -502,6 +544,8 @@ def chat_loop():
         active_tasks = [task for task in sched.list_tasks() if task.active]
         if active_tasks:
             print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
+        if agent_mode_from_config:
+            print(f"\033[1;33m{AGENT_MODE_CONFIG_NOTICE}\033[0m")
         print("\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
 
     # Wait for background tool loading (with a brief spinner if needed)
@@ -512,15 +556,40 @@ def chat_loop():
     mcp_clients = _bg_mcp_clients[0] or {}
     chat_state = _bg_chat_state[0] or ToolRuntimeState(all_tools=[], tool_map={}, tools=[])
 
+    # Session-only profile selection (plan 1.6): a `tool_profile` config key
+    # wins; otherwise local models default to the minimal profile unless the
+    # user explicitly activated one (saved prefs are never overwritten here).
+    from .tooling import active_profile_name, profile_tool_filter
+    _config_profile = (config.get("tool_profile") or "").strip().lower()
+    if _config_profile:
+        _prof_tools, _prof_desc = profile_tool_filter(
+            _config_profile, chat_state.all_tools, chat_state.tool_map, config
+        )
+        if _prof_tools is not None:
+            chat_state.tools = _prof_tools
+            print(f"\033[2mProfile '{_config_profile}' from config — {_prof_desc}\033[0m")
+        else:
+            print(f"\033[33m  ⚠ {_prof_desc}\033[0m", file=sys.stderr)
+    elif provider == "ollama" and not active_profile_name():
+        _prof_tools, _ = profile_tool_filter(
+            "minimal", chat_state.all_tools, chat_state.tool_map, config
+        )
+        if _prof_tools is not None and len(_prof_tools) < len(chat_state.tools):
+            chat_state.tools = _prof_tools
+            print(
+                "\033[2mLocal model: minimal tool profile active "
+                "(/profile full to override)\033[0m"
+            )
+
     # Inject location now that background thread has had time
     _loc_thread.join(timeout=0.1)
     if _location_result[0]:
-        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name)
+        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = system_prompt
 
     # Bind config client with current state
-    builtin_clients["conch_config"].bind(provider, model_name, session_usage)
+    builtin_clients["conch_config"].bind(provider, model_name, session_usage, config)
     builtin_clients["search_conversations"].bind(conv_mgr, memory=memory)
 
     _print_banner()
@@ -590,7 +659,16 @@ def chat_loop():
                     conv_mgr=conv_mgr,
                     current_conv=current_conv,
                     session_usage=session_usage,
+                    messages=messages,
                 )
+                # User-defined slash command: the rendered template becomes
+                # this turn's user message (handled by the normal flow below).
+                _custom_prompt = None
+                if isinstance(result, tuple) and result[0] == "user_prompt":
+                    _custom_prompt = result[1]
+                    result = None
+                    preview = _custom_prompt.strip().splitlines()[0][:70]
+                    print(f"  \033[2m→ {preview}\033[0m")
                 if result == "new_conversation":
                     _save_current()
                     _summarize_and_save(messages, config, raw_fn, memory)
@@ -643,19 +721,25 @@ def chat_loop():
                     if provider != old_provider:
                         from .runtime import normalize_messages_on_switch
                         normalize_messages_on_switch(messages, provider)
-                        from .prompts import get_chat_prompt
-                        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
-                        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name)
+                    # Rebuild the system prompt on any switch so the model's
+                    # self-description (provider/model/context window) stays true.
+                    from .prompts import get_chat_prompt
+                    base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
+                    system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
+                    if messages and messages[0].get("role") == "system":
                         messages[0]["content"] = system_prompt
-                continue
+                if _custom_prompt is None:
+                    continue
+                user_input = _custom_prompt
 
             # Set title from first user message immediately
             if current_conv.title == "New conversation":
                 current_conv.title = user_input.strip().splitlines()[0][:60] or "New conversation"
 
+            # Keep messages[0] byte-stable (KV prefix cache); volatile context
+            # (timestamp + recalled memories) rides on the user message.
             mem_context = memory.build_context(user_input)
-            messages[0]["content"] = system_prompt + ("\n\n" + mem_context if mem_context else "")
-            messages.append({"role": "user", "content": user_input})
+            messages.append({"role": "user", "content": _augment_user_message(user_input, mem_context)})
 
             if _typeahead_enabled:
                 _typeahead.start()
@@ -690,12 +774,19 @@ def chat_loop():
                 continue
 
             # API fallback inside chat_turn may switch provider/model via config only
+            _pre_fb = (provider, model_name)
             provider = (config.get("provider") or provider).lower()
             model_name = config.get("chat_model") or config.get("model") or model_name
             _sync_fn = RAW_FNS.get(provider)
             if _sync_fn:
                 raw_fn = _sync_fn
             builtin_clients["conch_config"].update(provider, model_name)
+            if (provider, model_name) != _pre_fb:
+                # Keep the self-description accurate after automatic fallback.
+                base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
+                system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = system_prompt
 
             _typeahead_partial = _typeahead.stop()
             _typeahead_queued.extend(_typeahead.get_queued())
@@ -714,21 +805,28 @@ def chat_loop():
                     _printer.flush()
                 print("\n\033[2m[no response]\033[0m\n")
 
-            # Display token/cost info
+            # Display token/cost info with a context-usage gauge
             in_tok = turn_usage.get("input_tokens", 0)
             out_tok = turn_usage.get("output_tokens", 0)
             used_model = turn_usage.get("model", model_name)
             if in_tok or out_tok:
                 from .providers import estimate_cost
+                from .runtime import estimate_tokens, format_context_gauge, get_context_limit
                 cost = estimate_cost(used_model, in_tok, out_tok)
                 session_usage["input_tokens"] += in_tok
                 session_usage["output_tokens"] += out_tok
                 session_usage["cost"] += cost
                 session_usage["turns"] += 1
-                if cost > 0.0001:
-                    print(f"  \033[2m{in_tok:,} in / {out_tok:,} out  ~${cost:.4f}  ({used_model})\033[0m")
-                else:
-                    print(f"  \033[2m{in_tok:,} in / {out_tok:,} out  free  ({used_model})\033[0m")
+                ctx_used = estimate_tokens(messages)
+                ctx_window = get_context_limit(provider, config)
+                gauge = format_context_gauge(ctx_used, ctx_window)
+                cost_str = f"~${cost:.4f}" if cost > 0.0001 else "free"
+                print(f"  \033[2m{in_tok:,} in / {out_tok:,} out  {cost_str}  {gauge}\033[2m  ({used_model})\033[0m")
+                if ctx_window and ctx_used / ctx_window >= 0.8:
+                    print(
+                        f"  \033[33m⚠ Context {ctx_used / ctx_window * 100:.0f}% full — "
+                        f"older history will be compacted soon (/clear or /new to reset)\033[0m"
+                    )
 
             # Process any config changes made by the LLM via conch_config tool
             _cfg_client = builtin_clients["conch_config"]
@@ -748,8 +846,11 @@ def chat_loop():
                         if provider != old_provider:
                             from .runtime import normalize_messages_on_switch
                             normalize_messages_on_switch(messages, provider)
-                            base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
-                            system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name)
+                        # Any switch (even same-provider model change) must
+                        # refresh the self-description in the system prompt.
+                        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
+                        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
+                        if messages and messages[0].get("role") == "system":
                             messages[0]["content"] = system_prompt
                         _cfg_client.update(provider, model_name)
                         print(f"  \033[1;32m\u2713 Now using {provider}/{model_name}\033[0m")
@@ -796,22 +897,24 @@ def chat_loop():
 def main():
     if len(sys.argv) > 1:
         config = load_config()
+        apply_agent_mode_from_config(config)
         provider = (config.get("provider") or "openai").lower()
         raw_fn = RAW_FNS.get(provider)
         if not raw_fn:
             print(f"conch: unknown provider {provider}", file=sys.stderr)
             sys.exit(1)
         model_name = config.get("chat_model", config.get("model", ""))
-        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name)
-        system_prompt = _build_system_prompt(base_prompt, _detect_location(), provider, model_name)
+        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
+        system_prompt = _build_system_prompt(base_prompt, _detect_location(), provider, model_name, config)
         user_text = " ".join(sys.argv[1:])
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)
-        if mem_context:
-            system_prompt += "\n\n" + mem_context
         builtin_clients = _make_builtin_clients(memory, config, interactive=True)
         mcp_clients, chat_state = _load_runtime_tools(builtin_clients)
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": _augment_user_message(user_text, mem_context)},
+        ]
         try:
             reply, _usage = chat_turn(
                 config,

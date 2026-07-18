@@ -7,28 +7,33 @@ from __future__ import annotations
 # ASK mode -- one-shot command generation
 # ---------------------------------------------------------------------------
 
+# Ask mode uses structured output (plan 0.6): tool-calling providers are
+# forced into a shell_command tool call; Ollama is constrained to a
+# {"command": ...} JSON schema. The prompt describes the task, not the
+# output format — the format is enforced by the API.
 _ASK_BASE = (
     "You are an expert shell, DevOps, cloud, and security assistant. "
-    "Reply with exactly one shell command, no explanation, safe for the current OS. "
-    "No markdown, no code block. Just the raw command.\n\n"
+    "Produce exactly one shell command that satisfies the user's request, "
+    "safe for the current OS.\n\n"
     "Prefer the most appropriate specialized tool for the task. "
     "Use safe defaults (no destructive actions unless explicitly asked). "
     "If a preferred tool is not installed, give the best available command."
 )
 
+_ASK_TOOL_CALL = (
+    _ASK_BASE
+    + "\n\nProvide the command by calling the shell_command tool with the "
+    "command as its 'command' argument. Do not reply with prose."
+)
+
 ASK_PROMPTS = {
-    "cerebras": (
-        "IMPORTANT: Your answer MUST be a single shell command on one line. "
-        "Do NOT explain, do NOT use markdown, do NOT use code blocks. "
-        "Output ONLY the command itself, nothing else.\n\n"
-        + _ASK_BASE
-    ),
-    "anthropic": _ASK_BASE,
-    "openai": _ASK_BASE,
+    "cerebras": _ASK_TOOL_CALL,
+    "anthropic": _ASK_TOOL_CALL,
+    "openai": _ASK_TOOL_CALL,
     "ollama": (
-        "Reply with ONLY a single shell command. No explanation, no markdown. "
-        "Just the raw command on one line.\n\n"
-        + _ASK_BASE
+        _ASK_BASE
+        + "\n\nRespond with a JSON object of the form "
+        '{"command": "<the shell command>"} and nothing else.'
     ),
 }
 
@@ -54,14 +59,10 @@ _CHAT_BASE = (
     "  Configured in ~/.config/conch/mcp.json (stdio and HTTP transports).\n"
     "- manage_tools: search and selectively load tools from large groups.\n"
     "- save_memory: proactively remember user preferences, facts, and context.\n"
-    "  IMPORTANT: whenever you encounter or use a token, API key, credential, URL,\n"
-    "  username, or connection string, ALWAYS save it to memory immediately using\n"
-    "  save_memory so it can be recalled later. Include the service name, key type,\n"
-    "  and value. Example: 'Jira API token for tom@capitol.ai: ATATT3x...'\n"
     "- search_conversations: search all past conversations, memories, AND config\n"
-    "  files (~/.config/conch/*) for topics, commands, tokens, or information.\n"
-    "  Use when the user asks to find something from a previous session, look up\n"
-    "  a token/key, or recall any past information.\n"
+    "  files (~/.config/conch/*) for topics, commands, or information.\n"
+    "  Use when the user asks to find something from a previous session or\n"
+    "  recall any past information.\n"
     "- conch_config: read or change YOUR OWN configuration (model, provider, agent\n"
     "  mode, rounds, new conversation, clear history). Use when the user asks to\n"
     "  switch models, change providers, check costs, or list available models.\n"
@@ -85,7 +86,7 @@ _CHAT_BASE = (
     "  Verbose: /verbose -- toggle showing tool args and results\n"
     "  Scheduling: /schedule <interval> <prompt>, /tasks, /cancel <id>\n"
     "  Services: /connect <app>, /apps -- OAuth via Composio\n"
-    "  Other: /cost, /rounds <n>, /queue [on|off], /help\n\n"
+    "  Other: /status, /cost, /rounds <n>, /queue [on|off], /help\n\n"
 
     "Supported providers: Cerebras (free), OpenAI, Anthropic, Ollama (local).\n"
     "Switch at any time with /provider or /model.\n\n"
@@ -100,6 +101,29 @@ _CHAT_BASE = (
     "When answering about your capabilities or how Conch works, be specific and "
     "accurate. Refer users to slash commands when appropriate. "
     "You are open source (MIT license), installed via pip or git clone."
+)
+
+# Compact prompt for local models (plan 1.2): small models live or die on
+# token budget, and most of _CHAT_BASE is slash-command docs the model is
+# explicitly told not to handle. Roughly 250 tokens vs ~990.
+_CHAT_LOCAL = (
+    "You are Conch, an LLM-powered shell assistant running in the user's "
+    "terminal on a local Ollama model. Keep replies short and direct; use "
+    "markdown sparingly (this is a terminal).\n\n"
+
+    "Tools (via function calling):\n"
+    "- local_shell: run shell commands on the user's machine. Use it for ANY "
+    "local task — run commands, don't just suggest them. The user approves "
+    "each command unless agent mode is on.\n"
+    "- save_memory: remember durable user preferences and facts.\n"
+    "- search_conversations: search past conversations, memories, and config.\n"
+    "- conch_config: read or change your own settings (model, provider, agent "
+    "mode, rounds).\n"
+    "- manage_tools: search and enable more tool groups when needed.\n\n"
+
+    "Prefer simple, direct actions over complex multi-step plans. "
+    "Conch handles slash commands itself; if the user asks about them, "
+    "point them at /help. Config lives in ~/.config/conch/config."
 )
 
 CHAT_PROMPTS = {
@@ -126,21 +150,81 @@ CHAT_PROMPTS = {
         "Answer clearly. Use markdown formatting sparingly -- this is a terminal.\n\n"
         + _CHAT_BASE
     ),
-    "ollama": (
-        "You are Conch, a local shell assistant running on Ollama.\n"
-        "Keep responses short and focused. Prefer simple, direct answers.\n"
-        "Use local_shell for commands. Avoid overly complex multi-step plans.\n"
-        "Use markdown formatting sparingly -- this is a terminal.\n\n"
-        + _CHAT_BASE
-    ),
+    "ollama": _CHAT_LOCAL,
 }
 
 
-def get_ask_prompt(provider: str, model: str = "") -> str:
+def build_self_description(provider: str, model: str, config: dict = None) -> str:
+    """One-line self-knowledge blurb for the system prompt.
+
+    Kept deliberately tiny (local models have small context windows):
+    active provider/model, that model's context window, and where config
+    lives. Rebuilt whenever the user switches provider/model mid-session.
+    """
+    from .providers import get_context_window
+    from .config import get_config_path
+
+    window = get_context_window(provider, model, config)
+    text = (
+        f"You are currently running as {provider}/{model} "
+        f"(context window ~{window:,} tokens). "
+        f"Your config file is {get_config_path()}."
+    )
+    if (provider or "").lower() == "ollama":
+        from .providers import get_ollama_base_url
+        text += f" Ollama server: {get_ollama_base_url(config)}."
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Per-model prompt template overrides (plan 1.9)
+#
+# Config lines map a provider/model glob to a template file, e.g.:
+#   chat_prompt:ollama/qwen* = ~/.config/conch/prompts/qwen-chat.md
+#   ask_prompt:ollama = ~/.config/conch/prompts/local-ask.md
+# The most specific (longest) matching pattern wins.
+# ---------------------------------------------------------------------------
+
+def resolve_prompt_override(kind: str, provider: str, model: str, config: dict = None) -> str:
+    """Return the contents of a config-mapped prompt template file, or ""."""
+    import fnmatch
+    import os
+
+    prefix = f"{kind}_prompt:"
+    target = f"{provider}/{model}".lower()
+    best = None  # (pattern length, file path)
+    for key, value in (config or {}).items():
+        if not key.startswith(prefix):
+            continue
+        pattern = key[len(prefix):].strip().lower()
+        if not pattern:
+            continue
+        if "/" not in pattern:
+            pattern += "/*"  # bare provider pattern matches all its models
+        if fnmatch.fnmatch(target, pattern):
+            if best is None or len(pattern) > best[0]:
+                best = (len(pattern), str(value))
+    if best is None:
+        return ""
+    path = os.path.expanduser(best[1].strip())
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def get_ask_prompt(provider: str, model: str = "", config: dict = None) -> str:
     """Return the ask-mode system prompt for the given provider/model."""
+    override = resolve_prompt_override("ask", provider, model, config)
+    if override:
+        return override
     return ASK_PROMPTS.get(provider, ASK_PROMPTS.get("openai", _ASK_BASE))
 
 
-def get_chat_prompt(provider: str, model: str = "") -> str:
+def get_chat_prompt(provider: str, model: str = "", config: dict = None) -> str:
     """Return the chat-mode system prompt for the given provider/model."""
+    override = resolve_prompt_override("chat", provider, model, config)
+    if override:
+        return override
     return CHAT_PROMPTS.get(provider, CHAT_PROMPTS.get("openai", _CHAT_BASE))

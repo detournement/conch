@@ -18,6 +18,7 @@ MAX_ACTIVE_TOOLS = 300
 PINNED_TOOL_NAMES = {
     "local_shell", "manage_tools", "save_memory", "public_api", "conch_config",
     "search_conversations", "api_layer", "todo_list", "delegate_task",
+    "skill_manage",
 }
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
@@ -991,8 +992,8 @@ class TodoListClient:
         self._items = []
 
 
-# Tool definition for the delegate_task subagent (plan 3.1); the client
-# lives below with the runtime wiring.
+# Tool definition for the delegate_task subagent (plan 3.1 + 4.2); the
+# client lives below with the runtime wiring.
 DELEGATE_TASK_TOOL = {
     "type": "function",
     "function": {
@@ -1001,7 +1002,9 @@ DELEGATE_TASK_TOOL = {
             "Delegate a self-contained subtask to a fresh subagent with clean "
             "context and its own tool budget. It returns only a concise "
             "summary — use this to keep large exploration or multi-step side "
-            "work out of your own context. Subagents run one at a time."
+            "work out of your own context. Subagents run one at a time. "
+            "Pass 'skill' to run a skill-scoped subagent: it gets that "
+            "skill's instructions, allowed tools, and model preference."
         ),
         "parameters": {
             "type": "object",
@@ -1014,11 +1017,161 @@ DELEGATE_TASK_TOOL = {
                     "type": "string",
                     "description": "Optional extra context the subagent needs",
                 },
+                "skill": {
+                    "type": "string",
+                    "description": "Optional skill name scoping the subagent "
+                                   "(see skill_manage action='list')",
+                },
             },
             "required": ["task"],
         },
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Skill management (plan 4.1): list/use/save/delete skills from
+# ~/.config/conch/skills/. 'use' injects the skill body into context (the
+# tool result is the injection); 'save' is the in-chat skill builder with a
+# human-in-the-loop confirmation before anything is written.
+# ---------------------------------------------------------------------------
+
+SKILL_MANAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "skill_manage",
+        "description": (
+            "Manage and use skills (reusable procedures in "
+            "~/.config/conch/skills/). action='use' loads a skill's "
+            "instructions into context — do this before performing a task a "
+            "skill covers. action='save' creates/updates a skill: when the "
+            "user asks to turn a procedure you just performed into a skill, "
+            "draft the name/description/body (steps, commands, pitfalls, "
+            "verification) and save it — the user confirms before anything "
+            "is written."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "use", "save", "delete"],
+                },
+                "name": {"type": "string", "description": "Skill name (lowercase, dashes ok)"},
+                "description": {"type": "string", "description": "One-line description (for save)"},
+                "body": {
+                    "type": "string",
+                    "description": "Skill instructions in markdown (for save): "
+                                   "steps, commands, pitfalls, verification",
+                },
+                "tools": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Tools the skill is allowed to use (for save; omit = all)",
+                },
+                "model": {"type": "string", "description": "Optional model preference (for save)"},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class SkillManageClient:
+    """Skill loader/builder tool. Saving and deleting are human-in-the-loop:
+    the user reviews the skill and confirms before the file is touched."""
+
+    name = "skill_manage"
+
+    def __init__(self):
+        self._interactive = True
+        self._input_fn = None
+
+    def configure(self, interactive: bool = True, input_fn=None):
+        self._interactive = interactive
+        self._input_fn = input_fn
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def _confirm(self, prompt: str) -> bool:
+        _input = self._input_fn or input
+        try:
+            answer = _input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer in ("", "y", "yes")
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        from . import skills as skills_mod
+
+        action = (arguments.get("action") or "list").lower()
+
+        if action == "list":
+            skills = skills_mod.load_skills()
+            if not skills:
+                return self._text(
+                    "No skills defined yet. Save one with action='save', or "
+                    f"drop markdown files in {skills_mod.skills_dir()}."
+                )
+            lines = ["Available skills:"]
+            for skill_name, skill in sorted(skills.items()):
+                scope = "all tools" if skill["tools"] is None else ", ".join(skill["tools"])
+                model = f", model={skill['model']}" if skill["model"] else ""
+                lines.append(f"- {skill_name}: {skill['description'] or '(no description)'} "
+                             f"[tools: {scope}{model}]")
+            return self._text("\n".join(lines))
+
+        if action == "use":
+            skill = skills_mod.get_skill(arguments.get("name", ""))
+            if skill is None:
+                return self._text(
+                    f"Unknown skill '{arguments.get('name', '')}'. Use action='list'."
+                )
+            return self._text(
+                skills_mod.render_skill(skill)
+                + "\n\nFollow this skill's procedure for the current task."
+            )
+
+        if action == "save":
+            skill_name = (arguments.get("name") or "").strip().lower()
+            body = (arguments.get("body") or "").strip()
+            if not skill_name or not skills_mod.SKILL_NAME_RE.fullmatch(skill_name):
+                return self._text("Error: provide a valid 'name' (lowercase, digits, - or _)")
+            if not body:
+                return self._text("Error: provide the skill 'body' (the procedure)")
+            description = (arguments.get("description") or "").strip()
+            tools = arguments.get("tools") or None
+            if tools is not None:
+                tools = [str(t).strip() for t in tools if str(t).strip()] or None
+            model = (arguments.get("model") or "").strip()
+            if not self._interactive:
+                return self._text("Error: saving skills requires an interactive session.")
+            existing = skills_mod.get_skill(skill_name)
+            verb = "Update" if existing else "Save new"
+            preview = skills_mod.format_skill_file(skill_name, description, body, tools, model)
+            print(f"\n  \033[1;33m{verb} skill '{skill_name}':\033[0m")
+            for line in preview.splitlines()[:30]:
+                print(f"    \033[2m{line}\033[0m")
+            if len(preview.splitlines()) > 30:
+                print(f"    \033[2m... ({len(preview.splitlines()) - 30} more lines)\033[0m")
+            if not self._confirm(f"  \033[1;33m{verb} skill? [y/N]\033[0m "):
+                return self._text("User declined to save the skill.")
+            path = skills_mod.save_skill(skill_name, description, body, tools, model)
+            return self._text(f"Saved skill '{skill_name}' to {path}. "
+                              f"Use it with skill_manage action='use' or /skill {skill_name}.")
+
+        if action == "delete":
+            skill_name = (arguments.get("name") or "").strip().lower()
+            if skills_mod.get_skill(skill_name) is None:
+                return self._text(f"Unknown skill '{skill_name}'.")
+            if not self._interactive:
+                return self._text("Error: deleting skills requires an interactive session.")
+            if not self._confirm(f"  \033[1;33mDelete skill '{skill_name}'? [y/N]\033[0m "):
+                return self._text("User declined to delete the skill.")
+            skills_mod.delete_skill(skill_name)
+            return self._text(f"Deleted skill '{skill_name}'.")
+
+        return self._text(f"Unknown action: {action}")
 
 
 class DelegateTaskClient:
@@ -1065,11 +1218,22 @@ class DelegateTaskClient:
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
 
-    def _subagent_config(self) -> tuple:
-        """(config copy, provider) for the subagent, applying subagent_model."""
+    def _subagent_config(self, preferred_model: str = "", preferred_provider: str = "") -> tuple:
+        """(config copy, provider) for the subagent.
+
+        Model preference order: the skill's model (plan 4.2) beats the
+        configured subagent_model beats the parent's model. Ollama models are
+        capability-gated (plan 0.4); unusable preferences fall back to the
+        parent's model with a warning.
+        """
+        from .providers import RAW_FNS
+
         config = dict(self._config)
         provider = (config.get("provider") or "").lower()
-        sub_model = (config.get("subagent_model") or "").strip()
+        if preferred_provider and preferred_provider in RAW_FNS:
+            provider = preferred_provider
+            config["provider"] = preferred_provider
+        sub_model = (preferred_model or config.get("subagent_model") or "").strip()
         if sub_model:
             usable = True
             if provider == "ollama":
@@ -1077,7 +1241,7 @@ class DelegateTaskClient:
                 ok, reason = validate_ollama_model(sub_model, config)
                 if ok is not True:
                     usable = False
-                    print(f"  \033[33m⚠ subagent_model '{sub_model}' unusable "
+                    print(f"  \033[33m⚠ subagent model '{sub_model}' unusable "
                           f"({reason or 'unverified'}) — using parent model\033[0m",
                           file=sys.stderr)
             if usable:
@@ -1091,6 +1255,16 @@ class DelegateTaskClient:
             return self._text("Error: 'task' is required")
         if self._chat_state is None:
             return self._text("Error: delegate_task not initialized")
+        skill = None
+        skill_name = (arguments.get("skill") or "").strip().lower()
+        if skill_name:
+            from . import skills as skills_mod
+            skill = skills_mod.get_skill(skill_name)
+            if skill is None:
+                return self._text(
+                    f"Error: unknown skill '{skill_name}' — use skill_manage "
+                    "action='list' to see available skills."
+                )
         # Serialize: one subagent at a time (single local GPU).
         if not self._lock.acquire(blocking=False):
             return self._text(
@@ -1098,36 +1272,64 @@ class DelegateTaskClient:
                 "one at a time. Finish or wait, then retry."
             )
         try:
-            return self._run(task, (arguments.get("context") or "").strip())
+            return self._run(task, (arguments.get("context") or "").strip(), skill)
         finally:
             self._lock.release()
 
-    def _run(self, task: str, context: str) -> dict:
+    def _run(self, task: str, context: str, skill: Optional[dict] = None) -> dict:
         from .config import get_int
         from .providers import RAW_FNS
         from .runtime import chat_turn, truncate_tool_result
 
-        config, provider = self._subagent_config()
+        config, provider = self._subagent_config(
+            preferred_model=(skill or {}).get("model", ""),
+            preferred_provider=(skill or {}).get("provider", ""),
+        )
         raw_fn = RAW_FNS.get(provider)
         if raw_fn is None:
             return self._text(f"Error: unknown provider '{provider}'")
-        rounds = get_int(config, "subagent_rounds", self.DEFAULT_ROUNDS)
+        rounds = (skill or {}).get("rounds", 0) or get_int(
+            config, "subagent_rounds", self.DEFAULT_ROUNDS
+        )
 
-        all_tools = getattr(self._chat_state, "tools", None) or []
-        sub_tools = [
-            t for t in all_tools
-            if t.get("function", {}).get("name") not in self.EXCLUDED_TOOLS
-        ]
-        sub_clients = {
-            k: v for k, v in self._builtin_clients.items()
-            if k not in self.EXCLUDED_TOOLS
-        }
+        if skill is not None and skill.get("tools") is not None:
+            # Skill-scoped toolset (plan 4.2): only the skill's allowed tools
+            # (minus the always-excluded self-management set), drawn from the
+            # full loaded tool list so profile filtering doesn't hide them.
+            allowed = set(skill["tools"]) - self.EXCLUDED_TOOLS
+            pool = (getattr(self._chat_state, "all_tools", None)
+                    or getattr(self._chat_state, "tools", None) or [])
+            sub_tools = [
+                t for t in pool
+                if t.get("function", {}).get("name") in allowed
+            ]
+            sub_clients = {
+                k: v for k, v in self._builtin_clients.items() if k in allowed
+            }
+        else:
+            pool = getattr(self._chat_state, "tools", None) or []
+            sub_tools = [
+                t for t in pool
+                if t.get("function", {}).get("name") not in self.EXCLUDED_TOOLS
+            ]
+            sub_clients = {
+                k: v for k, v in self._builtin_clients.items()
+                if k not in self.EXCLUDED_TOOLS
+            }
+        system_prompt = self.SUBAGENT_PROMPT
+        if skill is not None:
+            from . import skills as skills_mod
+            system_prompt += (
+                "\n\nYou are running the following skill — follow its "
+                "procedure:\n\n" + skills_mod.render_skill(skill)
+            )
         user_content = task if not context else f"{task}\n\nContext:\n{context}"
         messages = [
-            {"role": "system", "content": self.SUBAGENT_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
-        print(f"  \033[2m(subagent: {task[:70]})\033[0m", file=sys.stderr)
+        label = f"subagent[{skill['name']}]" if skill else "subagent"
+        print(f"  \033[2m({label}: {task[:70]})\033[0m", file=sys.stderr)
         try:
             reply, usage = chat_turn(
                 config,
@@ -1251,6 +1453,8 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(TODO_LIST_TOOL)
     if "delegate_task" in clients:
         builtin.append(DELEGATE_TASK_TOOL)
+    if "skill_manage" in clients:
+        builtin.append(SKILL_MANAGE_TOOL)
     all_tools.extend(builtin)
     for tool_def in builtin:
         name = tool_def["function"]["name"]

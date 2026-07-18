@@ -32,6 +32,7 @@ from .tooling import (
     ManageToolsClient,
     SaveMemoryClient,
     SearchConversationsClient,
+    SkillManageClient,
     TodoListClient,
     ToolRuntimeState,
     apply_filter,
@@ -133,6 +134,12 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
         repo_map = get_repo_map()
         if repo_map:
             prompt += "\n\n" + repo_map
+    # Available skills (plan 4.1): compact list so the model knows what it
+    # can load with skill_manage.
+    from .skills import build_skills_context
+    skills_ctx = build_skills_context()
+    if skills_ctx:
+        prompt += "\n\n" + skills_ctx
     return prompt
 
 
@@ -186,7 +193,9 @@ def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool =
         "search_conversations": search_convos,
         "todo_list": TodoListClient(),
         "delegate_task": DelegateTaskClient(),
+        "skill_manage": SkillManageClient(),
     }
+    clients["skill_manage"].configure(interactive=interactive)
     api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")
     if api_layer_key:
         api_layer = ApiLayerClient()
@@ -261,6 +270,30 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
             memory.add(f"[Session summary] {summary}", source="summary")
     except Exception:
         pass
+
+
+def _route_scheduled_output(config: dict, task, reply: str, usage: dict) -> None:
+    """Deliver a scheduled task's result over the notify channel (plan 4.3).
+    No configured channel = old behavior (output discarded). Never raises."""
+    try:
+        if not (config.get("notify_channel") or "").strip():
+            return
+        from .channels import ChannelManager
+        from .runtime import truncate_middle
+        if usage.get("error"):
+            body = ("the model backend was unreachable "
+                    f"({truncate_middle(str(usage['error']), 200)})")
+        else:
+            body = truncate_middle(reply or "(no output)", 2500)
+        task_id = getattr(task, "id", "?")
+        task_prompt = getattr(task, "prompt", "")
+        ok, detail = ChannelManager(config).notify(
+            f"[conch scheduled #{task_id}] {task_prompt}\n\n{body}"
+        )
+        if not ok:
+            print(f"  \033[33m⚠ scheduled notify failed: {detail}\033[0m", file=sys.stderr)
+    except Exception as exc:
+        print(f"  \033[33m⚠ scheduled notify failed: {exc}\033[0m", file=sys.stderr)
 
 
 def _conversation_title(conv: Conversation, messages: List[dict]) -> str:
@@ -473,7 +506,7 @@ def chat_loop():
         scheduled_builtins["delegate_task"].bind(config, scheduled_state, scheduled_builtins)
         try:
             scheduled_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
-            return chat_turn(
+            reply, usage = chat_turn(
                 config,
                 provider,
                 raw_fn,
@@ -484,6 +517,10 @@ def chat_loop():
                 max_tool_rounds=MAX_TOOL_ROUNDS,
                 chat_state=scheduled_state,
             )
+            # Route scheduled output over the notify channel (plan 4.3)
+            # instead of discarding it.
+            _route_scheduled_output(config, _task, reply, usage)
+            return reply, usage
         finally:
             mcp_mod.close_all(scheduled_clients)
 
@@ -533,7 +570,7 @@ def chat_loop():
         "/search", "/agent", "/yolo", "/verbose", "/schedule", "/tasks",
         "/cancel", "/tools", "/enable", "/disable", "/connect", "/apps",
         "/reload", "/rounds", "/cost", "/status", "/profile", "/profiles",
-        "/clear", "/queue", "/fact", "/facts",
+        "/clear", "/queue", "/fact", "/facts", "/skills", "/skill",
     ]
     # User-defined commands (~/.config/conch/commands/*.md) complete too
     from .commands import load_user_commands
@@ -641,6 +678,26 @@ def chat_loop():
     # Subagent delegation reads live config/tool state (plan 3.1)
     builtin_clients["delegate_task"].bind(config, chat_state, builtin_clients)
 
+    # Remote agentic loop (plan 4.3): opt-in via remote_enabled=true.
+    _remote_loop = None
+    if get_bool(config, "remote_enabled"):
+        from .remote import RemoteLoop
+        _remote_loop = RemoteLoop(config, conv_mgr=conv_mgr,
+                                  chat_state=chat_state,
+                                  builtin_clients=builtin_clients)
+        if _remote_loop.start():
+            print(
+                f"\033[2mRemote loop active on: {', '.join(_remote_loop.manager.configured())} "
+                f"(safe_auto cap, allowlisted senders only)\033[0m"
+            )
+        else:
+            _remote_loop = None
+            print(
+                "\033[33m  ⚠ remote_enabled is set but no channel is configured "
+                "(slack/sms/email)\033[0m",
+                file=sys.stderr,
+            )
+
     # Inject location now that background thread has had time
     _loc_thread.join(timeout=0.1)
     if _location_result[0]:
@@ -705,6 +762,7 @@ def chat_loop():
             builtin_clients["local_shell"].set_policy(
                 LocalShellPolicy(interactive=True, allow_auto_execute=get_agent_mode(), input_fn=_safe_input)
             )
+            builtin_clients["skill_manage"].configure(interactive=True, input_fn=_safe_input)
 
             if stripped.startswith("/"):
                 result = handle_slash_command(
@@ -971,6 +1029,8 @@ def chat_loop():
         except KeyboardInterrupt:
             pass
         sched.stop()
+        if _remote_loop is not None:
+            _remote_loop.stop()
         try:
             readline.write_history_file(history_file)
         except OSError:

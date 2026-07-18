@@ -103,6 +103,8 @@ def handle_slash_command(
             "  \033[1m/forget <id>\033[0m         Delete a memory\n"
             "  \033[1m/fact <text>\033[0m         Save an always-loaded fact (facts.md)\n"
             "  \033[1m/facts\033[0m               Show the always-loaded facts\n"
+            "  \033[1m/skills\033[0m              List saved skills\n"
+            "  \033[1m/skill <name> [task]\033[0m Run a skill's procedure on a task\n"
             "  \033[1m/search <query>\033[0m      Search conversations, memories, and config\n"
             "  \033[1m/browse\033[0m              Interactive conversation browser\n"
             "  \033[1m/new\033[0m                 Start a new conversation\n"
@@ -345,6 +347,38 @@ def handle_slash_command(
             print(f"  {line}")
         print()
         return None
+
+    if command == "/skills":
+        from .skills import load_skills, skills_dir
+        skills = load_skills()
+        if not skills:
+            print(f"\n  \033[2mNo skills yet. Ask conch to 'turn what we just did "
+                  f"into a skill', or drop .md files in {skills_dir()}\033[0m\n")
+            return None
+        print(f"\n  \033[1;36mSkills ({len(skills)}):\033[0m")
+        for name, skill in sorted(skills.items()):
+            scope = "all tools" if skill["tools"] is None else ", ".join(skill["tools"])
+            model = f"  \033[2mmodel={skill['model']}\033[0m" if skill["model"] else ""
+            print(f"    \033[1m{name:<20}\033[0m {skill['description'] or ''}"
+                  f"  \033[2m[{scope}]\033[0m{model}")
+        print("\n  \033[2mUse: /skill <name> [task], or delegate with "
+              "delegate_task(skill=...)\033[0m\n")
+        return None
+
+    if command == "/skill":
+        from .skills import get_skill, render_skill
+        if not arg:
+            print("\n  \033[2mUsage: /skill <name> [task for this skill]\033[0m\n")
+            return None
+        parts_ = arg.split(None, 1)
+        skill = get_skill(parts_[0])
+        if skill is None:
+            print(f"\n  \033[31mUnknown skill '{parts_[0]}'. /skills to list.\033[0m\n")
+            return None
+        prompt = render_skill(skill) + "\n\nFollow this skill's procedure."
+        if len(parts_) > 1:
+            prompt += f"\n\nTask: {parts_[1]}"
+        return ("user_prompt", prompt)
 
     if command == "/forget" and memory is not None:
         try:

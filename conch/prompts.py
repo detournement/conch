@@ -119,7 +119,11 @@ _CHAT_LOCAL = (
     "- search_conversations: search past conversations, memories, and config.\n"
     "- conch_config: read or change your own settings (model, provider, agent "
     "mode, rounds).\n"
-    "- manage_tools: search and enable more tool groups when needed.\n\n"
+    "- manage_tools: search and enable more tool groups when needed.\n"
+    "- skill_manage: load a saved skill's procedure before a task it covers; "
+    "when asked to turn a procedure into a skill, draft and save it.\n"
+    "- delegate_task: hand a self-contained subtask to a fresh subagent "
+    "(optionally scoped by a skill) that returns only a summary.\n\n"
 
     "Prefer simple, direct actions over complex multi-step plans. "
     "Conch handles slash commands itself; if the user asks about them, "

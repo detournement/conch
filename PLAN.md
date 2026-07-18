@@ -19,7 +19,7 @@ array must contain `"tools"`. Consequences baked into this plan:
 
 Effort scale: **S** = hours, **M** = 1–3 days, **L** = a week or more.
 
-**Status (July 2026):** Phases 0–3 are complete (✅ markers below); Phase 4
+**Status (July 2026):** Phases 0–4 are complete (✅ markers below); Phase 5
 is not started. One deliberate deviation from the text of 0.5 is noted
 inline; 2.7 applies the weak model to summaries and compaction (conversation
 titles never used an LLM — they come from the first user message). Hotfix
@@ -288,7 +288,7 @@ Later-phase capabilities that compose the earlier building blocks. Ordering
 within the phase matters: 4.1 (skills) before 4.2 (skill-scoped subagents);
 4.3 (remote loop) hard-depends on the Phase 2 permission model.
 
-### 4.1 Skill system + in-chat skill builder — **M–L**
+### 4.1 Skill system + in-chat skill builder — **M–L** ✅
 - **What:** skills as reusable definitions in `~/.config/conch/skills/` —
   one markdown file per skill with frontmatter (name, description, allowed
   tools, optional model preference) and a body of instructions/procedure.
@@ -310,7 +310,7 @@ within the phase matters: 4.1 (skills) before 4.2 (skill-scoped subagents);
   `commands.py` (`/skills`, `/skill <name>`), `prompts.py` (injection),
   `config.py`.
 
-### 4.2 Skill-scoped subagents — **M** (on top of 3.1)
+### 4.2 Skill-scoped subagents — **M** (on top of 3.1) ✅
 - **What:** extends the Phase 3.1 `delegate_task` mechanism so a delegation
   names a skill: the subagent gets that skill's instructions as its scoped
   system prompt, only the skill's allowed tools, and the skill's model
@@ -328,7 +328,7 @@ within the phase matters: 4.1 (skills) before 4.2 (skill-scoped subagents);
   2.6 (budgets); 0.4's capability gate applies to any skill model preference.
 - **Modules:** `runtime.py`, `tooling.py`, `config.py`.
 
-### 4.3 Remote agentic loop over Slack, SMS, email — **L**
+### 4.3 Remote agentic loop over Slack, SMS, email — **L** ✅
 - **What:** conch messages the user proactively over a channel (scheduled
   task results, long-running task completion, approval requests), and inbound
   replies on that channel resume/steer the session — a full remote loop:
@@ -368,6 +368,150 @@ within the phase matters: 4.1 (skills) before 4.2 (skill-scoped subagents);
 
 ---
 
+## Phase 5 — Long-horizon autonomous missions
+
+A **mission** is a goal conch pursues over hours/days/weeks with indeterminate
+duration — e.g. "sell these items on eBay", "develop a long-term trading
+strategy and execute it". This is a different regime from a chat session: the
+context window is ephemeral but the mission is not, so all mission state lives
+on disk and every model call reconstructs a small working context from it.
+
+**Prior art / failure modes:** AutoGPT-style open loops are the cautionary
+tale — aimless wandering (re-deciding the goal each iteration), context rot
+(dragging a growing transcript until the model degrades), and infinite
+retry loops. The mitigations, consistently rediscovered by Claude Code and
+Hermes, are the design here: goal and plan externalized in durable stores
+rather than the transcript; an append-only journal instead of transcript
+replay; periodic explicit re-planning against success criteria; hard
+iteration/spend budgets enforced in code; and human checkpoints on anything
+irreversible. Conch already has most of the substrate (conversations, memory
+facts, todo scratchpad 2.5, budgets 2.6, scheduler) — Phase 5 composes it
+rather than inventing parallel stores.
+
+### 5.1 Mission spec + state machine — **M**
+- **What:** a durable mission record under
+  `~/.local/state/conch/missions/<id>/`: `mission.json` holds the goal
+  statement, success criteria, constraints and budgets (see 5.4), channel
+  preferences, and status. State machine:
+  `draft → active → paused → blocked (awaiting approval/input) →
+  done | aborted | failed` — persisted on every transition so restarts of
+  conch (or the machine) resume cleanly. `/mission new` runs a short
+  conversational intake where conch drafts the spec (goal, measurable success
+  criteria, budget lines) and the user confirms before activation.
+- **Reuse, not parallel stores:** each mission owns a dedicated conversation
+  in `ConversationManager` (its working transcript, compacted as usual), a
+  per-mission todo scratchpad (the 2.5 tool, keyed by mission id), and writes
+  durable facts to the 2.8 memory tiers. `mission.json` is the only new
+  store; it is the source of truth for goal/status/budget.
+- **Modules:** new `missions.py`, `commands.py` (`/mission`),
+  `conversations.py` (mission↔conversation link), `tooling.py`
+  (mission-scoped scratchpad keying).
+
+### 5.2 Execution model: scheduler-driven work sessions — **M–L**
+- **Decision — sessions, not a daemon:** the loop runs as discrete,
+  checkpointed **work sessions** fired by `scheduler.py`, not a resident
+  always-on agent process. Rationale: conch already has a persistent
+  scheduler with on-disk tasks; sessions are naturally resumable and
+  crash-tolerant (worst case loses one session, not the mission); and on a
+  single local Ollama box a resident mission loop would pin VRAM and starve
+  interactive use. Nothing about the mission needs to be "hot" between
+  sessions — all state is on disk (5.1, 5.3).
+- **Session shape:** each session re-hydrates a *fresh* context sized for a
+  small local model (~2–3k tokens): the mission spec + current status, the
+  latest self-review summary and journal tail (not the full journal), and the
+  todo scratchpad. Never replay the full transcript. The session works for a
+  bounded number of rounds/tokens (2.6 budgets), then **checkpoints**: journal
+  entry, todo update, status transition if any, and — key — the model sets its
+  own `next_run` ("auction ends in 6h, wake me then") via a mission tool,
+  falling back to the mission's default cadence. Long or specialized steps go
+  through skill-scoped subagents (4.2) so the mission session's context stays
+  a coordinator, not a worker.
+- **Concurrency:** mission sessions are serialized with interactive use and
+  with each other (one Ollama server — same rule as 3.1); the scheduler skips
+  a due session if an interactive turn is running and retries shortly after.
+- **Modules:** `missions.py` (session runner, rehydration, checkpoint),
+  `scheduler.py` (mission task type, model-settable next-run),
+  `app.py` (executor wiring, interactive-use arbitration), `runtime.py`.
+
+### 5.3 Progress journal + self-evaluation — **M**
+- **Journal:** append-only JSONL per mission
+  (`missions/<id>/journal.jsonl`): timestamped entries for actions taken,
+  observations, decisions with one-line rationale, spend events, and session
+  checkpoints. Sessions append; nothing rewrites history. The weak model
+  (2.7) writes the per-session summary entry cheaply.
+- **Self-review:** every N sessions (or daily), a review session runs with a
+  dedicated prompt: score progress against the success criteria in
+  `mission.json`, detect stalls (no material state change across the last N
+  sessions, repeated failures of the same step), and either revise the
+  strategy — recorded in the journal as a new numbered plan version, todo
+  scratchpad rewritten to match — or escalate to the user over a channel
+  (5.5) when blocked or when the criteria themselves look wrong. This is the
+  anti-wandering mechanism: re-planning is an explicit, journaled event, not
+  an every-iteration improvisation.
+- **Modules:** `missions.py`, `prompts.py` (review prompt template).
+
+### 5.4 Money and irreversible-action safety — **M–L** *(hard prerequisite for any real transactions)*
+- **Budgets in the spec:** `mission.json` carries machine-enforced limits —
+  max total spend, max per transaction, max per day, max transaction count —
+  plus an action allowlist (which tools/commands the mission may use
+  unattended). A spend ledger derived from journal entries is checked
+  **in deterministic code** (mission gate + 2.2 `pre_tool_use` hooks) before
+  any transaction-capable tool call; prompt instructions are not a control.
+- **Approval checkpoints:** irreversible or financial actions (place listing,
+  submit order, send payment, delete remote data) always route an
+  approval request over the 4.3 channels (Slack/SMS/email) and park the
+  mission in `blocked` until the operator replies `approve <id>` /
+  `deny <id>`. Approvals are per-action, with the exact parameters (item,
+  price, order size) in the request message.
+- **Dry-run by default:** anything financial starts in dry-run/paper mode —
+  eBay missions draft listings without publishing; trading missions
+  paper-trade against live data and journal hypothetical fills. Going live
+  requires the operator to explicitly set `live=true` **and** non-zero budget
+  lines in the mission spec. **Full autonomy over money is never a model
+  decision and never a default — it exists only to the extent the operator
+  explicitly raises limits**, and even then per-action approval remains on
+  unless the operator also allowlists specific action types under specific
+  caps.
+- **Kill switch:** `/abort <mission>` locally, `abort <mission>` over any
+  authenticated channel (4.3 sender allowlist), and a stop-file
+  (`missions/<id>/STOP`) checked by the scheduler before starting and by the
+  gate before each tool call — so an abort takes effect mid-session, not at
+  the next wake.
+- **Audit log:** a separate append-only `missions/<id>/audit.jsonl` recording
+  every gated action: what was requested, gate decision, who approved and
+  over which channel, and the resulting spend. Distinct from the journal so
+  the model can't compact or rewrite it (the model has no write access to it).
+- **Modules:** `missions.py` (gate, ledger, stop-file), `tooling.py`
+  (hook integration), `scheduler.py`, `channels.py` (approval flow),
+  `config.py`.
+
+### 5.5 Mission observability — **S–M**
+- **Local:** `/missions` lists all missions with status, last activity, next
+  wake, spend vs budget, and current blocker; `/mission show <id>` prints the
+  spec, plan version, todo state, and journal tail; `/mission pause|resume|
+  abort <id>`.
+- **Remote:** proactive notifications over 4.3 channels on milestones
+  (success-criterion met, listing sold, plan revision), blockers/approvals
+  needed, budget thresholds (e.g. 80% of a limit), errors after retries, and
+  a periodic digest built from the 5.3 self-review summary.
+- **Modules:** `commands.py`, `missions.py`, `channels.py`.
+
+### Phase 5 dependencies and ordering
+- **Already in place (✅):** 2.1/2.2 (permission modes + hooks — the
+  enforcement substrate for 5.4), 2.5 (todo scratchpad), 2.6 (budgets),
+  2.7 (weak model for journaling/summaries), 2.8 (memory tiers), scheduler.
+- **Hard dependency:** 4.3 (channels) for approval checkpoints, remote abort,
+  and notifications — 5.4 and the remote half of 5.5 cannot ship without it.
+  4.1/4.2 (skills/subagents) are strongly recommended for work quality in 5.2
+  but not strictly blocking.
+- **Within-phase order:** 5.1 → 5.2 → 5.3 form the core and can be
+  prototyped *before* Phase 4 completes using local-only observability and
+  non-financial missions (e.g. "keep this repo's deps updated"); 5.4 must land
+  before any mission touches money or irreversible external actions; 5.5
+  local half ships with 5.1, remote half with 4.3.
+
+---
+
 ## Sequencing rationale
 
 - **Phase 0** items 0.1–0.3 fix the three defects that make local Ollama
@@ -388,6 +532,16 @@ within the phase matters: 4.1 (skills) before 4.2 (skill-scoped subagents);
   format, and the remote loop is gated on the Phase 2 permission model —
   shipping remote inbound control before graded permissions exist would be
   an unattended-shell hazard.
+- **Phase 5** turns the accumulated substrate (scheduler, scratchpad,
+  budgets, memory, permissions/hooks, and Phase 4's skills/subagents/channels)
+  into long-horizon autonomous missions. Its core (5.1–5.3: durable mission
+  spec, scheduler-driven checkpointed work sessions, journaled
+  self-evaluation) is deliberately state-on-disk/context-fresh to avoid the
+  AutoGPT failure modes of wandering and context rot, and can be prototyped
+  on non-financial missions before Phase 4 lands. The money/irreversible-
+  action gate (5.4) hard-depends on 4.3's approval-over-channel flow and must
+  precede any real-world transacting; dry-run is the default and raising
+  spend limits is an explicit operator act, never a model decision.
 
 Coordination note: 0.2 and 0.7 overlap with the qwen tool-calling and live
 model-list fixes in progress on the `curses` branch — check that diff before

@@ -70,7 +70,13 @@ Switch providers at any time in chat with `/provider openai`, `/provider anthrop
 | `hook_post_tool_use` / `hook_on_turn_end` | — | Scripts receiving tool results / the final reply |
 | `custom_base_url` / `custom_model` | — | OpenAI-compatible endpoint for `provider=custom` (vLLM, LM Studio, llama.cpp) |
 | `custom_context_window` | `32768` | Context window assumed for the custom endpoint |
-| `subagent_model` / `subagent_rounds` | parent model / `10` | Model and tool-round budget for `delegate_task` subagents |
+| `subagent_model` / `subagent_rounds` | parent model / `10` | Model and tool-round budget for `delegate_task` subagents (a skill's `model`/`rounds` override these) |
+| `remote_enabled` | `false` | Start the remote loop (channel polling + replies) |
+| `notify_channel` | — | Channel for scheduled-task output and notifications: `slack`, `sms`, or `email` |
+| `remote_poll_interval` / `remote_rounds` | `60` / `8` | Inbound poll cadence (seconds) and tool-round cap for remote turns |
+| `slack_channel` / `slack_allowed_senders` | — | Slack channel id + allowlisted user ids (token: `SLACK_BOT_TOKEN`) |
+| `twilio_from` / `sms_to` / `sms_allowed_senders` | — | Twilio number, default recipient, allowlisted phone numbers (`TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`) |
+| `email_address` / `email_to` / `email_smtp_host` / `email_imap_host` / `email_allowed_senders` | — | Email gateway (password: `EMAIL_PASSWORD`; optional `*_port` keys) |
 | `turn_token_budget` | off | Per-turn token cap; on exhaustion the model summarizes progress |
 | `weak_model` / `weak_provider` | — | Small fast model for side tasks (summaries, compaction) |
 | `repo_map` | `true` | Inject a ~1k-token repository map when cwd is a git repo |
@@ -123,7 +129,13 @@ Drop any executable into `~/.config/conch/tools/` and it becomes a tool: `<exe> 
 The model keeps itself on track with the `todo_list` tool: its current plan is re-injected into every round *outside* compactable history, so long tool sequences and auto-compaction never lose the thread.
 
 ### Subagent delegation
-The `delegate_task` tool runs a self-contained subtask in a fresh context with a narrowed toolset (no recursive delegation, no config access) and its own round budget, returning only a summary to the parent — big explorations stop polluting the main context. Subagents run strictly serially (one local GPU), default to the parent's model, and can use a configured `subagent_model`.
+The `delegate_task` tool runs a self-contained subtask in a fresh context with a narrowed toolset (no recursive delegation, no config access) and its own round budget, returning only a summary to the parent — big explorations stop polluting the main context. Subagents run strictly serially (one local GPU), default to the parent's model, and can use a configured `subagent_model`. Pass `skill=<name>` for a **skill-scoped subagent**: it gets that skill's instructions as its system prompt, only the skill's allowed tools, and the skill's model preference and round budget.
+
+### Skills
+Reusable procedures live in `~/.config/conch/skills/` — one markdown file per skill with frontmatter (`name`, `description`, `tools`, optional `model` and `rounds`) and a body of instructions. Where a custom slash command is a one-shot prompt template, a skill also scopes *tools* and *model*, and the model can invoke it itself: available skills are listed in the system prompt and loaded on demand with the `skill_manage` tool. Use `/skills` to list, `/skill <name> [task]` to run one on a task, or `delegate_task(skill=...)` for an isolated run. The **in-chat skill builder** closes the loop: ask conch to "turn what we just did into a skill" and it drafts the file (steps, commands, pitfalls, verification) and saves it via `skill_manage` — after showing you the file and getting a y/n confirmation, never silently.
+
+### Remote loop (Slack, SMS, email)
+With `remote_enabled=true`, conch messages you proactively and you can steer it from anywhere: scheduled task output is delivered over your `notify_channel`, and inbound replies are polled (Slack bot channel, Twilio SMS, IMAP inbox) and routed into conversations — a channel thread *is* a conch conversation, so replies resume it. Safety is enforced in code, not prompts: inbound senders must be on a per-channel allowlist (no allowlist = no inbound, fail closed); remote sessions are capped at **safe_auto** permissions regardless of local agent mode (read-only commands run, everything else — including anything destructive — posts an approval request over the channel that you answer with `approve <id>` / `deny <id>`); and remote sessions never see self-management or delegation tools.
 
 ### Budget-aware turns
 Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
@@ -196,6 +208,8 @@ Transient API errors (429, 5xx, connection refused, timeouts, missing models) ar
 | `/forget <id>` | Delete a memory |
 | `/fact <text>` | Save an always-loaded fact (`facts.md`) |
 | `/facts` | Show the always-loaded facts |
+| `/skills` | List saved skills |
+| `/skill <name> [task]` | Run a skill's procedure on a task |
 | `/tools` | List tool groups |
 | `/enable <group>` | Enable a tool group |
 | `/disable <group>` | Disable a tool group |
@@ -221,13 +235,14 @@ Transient API errors (429, 5xx, connection refused, timeouts, missing models) ar
 python3 -m unittest discover -s tests
 ```
 
-Tests covering rendering, message normalization, context compression and auto-compaction, error signaling, Ollama tool calling and model discovery, structured ask mode, tool profiles and selection, custom commands, project context, prompt overrides, shell approval and graded permissions, lifecycle hooks, executable user tools, custom providers, todo/plan tracking, subagent delegation, budgets and weak-model side tasks, FTS5 memory/search, repo maps, backend health, tool visibility, and conversation handling.
+Tests covering rendering, message normalization, context compression and auto-compaction, error signaling, Ollama tool calling and model discovery, structured ask mode, tool profiles and selection, custom commands, project context, prompt overrides, shell approval and graded permissions, lifecycle hooks, executable user tools, custom providers, todo/plan tracking, subagent delegation, budgets and weak-model side tasks, FTS5 memory/search, repo maps, backend health, skills and skill-scoped subagents, channel gateways and the remote loop, tool visibility, and conversation handling.
 
 ## Architecture
 
 ```
 conch/
 ├── app.py           Main chat loop and CLI entrypoint
+├── channels.py      Slack/SMS/email gateways + sender allowlists
 ├── cli.py           One-shot ask entrypoint
 ├── commands.py      Slash command handlers (+ user-defined commands)
 ├── composio.py      Composio OAuth integration
@@ -238,9 +253,11 @@ conch/
 ├── memory.py        Persistent memory store + facts file
 ├── prompts.py       Provider-specific system prompts + overrides
 ├── providers.py     LLM provider adapters + streaming (incl. custom)
+├── remote.py        Remote agentic loop: sessions, approvals, safe_auto cap
 ├── render.py        Syntax highlighting + StreamPrinter
 ├── repomap.py       Repository-map orientation context
 ├── runtime.py       Chat turn logic, compaction, budgets, hooks dispatch
 ├── scheduler.py     Background task scheduler
+├── skills.py        Skill definitions: loader, builder, rendering
 └── tooling.py       Tools, profiles, permissions, hooks, subagents
 ```

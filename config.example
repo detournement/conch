@@ -60,8 +60,37 @@ api_key_env=ANTHROPIC_API_KEY
 #weak_provider=ollama
 
 # Subagent delegation (delegate_task tool): model + tool-round budget.
+# Skill-scoped subagents (delegate_task skill=<name>) use the skill's own
+# model/rounds/tools instead; skills live in ~/.config/conch/skills/*.md.
 #subagent_model=qwen3-8b
 #subagent_rounds=10
+
+# --- Remote loop (Slack / SMS / email) ----------------------------------------
+# Opt-in remote operation: scheduled output is delivered over notify_channel,
+# and inbound replies are polled and routed into conversations. SAFETY:
+# inbound senders MUST be allowlisted per channel (no allowlist = no inbound);
+# remote sessions are capped at safe_auto — anything beyond read-only
+# commands posts an approval request you answer with 'approve <id>'.
+#remote_enabled=false
+#notify_channel=slack
+#remote_poll_interval=60
+#remote_rounds=8
+
+# Slack: create a bot, set SLACK_BOT_TOKEN in the environment.
+#slack_channel=C0123456789
+#slack_allowed_senders=U0AAAAAAA, U0BBBBBBB
+
+# SMS via Twilio: set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in the environment.
+#twilio_from=+15550001111
+#sms_to=+15559998888
+#sms_allowed_senders=+15559998888
+
+# Email: SMTP out, IMAP UNSEEN polling in. Set EMAIL_PASSWORD in the environment.
+#email_address=conch@example.com
+#email_to=me@example.com
+#email_smtp_host=smtp.example.com
+#email_imap_host=imap.example.com
+#email_allowed_senders=me@example.com
 
 # Repository map injected when cwd is a git repo (~1k tokens). On by default.
 #repo_map=true

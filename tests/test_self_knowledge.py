@@ -144,14 +144,15 @@ class TestOllamaContextLength(CtxCacheTestCase):
             window = get_context_window("ollama", "llama3.3", {"ollama_num_ctx": "8192"})
         self.assertEqual(window, 8192)
 
-    def test_default_num_ctx_when_nothing_known(self):
-        # Requests always send num_ctx explicitly, so the effective window is
-        # the default even when the server can't report a model max.
-        from conch.providers import DEFAULT_OLLAMA_NUM_CTX
+    def test_conservative_num_ctx_when_nothing_known(self):
+        # When the model's max context is unknown (unreachable server or old
+        # server without model_info) the default degrades to a conservative
+        # num_ctx instead of gambling on 32k the machine may not handle.
+        from conch.providers import DEFAULT_OLLAMA_NUM_CTX_UNKNOWN
         side_effect = _fake_show_server({}, reachable=False)
         with patch("urllib.request.urlopen", side_effect=side_effect):
             window = get_context_window("ollama", "llama3.3", {})
-        self.assertEqual(window, DEFAULT_OLLAMA_NUM_CTX)
+        self.assertEqual(window, DEFAULT_OLLAMA_NUM_CTX_UNKNOWN)
 
 
 # ---------------------------------------------------------------------------

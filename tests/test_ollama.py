@@ -9,6 +9,12 @@ Covers the failure modes fixed in the ollama-tools work:
 - tool result messages missing tool_name linkage
 - hardcoded model list allowing switches to models the server doesn't have
 - models without the "tools" capability being offered/accepted
+
+Plus the local-Ollama hotfix (older/smaller servers on localhost):
+- /api/show requests rejected by pre-rename servers that only accept "name"
+- per-model /api/show failures filtering out ALL models (conch unusable)
+- num_ctx=32768 blindly sent when the model's max context is unknown
+- startup model validation dead-ending instead of degrading gracefully
 """
 
 import io
@@ -207,12 +213,31 @@ class TestOllamaRequestOptions(OllamaCacheTestCase):
         return side_effect, recorded
 
     def test_raw_ollama_sends_default_num_ctx_and_keep_alive(self):
-        side_effect, recorded = self._serve()
+        side_effect, recorded = self._serve(model_info={"qwen2.context_length": 131072})
         with patch("urllib.request.urlopen", side_effect=side_effect):
             raw_ollama({"provider": "ollama", "model": "qwen3"}, [])
         body = recorded["body"]
         self.assertEqual(body["options"]["num_ctx"], providers.DEFAULT_OLLAMA_NUM_CTX)
         self.assertEqual(body["keep_alive"], providers.DEFAULT_OLLAMA_KEEP_ALIVE)
+
+    def test_raw_ollama_conservative_num_ctx_when_model_max_unknown(self):
+        # Older servers don't report model_info: don't gamble on a 32k KV
+        # cache the machine may not survive — send the conservative default.
+        side_effect, recorded = self._serve(model_info={})
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            raw_ollama({"provider": "ollama", "model": "qwen3"}, [])
+        self.assertEqual(
+            recorded["body"]["options"]["num_ctx"],
+            providers.DEFAULT_OLLAMA_NUM_CTX_UNKNOWN,
+        )
+
+    def test_explicit_config_num_ctx_wins_when_model_max_unknown(self):
+        side_effect, recorded = self._serve(model_info={})
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            raw_ollama(
+                {"provider": "ollama", "model": "qwen3", "ollama_num_ctx": "32768"}, []
+            )
+        self.assertEqual(recorded["body"]["options"]["num_ctx"], 32768)
 
     def test_raw_ollama_num_ctx_clamped_to_model_max(self):
         side_effect, recorded = self._serve(model_info={"qwen2.context_length": 8192})
@@ -234,7 +259,8 @@ class TestOllamaRequestOptions(OllamaCacheTestCase):
 
     def test_stream_ollama_sends_num_ctx_and_keep_alive(self):
         side_effect, recorded = self._serve(
-            chat_lines=_stream_lines([{"message": {"content": "hi"}, "done": True}])
+            model_info={"qwen2.context_length": 131072},
+            chat_lines=_stream_lines([{"message": {"content": "hi"}, "done": True}]),
         )
         with patch("urllib.request.urlopen", side_effect=side_effect):
             stream_ollama({"provider": "ollama", "model": "qwen3"}, [])
@@ -246,7 +272,7 @@ class TestOllamaRequestOptions(OllamaCacheTestCase):
         with patch("conch.providers.get_ollama_context_length", return_value=None):
             self.assertEqual(
                 providers.get_ollama_num_ctx("m", {"ollama_num_ctx": "not-a-number"}),
-                providers.DEFAULT_OLLAMA_NUM_CTX,
+                providers.DEFAULT_OLLAMA_NUM_CTX_UNKNOWN,
             )
 
 
@@ -535,6 +561,178 @@ class TestListOllamaModels(OllamaCacheTestCase):
 
         with patch("urllib.request.urlopen", side_effect=side_effect):
             self.assertTrue(ollama_model_supports_tools("qwen2.5:latest", {}))
+
+
+# ---------------------------------------------------------------------------
+# Older localhost servers: /api/show name/model compat + unknown-capability
+# models must never all be filtered out
+# ---------------------------------------------------------------------------
+
+def _http_error(code, message):
+    import io
+    return urllib.error.HTTPError(
+        "http://localhost:11434/api/show", code, message, {},
+        io.BytesIO(json.dumps({"error": message}).encode()),
+    )
+
+
+def _old_ollama_server(installed, template="{{ if .Tools }}...{{ end }}"):
+    """Server from before the /api/show name→model rename: rejects requests
+    that don't carry "name", returns template but no capabilities/model_info."""
+
+    def side_effect(req, timeout=None):
+        url = _req_url(req)
+        if url.endswith("/api/tags"):
+            return _FakeHTTPResponse({"models": [{"name": n} for n in installed]})
+        if url.endswith("/api/show"):
+            body = json.loads(req.data.decode())
+            if not body.get("name"):
+                raise _http_error(400, "model is required")
+            return _FakeHTTPResponse({"template": template})
+        raise AssertionError(f"unexpected URL {url}")
+
+    return side_effect
+
+
+class TestOldLocalOllamaServer(OllamaCacheTestCase):
+    def test_show_request_carries_both_model_and_name(self):
+        bodies = []
+
+        def side_effect(req, timeout=None):
+            url = _req_url(req)
+            if url.endswith("/api/show"):
+                bodies.append(json.loads(req.data.decode()))
+                return _FakeHTTPResponse({"capabilities": ["completion", "tools"]})
+            raise AssertionError(url)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            ollama_model_supports_tools("qwen2.5:3b", {})
+        self.assertEqual(bodies[0]["model"], "qwen2.5:3b")
+        self.assertEqual(bodies[0]["name"], "qwen2.5:3b")
+
+    def test_old_server_requiring_name_still_lists_models(self):
+        # Regression: sending only {"model": ...} made every /api/show fail
+        # on old servers, filtering ALL models out and leaving conch unusable.
+        side_effect = _old_ollama_server(["qwen2.5:3b", "llama3.2:1b"])
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            self.assertEqual(
+                list_ollama_models({}), ["qwen2.5:3b", "llama3.2:1b"]
+            )
+
+    def test_old_server_context_length_unknown_not_crash(self):
+        from conch.providers import get_ollama_context_length
+        side_effect = _old_ollama_server(["qwen2.5:3b"])
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            self.assertIsNone(get_ollama_context_length("qwen2.5:3b", {}))
+
+    def test_unknown_capability_models_kept_in_list(self):
+        # A reachable server whose per-model /api/show fails (500, timeout)
+        # yields supports=None — those models must stay listed rather than
+        # rendering the whole provider empty.
+        def side_effect(req, timeout=None):
+            url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({"models": [{"name": "qwen2.5:3b"}]})
+            if url.endswith("/api/show"):
+                raise _http_error(500, "internal error")
+            raise AssertionError(url)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            self.assertEqual(list_ollama_models({}), ["qwen2.5:3b"])
+
+    def test_known_non_tool_models_still_excluded(self):
+        side_effect = _fake_ollama_server(
+            installed=["qwen2.5:3b", "gemma3:latest"], tool_capable=["qwen2.5:3b"],
+        )
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            self.assertEqual(list_ollama_models({}), ["qwen2.5:3b"])
+
+    def test_validate_accepts_model_with_unknown_capabilities(self):
+        # Installed model whose /api/show fails: capability unknown — the
+        # switch must be allowed (only affirmative "no tools" is rejected).
+        def side_effect(req, timeout=None):
+            url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({"models": [{"name": "qwen2.5:3b"}]})
+            if url.endswith("/api/show"):
+                raise _http_error(500, "internal error")
+            raise AssertionError(url)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            ok, reason = validate_ollama_model("qwen2.5:3b", {})
+        self.assertTrue(ok)
+
+    def test_validate_still_rejects_missing_model_on_old_server(self):
+        side_effect = _old_ollama_server(["qwen2.5:3b"])
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            ok, reason = validate_ollama_model("llama9", {})
+        self.assertFalse(ok)
+        self.assertIn("not installed", reason)
+
+
+# ---------------------------------------------------------------------------
+# Startup model resolution must degrade gracefully, never dead-end
+# ---------------------------------------------------------------------------
+
+class TestResolveOllamaStartupModel(OllamaCacheTestCase):
+    def _resolve(self, config, model):
+        from conch.app import resolve_ollama_startup_model
+        return resolve_ollama_startup_model(config, model)
+
+    def test_configured_model_present_no_warning(self):
+        side_effect = _fake_ollama_server(
+            installed=["qwen2.5:3b"], tool_capable=["qwen2.5:3b"],
+        )
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            model, warnings = self._resolve({"provider": "ollama"}, "qwen2.5:3b")
+        self.assertEqual(model, "qwen2.5:3b")
+        self.assertEqual(warnings, [])
+
+    def test_missing_configured_model_substituted(self):
+        # User config says qwen3.5:122b; only small local models installed.
+        side_effect = _fake_ollama_server(
+            installed=["qwen2.5:3b"], tool_capable=["qwen2.5:3b"],
+        )
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
+        self.assertEqual(model, "qwen2.5:3b")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("qwen3.5:122b", warnings[0])
+        self.assertIn("qwen2.5:3b", warnings[0])
+
+    def test_missing_model_substituted_on_old_server(self):
+        # End-to-end localhost regression: old server + missing configured
+        # model must still yield a usable substitute.
+        side_effect = _old_ollama_server(["qwen2.5:3b"])
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
+        self.assertEqual(model, "qwen2.5:3b")
+
+    def test_unreachable_server_keeps_model_with_warning(self):
+        side_effect = _fake_ollama_server([], reachable=False)
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
+        self.assertEqual(model, "qwen3.5:122b")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("unreachable", warnings[0])
+
+    def test_zero_tool_capable_models_warns_without_crashing(self):
+        side_effect = _fake_ollama_server(
+            installed=["gemma3:latest"], tool_capable=[],
+        )
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
+        self.assertEqual(model, "qwen3.5:122b")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("tool", warnings[0].lower())
+
+    def test_empty_server_warns_without_crashing(self):
+        side_effect = _fake_ollama_server(installed=[], tool_capable=[])
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
+        self.assertEqual(model, "qwen3.5:122b")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("No models installed", warnings[0])
 
 
 class TestOllamaModelMatching(OllamaCacheTestCase):

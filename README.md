@@ -58,12 +58,22 @@ Switch providers at any time in chat with `/provider openai`, `/provider anthrop
 | `api_key_env` | per provider | Env var holding the API key |
 | `agent_mode` | `false` | Auto-execute shell commands without confirmation (a startup notice is shown when enabled from config) |
 | `base_url` / `ollama_base_url` | `http://localhost:11434` | Ollama server URL (`OLLAMA_HOST` also works) |
-| `ollama_num_ctx` | `32768` | Context window requested on every Ollama call (clamped to the model's max) |
+| `ollama_num_ctx` | `32768` | Context window requested on every Ollama call (clamped to the model's max; degrades to a conservative `8192` when the model's max is unknown — an explicit value always wins) |
 | `ollama_keep_alive` | `10m` | How long Ollama keeps the model loaded between turns |
 | `tool_profile` | — | Tool profile to apply for the session (see profiles below) |
 | `profile_<name>` | — | Define a custom tool profile, e.g. `profile_research = github, jira` |
 | `chat_prompt:<provider>/<model-glob>` | — | Path to a custom chat system-prompt template for matching models |
 | `ask_prompt:<provider>/<model-glob>` | — | Same for ask mode |
+| `permission_mode` | `prompt_all` | Shell approval policy: `prompt_all`, `safe_auto`, or `yolo` |
+| `allow_prefixes` | — | Comma-separated command prefixes that never prompt, e.g. `git status, ls` |
+| `hook_pre_tool_use` | — | Shell script gating every tool call (JSON on stdin; non-zero exit blocks) |
+| `hook_post_tool_use` / `hook_on_turn_end` | — | Scripts receiving tool results / the final reply |
+| `custom_base_url` / `custom_model` | — | OpenAI-compatible endpoint for `provider=custom` (vLLM, LM Studio, llama.cpp) |
+| `custom_context_window` | `32768` | Context window assumed for the custom endpoint |
+| `subagent_model` / `subagent_rounds` | parent model / `10` | Model and tool-round budget for `delegate_task` subagents |
+| `turn_token_budget` | off | Per-turn token cap; on exhaustion the model summarizes progress |
+| `weak_model` / `weak_provider` | — | Small fast model for side tasks (summaries, compaction) |
+| `repo_map` | `true` | Inject a ~1k-token repository map when cwd is a git repo |
 | `send_cwd`, `send_os_shell`, `send_history_count` | — | Extra context sent in ask mode |
 
 ### Supported providers
@@ -77,11 +87,17 @@ are rejected.
 | OpenAI | gpt-5.4 family, gpt-4.1 family, gpt-4o, o3, o4-mini, o1 (all tool-capable; o1-mini is not supported) | Paid |
 | Anthropic | claude-opus-4-8, claude-sonnet-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 | Paid |
 | Ollama | Discovered live from your server's `/api/tags`, filtered to models that advertise the `tools` capability | Free (local) |
+| Custom | Any OpenAI-compatible endpoint (vLLM, LM Studio, llama.cpp server, a second Ollama box) via `provider=custom` + `custom_base_url` + `custom_model`; verified tool-capable by a startup probe | Depends |
 
 Ollama models are never hardcoded: `/models`, `/model`, `/provider ollama`,
 and the fallback chain all use the live list from your server, and switching
 to a model that isn't installed or doesn't support tool calling is rejected
-with a clear message.
+with a clear message. Older local servers are supported too: `/api/show`
+requests are compatible with pre-rename servers, models whose tool
+capability can't be determined stay listed (only affirmatively non-tool
+models are excluded), ask mode falls back to the legacy `format="json"` on
+Ollama < 0.5, and startup degrades to warnings (with a pull hint) instead of
+dead-ending when the server is empty or unreachable.
 
 ## Features
 
@@ -92,10 +108,37 @@ Tokens stream to the terminal in real time with syntax-highlighted code blocks (
 Connect external tools via the [Model Context Protocol](https://modelcontextprotocol.io). Configure servers in `~/.config/conch/mcp.json`. Supports both stdio and HTTP transports.
 
 ### Local shell execution
-The LLM can run shell commands on your machine. In normal mode, each command shows a prompt: **y**/Enter to run, **n** to decline (with optional feedback), **e** to edit the command first, **a** to always-allow that exact command for the session. Toggle `/agent` (or `/yolo`) for auto-execution. Command output streams live to your terminal.
+The LLM can run shell commands on your machine. In normal mode, each command shows a prompt: **y**/Enter to run, **n** to decline (with optional feedback), **e** to edit the command first, **a** to always-allow commands with the same prefix for the session (`git status`, `docker ps`, …). Toggle `/agent` (or `/yolo`) for auto-execution. Command output streams live to your terminal.
+
+### Graded permissions
+Three approval modes via `permission_mode`: `prompt_all` (default — every command prompts), `safe_auto` (read-only commands like `ls`, `cat`, `git status` auto-approve; anything mutating prompts), and `yolo` (everything auto-executes; same as agent mode). Destructive commands — `rm`, `dd`, `mkfs`, `git push --force`, `git reset --hard`, and friends — always prompt for confirmation, **even in agent/yolo mode**, and are refused outright in non-interactive (scheduled) runs. Pre-seed trusted prefixes with `allow_prefixes=git status, ls`.
+
+### Lifecycle hooks
+Deterministic gates around the agent loop, configured as shell scripts: `hook_pre_tool_use` runs before every tool call (payload as JSON on stdin; non-zero exit blocks the call and the model sees why; stdout that parses as JSON rewrites the tool arguments), `hook_post_tool_use` receives each result, and `hook_on_turn_end` receives the final reply. Broken or missing hooks never brick the loop.
+
+### Executable tools
+Drop any executable into `~/.config/conch/tools/` and it becomes a tool: `<exe> --schema` must print `{"name", "description", "parameters"}` JSON; invocations pass the arguments as JSON on stdin and stdout becomes the tool result (budget-truncated like everything else). Grouped as `user` for profile filtering — far lighter than writing an MCP server for one-off tools.
+
+### Plan tracking
+The model keeps itself on track with the `todo_list` tool: its current plan is re-injected into every round *outside* compactable history, so long tool sequences and auto-compaction never lose the thread.
+
+### Subagent delegation
+The `delegate_task` tool runs a self-contained subtask in a fresh context with a narrowed toolset (no recursive delegation, no config access) and its own round budget, returning only a summary to the parent — big explorations stop polluting the main context. Subagents run strictly serially (one local GPU), default to the parent's model, and can use a configured `subagent_model`.
+
+### Budget-aware turns
+Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
+
+### Weak-model side tasks
+Point `weak_model` (and optionally `weak_provider`) at a small fast model and Conch runs session summaries and history compaction on it, keeping the main model's KV cache and VRAM untouched.
 
 ### Memory
-Conch remembers facts across sessions. Use `/remember` to save manually, or the LLM saves important context automatically via the `save_memory` tool.
+Conch remembers facts across sessions. Use `/remember` to save manually, or the LLM saves important context automatically via the `save_memory` tool. Recall is ranked with SQLite FTS5 (bm25) when available. A separate always-loaded tier lives in `~/.config/conch/facts.md` — append with `/fact <text>`, view with `/facts`; its (bounded) contents ride in the system prompt of every session. Conversation search (`/search`, `search_conversations`) runs on a SQLite FTS5 index instead of scanning every file, synced incrementally as conversations are saved.
+
+### Repository map
+When you start Conch inside a git repo, a ~1k-token structural overview (ranked files + top-level symbols) is injected into the system prompt so the model starts oriented. Disable with `repo_map=false`.
+
+### Backend preflight
+After a failed turn, Conch pings the Ollama server before sending your next message; if it's still offline you get a clean "still offline" notice, your message is kept in the input line for a one-keystroke retry, and nothing broken enters the transcript.
 
 ### Conversations
 Full conversation persistence with `/new`, `/switch`, `/convos`, `/delete`, and `/clear`. Titles are set automatically from your first message.
@@ -151,6 +194,8 @@ Transient API errors (429, 5xx, connection refused, timeouts, missing models) ar
 | `/remember <text>` | Save a memory |
 | `/memories` | List saved memories |
 | `/forget <id>` | Delete a memory |
+| `/fact <text>` | Save an always-loaded fact (`facts.md`) |
+| `/facts` | Show the always-loaded facts |
 | `/tools` | List tool groups |
 | `/enable <group>` | Enable a tool group |
 | `/disable <group>` | Disable a tool group |
@@ -176,7 +221,7 @@ Transient API errors (429, 5xx, connection refused, timeouts, missing models) ar
 python3 -m unittest discover -s tests
 ```
 
-Tests covering rendering, message normalization, context compression and auto-compaction, error signaling, Ollama tool calling and model discovery, structured ask mode, tool profiles and selection, custom commands, project context, prompt overrides, shell approval, tool visibility, and conversation handling.
+Tests covering rendering, message normalization, context compression and auto-compaction, error signaling, Ollama tool calling and model discovery, structured ask mode, tool profiles and selection, custom commands, project context, prompt overrides, shell approval and graded permissions, lifecycle hooks, executable user tools, custom providers, todo/plan tracking, subagent delegation, budgets and weak-model side tasks, FTS5 memory/search, repo maps, backend health, tool visibility, and conversation handling.
 
 ## Architecture
 
@@ -184,17 +229,18 @@ Tests covering rendering, message normalization, context compression and auto-co
 conch/
 ├── app.py           Main chat loop and CLI entrypoint
 ├── cli.py           One-shot ask entrypoint
-├── commands.py      Slash command handlers
+├── commands.py      Slash command handlers (+ user-defined commands)
 ├── composio.py      Composio OAuth integration
-├── config.py        Config file loading
-├── conversations.py Conversation persistence
-├── llm.py           Ask-mode LLM calls
+├── config.py        Config file loading, project .conchrc/CONCH.md
+├── conversations.py Conversation persistence + FTS5 search index
+├── llm.py           Ask-mode LLM calls (structured output)
 ├── mcp.py           MCP stdio + HTTP transport
-├── memory.py        Persistent memory store
-├── prompts.py       Provider-specific system prompts
-├── providers.py     LLM provider adapters + streaming
+├── memory.py        Persistent memory store + facts file
+├── prompts.py       Provider-specific system prompts + overrides
+├── providers.py     LLM provider adapters + streaming (incl. custom)
 ├── render.py        Syntax highlighting + StreamPrinter
-├── runtime.py       Chat turn logic, context compression
+├── repomap.py       Repository-map orientation context
+├── runtime.py       Chat turn logic, compaction, budgets, hooks dispatch
 ├── scheduler.py     Background task scheduler
-└── tooling.py       Tool filtering, profiles, built-in tools
+└── tooling.py       Tools, profiles, permissions, hooks, subagents
 ```

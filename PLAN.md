@@ -19,9 +19,14 @@ array must contain `"tools"`. Consequences baked into this plan:
 
 Effort scale: **S** = hours, **M** = 1–3 days, **L** = a week or more.
 
-**Status (July 2026):** Phase 0 and Phase 1 are complete (✅ markers below);
-Phases 2–4 are not started. One deliberate deviation from the text of 0.5 is
-noted inline.
+**Status (July 2026):** Phases 0–3 are complete (✅ markers below); Phase 4
+is not started. One deliberate deviation from the text of 0.5 is noted
+inline; 2.7 applies the weak model to summaries and compaction (conversation
+titles never used an LLM — they come from the first user message). Hotfix
+f3ad212 (older/smaller local Ollama servers: /api/show name compat,
+unknown-capability models kept, conservative num_ctx when the model max is
+unknown, ask-mode legacy format fallback, graceful startup resolution) is
+folded into the 0.1/0.4/0.6 behavior described here.
 
 ---
 
@@ -184,14 +189,14 @@ plumbing and immediately improve daily use.
 
 ## Phase 2 — Agent capability and integration surface
 
-### 2.1 Permission model upgrade — **M**
+### 2.1 Permission model upgrade — **M** ✅
 - **Fix:** replace exact-command always-allow with command-prefix allowlists
   (`git status`, `ls`, … auto-approved) plus a destructive-command check that
   still prompts even in agent mode. Graded modes like Codex CLI:
   prompt-all / safe-auto / yolo.
 - **Modules:** `tooling.py` (`LocalShellClient`).
 
-### 2.2 Lifecycle hooks — **M** *(extensibility)*
+### 2.2 Lifecycle hooks — **M** *(extensibility)* ✅
 - **Fix:** user shell scripts configured for `pre_tool_use` (receives tool
   name + JSON args; non-zero exit blocks the call, stdout can rewrite the
   command), `post_tool_use` (receives result), and `on_turn_end`. This is
@@ -201,7 +206,7 @@ plumbing and immediately improve daily use.
 - **Modules:** `runtime.py` (dispatch points), `tooling.py`, `config.py`
   (hook registration).
 
-### 2.3 Executable tools directory — **M** *(extensibility)*
+### 2.3 Executable tools directory — **M** *(extensibility)* ✅
 - **Fix:** any executable in `~/.config/conch/tools/` becomes a tool:
   `--schema` flag emits its JSON schema (name/description/parameters);
   invocation passes arguments as JSON on stdin; stdout is the tool result
@@ -210,7 +215,7 @@ plumbing and immediately improve daily use.
   filtering. Much lighter than writing an MCP server for one-off tools.
 - **Modules:** `tooling.py`.
 
-### 2.4 Custom OpenAI-compatible providers — **S–M** *(extensibility)*
+### 2.4 Custom OpenAI-compatible providers — **S–M** *(extensibility)* ✅
 - **Fix:** `provider=custom` (or named custom entries) in config with
   `base_url` + optional `api_key_env` + model name, reusing the existing
   OpenAI adapter and `_stream_openai_compat`. Supports vLLM, LM Studio,
@@ -220,25 +225,25 @@ plumbing and immediately improve daily use.
   items — can be pulled forward if a non-Ollama local backend is needed.
 - **Modules:** `providers.py`, `config.py`, `commands.py` (`/provider`).
 
-### 2.5 Plan/todo scratchpad tool — **M**
+### 2.5 Plan/todo scratchpad tool — **M** ✅
 - **Fix:** a todo/plan tool whose state is re-injected each round *outside*
   compactable history — keeps small models on track across long tool
   sequences (Claude Code TodoWrite / Hermes kanban pattern).
 - **Modules:** `tooling.py` (new tool), `runtime.py` (injection).
 
-### 2.6 Budget accounting and graceful exhaustion — **S**
+### 2.6 Budget accounting and graceful exhaustion — **S** ✅
 - **Fix:** extend `max_tool_rounds` with a token budget; on exhaustion, ask
   the model to summarize progress instead of returning
   `[max tool call rounds reached]` (Hermes IterationBudget pattern).
 - **Modules:** `runtime.py`.
 
-### 2.7 Weak-model side tasks — **M**
+### 2.7 Weak-model side tasks — **M** ✅
 - **Fix:** run conversation titles, session summaries, and 1.4 compaction on
   a small fast local model (configurable, e.g. a 3B) instead of the main chat
   model (aider weak-model pattern).
 - **Modules:** `app.py`, `runtime.py`, `config.py`.
 
-### 2.8 Memory upgrade — **M–L**
+### 2.8 Memory upgrade — **M–L** ✅
 - **Fix:** move toward Hermes's tiers: a bounded always-loaded facts file
   plus SQLite FTS5 search over conversation history, replacing keyword-overlap
   scoring in `memory.build_context` and the linear scan in
@@ -249,7 +254,7 @@ plumbing and immediately improve daily use.
 
 ## Phase 3 — Bigger bets
 
-### 3.1 `delegate_task` subagent — **L**
+### 3.1 `delegate_task` subagent — **L** ✅
 - **Fix:** builtin tool that runs a fresh `chat_turn` with clean context, a
   narrowed toolset, and its own round budget, returning only a summary to the
   parent. The highest-leverage context-protection pattern from both
@@ -263,13 +268,13 @@ plumbing and immediately improve daily use.
   skills, prompts, and model preferences on top of this mechanism.
 - **Modules:** `runtime.py`, `tooling.py`.
 
-### 3.2 Repo-map-style orientation context — **L**
+### 3.2 Repo-map-style orientation context — **L** ✅
 - **Fix:** when cwd is a git repo, inject a relevance-ranked structural
   overview (file tree + top-level symbols) within a ~1k-token budget (aider
   repo-map pattern; a cheap tree + symbols version first, tree-sitter later).
 - **Modules:** new module, `app.py`.
 
-### 3.3 Backend health/preflight — **M**
+### 3.3 Backend health/preflight — **M** ✅
 - **Fix:** ping `/api/tags` at startup and before turns following a failure;
   graceful "server offline — retry?" UX instead of error text in the
   transcript. Builds on Phase 0.3.

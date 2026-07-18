@@ -17,14 +17,32 @@ api_key_env=ANTHROPIC_API_KEY
 #model=qwen3.6:27b
 #chat_model=qwen3.6:27b
 # Context window requested on every Ollama call (clamped to the model's max).
+# When the model's max is unknown (older server without model_info) the
+# default degrades to a conservative 8192; setting this explicitly wins.
 #ollama_num_ctx=32768
 # How long the server keeps the model loaded between turns.
 #ollama_keep_alive=10m
+
+# --- Custom OpenAI-compatible endpoint (vLLM, LM Studio, llama.cpp) ----------
+# Assumed tool-capable; verified by a startup probe.
+#provider=custom
+#custom_base_url=http://192.168.1.50:8000/v1
+#custom_model=qwen2.5-32b
+#custom_context_window=32768
+#api_key_env=MY_ENDPOINT_KEY
 
 # --- Behavior ----------------------------------------------------------------
 # Auto-execute shell commands without confirmation (a startup notice is shown
 # when this is enabled here). Off by default.
 #agent_mode=false
+
+# Shell approval policy: prompt_all (default), safe_auto (read-only commands
+# auto-approve), or yolo (everything auto-executes). Destructive commands
+# (rm, dd, git push --force, ...) always prompt, even in agent/yolo mode.
+#permission_mode=safe_auto
+
+# Command prefixes that never prompt (comma-separated).
+#allow_prefixes=git status, ls, cat
 
 # Tool profile applied for the session (builtin: minimal, dev, comms, full).
 # On Ollama the minimal profile is the default unless overridden.
@@ -32,6 +50,28 @@ api_key_env=ANTHROPIC_API_KEY
 
 # Define custom tool profiles as comma-separated group lists.
 #profile_research=github, jira
+
+# Per-turn budgets: tool rounds are set with /rounds; an optional token cap
+# makes the model summarize progress instead of stopping abruptly.
+#turn_token_budget=40000
+
+# Small fast model for side tasks (session summaries, history compaction).
+#weak_model=qwen3-8b
+#weak_provider=ollama
+
+# Subagent delegation (delegate_task tool): model + tool-round budget.
+#subagent_model=qwen3-8b
+#subagent_rounds=10
+
+# Repository map injected when cwd is a git repo (~1k tokens). On by default.
+#repo_map=true
+
+# --- Lifecycle hooks -----------------------------------------------------------
+# Shell scripts run around the agent loop; payload arrives as JSON on stdin.
+# pre_tool_use: non-zero exit blocks the tool call; JSON stdout rewrites args.
+#hook_pre_tool_use=~/.config/conch/hooks/gate.sh
+#hook_post_tool_use=~/.config/conch/hooks/audit.sh
+#hook_on_turn_end=~/.config/conch/hooks/notify.sh
 
 # --- Prompt overrides ---------------------------------------------------------
 # Map provider/model globs to your own system-prompt template files.

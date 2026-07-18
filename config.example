@@ -1,6 +1,46 @@
 # Conch configuration
+# Files are read in order (later overrides earlier):
+#   ~/.config/conch/config, ~/.conchrc, then a per-project .conchrc
+#   (nearest file between the current directory and the git root).
+
 # Provider: anthropic, openai, cerebras, ollama
 provider=anthropic
 model=claude-sonnet-4-6
 chat_model=claude-sonnet-4-6
 api_key_env=ANTHROPIC_API_KEY
+
+# --- Ollama (local) example -------------------------------------------------
+# Models are discovered live from the server and filtered to tool-capable
+# ones; conch only supports models that advertise the "tools" capability.
+#provider=ollama
+#base_url=http://localhost:11434
+#model=qwen3.6:27b
+#chat_model=qwen3.6:27b
+# Context window requested on every Ollama call (clamped to the model's max).
+#ollama_num_ctx=32768
+# How long the server keeps the model loaded between turns.
+#ollama_keep_alive=10m
+
+# --- Behavior ----------------------------------------------------------------
+# Auto-execute shell commands without confirmation (a startup notice is shown
+# when this is enabled here). Off by default.
+#agent_mode=false
+
+# Tool profile applied for the session (builtin: minimal, dev, comms, full).
+# On Ollama the minimal profile is the default unless overridden.
+#tool_profile=minimal
+
+# Define custom tool profiles as comma-separated group lists.
+#profile_research=github, jira
+
+# --- Prompt overrides ---------------------------------------------------------
+# Map provider/model globs to your own system-prompt template files.
+# The most specific matching pattern wins.
+#chat_prompt:ollama/qwen*=~/.config/conch/prompts/qwen-chat.md
+#ask_prompt:ollama=~/.config/conch/prompts/local-ask.md
+
+# --- Ask-mode context ---------------------------------------------------------
+# Extra context sent with one-shot `conch-ask` requests.
+send_cwd=true
+send_os_shell=true
+send_history_count=0

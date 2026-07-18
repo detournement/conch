@@ -15,7 +15,10 @@ from typing import Any, Dict, List, Optional
 
 MAX_GROUP_TOOLS = 200
 MAX_ACTIVE_TOOLS = 300
-PINNED_TOOL_NAMES = {"local_shell", "manage_tools", "save_memory", "public_api", "conch_config", "search_conversations", "api_layer"}
+PINNED_TOOL_NAMES = {
+    "local_shell", "manage_tools", "save_memory", "public_api", "conch_config",
+    "search_conversations", "api_layer", "todo_list", "delegate_task",
+}
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
 
@@ -29,6 +32,135 @@ def set_agent_mode(enabled: bool):
 
 def get_agent_mode() -> bool:
     return _agent_mode
+
+
+# ---------------------------------------------------------------------------
+# Permission model (plan 2.1): graded modes + prefix allowlists + a
+# destructive-command check that prompts even in agent mode.
+# ---------------------------------------------------------------------------
+
+PERMISSION_MODES = ("prompt_all", "safe_auto", "yolo")
+_permission_mode = "prompt_all"
+
+
+def set_permission_mode(mode: str):
+    global _permission_mode
+    normalized = (mode or "").strip().lower().replace("-", "_")
+    if normalized in PERMISSION_MODES:
+        _permission_mode = normalized
+
+
+def get_permission_mode() -> str:
+    """Effective mode: agent mode (from /agent, A, or config) means yolo."""
+    if _agent_mode:
+        return "yolo"
+    return _permission_mode
+
+
+# Read-only commands auto-approved in safe_auto mode. Matched against the
+# whole command only when it contains no shell chaining/substitution, so a
+# safe prefix can't smuggle a second command.
+SAFE_COMMAND_PREFIXES = (
+    "ls", "pwd", "cat", "head", "tail", "wc", "echo", "date", "cal",
+    "whoami", "id", "uname", "hostname", "uptime", "df", "du", "stat",
+    "file", "which", "whereis", "printenv", "ps", "tree", "grep", "rg",
+    "find", "fd",
+    "git status", "git log", "git diff", "git show", "git branch",
+    "git remote", "git stash list",
+)
+
+_SHELL_CHAIN_RE = re.compile(r"[;&|`><]|\$\(")
+
+_DESTRUCTIVE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
+    r"\brm\b", r"\brmdir\b", r"\bmkfs", r"\bdd\b", r"\bshred\b",
+    r"\btruncate\b", r"\bshutdown\b", r"\breboot\b", r"\bhalt\b",
+    r"\bpoweroff\b", r"\bkillall\b", r"\bpkill\b",
+    r"git\s+push\s+[^\n]*(-f\b|--force)", r"git\s+reset\s+--hard",
+    r"git\s+clean\b", r"git\s+checkout\s+\.\s*$",
+    r"\bchmod\s+-r\b", r"\bchown\s+-r\b",
+    r">\s*/dev/(sd|disk|nvme)", r"\bdrop\s+(table|database)\b",
+    r":\s*\(\s*\)\s*\{",
+)]
+
+
+def is_destructive_command(cmd: str) -> bool:
+    """True for commands that can destroy data or take down the machine.
+    These prompt for confirmation even in agent/yolo mode."""
+    return any(p.search(cmd or "") for p in _DESTRUCTIVE_PATTERNS)
+
+
+def is_safe_command(cmd: str) -> bool:
+    """True for plain read-only commands (no chaining/redirection)."""
+    text = (cmd or "").strip()
+    if not text or _SHELL_CHAIN_RE.search(text):
+        return False
+    return any(
+        text == prefix or text.startswith(prefix + " ")
+        for prefix in SAFE_COMMAND_PREFIXES
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks (plan 2.2): user shell scripts run around the agent loop.
+# Config keys: hook_pre_tool_use, hook_post_tool_use, hook_on_turn_end.
+# The payload arrives as JSON on stdin. For pre_tool_use a non-zero exit
+# blocks the tool call (stderr/stdout becomes the reason) and stdout that
+# parses as a JSON object rewrites the tool arguments.
+# ---------------------------------------------------------------------------
+
+HOOK_EVENTS = ("pre_tool_use", "post_tool_use", "on_turn_end")
+HOOK_TIMEOUT = 10
+
+
+def get_hook_command(event: str, config: Optional[dict]) -> str:
+    return str((config or {}).get(f"hook_{event}", "") or "").strip()
+
+
+def run_hook(event: str, payload: dict, config: Optional[dict], timeout: int = HOOK_TIMEOUT) -> tuple:
+    """Run the configured hook for *event* with *payload* as JSON on stdin.
+
+    Returns (allowed, output): allowed is False only when the hook exists and
+    exits non-zero (deterministic gate); output is the hook's stdout (or the
+    block reason). Hooks that are missing, crash, or time out are permissive
+    — a broken hook must not brick the agent loop.
+    """
+    script = get_hook_command(event, config)
+    if not script:
+        return True, ""
+    try:
+        proc = subprocess.run(
+            script,
+            shell=True,
+            input=json.dumps(payload).encode(),
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError) as exc:
+        print(f"  \033[33m⚠ {event} hook failed to run: {exc}\033[0m", file=sys.stderr)
+        return True, ""
+    stdout = proc.stdout.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        reason = proc.stderr.decode("utf-8", errors="replace").strip() or stdout
+        return False, reason
+    return True, stdout
+
+
+# Multi-word prefix for tools whose first word says nothing by itself.
+_SUBCOMMAND_TOOLS = {
+    "git", "docker", "kubectl", "npm", "pnpm", "yarn", "pip", "pip3",
+    "brew", "cargo", "apt", "systemctl", "gh", "helm", "terraform",
+}
+
+
+def command_prefix(cmd: str) -> str:
+    """The allowlist key for a command: first token, or first two tokens for
+    subcommand-style tools (so 'a' on `git status` doesn't allow `git push`)."""
+    tokens = (cmd or "").strip().split()
+    if not tokens:
+        return ""
+    if tokens[0] in _SUBCOMMAND_TOOLS and len(tokens) > 1:
+        return f"{tokens[0]} {tokens[1]}"
+    return tokens[0]
 
 
 def load_tool_prefs() -> dict:
@@ -322,7 +454,7 @@ class LocalShellClient:
 
     def __init__(self):
         self.policy = LocalShellPolicy()
-        self._allowed_commands: set[str] = set()
+        self._allowed_prefixes: set[str] = set()
         self._result_budget = self.DEFAULT_RESULT_BUDGET
 
     def set_policy(self, policy: LocalShellPolicy):
@@ -331,6 +463,17 @@ class LocalShellClient:
     def set_result_budget(self, budget_chars: int):
         if budget_chars > 0:
             self._result_budget = budget_chars
+
+    def allow_prefixes(self, prefixes):
+        """Seed the always-allow list (config key allow_prefixes)."""
+        for prefix in prefixes or []:
+            prefix = str(prefix).strip()
+            if prefix:
+                self._allowed_prefixes.add(prefix)
+
+    def _prefix_allowed(self, cmd: str) -> bool:
+        prefix = command_prefix(cmd)
+        return bool(prefix) and prefix in self._allowed_prefixes
 
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
@@ -430,72 +573,100 @@ class LocalShellClient:
         clear_active_spinners()
         print(f"\n  \033[1;33m\u26a0 Run locally:\033[0m \033[1m{cmd}\033[0m", flush=True)
 
-        auto_execute = self.policy.allow_auto_execute or get_agent_mode()
-        if self.policy.interactive and not auto_execute:
-            if cmd in self._allowed_commands:
-                print("  \033[2m(always-allowed)\033[0m")
-                return self._run_command(cmd, timeout)
+        destructive = is_destructive_command(cmd)
+        mode = get_permission_mode()
+        auto_execute = self.policy.allow_auto_execute or mode == "yolo"
 
-            _input = self.policy.input_fn or input
-            while True:
-                try:
-                    sys.stdout.flush()
-                    answer = _input("  \033[1;33mExecute? [y/n/e/a/A/?]\033[0m ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    answer = ""
-
-                if answer == "?":
-                    print(
-                        "    \033[1my\033[0m / \033[1mEnter\033[0m  Run this command\n"
-                        "    \033[1mn\033[0m          Decline (with optional feedback to the LLM)\n"
-                        "    \033[1me\033[0m          Edit the command before running\n"
-                        "    \033[1ma\033[0m          Always allow this exact command (session)\n"
-                        "    \033[1mA\033[0m          Turn on agent mode (auto-execute everything)"
-                    )
-                    continue
-                break
-
-            if answer.lower() in ("", "y", "yes"):
-                return self._run_command(cmd, timeout)
-
-            if answer == "A":
-                set_agent_mode(True)
-                self.policy = LocalShellPolicy(
-                    interactive=self.policy.interactive,
-                    allow_auto_execute=True,
-                    input_fn=self.policy.input_fn,
-                )
-                print("  \033[1;32mAgent mode: ON\033[0m \u2014 all commands will auto-execute")
-                return self._run_command(cmd, timeout)
-
-            if answer.lower() in ("a", "always"):
-                self._allowed_commands.add(cmd)
-                return self._run_command(cmd, timeout)
-
-            if answer.lower() in ("e", "edit"):
-                try:
-                    edited = _input("  \033[1;33mCommand:\033[0m ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    edited = ""
-                cmd = edited or cmd
-                print(f"  \033[2m\u2192 {cmd}\033[0m")
-                return self._run_command(cmd, timeout)
-
-            # n / anything else = decline; ask for optional feedback
-            try:
-                feedback = _input("  \033[2mReason (optional):\033[0m ").strip()
-            except (EOFError, KeyboardInterrupt):
-                feedback = ""
-            msg = "User declined to execute the command."
-            if feedback:
-                msg += f" Feedback: {feedback}"
-            return self._text(msg)
-
-        elif not self.policy.interactive and not auto_execute:
-            return self._text("Background tasks cannot prompt for local command confirmation.")
+        # Decide whether this command may run without a prompt.
+        if destructive:
+            # Destructive commands always prompt, even in agent/yolo mode.
+            auto = False
+        elif auto_execute:
+            auto = True
+        elif self._prefix_allowed(cmd):
+            auto = True
+        elif mode == "safe_auto" and is_safe_command(cmd):
+            auto = True
         else:
-            print("  \033[2m(agent mode \u2014 auto-executing)\033[0m")
+            auto = False
+
+        if auto:
+            if auto_execute:
+                print("  \033[2m(agent mode \u2014 auto-executing)\033[0m")
+            elif self._prefix_allowed(cmd):
+                print(f"  \033[2m(always-allowed: {command_prefix(cmd)})\033[0m")
+            else:
+                print("  \033[2m(safe command \u2014 auto-approved)\033[0m")
             return self._run_command(cmd, timeout)
+
+        if not self.policy.interactive:
+            if destructive:
+                return self._text(
+                    "Refused: destructive commands require interactive confirmation."
+                )
+            return self._text("Background tasks cannot prompt for local command confirmation.")
+
+        if destructive:
+            print("  \033[1;31m\u26a0 Destructive command \u2014 confirmation required"
+                  " (even in agent mode)\033[0m")
+
+        _input = self.policy.input_fn or input
+        while True:
+            try:
+                sys.stdout.flush()
+                answer = _input("  \033[1;33mExecute? [y/n/e/a/A/?]\033[0m ").strip()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+
+            if answer == "?":
+                print(
+                    "    \033[1my\033[0m / \033[1mEnter\033[0m  Run this command\n"
+                    "    \033[1mn\033[0m          Decline (with optional feedback to the LLM)\n"
+                    "    \033[1me\033[0m          Edit the command before running\n"
+                    "    \033[1ma\033[0m          Always allow commands with this prefix (session)\n"
+                    "    \033[1mA\033[0m          Turn on agent mode (auto-execute everything)"
+                )
+                continue
+            break
+
+        if answer.lower() in ("", "y", "yes"):
+            return self._run_command(cmd, timeout)
+
+        if answer == "A":
+            set_agent_mode(True)
+            self.policy = LocalShellPolicy(
+                interactive=self.policy.interactive,
+                allow_auto_execute=True,
+                input_fn=self.policy.input_fn,
+            )
+            print("  \033[1;32mAgent mode: ON\033[0m \u2014 all commands will auto-execute")
+            return self._run_command(cmd, timeout)
+
+        if answer.lower() in ("a", "always"):
+            prefix = command_prefix(cmd)
+            if prefix and not destructive:
+                self._allowed_prefixes.add(prefix)
+                print(f"  \033[2m(will auto-approve '{prefix} ...' this session)\033[0m")
+            return self._run_command(cmd, timeout)
+
+        if answer.lower() in ("e", "edit"):
+            try:
+                edited = _input("  \033[1;33mCommand:\033[0m ").strip()
+            except (EOFError, KeyboardInterrupt):
+                edited = ""
+            cmd = edited or cmd
+            print(f"  \033[2m\u2192 {cmd}\033[0m")
+            return self._run_command(cmd, timeout)
+
+        # n / anything else = decline; ask for optional feedback
+        try:
+            feedback = _input("  \033[2mReason (optional):\033[0m ").strip()
+        except (EOFError, KeyboardInterrupt):
+            feedback = ""
+        msg = "User declined to execute the command."
+        if feedback:
+            msg += f" Feedback: {feedback}"
+        return self._text(msg)
 
 
 class ManageToolsClient:
@@ -722,17 +893,374 @@ class SearchConversationsClient:
         return {"content": [{"type": "text", "text": header + "\n".join(sections)}]}
 
 
+# ---------------------------------------------------------------------------
+# Plan/todo scratchpad (plan 2.5): session state the runtime re-injects into
+# every round *outside* compactable history, keeping small models on track
+# across long tool sequences.
+# ---------------------------------------------------------------------------
+
+TODO_LIST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "todo_list",
+        "description": (
+            "Track your plan for multi-step tasks. The current list is "
+            "re-shown to you every round, surviving history compaction. "
+            "Use add/complete as you work; keep items short."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "complete", "remove", "clear", "list"],
+                },
+                "item": {"type": "string", "description": "Item text (for add)"},
+                "items": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Several items to add at once",
+                },
+                "id": {"type": "integer", "description": "Item id (for complete/remove)"},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class TodoListClient:
+    """Session-scoped plan scratchpad (never persisted, never compacted)."""
+
+    name = "todo_list"
+    MAX_ITEMS = 30
+
+    def __init__(self):
+        self._items: List[Dict[str, Any]] = []
+        self._next_id = 1
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def render(self) -> str:
+        """Current state as the block injected each round ("" when empty)."""
+        if not self._items:
+            return ""
+        lines = ["[Current plan — todo_list]"]
+        for item in self._items:
+            mark = "x" if item["done"] else " "
+            lines.append(f"  [{mark}] #{item['id']} {item['text']}")
+        return "\n".join(lines)
+
+    def _add(self, texts: List[str]) -> int:
+        added = 0
+        for text in texts:
+            text = str(text).strip()
+            if not text or len(self._items) >= self.MAX_ITEMS:
+                continue
+            self._items.append({"id": self._next_id, "text": text, "done": False})
+            self._next_id += 1
+            added += 1
+        return added
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        action = (arguments.get("action") or "list").lower()
+        if action == "add":
+            texts = arguments.get("items") or []
+            if arguments.get("item"):
+                texts = [arguments["item"]] + list(texts)
+            added = self._add(texts)
+            if not added:
+                return self._text("Error: nothing added (provide 'item' or 'items')")
+        elif action == "complete":
+            item = next((i for i in self._items if i["id"] == arguments.get("id")), None)
+            if not item:
+                return self._text(f"Error: no item #{arguments.get('id')}")
+            item["done"] = True
+        elif action == "remove":
+            before = len(self._items)
+            self._items = [i for i in self._items if i["id"] != arguments.get("id")]
+            if len(self._items) == before:
+                return self._text(f"Error: no item #{arguments.get('id')}")
+        elif action == "clear":
+            self._items = []
+        elif action != "list":
+            return self._text(f"Unknown action: {action}")
+        return self._text(self.render() or "(todo list empty)")
+
+    def clear(self):
+        self._items = []
+
+
+# Tool definition for the delegate_task subagent (plan 3.1); the client
+# lives below with the runtime wiring.
+DELEGATE_TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "delegate_task",
+        "description": (
+            "Delegate a self-contained subtask to a fresh subagent with clean "
+            "context and its own tool budget. It returns only a concise "
+            "summary — use this to keep large exploration or multi-step side "
+            "work out of your own context. Subagents run one at a time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Complete, self-contained task description",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional extra context the subagent needs",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+
+class DelegateTaskClient:
+    """delegate_task subagent (plan 3.1): runs a fresh chat_turn with clean
+    context, a narrowed toolset, and its own round budget, returning only a
+    summary to the parent.
+
+    Subagents run strictly serially — on a single Ollama server a second
+    concurrent model load competes for VRAM and can evict the parent's model
+    (losing its KV cache). Default model is the parent's; a smaller/faster
+    model can be configured with ``subagent_model``.
+    """
+
+    name = "delegate_task"
+
+    SUBAGENT_PROMPT = (
+        "You are a Conch subagent handling one delegated subtask with a "
+        "fresh, clean context. Work autonomously with the available tools. "
+        "When finished, reply with a concise summary of what you did and "
+        "found (results, key facts, file paths, commands) — the parent agent "
+        "sees ONLY your final reply."
+    )
+
+    # Tools the subagent never gets: itself (no recursive delegation) and
+    # self-management tools that belong to the parent session.
+    EXCLUDED_TOOLS = {"delegate_task", "conch_config", "manage_tools", "todo_list"}
+
+    DEFAULT_ROUNDS = 10
+
+    def __init__(self):
+        import threading
+        self._config: dict = {}
+        self._chat_state = None
+        self._builtin_clients: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    def bind(self, config: dict, chat_state, builtin_clients: Dict[str, Any]):
+        """Bind live references: config/provider/tools are read at call time
+        so mid-session model switches carry over to subagents."""
+        self._config = config
+        self._chat_state = chat_state
+        self._builtin_clients = builtin_clients
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def _subagent_config(self) -> tuple:
+        """(config copy, provider) for the subagent, applying subagent_model."""
+        config = dict(self._config)
+        provider = (config.get("provider") or "").lower()
+        sub_model = (config.get("subagent_model") or "").strip()
+        if sub_model:
+            usable = True
+            if provider == "ollama":
+                from .providers import validate_ollama_model
+                ok, reason = validate_ollama_model(sub_model, config)
+                if ok is not True:
+                    usable = False
+                    print(f"  \033[33m⚠ subagent_model '{sub_model}' unusable "
+                          f"({reason or 'unverified'}) — using parent model\033[0m",
+                          file=sys.stderr)
+            if usable:
+                config["model"] = sub_model
+                config["chat_model"] = sub_model
+        return config, provider
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        task = (arguments.get("task") or "").strip()
+        if not task:
+            return self._text("Error: 'task' is required")
+        if self._chat_state is None:
+            return self._text("Error: delegate_task not initialized")
+        # Serialize: one subagent at a time (single local GPU).
+        if not self._lock.acquire(blocking=False):
+            return self._text(
+                "Error: another subagent is already running — subagents run "
+                "one at a time. Finish or wait, then retry."
+            )
+        try:
+            return self._run(task, (arguments.get("context") or "").strip())
+        finally:
+            self._lock.release()
+
+    def _run(self, task: str, context: str) -> dict:
+        from .config import get_int
+        from .providers import RAW_FNS
+        from .runtime import chat_turn, truncate_tool_result
+
+        config, provider = self._subagent_config()
+        raw_fn = RAW_FNS.get(provider)
+        if raw_fn is None:
+            return self._text(f"Error: unknown provider '{provider}'")
+        rounds = get_int(config, "subagent_rounds", self.DEFAULT_ROUNDS)
+
+        all_tools = getattr(self._chat_state, "tools", None) or []
+        sub_tools = [
+            t for t in all_tools
+            if t.get("function", {}).get("name") not in self.EXCLUDED_TOOLS
+        ]
+        sub_clients = {
+            k: v for k, v in self._builtin_clients.items()
+            if k not in self.EXCLUDED_TOOLS
+        }
+        user_content = task if not context else f"{task}\n\nContext:\n{context}"
+        messages = [
+            {"role": "system", "content": self.SUBAGENT_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        print(f"  \033[2m(subagent: {task[:70]})\033[0m", file=sys.stderr)
+        try:
+            reply, usage = chat_turn(
+                config,
+                provider,
+                raw_fn,
+                messages,
+                sub_tools or None,
+                getattr(self._chat_state, "tool_map", {}) or {},
+                sub_clients,
+                max_tool_rounds=rounds,
+            )
+        except Exception as exc:
+            return self._text(f"Error: subagent failed: {exc}")
+        if not (reply or "").strip():
+            return self._text("Subagent finished without a summary (likely a provider error).")
+        reply = truncate_tool_result(reply, provider, config)
+        in_tok = usage.get("input_tokens", 0)
+        out_tok = usage.get("output_tokens", 0)
+        footer = f"\n\n(subagent used {in_tok:,} in / {out_tok:,} out tokens)" if in_tok or out_tok else ""
+        return self._text(f"Subagent summary:\n{reply}{footer}")
+
+
+# ---------------------------------------------------------------------------
+# Executable tools directory (plan 2.3): any executable in
+# ~/.config/conch/tools/ becomes a tool. `<exe> --schema` must print a JSON
+# object with name/description/parameters; invocation passes the arguments
+# as JSON on stdin and stdout becomes the tool result.
+# ---------------------------------------------------------------------------
+
+USER_TOOL_TIMEOUT = 60
+USER_TOOL_SCHEMA_TIMEOUT = 5
+_USER_TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def user_tools_dir() -> Path:
+    return _config_dir() / "tools"
+
+
+class UserToolClient:
+    """Single client fronting every executable user tool (group: "user")."""
+
+    name = "user"
+
+    def __init__(self):
+        self._executables: Dict[str, str] = {}
+
+    def register(self, tool_name: str, path: str):
+        self._executables[tool_name] = path
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        path = self._executables.get(name)
+        if not path:
+            return {"content": [{"type": "text", "text": f"Error: unknown user tool '{name}'"}]}
+        try:
+            proc = subprocess.run(
+                [path],
+                input=json.dumps(arguments or {}).encode(),
+                capture_output=True,
+                timeout=USER_TOOL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return {"content": [{"type": "text", "text": f"Error: user tool '{name}' timed out after {USER_TOOL_TIMEOUT}s"}]}
+        except OSError as exc:
+            return {"content": [{"type": "text", "text": f"Error: user tool '{name}' failed to run: {exc}"}]}
+        text = proc.stdout.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            parts = [text, stderr, f"(exit code {proc.returncode})"]
+            text = "\n".join(p for p in parts if p)
+        return {"content": [{"type": "text", "text": text or "(no output)"}]}
+
+
+def discover_user_tools() -> tuple[List[dict], UserToolClient]:
+    """Probe every executable in the user tools dir with --schema."""
+    client = UserToolClient()
+    tools: List[dict] = []
+    directory = user_tools_dir()
+    if not directory.is_dir():
+        return tools, client
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or not os.access(path, os.X_OK):
+            continue
+        try:
+            proc = subprocess.run(
+                [str(path), "--schema"],
+                capture_output=True,
+                timeout=USER_TOOL_SCHEMA_TIMEOUT,
+            )
+            schema = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+        except Exception:
+            print(f"  \033[33m⚠ user tool {path.name}: --schema failed, skipped\033[0m",
+                  file=sys.stderr)
+            continue
+        if not isinstance(schema, dict):
+            continue
+        tool_name = str(schema.get("name") or path.stem)
+        if not _USER_TOOL_NAME_RE.fullmatch(tool_name):
+            continue
+        parameters = schema.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {"type": "object", "properties": {}}
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": str(schema.get("description", "")),
+                "parameters": parameters,
+            },
+        })
+        client.register(tool_name, str(path))
+    return tools, client
+
+
 def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], clients: Dict[str, Any]):
     builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL, PUBLIC_API_TOOL, SEARCH_CONVERSATIONS_TOOL]
     if "conch_config" in clients:
         builtin.append(CONCH_CONFIG_TOOL)
     if "api_layer" in clients:
         builtin.append(API_LAYER_TOOL)
+    if "todo_list" in clients:
+        builtin.append(TODO_LIST_TOOL)
+    if "delegate_task" in clients:
+        builtin.append(DELEGATE_TASK_TOOL)
     all_tools.extend(builtin)
     for tool_def in builtin:
         name = tool_def["function"]["name"]
         if name in clients:
             tool_map[name] = clients[name]
+    # Executable user tools (plan 2.3), grouped as "user" for profiles
+    user_tool_defs, user_client = discover_user_tools()
+    for tool_def in user_tool_defs:
+        all_tools.append(tool_def)
+        tool_map[tool_def["function"]["name"]] = user_client
 
 
 
@@ -916,6 +1444,11 @@ class ConchConfigClient:
             if key_env and not os.environ.get(key_env, "").strip():
                 return self._text(f"Cannot switch to {value}: {key_env} not set.")
             default_model = get_fallback_model(value, self._config)
+            if value == "custom" and not default_model:
+                return self._text(
+                    "Cannot switch to custom: set custom_base_url and "
+                    "custom_model in ~/.config/conch/config first."
+                )
             if value == "ollama" and not default_model:
                 if list_ollama_models(self._config) is None:
                     return self._text(

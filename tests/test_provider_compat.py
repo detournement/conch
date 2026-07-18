@@ -543,8 +543,8 @@ class TestModelCatalog(unittest.TestCase):
 
     def test_default_models_exist_in_catalog(self):
         for provider, model in DEFAULT_CHAT_MODEL_BY_PROVIDER.items():
-            if provider == "ollama":
-                continue  # ollama models are discovered live from the server
+            if provider in ("ollama", "custom"):
+                continue  # discovered live (ollama) / defined by config (custom)
             self.assertIn(
                 model, KNOWN_MODELS[provider],
                 f"default {provider} model '{model}' not in KNOWN_MODELS",

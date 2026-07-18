@@ -47,6 +47,9 @@ KNOWN_MODELS = {
     # Ollama models are discovered live from the server's /api/tags
     # (see list_ollama_models); no hardcoded list.
     "ollama": [],
+    # Custom OpenAI-compatible endpoints define their model in config
+    # (custom_model); nothing is hardcoded.
+    "custom": [],
 }
 
 DEFAULT_API_KEY_ENVS = {
@@ -54,6 +57,7 @@ DEFAULT_API_KEY_ENVS = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "ollama": "",
+    "custom": "",
 }
 
 PROVIDER_TOOL_LIMITS = {
@@ -62,6 +66,8 @@ PROVIDER_TOOL_LIMITS = {
     # Local models drown in large tool lists: cap hard and select the most
     # relevant tools per turn (see tooling.select_relevant_tools).
     "ollama": 12,
+    # Custom endpoints usually front local models too — stay conservative.
+    "custom": 32,
 }
 
 # Used for `/provider` and tool `set_provider` — stable defaults, not KNOWN_MODELS[0].
@@ -72,6 +78,7 @@ DEFAULT_CHAT_MODEL_BY_PROVIDER = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-6",
     "ollama": "llama3.3",
+    "custom": "",  # defined entirely by config (custom_model)
 }
 
 
@@ -116,6 +123,7 @@ PROVIDER_DEFAULT_CONTEXT_WINDOWS = {
     "openai": 128000,
     "anthropic": 200000,
     "ollama": 4096,
+    "custom": 32768,  # override with custom_context_window in config
 }
 
 
@@ -273,6 +281,12 @@ def get_context_window(provider: str, model: str, config: Optional[dict] = None)
     provider = (provider or "").lower()
     if provider == "ollama":
         return get_ollama_num_ctx(model, config)
+    if provider == "custom":
+        try:
+            window = int((config or {}).get("custom_context_window", 0) or 0)
+        except (TypeError, ValueError):
+            window = 0
+        return window if window > 0 else PROVIDER_DEFAULT_CONTEXT_WINDOWS["custom"]
     if model in MODEL_CONTEXT_WINDOWS:
         return MODEL_CONTEXT_WINDOWS[model]
     return PROVIDER_DEFAULT_CONTEXT_WINDOWS.get(provider, 128000)
@@ -320,6 +334,12 @@ def list_ollama_models(
             if ollama_model_supports_tools(m, config, timeout=timeout) is True
         ]
     return models
+
+
+def check_ollama_health(config: Optional[dict] = None) -> bool:
+    """Fresh /api/tags ping (bypasses the cache) — used for preflight after
+    a failed turn (plan 3.3)."""
+    return list_ollama_models(config, force_refresh=True, tool_capable_only=False) is not None
 
 
 def ollama_model_matches(model: str, available: List[str]) -> bool:
@@ -530,7 +550,7 @@ CROSS_PROVIDER_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
 def _has_key(provider: str) -> bool:
     key_env = DEFAULT_API_KEY_ENVS.get(provider, "")
     if not key_env:
-        return provider == "ollama"
+        return provider in ("ollama", "custom")
     return bool(os.environ.get(key_env, "").strip())
 
 
@@ -538,6 +558,9 @@ def _provider_models(provider: str, config: Optional[dict] = None) -> List[str]:
     """Models known to actually exist for *provider* (live list for ollama)."""
     if provider == "ollama":
         return list_ollama_models(config) or []
+    if provider == "custom":
+        model = ((config or {}).get("custom_model") or "").strip()
+        return [model] if model else []
     return KNOWN_MODELS.get(provider, [])
 
 
@@ -592,6 +615,10 @@ def get_fallback_model(provider: str, config: Optional[dict] = None) -> str:
         if preferred and ollama_model_matches(preferred, available):
             return preferred
         return available[0] if available else ""
+    if provider == "custom":
+        # The endpoint defines its model: custom_model in config, or "" when
+        # unconfigured (switching to custom is then rejected).
+        return ((config or {}).get("custom_model") or "").strip()
     if provider in DEFAULT_CHAT_MODEL_BY_PROVIDER:
         return DEFAULT_CHAT_MODEL_BY_PROVIDER[provider]
     models = KNOWN_MODELS.get(provider, [])
@@ -832,11 +859,141 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     }
 
 
+# ---------------------------------------------------------------------------
+# Custom OpenAI-compatible provider (plan 2.4): vLLM, LM Studio, llama.cpp
+# server, or a second Ollama box via its OpenAI endpoint. Config:
+#   provider=custom
+#   custom_base_url=http://host:port/v1   (or base_url when provider=custom)
+#   custom_model=<model>                  (also accepts model/chat_model)
+#   api_key_env=<ENV VAR>                 (optional)
+# Custom endpoints are assumed tool-capable (tools-only directive), verified
+# by a startup probe.
+# ---------------------------------------------------------------------------
+
+def get_custom_base_url(config: Optional[dict] = None) -> str:
+    config = config or {}
+    base = (config.get("custom_base_url") or "").strip()
+    if not base and (config.get("provider") or "").lower() == "custom":
+        base = (config.get("base_url") or "").strip()
+    if not base:
+        return ""
+    if "://" not in base:
+        base = "http://" + base
+    return base.rstrip("/")
+
+
+def _custom_headers(config: dict) -> Dict[str, str]:
+    headers = {"Content-Type": "application/json", "User-Agent": "conch/1.0"}
+    key_env = (config.get("api_key_env") or "").strip()
+    api_key = os.environ.get(key_env, "").strip() if key_env else ""
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _custom_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "model": config.get("chat_model") or config.get("model") or config.get("custom_model", ""),
+        "messages": messages,
+        "temperature": 0.7,
+        # max_tokens is the widely-supported spelling on OpenAI-compatible
+        # local servers (vLLM, LM Studio, llama.cpp).
+        "max_tokens": 8192,
+    }
+    if tools:
+        body["tools"] = tools
+    return body
+
+
+def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
+    base_url = get_custom_base_url(config)
+    if not base_url:
+        return error_response("custom provider requires custom_base_url in config")
+    body = _custom_body(config, messages, tools)
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=_custom_headers(config),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return error_response(format_http_api_error(exc))
+    except Exception as exc:
+        return error_response(str(exc))
+    message = (data.get("choices") or [{}])[0].get("message", {})
+    content = strip_think_blocks((message.get("content") or "").strip())
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": message.get("tool_calls"),
+        "_usage": _normalize_usage(data, "openai"),
+        "_model": body["model"],
+    }
+
+
+def stream_custom(config: dict, messages: list, tools=None, on_token=None) -> dict:
+    base_url = get_custom_base_url(config)
+    if not base_url:
+        return error_response("custom provider requires custom_base_url in config")
+    body = _custom_body(config, messages, tools)
+    return _stream_openai_compat(
+        f"{base_url}/chat/completions",
+        _custom_headers(config),
+        body,
+        body["model"],
+        "custom",
+        on_token,
+    )
+
+
+def probe_custom_provider(config: Optional[dict] = None, *, timeout: float = 10.0) -> tuple:
+    """Startup probe: verify the endpoint speaks OpenAI chat completions and
+    accepts a tools array (tools-only directive). Returns (ok, reason)."""
+    config = config or {}
+    base_url = get_custom_base_url(config)
+    if not base_url:
+        return False, "custom_base_url is not configured"
+    model = config.get("chat_model") or config.get("model") or config.get("custom_model", "")
+    if not model:
+        return False, "custom_model is not configured"
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "probe",
+                "description": "capability probe",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+    }
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=_custom_headers(config),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return False, format_http_api_error(exc)
+    except Exception as exc:
+        return False, f"endpoint unreachable at {base_url}: {exc}"
+    return True, ""
+
+
 RAW_FNS = {
     "cerebras": raw_cerebras,
     "openai": raw_openai,
     "anthropic": raw_anthropic,
     "ollama": raw_ollama,
+    "custom": raw_custom,
 }
 
 
@@ -1236,5 +1393,6 @@ STREAM_FNS = {
     "openai": stream_openai,
     "anthropic": stream_anthropic,
     "ollama": stream_ollama,
+    "custom": stream_custom,
 }
 

@@ -25,12 +25,14 @@ from .scheduler import Scheduler
 from .tooling import (
     ApiLayerClient,
     ConchConfigClient,
+    DelegateTaskClient,
     PublicApiClient,
     LocalShellClient,
     LocalShellPolicy,
     ManageToolsClient,
     SaveMemoryClient,
     SearchConversationsClient,
+    TodoListClient,
     ToolRuntimeState,
     apply_filter,
     auto_disable_oversized_groups,
@@ -63,6 +65,8 @@ def apply_agent_mode_from_config(config: dict) -> bool:
     so the caller knows to show the startup notice (manual /agent toggles
     mid-session never go through here).
     """
+    from .tooling import set_permission_mode
+    set_permission_mode(config.get("permission_mode", ""))
     if get_bool(config, "agent_mode"):
         set_agent_mode(True)
         return True
@@ -117,6 +121,18 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
     project_ctx = load_project_context()
     if project_ctx:
         prompt += "\n\n" + project_ctx
+    # Always-loaded facts tier (plan 2.8): bounded, user-editable.
+    from .memory import load_facts
+    facts = load_facts()
+    if facts:
+        prompt += "\n\n" + facts
+    # Repo-map orientation context (plan 3.2), budgeted at ~1k tokens.
+    # Disable with repo_map=false in config.
+    if get_bool(config or {}, "repo_map", True):
+        from .repomap import get_repo_map
+        repo_map = get_repo_map()
+        if repo_map:
+            prompt += "\n\n" + repo_map
     return prompt
 
 
@@ -151,6 +167,10 @@ def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool =
     local_shell.set_result_budget(
         tool_result_char_budget((config.get("provider") or "").lower(), config)
     )
+    # Seed the always-allow prefix list from config (plan 2.1)
+    allow = (config.get("allow_prefixes") or "").strip()
+    if allow:
+        local_shell.allow_prefixes(p.strip() for p in allow.split(","))
     manage_tools = ManageToolsClient()
     save_memory = SaveMemoryClient()
     save_memory.bind(memory)
@@ -164,6 +184,8 @@ def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool =
         "conch_config": conch_config,
         "public_api": public_api,
         "search_conversations": search_convos,
+        "todo_list": TodoListClient(),
+        "delegate_task": DelegateTaskClient(),
     }
     api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")
     if api_layer_key:
@@ -225,8 +247,13 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
             if isinstance(message.get("content"), str) and message["role"] in ("user", "assistant"):
                 summary_messages.append({"role": message["role"], "content": message["content"][:500]})
         summary_messages.append({"role": "user", "content": summary_prompt})
-        response = raw_fn(config, summary_messages, None)
-        from .runtime import is_error_response
+        # Session summaries are a side task — use the weak model when
+        # configured (plan 2.7).
+        from .runtime import is_error_response, side_task_fn
+        summary_fn, summary_config = side_task_fn(config, raw_fn, config)
+        if summary_fn is None:
+            return
+        response = summary_fn(summary_config, summary_messages, None)
         if is_error_response(response):
             return  # never save provider errors as permanent memories
         summary = response.get("content", "").strip()
@@ -379,6 +406,13 @@ def chat_loop():
                     "\033[33m  ⚠ No tool-capable models installed on the Ollama server\033[0m",
                     file=sys.stderr,
                 )
+    elif provider == "custom":
+        # Custom endpoints are assumed tool-capable, verified by a probe.
+        from .providers import probe_custom_provider
+        ok, reason = probe_custom_provider(config, timeout=5.0)
+        if not ok:
+            print(f"\033[33m  ⚠ Custom endpoint probe failed: {reason}\033[0m",
+                  file=sys.stderr)
 
     from .prompts import get_chat_prompt
     base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
@@ -414,6 +448,7 @@ def chat_loop():
         scheduled_memory = MemoryStore()
         scheduled_builtins = _make_builtin_clients(scheduled_memory, config, interactive=False)
         scheduled_clients, scheduled_state = _load_runtime_tools(scheduled_builtins)
+        scheduled_builtins["delegate_task"].bind(config, scheduled_state, scheduled_builtins)
         try:
             scheduled_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
             return chat_turn(
@@ -476,7 +511,7 @@ def chat_loop():
         "/search", "/agent", "/yolo", "/verbose", "/schedule", "/tasks",
         "/cancel", "/tools", "/enable", "/disable", "/connect", "/apps",
         "/reload", "/rounds", "/cost", "/status", "/profile", "/profiles",
-        "/clear", "/queue",
+        "/clear", "/queue", "/fact", "/facts",
     ]
     # User-defined commands (~/.config/conch/commands/*.md) complete too
     from .commands import load_user_commands
@@ -581,6 +616,9 @@ def chat_loop():
                 "(/profile full to override)\033[0m"
             )
 
+    # Subagent delegation reads live config/tool state (plan 3.1)
+    builtin_clients["delegate_task"].bind(config, chat_state, builtin_clients)
+
     # Inject location now that background thread has had time
     _loc_thread.join(timeout=0.1)
     if _location_result[0]:
@@ -609,6 +647,7 @@ def chat_loop():
                 _typeahead.start()
 
     last_interrupt = 0.0
+    _backend_failed = False  # preflight the server after a failed turn (plan 3.3)
     try:
         while True:
             if _typeahead_queued:
@@ -675,6 +714,7 @@ def chat_loop():
                     current_conv = conv_mgr.create(model=model_name, provider=provider)
                     messages = [{"role": "system", "content": system_prompt}]
                     current_conv.messages = messages
+                    builtin_clients["todo_list"].clear()
                     print("\n  \033[1;32m✓ New conversation started\033[0m\n")
                     continue
                 if result == "clear_conversation":
@@ -682,6 +722,7 @@ def chat_loop():
                     messages.clear()
                     messages.append({"role": "system", "content": system_prompt})
                     current_conv.messages = messages
+                    builtin_clients["todo_list"].clear()
                     _save_current()
                     print(f"\n  \033[1;32m\u2713 Cleared {old_count} messages\033[0m\n")
                     continue
@@ -732,6 +773,25 @@ def chat_loop():
                     continue
                 user_input = _custom_prompt
 
+            # Preflight after a failed turn (plan 3.3): don't burn the message
+            # against a dead server — check first and offer a clean retry.
+            if _backend_failed and provider == "ollama":
+                from .providers import check_ollama_health, get_ollama_base_url
+                from .render import Spinner
+                with Spinner("Checking Ollama server"):
+                    healthy = check_ollama_health(config)
+                if not healthy:
+                    print(
+                        f"\n  \033[31m✗ Ollama server still offline at "
+                        f"{get_ollama_base_url(config)}\033[0m\n"
+                        f"  \033[2m(message not sent — press Enter to retry it "
+                        f"when the server is back)\033[0m\n",
+                    )
+                    _typeahead_partial = user_input  # prefill for easy retry
+                    continue
+                _backend_failed = False
+                print("  \033[2m(server back online)\033[0m")
+
             # Set title from first user message immediately
             if current_conv.title == "New conversation":
                 current_conv.title = user_input.strip().splitlines()[0][:60] or "New conversation"
@@ -772,6 +832,8 @@ def chat_loop():
                 print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
                 _save_current()
                 continue
+
+            _backend_failed = bool(turn_usage.get("error"))
 
             # API fallback inside chat_turn may switch provider/model via config only
             _pre_fb = (provider, model_name)
@@ -911,6 +973,7 @@ def main():
         mem_context = memory.build_context(user_text)
         builtin_clients = _make_builtin_clients(memory, config, interactive=True)
         mcp_clients, chat_state = _load_runtime_tools(builtin_clients)
+        builtin_clients["delegate_task"].bind(config, chat_state, builtin_clients)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _augment_user_message(user_text, mem_context)},

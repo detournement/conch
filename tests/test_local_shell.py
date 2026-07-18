@@ -125,8 +125,10 @@ class TestLocalShellApproval(unittest.TestCase):
             result = client.call_tool("local_shell", {"command": "echo persistent"})
         self.assertIn("persistent", result["content"][0]["text"])
 
-    def test_always_allow_does_not_skip_other_commands(self):
-        scripted = _ScriptedInput(["a", "y"])
+    def test_always_allow_covers_same_prefix(self):
+        # 'a' allows the command *prefix* (plan 2.1), so a different echo
+        # command runs without another prompt...
+        scripted = _ScriptedInput(["a"])
         client = LocalShellClient()
         client.set_policy(LocalShellPolicy(
             interactive=True, allow_auto_execute=False, input_fn=scripted,
@@ -134,6 +136,18 @@ class TestLocalShellApproval(unittest.TestCase):
         with _CaptureStderr():
             client.call_tool("local_shell", {"command": "echo first"})
             client.call_tool("local_shell", {"command": "echo second"})
+        self.assertEqual(len(scripted.prompts), 1)
+
+    def test_always_allow_does_not_cover_other_prefixes(self):
+        # ...but a command with a different prefix still prompts.
+        scripted = _ScriptedInput(["a", "y"])
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(
+            interactive=True, allow_auto_execute=False, input_fn=scripted,
+        ))
+        with _CaptureStderr():
+            client.call_tool("local_shell", {"command": "echo first"})
+            client.call_tool("local_shell", {"command": "printf second"})
         self.assertEqual(len(scripted.prompts), 2)
 
     def test_agent_mode_skips_prompt(self):

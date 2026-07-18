@@ -101,6 +101,8 @@ def handle_slash_command(
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory\n"
+            "  \033[1m/fact <text>\033[0m         Save an always-loaded fact (facts.md)\n"
+            "  \033[1m/facts\033[0m               Show the always-loaded facts\n"
             "  \033[1m/search <query>\033[0m      Search conversations, memories, and config\n"
             "  \033[1m/browse\033[0m              Interactive conversation browser\n"
             "  \033[1m/new\033[0m                 Start a new conversation\n"
@@ -321,6 +323,29 @@ def handle_slash_command(
         print()
         return None
 
+    if command == "/fact":
+        from .memory import append_fact, facts_path
+        if not arg:
+            print(f"\n  \033[2mUsage: /fact <text> — appends to {facts_path()}\033[0m\n")
+            return None
+        if append_fact(arg):
+            print(f"\n  \033[1;32m✓ Fact saved\033[0m \033[2m(always loaded; edit {facts_path()})\033[0m\n")
+        else:
+            print("\n  \033[31mNothing to save\033[0m\n")
+        return None
+
+    if command == "/facts":
+        from .memory import facts_path, load_facts
+        facts = load_facts()
+        if not facts:
+            print(f"\n  \033[2mNo facts yet. Add with /fact <text> or edit {facts_path()}\033[0m\n")
+            return None
+        print()
+        for line in facts.splitlines():
+            print(f"  {line}")
+        print()
+        return None
+
     if command == "/forget" and memory is not None:
         try:
             entry_id = int(arg.lstrip("#"))
@@ -338,6 +363,9 @@ def handle_slash_command(
         for provider_name, models in KNOWN_MODELS.items():
             if provider_name == "ollama":
                 models = list_ollama_models(config)
+            elif provider_name == "custom":
+                custom_model = (config.get("custom_model") or "").strip()
+                models = [custom_model] if custom_model else []
             marker = " \033[1;33m← active\033[0m" if provider_name == provider else ""
             print(f"  \033[1;36m{provider_name}\033[0m{marker}")
             if provider_name == "ollama":
@@ -347,6 +375,9 @@ def handle_slash_command(
                 if not models:
                     print("    \033[2m(no tool-capable models installed)\033[0m")
                     continue
+            if provider_name == "custom" and not models:
+                print("    \033[2m(not configured — set custom_base_url + custom_model)\033[0m")
+                continue
             for model in models:
                 current = model == model_name or (
                     provider_name == "ollama" and provider == "ollama"
@@ -423,6 +454,16 @@ def handle_slash_command(
             else:
                 print("\n  \033[31mNo tool-capable models installed on the Ollama server — cannot switch\033[0m\n")
             return None
+        if new_provider == "custom":
+            from .providers import get_custom_base_url, probe_custom_provider
+            if not new_model or not get_custom_base_url(config):
+                print("\n  \033[31mSet custom_base_url and custom_model in "
+                      "~/.config/conch/config before switching to custom\033[0m\n")
+                return None
+            ok, reason = probe_custom_provider(config)
+            if not ok:
+                print(f"\n  \033[31mCustom endpoint probe failed: {reason}\033[0m\n")
+                return None
         config["provider"] = new_provider
         config["api_key_env"] = key_env
         config["chat_model"] = new_model

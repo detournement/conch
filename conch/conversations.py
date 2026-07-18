@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -98,9 +99,105 @@ class Conversation:
         )
 
 
+def _fts_match_expression(query: str) -> str:
+    """Build a safe FTS5 MATCH expression: each keyword becomes a quoted
+    prefix phrase, OR-ed together (mirrors the old substring-ish scan)."""
+    keywords = [kw for kw in query.lower().split() if kw]
+    parts = []
+    for kw in keywords:
+        escaped = kw.replace('"', '""')
+        parts.append(f'"{escaped}"*')
+    return " OR ".join(parts)
+
+
+class SearchIndex:
+    """SQLite FTS5 index over conversation messages (plan 2.8).
+
+    Replaces the linear load-every-file scan in ConversationManager.search.
+    Kept in sync on save/delete, with a lazy sync pass at search time for
+    conversations written by other sessions. Titles are indexed as special
+    rows (message_index -1) so title-only matches still surface.
+    """
+
+    def __init__(self):
+        self._conn: Optional[sqlite3.Connection] = None
+        self._ok: Optional[bool] = None
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._conn is None:
+            _state_dir().mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(_state_dir() / "search.db"),
+                                   check_same_thread=False)
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5("
+                "conv_id UNINDEXED, message_index UNINDEXED, role UNINDEXED, text)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS indexed_convs "
+                "(conv_id TEXT PRIMARY KEY, updated_at TEXT)"
+            )
+            self._conn = conn
+        return self._conn
+
+    def available(self) -> bool:
+        if self._ok is None:
+            try:
+                self._connect()
+                self._ok = True
+            except sqlite3.Error:
+                self._ok = False
+        return self._ok
+
+    def indexed_state(self) -> Dict[str, str]:
+        conn = self._connect()
+        return dict(conn.execute("SELECT conv_id, updated_at FROM indexed_convs"))
+
+    def index_conversation(self, conv: "Conversation"):
+        conn = self._connect()
+        with conn:
+            conn.execute("DELETE FROM messages_fts WHERE conv_id = ?", (conv.id,))
+            if conv.title and conv.title != "New conversation":
+                conn.execute(
+                    "INSERT INTO messages_fts VALUES (?, ?, ?, ?)",
+                    (conv.id, -1, "title", conv.title),
+                )
+            for i, msg in enumerate(conv.messages):
+                if msg.get("role") == "system":
+                    continue
+                text = _extract_searchable_text(msg)
+                if text.strip():
+                    conn.execute(
+                        "INSERT INTO messages_fts VALUES (?, ?, ?, ?)",
+                        (conv.id, i, msg.get("role", ""), text),
+                    )
+            conn.execute(
+                "INSERT OR REPLACE INTO indexed_convs VALUES (?, ?)",
+                (conv.id, conv.updated_at),
+            )
+
+    def remove_conversation(self, conv_id: str):
+        conn = self._connect()
+        with conn:
+            conn.execute("DELETE FROM messages_fts WHERE conv_id = ?", (conv_id,))
+            conn.execute("DELETE FROM indexed_convs WHERE conv_id = ?", (conv_id,))
+
+    def search_rows(self, query: str, limit: int = 400) -> List[tuple]:
+        """Matching (conv_id, message_index, role, text) rows, best first."""
+        match = _fts_match_expression(query)
+        if not match:
+            return []
+        conn = self._connect()
+        return conn.execute(
+            "SELECT conv_id, message_index, role, text FROM messages_fts "
+            "WHERE messages_fts MATCH ? ORDER BY bm25(messages_fts) LIMIT ?",
+            (match, limit),
+        ).fetchall()
+
+
 class ConversationManager:
     def __init__(self):
         self._index = self._load_index()
+        self._search_index = SearchIndex()
 
     def _load_index(self) -> Dict[str, Any]:
         try:
@@ -151,6 +248,11 @@ class ConversationManager:
             conversation.title = _extract_title(conversation.messages)
         conversation.save()
         self._upsert_index_entry(conversation)
+        if self._search_index.available():
+            try:
+                self._search_index.index_conversation(conversation)
+            except sqlite3.Error:
+                pass
 
     def load(self, conv_id: str) -> Optional[Conversation]:
         path = _state_dir() / f"{conv_id}.json"
@@ -167,6 +269,11 @@ class ConversationManager:
             item for item in self._index["conversations"] if item["id"] != conv_id
         ]
         self._save_index()
+        if self._search_index.available():
+            try:
+                self._search_index.remove_conversation(conv_id)
+            except sqlite3.Error:
+                pass
         return True
 
     def list_all(self) -> List[Dict[str, Any]]:
@@ -182,10 +289,81 @@ class ConversationManager:
         self, query: str, *, max_results: int = 20, context_chars: int = 120
     ) -> List[Dict[str, Any]]:
         """Search all conversations for a query string. Returns matches with
-        context snippets, sorted by relevance (match count)."""
+        context snippets, sorted by relevance.
+
+        Uses the SQLite FTS5 index (plan 2.8) when available, falling back
+        to the linear per-file scan otherwise.
+        """
         if not query.strip():
             return []
+        if self._search_index.available():
+            try:
+                self._sync_search_index()
+                return self._search_fts(query, max_results=max_results,
+                                        context_chars=context_chars)
+            except sqlite3.Error:
+                pass
+        return self._search_linear(query, max_results=max_results,
+                                   context_chars=context_chars)
 
+    def _sync_search_index(self):
+        """Index conversations that are new/stale (written by other sessions)
+        and drop entries for deleted ones."""
+        indexed = self._search_index.indexed_state()
+        live_ids = set()
+        for entry in self.list_all():
+            conv_id = entry["id"]
+            live_ids.add(conv_id)
+            if indexed.get(conv_id) == entry.get("updated_at"):
+                continue
+            conv = self.load(conv_id)
+            if conv:
+                self._search_index.index_conversation(conv)
+        for stale_id in set(indexed) - live_ids:
+            self._search_index.remove_conversation(stale_id)
+
+    def _search_fts(
+        self, query: str, *, max_results: int, context_chars: int
+    ) -> List[Dict[str, Any]]:
+        keywords = query.lower().split()
+        by_conv: Dict[str, Dict[str, Any]] = {}
+        meta = {entry["id"]: entry for entry in self.list_all()}
+        for conv_id, message_index, role, text in self._search_index.search_rows(query):
+            entry = meta.get(conv_id)
+            if entry is None:
+                continue
+            bucket = by_conv.setdefault(conv_id, {"score": 0, "matches": []})
+            text_lower = text.lower()
+            hit_count = sum(text_lower.count(kw) for kw in keywords) or 1
+            if message_index == -1:  # title row
+                bucket["score"] += 5
+                continue
+            bucket["score"] += hit_count
+            if len(bucket["matches"]) < 8:
+                bucket["matches"].append({
+                    "role": role,
+                    "message_index": message_index,
+                    "snippet": _extract_snippet(text, keywords, context_chars),
+                    "hits": hit_count,
+                })
+        results = []
+        for conv_id, bucket in by_conv.items():
+            entry = meta[conv_id]
+            results.append({
+                "id": conv_id,
+                "title": entry.get("title", ""),
+                "score": bucket["score"],
+                "updated_at": entry.get("updated_at", ""),
+                "message_count": entry.get("message_count", 0),
+                "matches": bucket["matches"],
+            })
+        results.sort(key=lambda r: r["score"], reverse=True)
+        return results[:max_results]
+
+    def _search_linear(
+        self, query: str, *, max_results: int = 20, context_chars: int = 120
+    ) -> List[Dict[str, Any]]:
+        """Fallback linear scan (used when SQLite/FTS5 is unavailable)."""
         keywords = query.lower().split()
         results: List[Tuple[int, Dict[str, Any]]] = []
 

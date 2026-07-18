@@ -334,8 +334,13 @@ def auto_compact(
         {"role": "system", "content": _COMPACT_SYSTEM_PROMPT},
         {"role": "user", "content": transcript},
     ]
+    # Compaction is a side task: run it on the weak model when configured
+    # (plan 2.7) so the main model's KV cache and VRAM stay untouched.
+    summary_fn, summary_config = side_task_fn(config, raw_fn, config)
+    if summary_fn is None:
+        return False
     try:
-        response = raw_fn(config, summary_messages, None)
+        response = summary_fn(summary_config, summary_messages, None)
     except Exception:
         return False
     if is_error_response(response):
@@ -774,6 +779,72 @@ def normalize_messages_on_switch(messages: list, new_provider: str):
     messages.extend(cleaned)
 
 
+# ---------------------------------------------------------------------------
+# Weak-model side tasks (plan 2.7): run summaries/compaction on a small fast
+# model (config: weak_model, optional weak_provider) instead of the chat model.
+# ---------------------------------------------------------------------------
+
+def weak_model_config(config: Optional[dict]) -> Optional[dict]:
+    """Config copy pointing at the configured weak model, or None."""
+    config = config or {}
+    weak = str(config.get("weak_model", "") or "").strip()
+    if not weak:
+        return None
+    cfg = dict(config)
+    provider = str(config.get("weak_provider", "") or config.get("provider", "") or "").lower()
+    cfg["provider"] = provider
+    cfg["model"] = weak
+    cfg["chat_model"] = weak
+    return cfg
+
+
+def side_task_fn(config: Optional[dict], default_fn=None, default_config: Optional[dict] = None):
+    """(raw_fn, config) to use for side tasks (titles, summaries, compaction):
+    the weak model when configured, otherwise the provided defaults."""
+    cfg = weak_model_config(config)
+    if cfg is not None:
+        from .providers import RAW_FNS
+        fn = RAW_FNS.get(cfg["provider"])
+        if fn is not None:
+            return fn, cfg
+    return default_fn, (default_config if default_config is not None else config)
+
+
+def _graceful_exhaustion(
+    config: dict,
+    provider: str,
+    raw_fn,
+    messages: List[dict],
+    total_usage: dict,
+    reason: str,
+) -> str:
+    """Budget exhausted (plan 2.6): ask the model to summarize progress
+    instead of returning a bare '[max tool call rounds reached]'."""
+    fallback = f"[{reason} reached]"
+    if raw_fn is None:
+        return fallback
+    prompt = (
+        f"You've reached the {reason} for this turn and cannot call more "
+        "tools. Summarize for the user: what you accomplished, key findings "
+        "or partial results, and what remains to be done."
+    )
+    send = normalize_messages_for_provider(messages, provider)
+    send.append({"role": "user", "content": prompt})
+    try:
+        response = raw_fn(config, send, None)
+    except Exception:
+        return fallback
+    if is_error_response(response):
+        return fallback
+    usage = response.get("_usage", {})
+    total_usage["input_tokens"] += usage.get("input_tokens", 0)
+    total_usage["output_tokens"] += usage.get("output_tokens", 0)
+    content = (response.get("content") or "").strip()
+    if not content:
+        return fallback
+    return f"{content}\n\n({reason} reached — reply to continue)"
+
+
 def chat_turn(
     config: dict,
     provider: str,
@@ -796,7 +867,27 @@ def chat_turn(
     from .providers import STREAM_FNS, PROVIDER_TOOL_LIMITS
 
     total_usage = {"input_tokens": 0, "output_tokens": 0, "model": ""}
-    for _ in range(max_tool_rounds):
+    # Optional per-turn token budget alongside the round budget (plan 2.6)
+    try:
+        token_budget = int(config.get("turn_token_budget", 0) or 0)
+    except (TypeError, ValueError):
+        token_budget = 0
+    for _round in range(max_tool_rounds):
+        if (
+            token_budget
+            and _round
+            and total_usage["input_tokens"] + total_usage["output_tokens"] >= token_budget
+        ):
+            print(
+                f"  \033[33m⚠ Turn token budget ({token_budget:,}) exhausted — "
+                f"summarizing progress\033[0m",
+                file=sys.stderr,
+            )
+            return (
+                _graceful_exhaustion(config, provider, raw_fn, messages,
+                                     total_usage, "token budget"),
+                total_usage,
+            )
         if provider == "anthropic":
             sanitize_anthropic_messages(messages)
         if chat_state and getattr(chat_state, "needs_tool_refresh", False):
@@ -817,6 +908,25 @@ def chat_turn(
             if provider == "anthropic":
                 sanitize_anthropic_messages(messages)
         send_messages = normalize_messages_for_provider(messages, provider)
+
+        # Re-inject the plan scratchpad every round (plan 2.5) — it lives
+        # outside compactable history so it survives auto-compaction.
+        todo_client = (builtin_clients or {}).get("todo_list")
+        todo_block = todo_client.render() if hasattr(todo_client, "render") else ""
+        if todo_block:
+            if provider == "anthropic":
+                # Anthropic takes one system string; append to it.
+                if send_messages and send_messages[0].get("role") == "system":
+                    send_messages[0] = dict(send_messages[0])
+                    send_messages[0]["content"] = (
+                        str(send_messages[0]["content"]) + "\n\n" + todo_block
+                    )
+                else:
+                    send_messages.insert(0, {"role": "system", "content": todo_block})
+            else:
+                # Trailing system message: keeps the KV prefix intact and the
+                # plan close to the model's attention.
+                send_messages.append({"role": "system", "content": todo_block})
 
         send_tools = tools
         tool_limit = PROVIDER_TOOL_LIMITS.get(provider)
@@ -953,6 +1063,9 @@ def chat_turn(
                         f"  \033[2m(nothing saved — send your message again to retry)\033[0m",
                         file=sys.stderr,
                     )
+                # Let the caller know the turn failed so it can preflight the
+                # backend before the next one (plan 3.3).
+                total_usage["error"] = final_detail
                 return "", total_usage
         tool_calls = response.get("tool_calls")
         if on_token is not None:
@@ -962,7 +1075,10 @@ def chat_turn(
         if not tool_calls:
             recovered = extract_textual_tool_use_blocks(response.get("content", ""))
             if not recovered:
-                return response.get("content", ""), total_usage
+                reply = response.get("content", "")
+                from .tooling import run_hook
+                run_hook("on_turn_end", {"reply": reply}, config)
+                return reply, total_usage
             tool_calls = [{
                 "id": str(block.get("id")),
                 "type": "function",
@@ -985,6 +1101,27 @@ def chat_turn(
             except (json.JSONDecodeError, TypeError):
                 arguments = {}
             _print_tool_preview(name, arguments, verbose=_verbose_tools)
+            # pre_tool_use hook (plan 2.2): deterministic gate around the
+            # loop — non-zero exit blocks, JSON stdout rewrites arguments.
+            from .tooling import run_hook
+            allowed, hook_out = run_hook(
+                "pre_tool_use", {"tool": name, "arguments": arguments}, config
+            )
+            if not allowed:
+                reason = hook_out or "blocked by pre_tool_use hook"
+                result_text = f"Blocked by pre_tool_use hook: {reason}"
+                print(f"  \033[33m⚠ {name} blocked by hook\033[0m", file=sys.stderr)
+                results.append({"id": tool_call.get("id", ""), "content": result_text})
+                continue
+            if hook_out:
+                try:
+                    rewritten = json.loads(hook_out)
+                except json.JSONDecodeError:
+                    rewritten = None
+                if isinstance(rewritten, dict):
+                    arguments = rewritten
+                    print("  \033[2m(arguments rewritten by pre_tool_use hook)\033[0m",
+                          file=sys.stderr)
             try:
                 if name in builtin_clients:
                     raw_result = builtin_clients[name].call_tool(name, arguments)
@@ -995,6 +1132,11 @@ def chat_turn(
             except KeyboardInterrupt:
                 result_text = "Tool execution cancelled by user."
                 print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
+            run_hook(
+                "post_tool_use",
+                {"tool": name, "arguments": arguments, "result": result_text},
+                config,
+            )
             is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
             _print_tool_result(result_text, verbose=_verbose_tools, error=is_error)
             # Budget scaled to the model's context window (plan 1.5), not a
@@ -1005,5 +1147,16 @@ def chat_turn(
             append_results_anthropic(messages, response, results)
         else:
             append_results_openai(messages, response, results)
-    return "[max tool call rounds reached]", total_usage
+    # Round budget exhausted: summarize progress instead of a bare marker
+    # (plan 2.6).
+    print(
+        f"  \033[33m⚠ Tool round budget ({max_tool_rounds}) exhausted — "
+        f"summarizing progress\033[0m",
+        file=sys.stderr,
+    )
+    return (
+        _graceful_exhaustion(config, provider, raw_fn, messages, total_usage,
+                             "tool round budget"),
+        total_usage,
+    )
 

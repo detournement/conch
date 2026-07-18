@@ -118,6 +118,20 @@ def load_config() -> Dict[str, str]:
         # endpoint so it survives provider switches and fallbacks.
         if config.get("base_url") and not config.get("ollama_base_url"):
             config["ollama_base_url"] = config["base_url"]
+    elif provider == "custom":
+        # Custom OpenAI-compatible endpoint (plan 2.4): vLLM, LM Studio, etc.
+        config.setdefault("api_key_env", "")
+        if config.get("base_url") and not config.get("custom_base_url"):
+            config["custom_base_url"] = config["base_url"]
+        model = (config.get("model") or "").strip()
+        if not model or model == DEFAULT_CONFIG["model"]:
+            # model inherited from defaults → the endpoint's custom_model wins
+            model = (config.get("custom_model") or "").strip()
+        config["model"] = model
+        config["custom_model"] = (config.get("custom_model") or "").strip() or model
+        # chat_model follows the endpoint's model unless explicitly set.
+        if config.get("chat_model") in (DEFAULT_CONFIG["chat_model"], "", None):
+            config["chat_model"] = model
     else:
         config.setdefault("api_key_env", "ANTHROPIC_API_KEY")
         config.setdefault("model", "claude-sonnet-4-6")

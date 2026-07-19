@@ -9,6 +9,10 @@ from .llm import ask
 
 def main():
     """Return one shell command for the given request."""
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        from . import __version__
+        print(f"conch-ask {__version__}")
+        return
     if len(sys.argv) <= 1:
         print("conch-ask: provide a prompt", file=sys.stderr)
         sys.exit(1)

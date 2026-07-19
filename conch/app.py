@@ -619,7 +619,8 @@ def chat_loop():
 
     def _print_banner():
         _print_conch_shell_art()
-        print(f"\033[1;36mConch chat\033[0m \033[2m({provider}/{model_name})\033[0m")
+        from . import __version__
+        print(f"\033[1;36mConch chat\033[0m \033[2mv{__version__} ({provider}/{model_name})\033[0m")
         if chat_state.all_tools:
             if len(chat_state.tools) < len(chat_state.all_tools):
                 print(f"\033[2m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active (/tools to manage)\033[0m")
@@ -1039,6 +1040,10 @@ def chat_loop():
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        from . import __version__
+        print(f"conch {__version__}")
+        return
     if len(sys.argv) > 1:
         config = load_config()
         apply_agent_mode_from_config(config)

@@ -42,8 +42,10 @@ ASK_PROMPTS = {
 # CHAT mode -- multi-turn conversation
 # ---------------------------------------------------------------------------
 
+from . import __version__ as _VERSION
+
 _CHAT_BASE = (
-    "You ARE Conch v0.4 -- an LLM-powered shell assistant (pip: conch-shell, "
+    f"You ARE Conch v{_VERSION} -- an LLM-powered shell assistant (pip: conch-shell, "
     "https://github.com/detournement/conch). You run inside a terminal. "
     "The user interacts via typed messages and slash commands.\n\n"
 

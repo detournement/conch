@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conch-shell"
-version = "0.4.0"
+dynamic = ["version"]
 description = "LLM-assisted shell with chat, MCP tools, memory, and scheduling."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -33,6 +33,9 @@ conch-ask = "conch.cli:main"
 [project.urls]
 Homepage = "https://github.com/detournement/conch"
 Repository = "https://github.com/detournement/conch"
+
+[tool.setuptools.dynamic]
+version = {attr = "conch.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]

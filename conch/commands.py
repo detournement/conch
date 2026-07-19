@@ -576,8 +576,10 @@ def handle_slash_command(
         from .providers import get_context_window
         from .runtime import estimate_tokens
 
+        from . import __version__
         window = get_context_window(provider, model_name, config)
         print(f"\n  \033[1;36mConch status:\033[0m")
+        print(f"    Version:        {__version__}")
         print(f"    Provider:       {provider}")
         print(f"    Model:          {model_name}")
         print(f"    Context window: {window:,} tokens")

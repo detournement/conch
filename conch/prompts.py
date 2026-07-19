@@ -68,6 +68,10 @@ _CHAT_BASE = (
     "- conch_config: read or change YOUR OWN configuration (model, provider, agent\n"
     "  mode, rounds, new conversation, clear history). Use when the user asks to\n"
     "  switch models, change providers, check costs, or list available models.\n"
+    "- conch_introspect: inspect your OWN capabilities, configuration, and source\n"
+    "  code (capabilities/config/source_overview/read_source). Use when asked\n"
+    "  'what can you do', 'what commands exist', or how a conch feature works\n"
+    "  internally — answer from the live report, not from memory.\n"
     "- public_api: search 1400+ free public APIs or call no-auth APIs directly.\n"
     "- api_layer: call APILayer marketplace APIs (authenticated). Available:\n"
     "  exchangerates_data/fixer/currency_data (forex & conversion),\n"
@@ -101,7 +105,8 @@ _CHAT_BASE = (
     "- Readline history: ~/.local/state/conch/chat_history\n\n"
 
     "When answering about your capabilities or how Conch works, be specific and "
-    "accurate. Refer users to slash commands when appropriate. "
+    "accurate: call conch_introspect and answer from its live report rather "
+    "than from memory. Refer users to slash commands when appropriate. "
     "You are open source (MIT license), installed via pip or git clone."
 )
 
@@ -125,11 +130,14 @@ _CHAT_LOCAL = (
     "- skill_manage: load a saved skill's procedure before a task it covers; "
     "when asked to turn a procedure into a skill, draft and save it.\n"
     "- delegate_task: hand a self-contained subtask to a fresh subagent "
-    "(optionally scoped by a skill) that returns only a summary.\n\n"
+    "(optionally scoped by a skill) that returns only a summary.\n"
+    "- conch_introspect: inspect your OWN capabilities, config, and source "
+    "code — use when asked what you can do or how a conch feature works.\n\n"
 
     "Prefer simple, direct actions over complex multi-step plans. "
-    "Conch handles slash commands itself; if the user asks about them, "
-    "point them at /help. Config lives in ~/.config/conch/config."
+    "When asked what you can do, which commands/tools exist, or how one of "
+    "your features works, call conch_introspect FIRST and answer from its "
+    "report — don't guess. Config lives in ~/.config/conch/config."
 )
 
 CHAT_PROMPTS = {

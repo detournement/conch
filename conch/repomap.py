@@ -137,6 +137,16 @@ def build_repo_map(start_dir: str = "", budget_chars: int = REPO_MAP_BUDGET_CHAR
     root = find_git_root(start_dir)
     if root is None:
         return ""
+    return build_map_for_root(root, budget_chars)
+
+
+def build_map_for_root(root: Path, budget_chars: int = REPO_MAP_BUDGET_CHARS) -> str:
+    """Ranked file + symbol overview for an explicit *root* directory.
+
+    Works for non-git roots too (installed packages): _list_files falls back
+    to a filtered walk when git ls-files isn't available there.
+    """
+    root = Path(root)
     files = _list_files(root)
     if not files:
         return ""

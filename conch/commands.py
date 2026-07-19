@@ -73,6 +73,56 @@ def render_user_command(template: str, arguments: str) -> str:
     return template
 
 
+# ---------------------------------------------------------------------------
+# Slash-command registry: single source for tab completion and the
+# conch_introspect capabilities report (so neither goes stale).
+# ---------------------------------------------------------------------------
+
+SLASH_COMMANDS = [
+    ("/help", "Show all commands"),
+    ("/models", "List available models"),
+    ("/model <name>", "Switch model"),
+    ("/provider <name>", "Switch provider (cerebras, openai, anthropic, ollama, custom)"),
+    ("/remember <text>", "Save a persistent memory"),
+    ("/memories", "List memories"),
+    ("/forget <id>", "Delete a memory"),
+    ("/fact <text>", "Save an always-loaded fact (facts.md)"),
+    ("/facts", "Show the always-loaded facts"),
+    ("/skills", "List saved skills"),
+    ("/skill <name> [task]", "Run a skill's procedure on a task"),
+    ("/search <query>", "Search conversations, memories, and config"),
+    ("/browse", "Interactive conversation browser"),
+    ("/new", "Start a new conversation"),
+    ("/convos", "List past conversations"),
+    ("/switch <id>", "Switch conversation"),
+    ("/delete <id>", "Delete conversation"),
+    ("/clear", "Wipe conversation history (keep conversation)"),
+    ("/agent", "Toggle agent mode (auto-execute shell)"),
+    ("/yolo", "Alias for /agent"),
+    ("/verbose", "Toggle showing tool args and results"),
+    ("/schedule <interval> <prompt>", "Schedule a recurring task"),
+    ("/tasks", "List scheduled tasks"),
+    ("/cancel <id>", "Cancel a scheduled task"),
+    ("/tools", "List tool groups"),
+    ("/enable <group>", "Enable a tool group"),
+    ("/disable <group>", "Disable a tool group"),
+    ("/profile [name]", "Switch tool profile"),
+    ("/profiles", "List tool profiles"),
+    ("/connect <app>", "Connect a service via OAuth (Composio)"),
+    ("/apps", "List connectable services"),
+    ("/reload", "Reload MCP tools"),
+    ("/rounds <n>", "Set max tool call rounds"),
+    ("/queue", "Toggle typeahead input"),
+    ("/status", "Show version, provider, model, context window, and config"),
+    ("/cost", "Show session token usage and cost"),
+]
+
+
+def slash_command_names() -> List[str]:
+    """Bare command names (first word of each registry entry)."""
+    return [entry[0].split()[0] for entry in SLASH_COMMANDS]
+
+
 def handle_slash_command(
     cmd: str,
     config: dict,

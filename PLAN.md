@@ -273,6 +273,11 @@ plumbing and immediately improve daily use.
   overview (file tree + top-level symbols) within a ~1k-token budget (aider
   repo-map pattern; a cheap tree + symbols version first, tree-sitter later).
 - **Modules:** new module, `app.py`.
+- **Extended (post-plan):** the `conch_introspect` tool reuses this
+  machinery pointed at conch's *own* source (plus live capability/config
+  reports and path-validated source reading), giving the model accurate
+  self-knowledge on demand — the model-facing complement of `/status` and
+  the 0.1-era self-description.
 
 ### 3.3 Backend health/preflight — **M** ✅
 - **Fix:** ping `/api/tags` at startup and before turns following a failure;

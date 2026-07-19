@@ -18,7 +18,7 @@ MAX_ACTIVE_TOOLS = 300
 PINNED_TOOL_NAMES = {
     "local_shell", "manage_tools", "save_memory", "public_api", "conch_config",
     "search_conversations", "api_layer", "todo_list", "delegate_task",
-    "skill_manage",
+    "skill_manage", "conch_introspect",
 }
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
@@ -1455,6 +1455,8 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(DELEGATE_TASK_TOOL)
     if "skill_manage" in clients:
         builtin.append(SKILL_MANAGE_TOOL)
+    if "conch_introspect" in clients:
+        builtin.append(CONCH_INTROSPECT_TOOL)
     all_tools.extend(builtin)
     for tool_def in builtin:
         name = tool_def["function"]["name"]
@@ -1691,6 +1693,284 @@ class ConchConfigClient:
             return self._text("New conversation started.")
 
         return self._text(f"Unknown action: {action}")
+
+
+# ---------------------------------------------------------------------------
+# conch_introspect — model-facing introspection of conch's own capabilities,
+# configuration, and source code. Everything is derived from live registries
+# (slash commands, loaded tools, skills, profiles, providers) so it never
+# goes stale; outputs are token-bounded for small local models.
+# ---------------------------------------------------------------------------
+
+INTROSPECT_OUTPUT_MAX = 4000
+
+CONCH_INTROSPECT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "conch_introspect",
+        "description": (
+            "Inspect YOUR OWN capabilities, configuration, and source code. "
+            "Use when the user asks what you can do, what commands/tools/"
+            "skills exist, how a conch feature works internally, or where "
+            "you are installed. Actions: capabilities (full feature surface, "
+            "generated from live registries), config (effective settings), "
+            "source_overview (map of conch's own codebase), read_source "
+            "(read one conch source file)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["capabilities", "config", "source_overview", "read_source"],
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Source file to read, relative to the conch "
+                                   "repo/package (for read_source), e.g. "
+                                   "conch/runtime.py",
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-based line to start reading from "
+                                   "(for read_source; default 1)",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+def conch_source_root() -> Path:
+    """Root of conch's own source: the git checkout containing the package
+    when present, otherwise the installed package directory itself."""
+    package_dir = Path(__file__).resolve().parent
+    if (package_dir.parent / ".git").exists():
+        return package_dir.parent
+    return package_dir
+
+
+class ConchIntrospectClient:
+    """Built-in tool that lets the model examine conch itself."""
+
+    name = "conch_introspect"
+
+    def __init__(self):
+        self._provider = ""
+        self._model = ""
+        self._config: dict = {}
+        self._chat_state = None
+
+    def bind(self, provider: str, model: str, config: dict, chat_state=None):
+        self._provider = provider
+        self._model = model
+        self._config = config
+        self._chat_state = chat_state
+
+    def update(self, provider: str, model: str):
+        self._provider = provider
+        self._model = model
+
+    def _text(self, msg: str) -> dict:
+        from .runtime import truncate_middle
+        return {"content": [{"type": "text", "text": truncate_middle(msg, INTROSPECT_OUTPUT_MAX)}]}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        action = (arguments.get("action") or "capabilities").lower()
+        if action == "capabilities":
+            return self._text(self._capabilities())
+        if action == "config":
+            return self._text(self._config_report())
+        if action == "source_overview":
+            return self._text(self._source_overview())
+        if action == "read_source":
+            return self._read_source(
+                arguments.get("path", ""), int(arguments.get("start_line", 1) or 1)
+            )
+        return self._text(f"Unknown action: {action}")
+
+    # --- capabilities -------------------------------------------------------
+
+    def _capabilities(self) -> str:
+        from . import __version__
+        from .commands import SLASH_COMMANDS, load_user_commands
+        from .providers import RAW_FNS
+        from .skills import load_skills
+
+        lines = [f"Conch v{__version__} — capability report (generated live)"]
+
+        lines.append("\n## Slash commands (typed by the user, handled by conch)")
+        for spec, description in SLASH_COMMANDS:
+            lines.append(f"- {spec}: {description}")
+        user_commands = load_user_commands()
+        if user_commands:
+            lines.append(f"- custom commands from ~/.config/conch/commands/: "
+                         + ", ".join("/" + n for n in sorted(user_commands)))
+
+        lines.append("\n## Tools (callable by the model)")
+        lines.extend(self._tool_lines())
+
+        skills = load_skills()
+        lines.append("\n## Skills (reusable procedures; skill_manage / /skill)")
+        if skills:
+            for skill_name, skill in sorted(skills.items()):
+                lines.append(f"- {skill_name}: {skill['description'] or '(no description)'}")
+        else:
+            lines.append("- none saved yet")
+
+        profiles = list_profiles(self._config)
+        active = active_profile_name() or "(default)"
+        lines.append(f"\n## Tool profiles (active: {active})")
+        for prof_name, info in sorted(profiles.items()):
+            lines.append(f"- {prof_name}: {info.get('description', '')}")
+
+        lines.append("\n## Providers")
+        lines.append(f"- supported: {', '.join(sorted(RAW_FNS))}")
+        lines.append(f"- current: {self._provider}/{self._model}")
+        return "\n".join(lines)
+
+    def _tool_lines(self) -> List[str]:
+        state = self._chat_state
+        all_tools = getattr(state, "all_tools", None) or []
+        tool_map = getattr(state, "tool_map", None) or {}
+        active = {
+            t.get("function", {}).get("name", "")
+            for t in (getattr(state, "tools", None) or [])
+        }
+        if not all_tools:
+            return ["- (tool registry not loaded)"]
+        by_group: Dict[str, List[str]] = {}
+        descriptions: Dict[str, str] = {}
+        for tool in all_tools:
+            fn = tool.get("function", {})
+            tool_name = fn.get("name", "")
+            group = tool_group(tool_name, tool_map)
+            by_group.setdefault(group, []).append(tool_name)
+            desc = (fn.get("description") or "").split(". ")[0].strip()
+            descriptions[tool_name] = desc[:110]
+        lines: List[str] = []
+        for group in sorted(by_group):
+            names = by_group[group]
+            if len(names) == 1 and names[0] == group:
+                marker = "" if group in active else " [inactive]"
+                lines.append(f"- {group}: {descriptions.get(group, '')}{marker}")
+            else:
+                shown = ", ".join(sorted(names)[:8])
+                more = f", +{len(names) - 8} more" if len(names) > 8 else ""
+                lines.append(f"- {group} ({len(names)} tools): {shown}{more}")
+        return lines
+
+    # --- config -------------------------------------------------------------
+
+    def _config_report(self) -> str:
+        from .config import find_project_rc, get_config_path
+        from .providers import get_context_window, get_ollama_base_url
+
+        lines = ["Effective configuration:"]
+        lines.append(f"- provider: {self._provider}")
+        lines.append(f"- model: {self._model}")
+        lines.append(f"- context window: "
+                     f"{get_context_window(self._provider, self._model, self._config):,} tokens")
+        if self._provider == "ollama":
+            lines.append(f"- ollama server: {get_ollama_base_url(self._config)}")
+        lines.append(f"- agent mode: {'on' if get_agent_mode() else 'off'}; "
+                     f"permission mode: {get_permission_mode()}")
+        config_path = get_config_path()
+        exists = "" if os.path.isfile(config_path) else " (not created yet)"
+        lines.append(f"- config file: {config_path}{exists}")
+        project_rc = find_project_rc()
+        if project_rc is not None:
+            lines.append(f"- project .conchrc: {project_rc}")
+
+        hidden = ("token", "key", "password", "secret", "credential")
+
+        def _is_secret(key: str) -> bool:
+            return not key.endswith("_env") and any(h in key.lower() for h in hidden)
+
+        skip = {"provider", "model", "chat_model"}
+        entries = [
+            f"  {key} = {value}" for key, value in sorted(self._config.items())
+            if key not in skip and not _is_secret(key)
+        ]
+        if entries:
+            lines.append("- settings:")
+            lines.extend(entries)
+        secret_count = sum(
+            1 for key in self._config if key not in skip and _is_secret(key)
+        )
+        if secret_count:
+            lines.append(f"- ({secret_count} secret-like setting(s) hidden)")
+        return "\n".join(lines)
+
+    # --- source -------------------------------------------------------------
+
+    def _source_overview(self) -> str:
+        from . import __version__
+        from .repomap import build_map_for_root
+
+        root = conch_source_root()
+        is_checkout = (root / ".git").exists()
+        lines = [f"Conch v{__version__} source at {root} "
+                 f"({'git checkout' if is_checkout else 'installed package'})"]
+        if is_checkout:
+            try:
+                branch = subprocess.run(
+                    ["git", "branch", "--show-current"], cwd=str(root),
+                    capture_output=True, timeout=5,
+                ).stdout.decode().strip()
+                if branch:
+                    lines.append(f"branch: {branch}")
+                log = subprocess.run(
+                    ["git", "log", "--oneline", "-6"], cwd=str(root),
+                    capture_output=True, timeout=5,
+                ).stdout.decode().strip()
+                if log:
+                    lines.append("recent commits:")
+                    lines.extend(f"  {entry}" for entry in log.splitlines())
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        overview = build_map_for_root(root, budget_chars=2800)
+        if overview:
+            lines.append(overview)
+        return "\n".join(lines)
+
+    def _read_source(self, rel_path: str, start_line: int = 1) -> dict:
+        rel_path = (rel_path or "").strip()
+        if not rel_path:
+            return self._text("Error: provide 'path' (e.g. conch/runtime.py)")
+        root = conch_source_root()
+        target = (root / rel_path).resolve()
+        try:
+            inside = target.is_relative_to(root)
+        except AttributeError:  # python < 3.9 fallback (not expected)
+            inside = str(target).startswith(str(root) + os.sep)
+        if not inside:
+            return self._text("Error: path escapes the conch source tree")
+        if not target.is_file():
+            return self._text(f"Error: no such file: {rel_path} "
+                              "(use action='source_overview' to list files)")
+        try:
+            source_lines = target.read_text(errors="replace").splitlines()
+        except OSError as exc:
+            return self._text(f"Error reading {rel_path}: {exc}")
+        total = len(source_lines)
+        start = max(1, start_line)
+        chunk: List[str] = []
+        used = 0
+        end = start - 1
+        for i in range(start - 1, total):
+            line = f"{i + 1:5d}| {source_lines[i]}"
+            if used + len(line) + 1 > INTROSPECT_OUTPUT_MAX - 200:
+                break
+            chunk.append(line)
+            used += len(line) + 1
+            end = i + 1
+        header = f"{rel_path} lines {start}-{end} of {total}"
+        if end < total:
+            header += f" (continue with start_line={end + 1})"
+        # Bypass the generic middle-truncation: this output is already sized.
+        return {"content": [{"type": "text", "text": header + "\n" + "\n".join(chunk)}]}
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ from .scheduler import Scheduler
 from .tooling import (
     ApiLayerClient,
     ConchConfigClient,
+    ConchIntrospectClient,
     DelegateTaskClient,
     PublicApiClient,
     LocalShellClient,
@@ -194,6 +195,7 @@ def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool =
         "todo_list": TodoListClient(),
         "delegate_task": DelegateTaskClient(),
         "skill_manage": SkillManageClient(),
+        "conch_introspect": ConchIntrospectClient(),
     }
     clients["skill_manage"].configure(interactive=interactive)
     api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")
@@ -504,6 +506,9 @@ def chat_loop():
         scheduled_builtins = _make_builtin_clients(scheduled_memory, config, interactive=False)
         scheduled_clients, scheduled_state = _load_runtime_tools(scheduled_builtins)
         scheduled_builtins["delegate_task"].bind(config, scheduled_state, scheduled_builtins)
+        scheduled_builtins["conch_introspect"].bind(
+            provider, config.get("chat_model", ""), config, scheduled_state
+        )
         try:
             scheduled_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
             reply, usage = chat_turn(
@@ -564,16 +569,10 @@ def chat_loop():
         pass
     readline.set_history_length(500)
 
-    _SLASH_COMMANDS = [
-        "/help", "/models", "/model", "/provider", "/remember", "/memories",
-        "/forget", "/browse", "/new", "/convos", "/switch", "/delete",
-        "/search", "/agent", "/yolo", "/verbose", "/schedule", "/tasks",
-        "/cancel", "/tools", "/enable", "/disable", "/connect", "/apps",
-        "/reload", "/rounds", "/cost", "/status", "/profile", "/profiles",
-        "/clear", "/queue", "/fact", "/facts", "/skills", "/skill",
-    ]
-    # User-defined commands (~/.config/conch/commands/*.md) complete too
-    from .commands import load_user_commands
+    # Completion list comes from the shared command registry, plus
+    # user-defined commands (~/.config/conch/commands/*.md).
+    from .commands import load_user_commands, slash_command_names
+    _SLASH_COMMANDS = list(dict.fromkeys(slash_command_names()))
     _SLASH_COMMANDS += sorted(
         "/" + name for name in load_user_commands() if "/" + name not in _SLASH_COMMANDS
     )
@@ -708,6 +707,7 @@ def chat_loop():
 
     # Bind config client with current state
     builtin_clients["conch_config"].bind(provider, model_name, session_usage, config)
+    builtin_clients["conch_introspect"].bind(provider, model_name, config, chat_state)
     builtin_clients["search_conversations"].bind(conv_mgr, memory=memory)
 
     _print_banner()
@@ -924,6 +924,7 @@ def chat_loop():
             if _sync_fn:
                 raw_fn = _sync_fn
             builtin_clients["conch_config"].update(provider, model_name)
+            builtin_clients["conch_introspect"].update(provider, model_name)
             if (provider, model_name) != _pre_fb:
                 # Keep the self-description accurate after automatic fallback.
                 base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
@@ -1061,6 +1062,7 @@ def main():
         builtin_clients = _make_builtin_clients(memory, config, interactive=True)
         mcp_clients, chat_state = _load_runtime_tools(builtin_clients)
         builtin_clients["delegate_task"].bind(config, chat_state, builtin_clients)
+        builtin_clients["conch_introspect"].bind(provider, model_name, config, chat_state)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _augment_user_message(user_text, mem_context)},

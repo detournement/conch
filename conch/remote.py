@@ -139,7 +139,7 @@ REMOTE_SYSTEM_PROMPT = (
 # Tools a remote session must never see.
 REMOTE_EXCLUDED_TOOLS = {
     "delegate_task", "conch_config", "manage_tools", "skill_manage",
-    "todo_list", "api_layer",
+    "todo_list", "api_layer", "conch_introspect",
 }
 
 

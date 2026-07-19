@@ -274,6 +274,25 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
         pass
 
 
+def _summarize_and_save_async(messages: List[dict], config: dict, raw_fn, memory: MemoryStore):
+    """Fire-and-forget session summary for /new: the LLM call inside
+    _summarize_and_save can block for a long time on a busy backend, and
+    starting a fresh conversation must not wait on it. Snapshots the
+    transcript and summarizes on a daemon thread; the summary is
+    best-effort, so losing it on an early exit is acceptable."""
+    user_turns = [m for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)]
+    if len(user_turns) < 2:
+        return None
+    snapshot = list(messages)
+    thread = threading.Thread(
+        target=_summarize_and_save,
+        args=(snapshot, config, raw_fn, memory),
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _route_scheduled_output(config: dict, task, reply: str, usage: dict) -> None:
     """Deliver a scheduled task's result over the notify channel (plan 4.3).
     No configured channel = old behavior (output discarded). Never raises."""
@@ -833,7 +852,9 @@ def chat_loop():
                     print(f"  \033[2m→ {preview}\033[0m")
                 if result == "new_conversation":
                     _save_current()
-                    _summarize_and_save(messages, config, raw_fn, memory)
+                    # Summarize in the background: the LLM call would
+                    # otherwise block /new for the full generation time.
+                    _summarize_and_save_async(messages, config, raw_fn, memory)
                     current_conv = conv_mgr.create(model=model_name, provider=provider)
                     messages = [{"role": "system", "content": system_prompt}]
                     current_conv.messages = messages

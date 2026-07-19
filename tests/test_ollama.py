@@ -430,6 +430,83 @@ class TestQwenToolCallRecovery(unittest.TestCase):
     def test_json_missing_arguments_not_recovered(self):
         self.assertIsNone(extract_textual_tool_use_blocks('{"name": "tool_x"}'))
 
+    def test_known_tools_filter_applies_to_json_paths(self):
+        text = '{"name": "not_registered", "arguments": {}}'
+        self.assertIsNotNone(extract_textual_tool_use_blocks(text))
+        self.assertIsNone(
+            extract_textual_tool_use_blocks(text, {"local_shell"}),
+            "calls to unregistered tools must be rejected when the registry is known",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Claude-XML tool-call recovery: observed live from qwen3.6 against an older
+# Ollama server that dropped the tools array — the model improvised the
+# Anthropic <function_calls><invoke> syntax from training.
+# ---------------------------------------------------------------------------
+
+CLAUDE_XML = (
+    "<function_calls>\n"
+    '<invoke name="local_shell">\n'
+    "<parameter name=\"command\"> date </parameter>\n"
+    "</invoke>\n"
+    "</function_calls>"
+)
+
+
+class TestClaudeXmlToolCallRecovery(unittest.TestCase):
+    def test_single_invoke_recovered(self):
+        blocks = extract_textual_tool_use_blocks(CLAUDE_XML, {"local_shell"})
+        self.assertIsNotNone(blocks)
+        self.assertEqual(blocks[0]["name"], "local_shell")
+        self.assertEqual(blocks[0]["input"], {"command": "date"})
+
+    def test_recovered_without_registry_too(self):
+        # Direct calls without a registry still parse (chat_turn always
+        # passes the live registry).
+        blocks = extract_textual_tool_use_blocks(CLAUDE_XML)
+        self.assertIsNotNone(blocks)
+        self.assertEqual(blocks[0]["name"], "local_shell")
+
+    def test_unregistered_tool_rejected(self):
+        xml = CLAUDE_XML.replace("local_shell", "totally_made_up_tool")
+        self.assertIsNone(
+            extract_textual_tool_use_blocks(xml, {"local_shell", "save_memory"}),
+            "XML naming an unregistered tool must never execute",
+        )
+
+    def test_multiple_invokes_and_typed_parameters(self):
+        xml = (
+            "<function_calls>"
+            '<invoke name="local_shell">'
+            '<parameter name="command">ls -la</parameter>'
+            '<parameter name="timeout">30</parameter>'
+            "</invoke>"
+            '<invoke name="save_memory">'
+            '<parameter name="content">likes cats</parameter>'
+            "</invoke>"
+            "</function_calls>"
+        )
+        blocks = extract_textual_tool_use_blocks(xml, {"local_shell", "save_memory"})
+        self.assertEqual([b["name"] for b in blocks], ["local_shell", "save_memory"])
+        self.assertEqual(blocks[0]["input"], {"command": "ls -la", "timeout": 30})
+        self.assertEqual(blocks[1]["input"], {"content": "likes cats"})
+        self.assertEqual(len({b["id"] for b in blocks}), 2)
+
+    def test_surrounding_prose_tolerated(self):
+        text = f"I'll check the date now.\n{CLAUDE_XML}\nDone."
+        blocks = extract_textual_tool_use_blocks(text, {"local_shell"})
+        self.assertIsNotNone(blocks)
+
+    def test_unclosed_wrapper_not_recovered(self):
+        broken = "<function_calls>\n<invoke name=\"local_shell\">"
+        self.assertIsNone(extract_textual_tool_use_blocks(broken, {"local_shell"}))
+
+    def test_prose_mentioning_tags_not_executed(self):
+        text = ("Claude uses <function_calls> wrappers with <invoke> tags "
+                "to call tools, unlike JSON-based formats.")
+        self.assertIsNone(extract_textual_tool_use_blocks(text, {"local_shell"}))
+
 
 # ---------------------------------------------------------------------------
 # Sending history back to Ollama: arguments must be objects, results linked

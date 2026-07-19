@@ -1622,7 +1622,17 @@ class ConchConfigClient:
                         return self._text(f"Cannot verify model '{value}': {reason}.")
                     return self._text(f"Cannot switch: {reason}. Use action=list_models to see options.")
             if not target_provider:
-                return self._text(f"Unknown model '{value}'. Use action=list_models to see options.")
+                from .providers import suggest_models
+                pool = [
+                    m for prov, models in KNOWN_MODELS.items()
+                    if prov != "ollama" for m in models
+                ]
+                suggestions = suggest_models(value, pool)
+                hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+                return self._text(
+                    f"Unknown model '{value}'.{hint} "
+                    "Use action=list_models to see options."
+                )
             if value == self._model and target_provider == self._provider:
                 return self._text(f"Already using {target_provider}/{value}. No change needed.")
             key_env = DEFAULT_API_KEY_ENVS.get(target_provider, "")

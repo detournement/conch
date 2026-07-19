@@ -98,7 +98,12 @@ are rejected.
 Ollama models are never hardcoded: `/models`, `/model`, `/provider ollama`,
 and the fallback chain all use the live list from your server, and switching
 to a model that isn't installed or doesn't support tool calling is rejected
-with a clear message. Older local servers are supported too: `/api/show`
+with a clear message. Cloud providers are validated too: `/model` (and the
+model-facing `conch_config` switches) reject names that aren't in the
+provider's catalog and suggest close matches for typos ("Did you mean:
+claude-sonnet-4-6?"). For a model newer than conch's catalog, use
+`/model <name> --force` — it switches with a warning instead of validating.
+Config-file model values get the same scrutiny at startup (warn, don't die). Older local servers are supported too: `/api/show`
 requests are compatible with pre-rename servers, models whose tool
 capability can't be determined stay listed (only affirmatively non-tool
 models are excluded), ask mode falls back to the legacy `format="json"` on
@@ -197,7 +202,7 @@ Transient API errors (429, 5xx, connection refused, timeouts, missing models) ar
 |---------|-------------|
 | `/help` | Show all commands |
 | `/models` | List available models |
-| `/model <name>` | Switch model |
+| `/model <name>` | Switch model (validated against the provider's catalog/server; suggests close matches on typos; `--force` bypasses for brand-new models) |
 | `/provider <name>` | Switch provider |
 | `/agent` | Toggle agent mode (auto-execute shell) |
 | `/yolo` | Alias for `/agent on` |

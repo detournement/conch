@@ -477,7 +477,14 @@ def handle_slash_command(
         if not arg:
             print(f"\n  \033[2mCurrent model:\033[0m \033[1m{model_name}\033[0m ({provider})\n")
             return None
-        new_model = arg
+        tokens = arg.split()
+        force = "--force" in tokens
+        if force:
+            tokens = [t for t in tokens if t != "--force"]
+        new_model = " ".join(tokens)
+        if not new_model:
+            print("\n  \033[2mUsage: /model <name> [--force]\033[0m\n")
+            return None
         new_provider = None
         for provider_name, models in KNOWN_MODELS.items():
             if provider_name != "ollama" and new_model in models:
@@ -488,10 +495,13 @@ def handle_slash_command(
             if ollama_models and ollama_model_matches(new_model, ollama_models):
                 new_provider = "ollama"
         if new_provider is None:
-            # Not in any catalog — assume the current provider, but for Ollama
-            # the model must actually exist on the server and support tools.
+            # Not in any catalog — assume the current provider; the model
+            # must then pass that provider's validation below.
             new_provider = provider
-        if new_provider == "ollama":
+        if force:
+            print(f"\n  \033[33m⚠ Skipping model validation for '{new_model}' (--force) — "
+                  f"requests will fail if {new_provider} doesn't know it\033[0m")
+        elif new_provider == "ollama":
             ok, reason = validate_ollama_model(new_model, config)
             if ok is None:
                 print(f"\n  \033[31m{reason} — cannot verify model '{new_model}'\033[0m\n")
@@ -504,6 +514,16 @@ def handle_slash_command(
                 else:
                     print("  \033[2mNo tool-capable models installed on the server.\033[0m\n")
                 return None
+        else:
+            from .providers import validate_model_for_provider
+            ok, reason = validate_model_for_provider(new_provider, new_model, config)
+            if ok is False:
+                print(f"\n  \033[31mCannot switch: {reason}\033[0m")
+                print("  \033[2mUse /models to list, or '/model <name> --force' if the "
+                      "model is newer than conch's catalog.\033[0m\n")
+                return None
+            if ok is None and reason:
+                print(f"\n  \033[33m⚠ {reason}\033[0m")
         new_fn = RAW_FNS.get(new_provider)
         if not new_fn:
             print(f"\n  \033[31mUnknown provider for model '{new_model}'\033[0m\n")

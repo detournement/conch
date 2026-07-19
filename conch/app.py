@@ -398,6 +398,28 @@ class TypeaheadBuffer:
                 break
 
 
+def warn_unknown_cloud_model(provider: str, model_name: str) -> str:
+    """Startup scrutiny for config-file model values on cloud providers
+    (warn-don't-die): "" when the model is known, otherwise a warning with
+    close-match suggestions. The model is kept — it may simply be newer
+    than conch's catalog."""
+    from .providers import KNOWN_MODELS, suggest_models
+
+    provider = (provider or "").lower()
+    if provider in ("ollama", "custom"):
+        return ""  # ollama is resolved live; custom isn't enumerable
+    known = KNOWN_MODELS.get(provider)
+    if not known or not model_name or model_name in known:
+        return ""
+    suggestions = suggest_models(model_name, known)
+    hint = f" — did you mean {', '.join(suggestions)}?" if suggestions else ""
+    return (
+        f"Configured model '{model_name}' isn't in conch's {provider} "
+        f"catalog{hint} (keeping it — it may be newer than this conch; "
+        f"/models to list)"
+    )
+
+
 def resolve_ollama_startup_model(config: dict, model_name: str) -> tuple:
     """Verify the configured Ollama model at startup, substituting one that
     exists on the server when possible.
@@ -411,7 +433,21 @@ def resolve_ollama_startup_model(config: dict, model_name: str) -> tuple:
         get_ollama_base_url,
         list_ollama_models,
         ollama_model_matches,
+        ollama_model_supports_tools,
     )
+
+    def _tool_support_warnings(model: str) -> list:
+        # Old/limited servers can't always report capabilities; such models
+        # are kept (hotfix 151c874) but may never receive native tool
+        # schemas — they then improvise textual tool-call syntax. Say so.
+        if ollama_model_supports_tools(model, config) is None:
+            return [
+                f"Can't verify that '{model}' supports native tool calling "
+                "on this Ollama server — tool calls may degrade to text "
+                "(conch recovers well-formed ones, but consider upgrading "
+                "the server or model)"
+            ]
+        return []
 
     live_models = list_ollama_models(config)
     if live_models is None:
@@ -420,13 +456,13 @@ def resolve_ollama_startup_model(config: dict, model_name: str) -> tuple:
             f"model '{model_name}' unverified"
         ]
     if ollama_model_matches(model_name, live_models):
-        return model_name, []
+        return model_name, _tool_support_warnings(model_name)
     replacement = get_fallback_model("ollama", config)
     if replacement:
         return replacement, [
             f"Model '{model_name}' is not available/tool-capable on the "
             f"Ollama server — using '{replacement}' instead"
-        ]
+        ] + _tool_support_warnings(replacement)
     installed = list_ollama_models(config, tool_capable_only=False) or []
     if installed:
         warning = (
@@ -470,6 +506,12 @@ def chat_loop():
         if not ok:
             print(f"\033[33m  ⚠ Custom endpoint probe failed: {reason}\033[0m",
                   file=sys.stderr)
+    else:
+        # Cloud providers: config-file model values get the same scrutiny as
+        # switches, but at startup we warn instead of dying (plan-0.4 spirit).
+        _model_warning = warn_unknown_cloud_model(provider, model_name)
+        if _model_warning:
+            print(f"\033[33m  ⚠ {_model_warning}\033[0m", file=sys.stderr)
 
     from .prompts import get_chat_prompt
     base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
@@ -1054,6 +1096,9 @@ def main():
             print(f"conch: unknown provider {provider}", file=sys.stderr)
             sys.exit(1)
         model_name = config.get("chat_model", config.get("model", ""))
+        _model_warning = warn_unknown_cloud_model(provider, model_name)
+        if _model_warning:
+            print(f"\033[33m  ⚠ {_model_warning}\033[0m", file=sys.stderr)
         base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
         system_prompt = _build_system_prompt(base_prompt, _detect_location(), provider, model_name, config)
         user_text = " ".join(sys.argv[1:])

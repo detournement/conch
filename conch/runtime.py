@@ -494,23 +494,81 @@ def _tool_call_from_json_payload(payload, idx: int) -> Optional[dict]:
     }
 
 
-def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
-    """Guarded JSON-only recovery of tool calls the serving layer failed to
-    parse into structured tool_calls.
+# Claude-style XML tool calls. Observed live from qwen3.6 against an older
+# local Ollama server: when the server drops/ignores the request's `tools`
+# array, the model knows tool names only from the system prompt and
+# improvises the Anthropic XML syntax it saw in training. Plan 0.5
+# deliberately deleted the old loose `<tool_called .../>` regex path; this
+# is a *different, real-world-observed* format and is recovered under strict
+# guards: full well-formed wrapper required, and (at the chat_turn call
+# site) the tool name must match a registered tool — prose is never executed.
+_FN_CALLS_RE = re.compile(r"<function_calls>\s*(.*?)\s*</function_calls>", re.DOTALL)
+_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL)
+_PARAM_RE = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL)
+
+
+def _coerce_param_value(raw: str):
+    """Parameter values arrive as text; keep strings but un-JSON obvious
+    numbers/booleans/objects so schemas with typed params still work."""
+    value = raw.strip()
+    if value and (value[0] in "{[" or value in ("true", "false", "null")
+                  or value.lstrip("-").replace(".", "", 1).isdigit()):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    return value
+
+
+def _extract_claude_xml_blocks(raw: str, known_tools: Optional[set]) -> Optional[List[dict]]:
+    if "<function_calls>" not in raw or "<invoke" not in raw:
+        return None
+    normalized: List[dict] = []
+    for wrapper in _FN_CALLS_RE.finditer(raw):
+        for invoke in _INVOKE_RE.finditer(wrapper.group(1)):
+            name = invoke.group(1).strip()
+            if not name:
+                continue
+            if known_tools is not None and name not in known_tools:
+                continue  # never execute calls to tools that don't exist
+            arguments = {
+                param.group(1).strip(): _coerce_param_value(param.group(2))
+                for param in _PARAM_RE.finditer(invoke.group(2))
+                if param.group(1).strip()
+            }
+            normalized.append({
+                "type": "tool_use",
+                "id": f"xml_fn_call_{len(normalized) + 1}",
+                "name": name,
+                "input": arguments,
+            })
+    return normalized or None
+
+
+def extract_textual_tool_use_blocks(
+    text: str, known_tools: Optional[set] = None
+) -> Optional[List[dict]]:
+    """Guarded recovery of tool calls the serving layer failed to parse into
+    structured tool_calls.
 
     Live testing showed qwen2.5-coder via Ollama emitting calls either as
     bare JSON content ({"name": ..., "arguments": {...}}) or inside
-    <tool_call>...</tool_call> tags. Both paths require strict JSON and a
-    tool-call-shaped payload, so quoted prose or ordinary JSON answers are
-    never executed. The old regex/XML/ast.literal_eval recovery paths were
-    removed (plan 0.5) — native tool_calls plus these two JSON recoveries
-    are the only accepted forms.
+    <tool_call>...</tool_call> tags, and qwen3.6 on an older server emitting
+    Claude-style <function_calls><invoke name=...> XML. All paths require a
+    well-formed, tool-call-shaped payload; when *known_tools* is given, any
+    recovered call naming an unregistered tool is rejected. Quoted prose and
+    ordinary JSON answers are never executed. The old loose regex/
+    ast.literal_eval paths remain removed (plan 0.5).
     """
     if not isinstance(text, str):
         return None
     raw = text.strip()
     if not raw:
         return None
+
+    xml_blocks = _extract_claude_xml_blocks(raw, known_tools)
+    if xml_blocks:
+        return xml_blocks
 
     # Bare JSON tool call: qwen2.5 via Ollama often emits the call as the
     # entire message content — {"name": ..., "arguments": {...}} — with no
@@ -533,6 +591,8 @@ def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
                 normalized = []
                 break
             normalized.append(block)
+        if known_tools is not None:
+            normalized = [b for b in normalized if b["name"] in known_tools]
         if normalized:
             return normalized
 
@@ -565,6 +625,8 @@ def extract_textual_tool_use_blocks(text: str) -> Optional[List[dict]]:
                 "name": name,
                 "input": tool_input,
             })
+        if known_tools is not None:
+            normalized = [b for b in normalized if b["name"] in known_tools]
         if normalized:
             return normalized
 
@@ -1073,7 +1135,15 @@ def chat_turn(
             if hasattr(sp, "end_waiting"):
                 sp.end_waiting()
         if not tool_calls:
-            recovered = extract_textual_tool_use_blocks(response.get("content", ""))
+            # Recovery only ever targets tools that actually exist this turn.
+            known_tool_names = set(builtin_clients or {}) | set(tool_map or {})
+            for t in tools or []:
+                tool_fn_name = t.get("function", {}).get("name", "")
+                if tool_fn_name:
+                    known_tool_names.add(tool_fn_name)
+            recovered = extract_textual_tool_use_blocks(
+                response.get("content", ""), known_tool_names
+            )
             if not recovered:
                 reply = response.get("content", "")
                 from .tooling import run_hook

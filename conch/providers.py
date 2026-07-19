@@ -351,6 +351,44 @@ def list_ollama_models(
     return models
 
 
+def suggest_models(model: str, candidates: List[str], limit: int = 3) -> List[str]:
+    """Close matches for a mistyped model name (difflib-based)."""
+    import difflib
+    return difflib.get_close_matches(model, candidates, n=limit, cutoff=0.4)
+
+
+def validate_model_for_provider(provider: str, model: str, config: Optional[dict] = None) -> tuple:
+    """Validate that *model* exists for *provider* on a switch.
+
+    Returns (ok, reason): True when valid; False when it must be rejected
+    (*reason* explains and suggests close matches); None when it can't be
+    verified (custom endpoints don't publish an enumerable list; unreachable
+    Ollama servers are reported by validate_ollama_model itself).
+    """
+    provider = (provider or "").lower()
+    model = (model or "").strip()
+    if not model:
+        return False, "no model given"
+    if provider == "ollama":
+        return validate_ollama_model(model, config)
+    if provider == "custom":
+        return None, ("custom endpoints don't publish a model list — "
+                      "the name is taken as-is")
+    known = KNOWN_MODELS.get(provider)
+    if known is None:
+        return None, f"unknown provider '{provider}'"
+    if model in known:
+        return True, ""
+    suggestions = suggest_models(model, known)
+    if suggestions:
+        hint = f"Did you mean: {', '.join(suggestions)}?"
+    else:
+        shown = ", ".join(known[:8])
+        more = ", ..." if len(known) > 8 else ""
+        hint = f"Known {provider} models: {shown}{more}"
+    return False, f"unknown {provider} model '{model}'. {hint}"
+
+
 def check_ollama_health(config: Optional[dict] = None) -> bool:
     """Fresh /api/tags ping (bypasses the cache) — used for preflight after
     a failed turn (plan 3.3)."""

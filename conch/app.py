@@ -293,6 +293,24 @@ def _summarize_and_save_async(messages: List[dict], config: dict, raw_fn, memory
     return thread
 
 
+EXIT_SUMMARY_TIMEOUT_S = 2.5
+
+
+def _summarize_and_save_bounded(
+    messages: List[dict], config: dict, raw_fn, memory: MemoryStore,
+    timeout: float = EXIT_SUMMARY_TIMEOUT_S,
+):
+    """Exit-path session summary: give the LLM call a short, bounded window
+    instead of blocking quit for the full generation time. Tradeoff: the
+    worker is a daemon thread, so if the backend hasn't answered within the
+    timeout the summary is lost when the interpreter exits — acceptable for
+    a best-effort memory, and far better than hanging exit on a busy
+    server."""
+    thread = _summarize_and_save_async(messages, config, raw_fn, memory)
+    if thread is not None:
+        thread.join(timeout)
+
+
 def _route_scheduled_output(config: dict, task, reply: str, usage: dict) -> None:
     """Deliver a scheduled task's result over the notify channel (plan 4.3).
     No configured channel = old behavior (output discarded). Never raises."""
@@ -1090,7 +1108,7 @@ def chat_loop():
             else:
                 print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, free\033[0m")
         try:
-            _summarize_and_save(messages, config, raw_fn, memory)
+            _summarize_and_save_bounded(messages, config, raw_fn, memory)
         except KeyboardInterrupt:
             pass
         sched.stop()

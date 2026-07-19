@@ -1,7 +1,8 @@
-"""Tests that /new never blocks on the session-summary LLM call.
+"""Tests that /new and exit never block on the session-summary LLM call.
 
 The summary is a side task: it runs on a background daemon thread so the
 new conversation starts immediately even when the backend is slow or busy.
+On exit the wait is bounded (a short join) rather than skipped entirely.
 """
 
 import threading
@@ -96,6 +97,58 @@ class TestSummarizeAsync(unittest.TestCase):
         release.set()
         thread.join(5)
         self.assertEqual(seen["turns"], ["one", "reply", "two"])
+
+
+class TestSummarizeBoundedOnExit(unittest.TestCase):
+    def test_slow_backend_never_blocks_exit_past_timeout(self):
+        from conch.app import _summarize_and_save_bounded
+
+        release = threading.Event()
+
+        def stuck_raw_fn(config, msgs, tools):
+            release.wait(30)
+            return {"content": "- too late"}
+
+        memory = FakeMemory()
+        t0 = time.monotonic()
+        _summarize_and_save_bounded(
+            _messages(), {"provider": "ollama"}, stuck_raw_fn, memory, timeout=0.2
+        )
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2.0, "exit must not wait for a stuck summary call")
+        self.assertEqual(memory.saved, [], "nothing saved within the bounded window")
+        release.set()  # unblock the daemon thread before the test ends
+
+    def test_fast_backend_summary_saved_before_exit(self):
+        from conch.app import _summarize_and_save_bounded
+
+        def fast_raw_fn(config, msgs, tools):
+            return {"content": "- quick summary"}
+
+        memory = FakeMemory()
+        _summarize_and_save_bounded(
+            _messages(), {"provider": "ollama"}, fast_raw_fn, memory, timeout=5
+        )
+        self.assertEqual(len(memory.saved), 1)
+        self.assertIn("[Session summary]", memory.saved[0])
+
+    def test_short_conversation_returns_immediately(self):
+        from conch.app import _summarize_and_save_bounded
+
+        calls = []
+
+        def raw_fn(config, msgs, tools):
+            calls.append(1)
+            return {"content": "- summary"}
+
+        memory = FakeMemory()
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "only one turn"},
+        ]
+        _summarize_and_save_bounded(messages, {"provider": "ollama"}, raw_fn, memory)
+        self.assertEqual(calls, [])
+        self.assertEqual(memory.saved, [])
 
 
 if __name__ == "__main__":

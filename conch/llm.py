@@ -163,6 +163,97 @@ def call_cerebras(config: dict, messages: list) -> str:
     return command_from_tool_calls(msg)
 
 
+def call_bedrock(config: dict, messages: list) -> str:
+    import urllib.error
+    import urllib.request
+
+    from .providers import format_http_api_error, get_bedrock_base_url
+
+    api_key = os.environ.get(
+        config.get("api_key_env", "AWS_BEARER_TOKEN_BEDROCK"), ""
+    ).strip()
+    if not api_key:
+        print("conch: AWS_BEARER_TOKEN_BEDROCK not set", file=sys.stderr)
+        sys.exit(1)
+    body = {
+        "model": config.get("model", "moonshotai.kimi-k2.5"),
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "tools": [SHELL_COMMAND_TOOL],
+        "tool_choice": {"type": "function", "function": {"name": "shell_command"}},
+    }
+    req = urllib.request.Request(
+        f"{get_bedrock_base_url(config)}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "conch/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"conch: API error: {format_http_api_error(e)}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"conch: API error: {e}", file=sys.stderr)
+        sys.exit(1)
+    msg = (data.get("choices") or [{}])[0].get("message", {})
+    return command_from_tool_calls(msg)
+
+
+def call_openrouter(config: dict, messages: list) -> str:
+    import urllib.error
+    import urllib.request
+
+    from .providers import OPENROUTER_BASE_URL, format_http_api_error
+
+    api_key = os.environ.get(
+        config.get("api_key_env", "OPENROUTER_API_KEY"), ""
+    ).strip()
+    if not api_key:
+        print("conch: OPENROUTER_API_KEY not set", file=sys.stderr)
+        sys.exit(1)
+    body = {
+        "model": config.get("model", "moonshotai/kimi-k3"),
+        "messages": messages,
+        "max_tokens": 2048,
+        # Same rationale as chat mode (_openrouter_body): low effort, no
+        # temperature keeps Kimi K3 tool-calling reliably.
+        "reasoning_effort": "low",
+        "tools": [SHELL_COMMAND_TOOL],
+        # Kimi K3's upstream 400s on the named {"type":"function",...} form;
+        # "required" is equivalent here since only one tool is offered
+        # (verified live on both K3 and GLM-5.2).
+        "tool_choice": "required",
+    }
+    req = urllib.request.Request(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "conch/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"conch: API error: {format_http_api_error(e)}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"conch: API error: {e}", file=sys.stderr)
+        sys.exit(1)
+    msg = (data.get("choices") or [{}])[0].get("message", {})
+    return command_from_tool_calls(msg)
+
+
 def call_openai(config: dict, messages: list) -> str:
     import urllib.error
     import urllib.request
@@ -313,6 +404,8 @@ def call_ollama(config: dict, messages: list) -> str:
 
 _ASK_CALLERS = {
     "cerebras": call_cerebras,
+    "bedrock": call_bedrock,
+    "openrouter": call_openrouter,
     "openai": call_openai,
     "anthropic": call_anthropic,
     "ollama": call_ollama,

@@ -106,6 +106,19 @@ def load_config() -> Dict[str, str]:
         config["api_key_env"] = config.get("api_key_env") or "CEREBRAS_API_KEY"
         config["model"] = config.get("model") or "zai-glm-4.7"
         config["chat_model"] = config.get("chat_model") or config["model"]
+    elif provider == "bedrock":
+        config.setdefault("api_key_env", "AWS_BEARER_TOKEN_BEDROCK")
+        config.setdefault("model", "moonshotai.kimi-k2.5")
+        config.setdefault("chat_model", config["model"])
+    elif provider == "openrouter":
+        # Values inherited from DEFAULT_CONFIG (anthropic) don't count as
+        # user choices — replace them with OpenRouter's own defaults.
+        if config.get("api_key_env") in (DEFAULT_CONFIG["api_key_env"], "", None):
+            config["api_key_env"] = "OPENROUTER_API_KEY"
+        if config.get("model") in (DEFAULT_CONFIG["model"], "", None):
+            config["model"] = "moonshotai/kimi-k3"
+        if config.get("chat_model") in (DEFAULT_CONFIG["chat_model"], "", None):
+            config["chat_model"] = config["model"]
     elif provider == "openai":
         config.setdefault("api_key_env", "OPENAI_API_KEY")
         config.setdefault("model", "gpt-4o-mini")

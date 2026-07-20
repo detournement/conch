@@ -3,11 +3,21 @@
 #   ~/.config/conch/config, ~/.conchrc, then a per-project .conchrc
 #   (nearest file between the current directory and the git root).
 
-# Provider: anthropic, openai, cerebras, ollama
+# Provider: anthropic, openai, cerebras, bedrock, openrouter, ollama, custom
 provider=anthropic
 model=claude-sonnet-4-6
 chat_model=claude-sonnet-4-6
 api_key_env=ANTHROPIC_API_KEY
+
+# --- AWS Bedrock (Moonshot Kimi) example -------------------------------------
+# Uses Bedrock's OpenAI-compatible endpoint with a long-term Bedrock API key
+# (create one: aws iam create-service-specific-credential --user-name <you>
+#  --service-name bedrock.amazonaws.com) exported as AWS_BEARER_TOKEN_BEDROCK.
+#provider=bedrock
+#model=moonshotai.kimi-k2.5
+#chat_model=moonshotai.kimi-k2.5
+#bedrock_region=us-east-2
+#api_key_env=AWS_BEARER_TOKEN_BEDROCK
 
 # --- Ollama (local) example -------------------------------------------------
 # Models are discovered live from the server and filtered to tool-capable
@@ -30,6 +40,16 @@ api_key_env=ANTHROPIC_API_KEY
 #custom_model=qwen2.5-32b
 #custom_context_window=32768
 #api_key_env=MY_ENDPOINT_KEY
+
+# --- OpenRouter ---------------------------------------------------------------
+# Frontier models not on the other providers, via openrouter.ai:
+#   moonshotai/kimi-k3  (2.8T MoE, 1M context, $3/$15 per MTok)
+#   z-ai/glm-5.2        (~750B MoE, 1M context, $0.98/$3.08 per MTok)
+# Switch between them in chat with /model.
+#provider=openrouter
+#model=moonshotai/kimi-k3
+#chat_model=moonshotai/kimi-k3
+#api_key_env=OPENROUTER_API_KEY
 
 # --- Behavior ----------------------------------------------------------------
 # Auto-execute shell commands without confirmation (a startup notice is shown

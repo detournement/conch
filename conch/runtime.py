@@ -921,13 +921,31 @@ def build_tool_call_exemplar(provider: str) -> List[dict]:
     """
     if provider not in LOCAL_PROVIDERS:
         return []
-    call = {
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [
-            {"function": {"name": "local_shell", "arguments": {"command": "date"}}}
-        ],
-    }
+    if provider == "ollama":
+        # Ollama wire shape: arguments as a JSON object, results linked by
+        # tool_name (see _ollama_wire_tool_calls).
+        call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "local_shell", "arguments": {"command": "date"}}}
+            ],
+        }
+        result = {"role": "tool", "content": "Wed Jul 15 2026", "tool_name": "local_shell"}
+    else:
+        # OpenAI wire shape for custom endpoints: arguments MUST be a JSON
+        # string and results link via tool_call_id — strict backends (e.g.
+        # Moonshot Kimi behind OpenRouter) 400 on object-shaped arguments.
+        call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "exemplar_call_0",
+                "type": "function",
+                "function": {"name": "local_shell", "arguments": "{\"command\": \"date\"}"},
+            }],
+        }
+        result = {"role": "tool", "content": "Wed Jul 15 2026", "tool_call_id": "exemplar_call_0"}
     return [
         {
             "role": "system",
@@ -939,7 +957,7 @@ def build_tool_call_exemplar(provider: str) -> List[dict]:
         },
         {"role": "user", "content": "(example) what is today's date?"},
         call,
-        {"role": "tool", "content": "Wed Jul 15 2026", "tool_name": "local_shell"},
+        result,
         {"role": "assistant", "content": "(example) Today is Wed Jul 15 2026."},
     ]
 

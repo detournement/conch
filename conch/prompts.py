@@ -28,6 +28,8 @@ _ASK_TOOL_CALL = (
 
 ASK_PROMPTS = {
     "cerebras": _ASK_TOOL_CALL,
+    "bedrock": _ASK_TOOL_CALL,
+    "openrouter": _ASK_TOOL_CALL,
     "anthropic": _ASK_TOOL_CALL,
     "openai": _ASK_TOOL_CALL,
     "ollama": (
@@ -94,8 +96,9 @@ _CHAT_BASE = (
     "  Services: /connect <app>, /apps -- OAuth via Composio\n"
     "  Other: /status, /cost, /rounds <n>, /queue [on|off], /help\n\n"
 
-    "Supported providers: Cerebras (free), OpenAI, Anthropic, Ollama (local).\n"
-    "Switch at any time with /provider or /model.\n\n"
+    "Supported providers: Cerebras (free), OpenAI, Anthropic, Bedrock (AWS,\n"
+    "Moonshot Kimi), OpenRouter (Kimi K3, GLM-5.2), Ollama (local). Switch at\n"
+    "any time with /provider or /model.\n\n"
 
     "Config & data:\n"
     "- Config: ~/.config/conch/config (provider, model, tokens, settings)\n"
@@ -161,6 +164,24 @@ CHAT_PROMPTS = {
         "You are Conch, a versatile shell assistant powered by GPT.\n"
         "Balance speed and thoroughness. Be practical and action-oriented.\n"
         "Use local_shell to execute commands directly when appropriate.\n"
+        "Answer clearly. Use markdown formatting sparingly -- this is a terminal.\n\n"
+        + _CHAT_BASE
+    ),
+    "openrouter": (
+        "You are Conch, a capable shell assistant powered by a frontier "
+        "model via OpenRouter.\n"
+        "Be direct and practical. Execute tasks via tools rather than "
+        "explaining how to do them.\n"
+        "Use local_shell to run commands directly. Plan multi-step work, then act.\n"
+        "Answer clearly. Use markdown formatting sparingly -- this is a terminal.\n\n"
+        + _CHAT_BASE
+    ),
+    "bedrock": (
+        "You are Conch, a capable shell assistant powered by Moonshot Kimi "
+        "via AWS Bedrock.\n"
+        "Be direct and practical. Execute tasks via tools rather than "
+        "explaining how to do them.\n"
+        "Use local_shell to run commands directly. Plan multi-step work, then act.\n"
         "Answer clearly. Use markdown formatting sparingly -- this is a terminal.\n\n"
         + _CHAT_BASE
     ),

@@ -15,6 +15,24 @@ KNOWN_MODELS = {
     "cerebras": [
         "zai-glm-4.7",
     ],
+    # AWS Bedrock via its OpenAI-compatible endpoint. Moonshot Kimi models
+    # verified live in this account (us-east-2). Kimi K3 (2.8T MoE) should be
+    # added here when AWS lists it — weights ship 2026-07-27 and it is far too
+    # large (64+ accelerators) to self-host on a SageMaker endpoint.
+    "bedrock": [
+        "moonshotai.kimi-k2.5",
+        "moonshot.kimi-k2-thinking",
+        # Z.AI GLM-5 (744B MoE, ~44B active) — biggest GLM on Bedrock,
+        # verified live in us-east-2 (also us-east-1/us-west-2).
+        "zai.glm-5",
+    ],
+    # OpenRouter (openrouter.ai) — OpenAI-compatible gateway to frontier
+    # models not available on other providers here. Both verified live with
+    # native tool calling and streaming.
+    "openrouter": [
+        "moonshotai/kimi-k3",
+        "z-ai/glm-5.2",
+    ],
     # Conch requires tool calling, so only tool-capable models are listed
     # (e.g. o1-mini is excluded: it supports neither tools nor system messages).
     "openai": [
@@ -54,6 +72,10 @@ KNOWN_MODELS = {
 
 DEFAULT_API_KEY_ENVS = {
     "cerebras": "CEREBRAS_API_KEY",
+    # Long-term Bedrock API key (IAM service-specific credential); the env
+    # var name is AWS's documented standard for Bedrock bearer auth.
+    "bedrock": "AWS_BEARER_TOKEN_BEDROCK",
+    "openrouter": "OPENROUTER_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "ollama": "",
@@ -63,6 +85,8 @@ DEFAULT_API_KEY_ENVS = {
 PROVIDER_TOOL_LIMITS = {
     "openai": 128,
     "cerebras": 128,
+    "bedrock": 128,
+    "openrouter": 128,
     # Local models drown in large tool lists: cap hard and select the most
     # relevant tools per turn (see tooling.select_relevant_tools).
     "ollama": 12,
@@ -75,6 +99,8 @@ PROVIDER_TOOL_LIMITS = {
 # exists on the configured server (see get_fallback_model).
 DEFAULT_CHAT_MODEL_BY_PROVIDER = {
     "cerebras": "zai-glm-4.7",
+    "bedrock": "moonshotai.kimi-k2.5",
+    "openrouter": "moonshotai/kimi-k3",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-6",
     "ollama": "llama3.3",
@@ -87,6 +113,13 @@ DEFAULT_CHAT_MODEL_BY_PROVIDER = {
 MODEL_CONTEXT_WINDOWS = {
     # cerebras
     "zai-glm-4.7": 131072,
+    # bedrock (Moonshot Kimi, Z.AI GLM)
+    "moonshotai.kimi-k2.5": 262144,
+    "moonshot.kimi-k2-thinking": 262144,
+    "zai.glm-5": 202752,  # Bedrock's listed window (model card says 200K-class)
+    # openrouter (windows per openrouter.ai/api/v1/models, verified 2026-07)
+    "moonshotai/kimi-k3": 1048576,
+    "z-ai/glm-5.2": 1048576,
     # openai
     "gpt-5.4": 400000,
     "gpt-5.4-pro": 400000,
@@ -120,6 +153,8 @@ MODEL_CONTEXT_WINDOWS = {
 # the entry here documents the server's own default when num_ctx is omitted.)
 PROVIDER_DEFAULT_CONTEXT_WINDOWS = {
     "cerebras": 131072,
+    "bedrock": 131072,
+    "openrouter": 131072,
     "openai": 128000,
     "anthropic": 200000,
     "ollama": 4096,
@@ -485,6 +520,13 @@ def format_http_api_error(exc: BaseException) -> str:
 # Per-1M-token pricing (input, output). $0 = free tier.
 MODEL_PRICING = {
     "zai-glm-4.7":                 (0.00, 0.00),
+    "moonshotai.kimi-k2.5":        (0.60, 3.00),
+    "moonshot.kimi-k2-thinking":   (0.60, 2.50),
+    # Bedrock on-demand US-region rates (aws.amazon.com/bedrock/pricing).
+    "zai.glm-5":                   (1.00, 3.20),
+    # OpenRouter rates (openrouter.ai/api/v1/models, verified 2026-07).
+    "moonshotai/kimi-k3":          (3.00, 15.00),
+    "z-ai/glm-5.2":                (0.98, 3.08),
     "gpt-5.4":                     (2.50, 15.00),
     "gpt-5.4-pro":                 (15.00, 120.00),
     "gpt-5.4-mini":                (0.75, 4.50),
@@ -577,7 +619,7 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
 
 def _normalize_usage(data: dict, provider: str) -> dict:
     """Extract a uniform usage dict from any provider's raw API response."""
-    if provider in ("cerebras", "openai"):
+    if provider in ("cerebras", "openai", "bedrock", "openrouter"):
         usage = data.get("usage", {})
         return {
             "input_tokens": usage.get("prompt_tokens", 0),
@@ -597,7 +639,7 @@ def _normalize_usage(data: dict, provider: str) -> dict:
     return {"input_tokens": 0, "output_tokens": 0}
 
 
-CROSS_PROVIDER_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "ollama"]
+CROSS_PROVIDER_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "bedrock", "openrouter", "ollama"]
 
 
 def _has_key(provider: str) -> bool:
@@ -838,18 +880,19 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
     }
 
 
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>|<reasoning>.*?</reasoning>", re.DOTALL)
 
 
 def strip_think_blocks(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks that qwen3 (and other
-    reasoning models) embed in message content."""
-    if not text or "<think>" not in text:
+    """Remove <think>/<reasoning> blocks that reasoning models (qwen3,
+    kimi-k2-thinking, ...) embed in message content."""
+    if not text or ("<think>" not in text and "<reasoning>" not in text):
         return text
     cleaned = _THINK_BLOCK_RE.sub("", text)
-    # Unterminated <think> (stream cut off mid-thought): drop the tail.
-    if "<think>" in cleaned:
-        cleaned = cleaned.split("<think>", 1)[0]
+    # Unterminated block (stream cut off mid-thought): drop the tail.
+    for tag in ("<think>", "<reasoning>"):
+        if tag in cleaned:
+            cleaned = cleaned.split(tag, 1)[0]
     return cleaned.strip()
 
 
@@ -910,6 +953,251 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         "_usage": _normalize_usage(data, "ollama"),
         "_model": body["model"],
     }
+
+
+# ---------------------------------------------------------------------------
+# AWS Bedrock via its OpenAI-compatible chat completions endpoint.
+# Auth is a long-term Bedrock API key (IAM service-specific credential) sent
+# as a bearer token — no SigV4/boto3 needed, keeping conch dependency-free.
+# Config:
+#   provider=bedrock
+#   bedrock_region=us-east-2            (or AWS_REGION/AWS_DEFAULT_REGION)
+#   api_key_env=AWS_BEARER_TOKEN_BEDROCK (default)
+# ---------------------------------------------------------------------------
+
+DEFAULT_BEDROCK_REGION = "us-east-2"
+
+
+def get_bedrock_base_url(config: Optional[dict] = None) -> str:
+    config = config or {}
+    region = (config.get("bedrock_region") or "").strip()
+    if not region:
+        region = (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "").strip()
+    if not region:
+        region = DEFAULT_BEDROCK_REGION
+    return f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
+
+
+def _bedrock_headers(config: dict) -> Dict[str, str]:
+    api_key = os.environ.get(config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK", "").strip()
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "conch/1.0",
+    }
+
+
+def _bedrock_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "model": config.get("chat_model", config.get("model", "moonshotai.kimi-k2.5")),
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 16384,
+    }
+    if tools:
+        body["tools"] = _sanitize_tools_for_openai(tools)
+    return body
+
+
+def raw_bedrock(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
+    api_key = os.environ.get(config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK", "").strip()
+    if not api_key:
+        return {"content": "", "tool_calls": None}
+    body = _bedrock_body(config, messages, tools)
+    req = urllib.request.Request(
+        f"{get_bedrock_base_url(config)}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=_bedrock_headers(config),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return error_response(format_http_api_error(exc))
+    except Exception as exc:
+        return error_response(str(exc))
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        msg = err.get("message", json.dumps(err)) if isinstance(err, dict) else str(err)
+        return error_response(msg)
+    message = (data.get("choices") or [{}])[0].get("message", {})
+    # kimi-k2-thinking embeds <reasoning> blocks in content — strip them.
+    content = strip_think_blocks((message.get("content") or "").strip())
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": message.get("tool_calls"),
+        "_usage": _normalize_usage(data, "bedrock"),
+        "_model": body["model"],
+    }
+
+
+class _ReasoningStreamFilter:
+    """Suppress <reasoning>...</reasoning> spans from streamed display tokens.
+
+    kimi-k2-thinking (Bedrock) streams its chain of thought as tagged spans
+    inside ordinary content deltas; without filtering, the raw reasoning is
+    printed live to the terminal. Tags can be split across chunk boundaries,
+    so a small tail is buffered until it can't be a tag prefix anymore.
+    """
+
+    OPEN = "<reasoning>"
+    CLOSE = "</reasoning>"
+
+    def __init__(self, on_token):
+        self._on_token = on_token
+        self._buffer = ""
+        self._inside = False
+
+    def feed(self, text: str):
+        self._buffer += text
+        emitted: list = []
+        while self._buffer:
+            tag = self.CLOSE if self._inside else self.OPEN
+            idx = self._buffer.find(tag)
+            if idx >= 0:
+                if not self._inside:
+                    emitted.append(self._buffer[:idx])
+                self._buffer = self._buffer[idx + len(tag):]
+                self._inside = not self._inside
+                continue
+            if self._inside:
+                # Drop consumed reasoning, keep only a possible split close tag.
+                self._buffer = self._buffer[-(len(tag) - 1):]
+            else:
+                # Emit everything except a possible split open tag at the end.
+                keep = 0
+                for k in range(min(len(tag) - 1, len(self._buffer)), 0, -1):
+                    if tag.startswith(self._buffer[-k:]):
+                        keep = k
+                        break
+                emitted.append(self._buffer[:-keep] if keep else self._buffer)
+                self._buffer = self._buffer[-keep:] if keep else ""
+            break
+        out = "".join(emitted)
+        if out:
+            self._on_token(out)
+
+    def finish(self):
+        if not self._inside and self._buffer:
+            self._on_token(self._buffer)
+            self._buffer = ""
+
+
+def stream_bedrock(config: dict, messages: list, tools=None, on_token=None) -> dict:
+    api_key = os.environ.get(config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK", "").strip()
+    if not api_key:
+        return {"content": "", "tool_calls": None}
+    body = _bedrock_body(config, messages, tools)
+    reasoning_filter = _ReasoningStreamFilter(on_token) if on_token else None
+    result = _stream_openai_compat(
+        f"{get_bedrock_base_url(config)}/chat/completions",
+        _bedrock_headers(config),
+        body,
+        body["model"],
+        "bedrock",
+        reasoning_filter.feed if reasoning_filter else None,
+    )
+    if reasoning_filter:
+        reasoning_filter.finish()
+    if result.get("content"):
+        result["content"] = strip_think_blocks(result["content"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter (openrouter.ai) via its OpenAI-compatible endpoint. First-class
+# home for frontier models conch can't get elsewhere (Kimi K3, GLM-5.2).
+# Config:
+#   provider=openrouter
+#   api_key_env=OPENROUTER_API_KEY (default)
+# ---------------------------------------------------------------------------
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _openrouter_headers(config: dict) -> Dict[str, str]:
+    api_key = os.environ.get(config.get("api_key_env") or "OPENROUTER_API_KEY", "").strip()
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "conch/1.0",
+    }
+
+
+def _openrouter_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "model": config.get("chat_model", config.get("model", "moonshotai/kimi-k3")),
+        "messages": messages,
+        "max_tokens": 16384,
+        # Low reasoning effort and NO temperature: at the default (max)
+        # effort with temperature set, Kimi K3 sometimes answers in prose
+        # instead of emitting tool_calls; with effort=low it tool-calls
+        # reliably. OpenRouter normalizes the value for models with other
+        # effort scales (GLM-5.2 verified live with this exact body).
+        "reasoning_effort": "low",
+    }
+    if tools:
+        body["tools"] = _sanitize_tools_for_openai(tools)
+    return body
+
+
+def raw_openrouter(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
+    api_key = os.environ.get(config.get("api_key_env") or "OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return {"content": "", "tool_calls": None}
+    body = _openrouter_body(config, messages, tools)
+    req = urllib.request.Request(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=_openrouter_headers(config),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return error_response(format_http_api_error(exc))
+    except Exception as exc:
+        return error_response(str(exc))
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        msg = err.get("message", json.dumps(err)) if isinstance(err, dict) else str(err)
+        return error_response(msg)
+    message = (data.get("choices") or [{}])[0].get("message", {})
+    # Reasoning arrives in a separate `reasoning` field on OpenRouter, but
+    # strip tagged blocks too in case an upstream embeds them in content.
+    content = strip_think_blocks((message.get("content") or "").strip())
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": message.get("tool_calls"),
+        "_usage": _normalize_usage(data, "openrouter"),
+        "_model": body["model"],
+    }
+
+
+def stream_openrouter(config: dict, messages: list, tools=None, on_token=None) -> dict:
+    api_key = os.environ.get(config.get("api_key_env") or "OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return {"content": "", "tool_calls": None}
+    body = _openrouter_body(config, messages, tools)
+    body["stream_options"] = {"include_usage": True}
+    reasoning_filter = _ReasoningStreamFilter(on_token) if on_token else None
+    result = _stream_openai_compat(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        _openrouter_headers(config),
+        body,
+        body["model"],
+        "openrouter",
+        reasoning_filter.feed if reasoning_filter else None,
+    )
+    if reasoning_filter:
+        reasoning_filter.finish()
+    if result.get("content"):
+        result["content"] = strip_think_blocks(result["content"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1331,8 @@ def probe_custom_provider(config: Optional[dict] = None, *, timeout: float = 10.
 
 RAW_FNS = {
     "cerebras": raw_cerebras,
+    "bedrock": raw_bedrock,
+    "openrouter": raw_openrouter,
     "openai": raw_openai,
     "anthropic": raw_anthropic,
     "ollama": raw_ollama,
@@ -1138,7 +1428,11 @@ def _stream_openai_compat(
         return error_response(str(exc))
 
     full_text = "".join(content_parts).strip()
-    if not full_text and reasoning_parts:
+    # Reasoning-only replies (no content, no tool calls) surface the
+    # reasoning as the answer. On tool-call turns the empty content is
+    # correct — promoting reasoning there would persist chain-of-thought
+    # (OpenRouter models stream reasoning on every tool call).
+    if not full_text and reasoning_parts and not tool_calls_acc:
         full_text = "".join(reasoning_parts).strip()
     tool_calls = None
     if tool_calls_acc:
@@ -1511,6 +1805,8 @@ def stream_ollama(
 
 STREAM_FNS = {
     "cerebras": stream_cerebras,
+    "bedrock": stream_bedrock,
+    "openrouter": stream_openrouter,
     "openai": stream_openai,
     "anthropic": stream_anthropic,
     "ollama": stream_ollama,

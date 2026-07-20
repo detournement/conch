@@ -1373,6 +1373,65 @@ def stream_anthropic(
     }
 
 
+# Content prefixes that signal a *textual* tool call rather than a reply:
+# bare JSON (qwen2.5-coder emits its calls this way on every single tool
+# use — measured 24/24 in live batches), <tool_call> tags, Claude XML, and
+# fenced json blocks.
+_TEXTUAL_TOOL_MARKERS = ("{", "[", "<tool_call", "<function_calls", "```")
+
+
+class _StreamDisplayGate:
+    """Withhold streamed content from the terminal while it might be a
+    textual tool call.
+
+    Without this, the raw JSON/XML of a textual tool call is printed live to
+    the user's screen before the guarded recovery in chat_turn executes it —
+    which reads as "the model printed the command instead of running it".
+    Withheld content is never lost: if it turns out to be an ordinary reply
+    (recovery declines it), the app prints the full reply after the stream
+    ends (the printed-vs-streamed fallback in app.py).
+    """
+
+    def __init__(self, on_token):
+        self._on_token = on_token
+        self._buffer = ""
+        self._verdict: Optional[bool] = None  # True=suppress, False=forward
+
+    def feed(self, text: str):
+        if self._verdict is False:
+            self._on_token(text)
+            return
+        if self._verdict is True:
+            return
+        self._buffer += text
+        head = self._buffer.lstrip()
+        if not head:
+            return
+        for marker in _TEXTUAL_TOOL_MARKERS:
+            if head.startswith(marker):
+                self._verdict = True
+                return
+        # Still a prefix of a marker (e.g. "<tool_ca", "``")? Keep buffering.
+        if any(marker.startswith(head) for marker in _TEXTUAL_TOOL_MARKERS
+               if len(head) < len(marker)):
+            return
+        self._verdict = False
+        self._on_token(self._buffer)
+
+    def finish(self):
+        """Stream ended. If we're still buffering, the content only ever
+        matched a *prefix* of a marker (e.g. a lone "<" or "``") and never
+        resolved into a real textual tool call — so it's an ordinary short
+        reply. Flush it to the terminal so nothing is lost. (Genuine tool
+        calls reach a full marker and are suppressed with verdict=True; a
+        declined reply that begins with a full marker stays suppressed and is
+        reprinted by app.py's printed-vs-streamed fallback.)
+        """
+        if self._verdict is None and self._buffer:
+            self._verdict = False
+            self._on_token(self._buffer)
+
+
 def stream_ollama(
     config: dict, messages: list, tools=None, on_token=None
 ) -> dict:
@@ -1397,6 +1456,12 @@ def stream_ollama(
     content_parts: list[str] = []
     raw_tool_calls: list = []
     final_data: dict = {}
+    # Route display through the gate so the raw JSON/XML of a *textual* tool
+    # call is withheld from the terminal instead of being printed live before
+    # chat_turn's recovery can execute it. The full raw content is still
+    # accumulated in content_parts and returned for recovery — the gate only
+    # affects what reaches the screen.
+    gate = _StreamDisplayGate(on_token) if on_token else None
 
     try:
         with urllib.request.urlopen(req, timeout=120) as response:
@@ -1421,14 +1486,17 @@ def stream_ollama(
                 # not part of the reply.
                 if msg.get("content"):
                     content_parts.append(msg["content"])
-                    if on_token:
-                        on_token(msg["content"])
+                    if gate:
+                        gate.feed(msg["content"])
 
                 if data.get("done"):
                     final_data = data
                     break
     except Exception as exc:
         return error_response(str(exc))
+
+    if gate:
+        gate.finish()
 
     full_text = strip_think_blocks("".join(content_parts).strip())
 

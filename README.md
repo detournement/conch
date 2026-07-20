@@ -113,7 +113,7 @@ dead-ending when the server is empty or unreachable.
 ## Features
 
 ### Streaming replies
-Tokens stream to the terminal in real time with syntax-highlighted code blocks (via Pygments) and inline markdown formatting (bold, italic, headers, lists).
+Tokens stream to the terminal in real time with syntax-highlighted code blocks (via Pygments) and inline markdown formatting (bold, italic, headers, lists). When a local model (e.g. qwen2.5-coder) emits a tool call as plain content — bare JSON, `<tool_call>`/Claude XML, or a fenced json block — instead of a native `tool_calls` field, conch withholds that raw text from the terminal while it's being streamed, then recovers and executes it, so you never see the command printed instead of run. Ordinary replies that merely start with `{` or a code fence are still shown in full.
 
 ### MCP tools
 Connect external tools via the [Model Context Protocol](https://modelcontextprotocol.io). Configure servers in `~/.config/conch/mcp.json`. Supports both stdio and HTTP transports.

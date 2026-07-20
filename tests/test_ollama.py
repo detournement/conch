@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 from conch import providers
 from conch.providers import (
+    _StreamDisplayGate,
     get_fallback_chain,
     get_fallback_model,
     get_ollama_base_url,
@@ -38,6 +39,7 @@ from conch.providers import (
     validate_ollama_model,
 )
 from conch.runtime import (
+    chat_turn,
     extract_textual_tool_use_blocks,
     normalize_messages_for_provider,
 )
@@ -357,6 +359,184 @@ class TestStreamOllama(unittest.TestCase):
         ])
         self.assertIsNone(result["tool_calls"])
         self.assertEqual(result["content"], "plain reply")
+
+    def test_textual_tool_call_not_streamed_but_returned(self):
+        """A bare-JSON textual tool call must NOT reach the terminal, yet the
+        full raw content must still be returned so recovery can execute it."""
+        tokens = []
+        payload = '{"name": "local_shell", "arguments": {"command": "ls /tmp"}}'
+        result = self._stream([
+            {"message": {"content": payload}, "done": False},
+            {"done": True},
+        ], on_token=tokens.append)
+        self.assertEqual("".join(tokens), "", "raw tool-call JSON must not be displayed")
+        self.assertEqual(result["content"], payload, "raw content must be returned for recovery")
+
+    def test_normal_reply_is_streamed(self):
+        tokens = []
+        result = self._stream([
+            {"message": {"content": "The files are: "}, "done": False},
+            {"message": {"content": "a.txt, b.txt"}, "done": False},
+            {"done": True},
+        ], on_token=tokens.append)
+        self.assertEqual("".join(tokens), "The files are: a.txt, b.txt")
+        self.assertEqual(result["content"], "The files are: a.txt, b.txt")
+
+
+# ---------------------------------------------------------------------------
+# _StreamDisplayGate: withhold textual-tool-call content from the terminal
+# ---------------------------------------------------------------------------
+
+class TestStreamDisplayGate(unittest.TestCase):
+    def _run(self, tokens):
+        shown = []
+        gate = _StreamDisplayGate(shown.append)
+        for tok in tokens:
+            gate.feed(tok)
+        gate.finish()
+        return "".join(shown)
+
+    def test_suppresses_bare_json(self):
+        self.assertEqual(self._run(['{"name": "local_shell"}']), "")
+
+    def test_suppresses_bare_json_array(self):
+        self.assertEqual(self._run(['[{"name": "x"}]']), "")
+
+    def test_suppresses_tool_call_tag(self):
+        self.assertEqual(self._run(['<tool_call>{"name": "x"}</tool_call>']), "")
+
+    def test_suppresses_claude_function_calls_xml(self):
+        self.assertEqual(self._run(['<function_calls><invoke name="x">']), "")
+
+    def test_suppresses_fenced_json(self):
+        self.assertEqual(self._run(['```json\n{"name": "x"}\n```']), "")
+
+    def test_suppresses_with_leading_whitespace(self):
+        self.assertEqual(self._run(['   {"name": "x"}']), "")
+
+    def test_forwards_normal_prose(self):
+        self.assertEqual(self._run(["Here are the files in /tmp."]),
+                         "Here are the files in /tmp.")
+
+    def test_forwards_prose_starting_with_word(self):
+        self.assertEqual(self._run(["Sure, ", "running that now."]),
+                         "Sure, running that now.")
+
+    def test_token_by_token_tool_call_tag_split_across_boundaries(self):
+        # "<", "to", "ol_call", ">..." — must stay suppressed the whole way.
+        self.assertEqual(
+            self._run(["<", "to", "ol_call", '>{"name": "x"}</tool_call>']),
+            "",
+        )
+
+    def test_token_by_token_fence_split(self):
+        # Backticks arriving one at a time still resolves to suppress.
+        self.assertEqual(self._run(["`", "`", "`", "python\nprint(1)\n```"]), "")
+
+    def test_token_by_token_prose_after_ambiguous_prefix(self):
+        # "<" looks like the start of a tag, but "hello" disambiguates it as
+        # prose — the buffered "<" must be flushed with the rest.
+        self.assertEqual(self._run(["<", "hello"]), "<hello")
+
+    def test_flushes_short_ambiguous_buffer_at_stream_end(self):
+        # Stream ends while still buffering a lone marker-prefix — it never
+        # became a real tool call, so it must be flushed, not swallowed.
+        self.assertEqual(self._run(["<"]), "<")
+        self.assertEqual(self._run(["`", "`"]), "``")
+
+    def test_empty_stream_shows_nothing(self):
+        self.assertEqual(self._run([]), "")
+
+    def test_prose_containing_brace_later_is_not_suppressed(self):
+        self.assertEqual(self._run(["The set is {1, 2, 3}."]),
+                         "The set is {1, 2, 3}.")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: streamed textual tool call is recovered + executed WITHOUT the
+# raw JSON being displayed, while a normal reply IS displayed.
+# ---------------------------------------------------------------------------
+
+class TestStreamedRecoveryIntegration(unittest.TestCase):
+    def test_streamed_bare_json_tool_call_recovered_not_displayed(self):
+        class RecordingShell:
+            def __init__(self):
+                self.calls = []
+
+            def call_tool(self, name, arguments):
+                self.calls.append((name, arguments))
+                return {"content": [{"text": "a.txt\nb.txt"}]}
+
+        shell = RecordingShell()
+        tool_json = '{"name": "local_shell", "arguments": {"command": "ls /tmp"}}'
+        # Round 1: model emits the tool call as bare JSON content (qwen2.5-coder
+        # style). Round 2: model emits the ordinary reply.
+        streams = [
+            _FakeHTTPResponse(lines=_stream_lines([
+                {"message": {"content": tool_json}, "done": False},
+                {"done": True},
+            ])),
+            _FakeHTTPResponse(lines=_stream_lines([
+                {"message": {"content": "The files in /tmp are a.txt and b.txt."},
+                 "done": False},
+                {"done": True},
+            ])),
+        ]
+
+        tokens = []
+        with patch("urllib.request.urlopen", side_effect=streams), \
+                patch("sys.stderr", io.StringIO()):
+            reply, _usage = chat_turn(
+                config={"provider": "ollama", "chat_model": "qwen2.5-coder"},
+                provider="ollama",
+                raw_fn=raw_ollama,
+                messages=[{"role": "user", "content": "list files in /tmp"}],
+                tools=None,
+                tool_map={},
+                builtin_clients={"local_shell": shell},
+                max_tool_rounds=5,
+                on_token=tokens.append,
+            )
+
+        displayed = "".join(tokens)
+        self.assertEqual(shell.calls, [("local_shell", {"command": "ls /tmp"})],
+                         "the recovered tool call must actually execute")
+        self.assertNotIn("local_shell", displayed,
+                         "raw tool-call JSON must never reach the terminal")
+        self.assertNotIn("{", displayed)
+        self.assertEqual(displayed, "The files in /tmp are a.txt and b.txt.",
+                         "only the ordinary reply should be displayed")
+        self.assertEqual(reply, "The files in /tmp are a.txt and b.txt.")
+
+    def test_streamed_reply_that_looks_like_json_is_preserved(self):
+        """A reply that genuinely starts with '{' but is NOT a registered-tool
+        call: recovery declines it, so the content survives in the returned
+        reply (app.py reprints it via the printed-vs-streamed fallback)."""
+        json_reply = '{"answer": 42, "note": "not a tool call"}'
+        streams = [
+            _FakeHTTPResponse(lines=_stream_lines([
+                {"message": {"content": json_reply}, "done": False},
+                {"done": True},
+            ])),
+        ]
+        tokens = []
+        with patch("urllib.request.urlopen", side_effect=streams), \
+                patch("sys.stderr", io.StringIO()):
+            reply, _usage = chat_turn(
+                config={"provider": "ollama", "chat_model": "qwen2.5-coder"},
+                provider="ollama",
+                raw_fn=raw_ollama,
+                messages=[{"role": "user", "content": "give me json"}],
+                tools=None,
+                tool_map={},
+                builtin_clients={"local_shell": object()},
+                max_tool_rounds=5,
+                on_token=tokens.append,
+            )
+        # Gate withheld it from the live stream (it looked like a tool call)...
+        self.assertEqual("".join(tokens), "")
+        # ...but it is returned intact so the app can print the full reply.
+        self.assertEqual(reply, json_reply)
 
 
 # ---------------------------------------------------------------------------

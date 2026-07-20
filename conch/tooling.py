@@ -387,6 +387,11 @@ class ToolRuntimeState:
     tool_map: Dict[str, Any]
     tools: List[dict]
     needs_tool_refresh: bool = False
+    # Tool-call drift tracking (see runtime.apply_tool_call_scaffolding):
+    # count of textual tool calls seen this session, and a one-shot flag that
+    # forces the corrective reminder on the next request (set by /resettools).
+    textual_tool_calls: int = 0
+    force_tool_reminder: bool = False
 
 
 @dataclass

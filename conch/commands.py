@@ -111,6 +111,7 @@ SLASH_COMMANDS = [
     ("/connect <app>", "Connect a service via OAuth (Composio)"),
     ("/apps", "List connectable services"),
     ("/reload", "Reload MCP tools"),
+    ("/resettools", "Reset tool-calling if the model drifts to textual calls"),
     ("/rounds <n>", "Set max tool call rounds"),
     ("/queue", "Toggle typeahead input"),
     ("/status", "Show version, provider, model, context window, and config"),
@@ -178,6 +179,7 @@ def handle_slash_command(
             "  \033[1m/status\033[0m              Show provider, model, context window, and config\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
+            "  \033[1m/resettools\033[0m          Reset tool-calling if the model drifts to textual calls\n"
             "\n  Shell approval: \033[1my\033[0m/\033[1mEnter\033[0m=run  \033[1mn\033[0m=decline  \033[1me\033[0m=edit  \033[1ma\033[0m=always allow  \033[1mA\033[0m=agent mode on\n"
         )
         return None
@@ -242,6 +244,9 @@ def handle_slash_command(
 
     if command == "/clear":
         return "clear_conversation"
+
+    if command in ("/resettools", "/reset"):
+        return "reset_tool_calling"
 
     if command == "/new" and conv_mgr is not None:
         return "new_conversation"

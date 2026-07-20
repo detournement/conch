@@ -888,6 +888,19 @@ def chat_loop():
                     _save_current()
                     print(f"\n  \033[1;32m\u2713 Cleared {old_count} messages\033[0m\n")
                     continue
+                if result == "reset_tool_calling":
+                    from .runtime import reset_tool_calling
+                    scrubbed = reset_tool_calling(messages)
+                    chat_state.textual_tool_calls = 0
+                    chat_state.force_tool_reminder = True
+                    current_conv.messages = messages
+                    _save_current()
+                    print(
+                        f"\n  \033[1;32m\u2713 Tool-calling reset\033[0m "
+                        f"\033[2m({scrubbed} textual tool-call message(s) scrubbed; "
+                        f"native tool-calling will be reinforced next turn)\033[0m\n"
+                    )
+                    continue
                 if isinstance(result, tuple) and result[0] == "switch_conversation":
                     conv = conv_mgr.load(result[1])
                     if conv:

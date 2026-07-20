@@ -169,6 +169,9 @@ Switch between named tool presets: `/profile minimal` (shell only), `/profile de
 ### Local-model context management
 Every Ollama request sets `options.num_ctx` (default 32768, clamped to the model's max — no more silent 4k truncation) and `keep_alive` so the model stays warm. The system prompt stays byte-stable within a session so Ollama's KV prefix cache is reused; timestamps and recalled memories ride on the user message instead. Token estimates are calibrated against the real `prompt_eval_count` Ollama reports, a per-turn context gauge shows window usage (with a warning at 80%), and at ~70% full the model itself summarizes older history into a compact brief. Tool results are truncated to a budget scaled to the context window (head and tail kept) instead of a fixed char cap.
 
+### Tool-calling drift control
+Small local models sometimes fall out of native function-calling and start emitting tool calls as *text* (bare JSON, `<tool_call>` tags, Claude XML, fenced code) — and once they do, they tend to keep doing it. Well-formed textual calls are still recovered and re-stored as structured tool calls, so those replay cleanly; the corrupting case is a malformed or unregistered-tool textual call that gets persisted as prose and then imitated. To counter this, every local (Ollama/custom) request carries a tiny few-shot exemplar of a correct native tool call (disable with `local_tool_exemplar = false`), and sustained textual-call drift escalates to a corrective reminder. All of this scaffolding is transient — it is added to the request only, never saved into the conversation. If a model gets stuck, `/resettools` scrubs the textual-tool-call prose from history and reinforces native tool-calling on the next turn.
+
 ### Custom slash commands
 Markdown files in `~/.config/conch/commands/` become commands: `review.md` becomes `/review`, and `$ARGUMENTS` in the file body is replaced with whatever follows the command. Custom commands tab-complete alongside builtins (builtins always win on name conflicts).
 
@@ -233,6 +236,7 @@ Transient API errors (429, 5xx, connection refused, timeouts, missing models) ar
 | `/rounds <n>` | Set max tool call rounds |
 | `/queue` | Toggle typeahead input |
 | `/reload` | Reload MCP tools |
+| `/resettools` | Reset tool-calling when a local model drifts into writing tool calls as text |
 | `/search <query>` | Search conversations, memories, and config |
 | `/browse` | Interactive conversation browser |
 | `/<custom>` | Any markdown file in `~/.config/conch/commands/` |

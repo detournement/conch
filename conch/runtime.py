@@ -842,6 +842,182 @@ def normalize_messages_on_switch(messages: list, new_provider: str):
 
 
 # ---------------------------------------------------------------------------
+# Tool-call drift control (few-shot anchor + corrective reset)
+# ---------------------------------------------------------------------------
+#
+# Small local models sometimes fall out of native function-calling and start
+# emitting tool calls as *text* (bare JSON, <tool_call> tags, Claude XML,
+# fenced json). The guarded recovery in chat_turn executes and re-stores the
+# well-formed ones as structured tool_calls, so those replay correctly. The
+# corrupting case is a *malformed* or unregistered-tool textual call: recovery
+# declines it, it becomes the assistant reply, and it is persisted as plain
+# prose. On the next turn the model sees its own "tool call" rendered as
+# ordinary text with no structured tool_calls — and imitates it, compounding
+# the drift ("once it starts it keeps doing it").
+#
+# Three defenses, all gated to local providers and all transient (never
+# persisted into the saved conversation):
+#   1. a tiny few-shot EXEMPLAR of a correct native tool call, prepended to
+#      every local request so the model always has a good pattern to copy;
+#   2. drift DETECTION (count textual tool calls this session) that escalates
+#      to a corrective REMINDER injected into subsequent requests;
+#   3. a manual reset (reset_tool_calling / the /resettools command) that
+#      scrubs already-persisted textual-tool-call prose from history and forces
+#      the reminder on the next turn.
+
+LOCAL_PROVIDERS = ("ollama", "custom")
+
+# After this many textual tool calls in a session, start appending the
+# corrective reminder to requests (the exemplar is always present for local
+# providers regardless).
+DRIFT_REMINDER_THRESHOLD = 2
+
+TOOL_CALL_REMINDER = (
+    "Reminder: call tools ONLY through the native function-calling mechanism "
+    "(structured tool calls). Do NOT write tool calls as text — no JSON "
+    "objects, no <tool_call> tags, no <function_calls> XML, no fenced code "
+    "blocks. Either call a tool natively or reply in plain prose."
+)
+
+# Prefixes that mark content as a *textual* tool-call attempt rather than an
+# ordinary reply (mirrors providers._TEXTUAL_TOOL_MARKERS).
+_TEXTUAL_TOOL_CALL_PREFIXES = ("{", "[", "<tool_call", "<function_calls", "```")
+
+
+def looks_like_textual_tool_call(text: str) -> bool:
+    """True when *text* is (or clearly attempts to be) a tool call written as
+    plain text rather than a native structured call.
+
+    Conservative on purpose: a well-formed tool-call-shaped payload always
+    counts (via extract_textual_tool_use_blocks with no registry filter), and
+    a malformed one counts only when it both starts with a tool-call marker
+    and carries name+arguments hints — so ordinary JSON answers or prose that
+    merely contains braces are not misread as drift.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if extract_textual_tool_use_blocks(stripped, None):
+        return True
+    if stripped.startswith("<tool_call") or stripped.startswith("<function_calls"):
+        return True
+    if stripped.startswith(("{", "[", "```")) and '"name"' in stripped and (
+        '"arguments"' in stripped or '"parameters"' in stripped
+    ):
+        return True
+    return False
+
+
+def build_tool_call_exemplar(provider: str) -> List[dict]:
+    """A tiny synthetic user→assistant(native tool_call)→tool→assistant
+    exchange demonstrating correct tool-calling, in the normalized wire shape
+    for *provider*. Returns [] for non-local providers.
+
+    Kept deliberately small (small local context budgets) and clearly framed
+    as an example so it is never mistaken for real conversation history. It is
+    only ever added to the per-request message list, never persisted.
+    """
+    if provider not in LOCAL_PROVIDERS:
+        return []
+    call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"function": {"name": "local_shell", "arguments": {"command": "date"}}}
+        ],
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "The next four messages are a FORMAT EXAMPLE, not part of the "
+                "conversation — they show the ONLY correct way to call a tool: "
+                "as a native structured tool call, never as text."
+            ),
+        },
+        {"role": "user", "content": "(example) what is today's date?"},
+        call,
+        {"role": "tool", "content": "Wed Jul 15 2026", "tool_name": "local_shell"},
+        {"role": "assistant", "content": "(example) Today is Wed Jul 15 2026."},
+    ]
+
+
+def _leading_system_count(messages: List[dict]) -> int:
+    return 1 if messages and messages[0].get("role") == "system" else 0
+
+
+def apply_tool_call_scaffolding(
+    send_messages: List[dict],
+    provider: str,
+    config: Optional[dict],
+    chat_state=None,
+) -> List[dict]:
+    """Inject the few-shot exemplar (always, for local providers) and — when
+    the session is drifting — the corrective reminder into a *copy-safe*
+    per-request message list. Never touches persisted history.
+
+    Gated to local providers. The exemplar can be disabled with config
+    ``local_tool_exemplar = false``.
+    """
+    if provider not in LOCAL_PROVIDERS:
+        return send_messages
+    cfg = config or {}
+    exemplar_enabled = str(cfg.get("local_tool_exemplar", "true")).strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+    if exemplar_enabled:
+        insert_at = _leading_system_count(send_messages)
+        exemplar = build_tool_call_exemplar(provider)
+        if exemplar:
+            send_messages[insert_at:insert_at] = exemplar
+
+    drift = 0
+    force = False
+    if chat_state is not None:
+        drift = int(getattr(chat_state, "textual_tool_calls", 0) or 0)
+        force = bool(getattr(chat_state, "force_tool_reminder", False))
+    if force or drift >= DRIFT_REMINDER_THRESHOLD:
+        send_messages.append({"role": "system", "content": TOOL_CALL_REMINDER})
+        if chat_state is not None:
+            # One-shot force flag: consumed once the reminder is sent.
+            chat_state.force_tool_reminder = False
+    return send_messages
+
+
+def note_textual_tool_call(chat_state) -> None:
+    """Record that the model emitted a tool call as text (drift signal)."""
+    if chat_state is None:
+        return
+    chat_state.textual_tool_calls = int(
+        getattr(chat_state, "textual_tool_calls", 0) or 0
+    ) + 1
+
+
+def reset_tool_calling(messages: List[dict]) -> int:
+    """Scrub persisted textual-tool-call prose from *messages* in place so it
+    stops reinforcing drift on replay. Structured tool_calls (the correct
+    form) are left untouched. Returns the number of messages removed."""
+    kept: List[dict] = []
+    removed = 0
+    for msg in messages:
+        if (
+            msg.get("role") == "assistant"
+            and not msg.get("tool_calls")
+            and isinstance(msg.get("content"), str)
+            and looks_like_textual_tool_call(msg["content"])
+        ):
+            removed += 1
+            continue
+        kept.append(msg)
+    if removed:
+        messages.clear()
+        messages.extend(kept)
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Weak-model side tasks (plan 2.7): run summaries/compaction on a small fast
 # model (config: weak_model, optional weak_provider) instead of the chat model.
 # ---------------------------------------------------------------------------
@@ -970,6 +1146,12 @@ def chat_turn(
             if provider == "anthropic":
                 sanitize_anthropic_messages(messages)
         send_messages = normalize_messages_for_provider(messages, provider)
+
+        # Few-shot tool-call anchor + corrective reminder for local models
+        # (transient: added to the request only, never persisted).
+        send_messages = apply_tool_call_scaffolding(
+            send_messages, provider, config, chat_state
+        )
 
         # Re-inject the plan scratchpad every round (plan 2.5) — it lives
         # outside compactable history so it survives auto-compaction.
@@ -1146,6 +1328,18 @@ def chat_turn(
             )
             if not recovered:
                 reply = response.get("content", "")
+                # A reply that is itself a malformed/unregistered textual tool
+                # call is drift: recovery declined it and it will be persisted
+                # as prose. Flag it so the next turn gets the corrective
+                # reminder (the exemplar is already always present locally).
+                if looks_like_textual_tool_call(reply):
+                    note_textual_tool_call(chat_state)
+                    print(
+                        "  \033[2m(reply looks like a textual tool call — will "
+                        "reinforce native tool-calling next turn; /resettools "
+                        "to reset)\033[0m",
+                        file=sys.stderr,
+                    )
                 from .tooling import run_hook
                 run_hook("on_turn_end", {"reply": reply}, config)
                 return reply, total_usage
@@ -1161,6 +1355,10 @@ def chat_turn(
             if provider == "anthropic":
                 response["_anthropic_content"] = recovered
             response["content"] = ""
+            # Recovery re-stores this as a structured tool_call (so replay is
+            # clean), but the model still *emitted* it as text — count it as
+            # drift so sustained textual calling triggers the reminder.
+            note_textual_tool_call(chat_state)
             print("  \033[2m(recovered textual tool call)\033[0m", file=sys.stderr)
         results = []
         for tool_call in tool_calls:

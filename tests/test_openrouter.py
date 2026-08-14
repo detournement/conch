@@ -55,7 +55,12 @@ class TestOpenRouterCatalog(unittest.TestCase):
         )
 
     def test_models_registered(self):
-        for model in ("moonshotai/kimi-k3", "z-ai/glm-5.2"):
+        for model in (
+            "moonshotai/kimi-k3",
+            "z-ai/glm-5.2",
+            "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-v4-flash",
+        ):
             self.assertIn(model, KNOWN_MODELS["openrouter"])
             self.assertIn(model, MODEL_CONTEXT_WINDOWS)
             self.assertIn(model, MODEL_PRICING)
@@ -63,6 +68,8 @@ class TestOpenRouterCatalog(unittest.TestCase):
     def test_million_token_windows(self):
         self.assertEqual(MODEL_CONTEXT_WINDOWS["moonshotai/kimi-k3"], 1048576)
         self.assertEqual(MODEL_CONTEXT_WINDOWS["z-ai/glm-5.2"], 1048576)
+        self.assertEqual(MODEL_CONTEXT_WINDOWS["deepseek/deepseek-v4-pro"], 1048576)
+        self.assertEqual(MODEL_CONTEXT_WINDOWS["deepseek/deepseek-v4-flash"], 1048576)
 
 
 class TestOpenRouterBody(unittest.TestCase):

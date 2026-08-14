@@ -13,12 +13,13 @@ from typing import Any, Dict, List, Optional
 
 KNOWN_MODELS = {
     "cerebras": [
+        "gpt-oss-120b",
+        "gemma-4-31b",
         "zai-glm-4.7",
     ],
     # AWS Bedrock via its OpenAI-compatible endpoint. Moonshot Kimi models
-    # verified live in this account (us-east-2). Kimi K3 (2.8T MoE) should be
-    # added here when AWS lists it — weights ship 2026-07-27 and it is far too
-    # large (64+ accelerators) to self-host on a SageMaker endpoint.
+    # verified live in this account (us-east-2). Kimi K3 is still not in
+    # Bedrock's managed catalog (as of 2026-08); use OpenRouter for it.
     "bedrock": [
         "moonshotai.kimi-k2.5",
         "moonshot.kimi-k2-thinking",
@@ -27,15 +28,23 @@ KNOWN_MODELS = {
         "zai.glm-5",
     ],
     # OpenRouter (openrouter.ai) — OpenAI-compatible gateway to frontier
-    # models not available on other providers here. Both verified live with
-    # native tool calling and streaming.
+    # models not available on other providers here. All listed models
+    # advertise native tool calling and streaming.
     "openrouter": [
         "moonshotai/kimi-k3",
         "z-ai/glm-5.2",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
     ],
     # Conch requires tool calling, so only tool-capable models are listed
     # (e.g. o1-mini is excluded: it supports neither tools nor system messages).
     "openai": [
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex",
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.4-nano",
@@ -55,7 +64,11 @@ KNOWN_MODELS = {
         "gpt-5.4-pro",
     ],
     "anthropic": [
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
         "claude-opus-4-8",
+        "claude-opus-4-7",
         "claude-sonnet-4-7",
         "claude-sonnet-4-6",
         "claude-opus-4-6",
@@ -98,11 +111,11 @@ PROVIDER_TOOL_LIMITS = {
 # The ollama entry is only a *preference*: it is used when the model actually
 # exists on the configured server (see get_fallback_model).
 DEFAULT_CHAT_MODEL_BY_PROVIDER = {
-    "cerebras": "zai-glm-4.7",
+    "cerebras": "gpt-oss-120b",
     "bedrock": "moonshotai.kimi-k2.5",
     "openrouter": "moonshotai/kimi-k3",
     "openai": "gpt-4o-mini",
-    "anthropic": "claude-sonnet-4-6",
+    "anthropic": "claude-sonnet-5",
     "ollama": "llama3.3",
     "custom": "",  # defined entirely by config (custom_model)
 }
@@ -112,6 +125,8 @@ DEFAULT_CHAT_MODEL_BY_PROVIDER = {
 # discovered live from the server instead (see get_ollama_context_length).
 MODEL_CONTEXT_WINDOWS = {
     # cerebras
+    "gpt-oss-120b": 131072,
+    "gemma-4-31b": 131072,
     "zai-glm-4.7": 131072,
     # bedrock (Moonshot Kimi, Z.AI GLM)
     "moonshotai.kimi-k2.5": 262144,
@@ -120,7 +135,15 @@ MODEL_CONTEXT_WINDOWS = {
     # openrouter (windows per openrouter.ai/api/v1/models, verified 2026-07)
     "moonshotai/kimi-k3": 1048576,
     "z-ai/glm-5.2": 1048576,
+    "deepseek/deepseek-v4-pro": 1048576,
+    "deepseek/deepseek-v4-flash": 1048576,
     # openai
+    "gpt-5.6": 1050000,
+    "gpt-5.6-sol": 1050000,
+    "gpt-5.6-terra": 1050000,
+    "gpt-5.6-luna": 1050000,
+    "gpt-5.5": 1050000,
+    "gpt-5.3-codex": 400000,
     "gpt-5.4": 400000,
     "gpt-5.4-pro": 400000,
     "gpt-5.4-mini": 400000,
@@ -139,11 +162,15 @@ MODEL_CONTEXT_WINDOWS = {
     "o1": 200000,
     "o1-mini": 128000,
     "o1-pro": 200000,
-    # anthropic
-    "claude-opus-4-8": 200000,
-    "claude-sonnet-4-7": 200000,
-    "claude-sonnet-4-6": 200000,
-    "claude-opus-4-6": 200000,
+    # anthropic (1M is the default window from Sonnet 4.6 / Opus 4.6 onward)
+    "claude-fable-5": 1000000,
+    "claude-opus-5": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-opus-4-8": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-sonnet-4-7": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-opus-4-6": 1000000,
     "claude-haiku-4-5": 200000,
     "claude-sonnet-4-5-20250929": 200000,
 }
@@ -519,14 +546,24 @@ def format_http_api_error(exc: BaseException) -> str:
 
 # Per-1M-token pricing (input, output). $0 = free tier.
 MODEL_PRICING = {
+    "gpt-oss-120b":                (0.35, 0.75),
+    "gemma-4-31b":                 (2.15, 2.70),
     "zai-glm-4.7":                 (0.00, 0.00),
     "moonshotai.kimi-k2.5":        (0.60, 3.00),
     "moonshot.kimi-k2-thinking":   (0.60, 2.50),
     # Bedrock on-demand US-region rates (aws.amazon.com/bedrock/pricing).
     "zai.glm-5":                   (1.00, 3.20),
-    # OpenRouter rates (openrouter.ai/api/v1/models, verified 2026-07).
+    # OpenRouter rates (openrouter.ai/api/v1/models, verified 2026-08).
     "moonshotai/kimi-k3":          (3.00, 15.00),
     "z-ai/glm-5.2":                (0.98, 3.08),
+    "deepseek/deepseek-v4-pro":    (0.435, 0.87),
+    "deepseek/deepseek-v4-flash":  (0.14, 0.28),
+    "gpt-5.6":                     (5.00, 30.00),
+    "gpt-5.6-sol":                 (5.00, 30.00),
+    "gpt-5.6-terra":               (2.00, 12.00),
+    "gpt-5.6-luna":                (0.20, 1.20),
+    "gpt-5.5":                     (5.00, 30.00),
+    "gpt-5.3-codex":               (1.75, 14.00),
     "gpt-5.4":                     (2.50, 15.00),
     "gpt-5.4-pro":                 (15.00, 120.00),
     "gpt-5.4-mini":                (0.75, 4.50),
@@ -545,11 +582,15 @@ MODEL_PRICING = {
     "o1":                          (15.00, 60.00),
     "o1-mini":                     (1.10, 4.40),
     "o1-pro":                      (150.00, 600.00),
+    "claude-fable-5":              (10.00, 50.00),
+    "claude-opus-5":               (5.00, 25.00),
+    "claude-sonnet-5":             (2.00, 10.00),
     "claude-sonnet-4-6":           (3.00, 15.00),
-    "claude-opus-4-6":             (15.00, 75.00),
-    "claude-haiku-4-5":            (0.80, 4.00),
+    "claude-opus-4-6":             (5.00, 25.00),
+    "claude-haiku-4-5":            (1.00, 5.00),
     "claude-sonnet-4-5-20250929":  (3.00, 15.00),
-    "claude-opus-4-8":             (15.00, 75.00),
+    "claude-opus-4-8":             (5.00, 25.00),
+    "claude-opus-4-7":             (5.00, 25.00),
     "claude-sonnet-4-7":           (3.00, 15.00),
 }
 
@@ -557,6 +598,14 @@ MODEL_PRICING = {
 def _openai_is_strict_reasoning_model(model: str) -> bool:
     """OpenAI o-series models reject custom sampling params; use max_completion_tokens only."""
     return bool(re.match(r"^o\d", model.lower().strip()))
+
+
+def _anthropic_max_tokens(model: str) -> int:
+    """Gen-5 Claude models think by default; leave room for thinking + reply."""
+    name = (model or "").lower()
+    if any(tag in name for tag in ("-opus-5", "-sonnet-5", "-fable-5", "-mythos-5")):
+        return 32768
+    return 16384
 
 
 def _fix_tool_schema(schema: Any) -> Any:
@@ -726,7 +775,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
         return {"content": "", "tool_calls": None}
     base_url = (config.get("base_url") or os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")).rstrip("/")
     body: Dict[str, Any] = {
-        "model": config.get("chat_model", config.get("model", "zai-glm-4.7")),
+        "model": config.get("chat_model", config.get("model", "gpt-oss-120b")),
         "messages": messages,
         "temperature": 0.7,
         "max_completion_tokens": 16384,
@@ -819,9 +868,10 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
             system = message["content"] if isinstance(message["content"], str) else str(message["content"])
         else:
             user_messages.append(message)
+    model = config.get("chat_model", config.get("model", "claude-sonnet-5"))
     body: Dict[str, Any] = {
-        "model": config.get("chat_model", config.get("model", "claude-sonnet-4-6")),
-        "max_tokens": 16384,
+        "model": model,
+        "max_tokens": _anthropic_max_tokens(model),
         "system": system,
         "messages": user_messages,
     }
@@ -1466,7 +1516,7 @@ def stream_cerebras(
         config.get("base_url")
         or os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
     ).rstrip("/")
-    model = config.get("chat_model", config.get("model", "zai-glm-4.7"))
+    model = config.get("chat_model", config.get("model", "gpt-oss-120b"))
     body: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -1537,10 +1587,10 @@ def stream_anthropic(
         else:
             user_messages.append(msg)
 
-    model = config.get("chat_model", config.get("model", "claude-sonnet-4-6"))
+    model = config.get("chat_model", config.get("model", "claude-sonnet-5"))
     body: Dict[str, Any] = {
         "model": model,
-        "max_tokens": 16384,
+        "max_tokens": _anthropic_max_tokens(model),
         "system": system,
         "messages": user_messages,
         "stream": True,
@@ -1618,6 +1668,10 @@ def stream_anthropic(
                             on_token(t)
                     elif delta.get("type") == "input_json_delta":
                         cur_json += delta.get("partial_json", "")
+                    elif delta.get("type") == "thinking_delta":
+                        cur_text.append(delta.get("thinking", ""))
+                    elif delta.get("type") == "signature_delta":
+                        cur_block_meta["signature"] = delta.get("signature", "")
 
                 elif etype == "content_block_stop":
                     if cur_block_type == "text":
@@ -1642,6 +1696,20 @@ def stream_anthropic(
                                 "name": cur_block_meta.get("name", ""),
                                 "arguments": json.dumps(inp),
                             },
+                        })
+                    elif cur_block_type == "thinking":
+                        block = {
+                            "type": "thinking",
+                            "thinking": "".join(cur_text),
+                        }
+                        sig = cur_block_meta.get("signature")
+                        if sig:
+                            block["signature"] = sig
+                        anthropic_content.append(block)
+                    elif cur_block_type == "redacted_thinking":
+                        anthropic_content.append({
+                            "type": "redacted_thinking",
+                            "data": cur_block_meta.get("data", ""),
                         })
                     cur_block_type = None
 

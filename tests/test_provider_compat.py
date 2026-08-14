@@ -24,6 +24,7 @@ from conch.providers import (
     MODEL_PRICING,
     PROVIDER_TOOL_LIMITS,
     DEFAULT_CHAT_MODEL_BY_PROVIDER,
+    _anthropic_max_tokens,
     _openai_is_strict_reasoning_model,
     _fix_tool_schema,
     _sanitize_tools_for_openai,
@@ -32,6 +33,7 @@ from conch.providers import (
     get_fallback_chain,
     get_fallback_model,
     estimate_cost,
+    stream_anthropic,
 )
 from conch.runtime import (
     append_results_openai,
@@ -376,7 +378,8 @@ class TestFallbackChain(unittest.TestCase):
 class TestGetFallbackModel(unittest.TestCase):
     def test_returns_stable_default(self):
         self.assertEqual(get_fallback_model("openai"), "gpt-4o-mini")
-        self.assertEqual(get_fallback_model("anthropic"), "claude-sonnet-4-6")
+        self.assertEqual(get_fallback_model("anthropic"), "claude-sonnet-5")
+        self.assertEqual(get_fallback_model("cerebras"), "gpt-oss-120b")
 
     def test_unknown_provider_empty(self):
         self.assertEqual(get_fallback_model("nonexistent"), "")
@@ -557,6 +560,99 @@ class TestModelCatalog(unittest.TestCase):
         self.assertIn("o3", openai_models)
         self.assertIn("o4-mini", openai_models)
         self.assertIn("gpt-5.4", openai_models)
+        self.assertIn("gpt-5.5", openai_models)
+        self.assertIn("gpt-5.3-codex", openai_models)
+        self.assertIn("gpt-5.6", openai_models)
+        self.assertIn("gpt-5.6-sol", openai_models)
+        self.assertIn("gpt-5.6-terra", openai_models)
+        self.assertIn("gpt-5.6-luna", openai_models)
+
+    def test_anthropic_has_current_models(self):
+        anthropic_models = KNOWN_MODELS["anthropic"]
+        self.assertIn("claude-fable-5", anthropic_models)
+        self.assertIn("claude-opus-5", anthropic_models)
+        self.assertIn("claude-sonnet-5", anthropic_models)
+        self.assertIn("claude-opus-4-8", anthropic_models)
+        self.assertIn("claude-opus-4-7", anthropic_models)
+        self.assertIn("claude-sonnet-4-6", anthropic_models)
+
+    def test_cerebras_has_current_models(self):
+        cerebras_models = KNOWN_MODELS["cerebras"]
+        self.assertIn("gpt-oss-120b", cerebras_models)
+        self.assertIn("gemma-4-31b", cerebras_models)
+        self.assertIn("zai-glm-4.7", cerebras_models)
+
+
+class TestCerebrasConfigLoading(unittest.TestCase):
+    def test_inherited_anthropic_defaults_are_replaced(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from conch.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conch_dir = Path(tmp) / "conch"
+            conch_dir.mkdir()
+            (conch_dir / "config").write_text("provider = cerebras\n")
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}), \
+                 mock.patch.object(Path, "home", return_value=Path(tmp)):
+                config = load_config()
+        self.assertEqual(config["provider"], "cerebras")
+        self.assertEqual(config["api_key_env"], "CEREBRAS_API_KEY")
+        self.assertEqual(config["model"], "gpt-oss-120b")
+        self.assertEqual(config["chat_model"], "gpt-oss-120b")
+
+
+class TestAnthropicGen5RequestShape(unittest.TestCase):
+    def test_gen5_gets_larger_max_tokens(self):
+        self.assertEqual(_anthropic_max_tokens("claude-opus-5"), 32768)
+        self.assertEqual(_anthropic_max_tokens("claude-sonnet-5"), 32768)
+        self.assertEqual(_anthropic_max_tokens("claude-fable-5"), 32768)
+
+    def test_older_claude_keeps_16k(self):
+        self.assertEqual(_anthropic_max_tokens("claude-sonnet-4-6"), 16384)
+        self.assertEqual(_anthropic_max_tokens("claude-opus-4-8"), 16384)
+        self.assertEqual(_anthropic_max_tokens("claude-sonnet-4-5-20250929"), 16384)
+
+    def test_stream_preserves_thinking_blocks(self):
+        events = [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
+            {"type": "content_block_start", "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "plan first"}},
+            {"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "sig123"}},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "done"}},
+            {"type": "content_block_stop"},
+            {"type": "message_delta", "usage": {"output_tokens": 4}},
+        ]
+        lines = [f"data: {json.dumps(event)}\n".encode() for event in events]
+
+        class _FakeResp:
+            def __iter__(self):
+                return iter(lines)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
+             patch("urllib.request.urlopen", return_value=_FakeResp()):
+            result = stream_anthropic(
+                {"model": "claude-opus-5"},
+                [{"role": "user", "content": "hi"}],
+            )
+        self.assertEqual(result["content"], "done")
+        self.assertEqual(result["_anthropic_content"][0], {
+            "type": "thinking",
+            "thinking": "plan first",
+            "signature": "sig123",
+        })
+        self.assertEqual(result["_anthropic_content"][1], {"type": "text", "text": "done"})
 
 
 if __name__ == "__main__":

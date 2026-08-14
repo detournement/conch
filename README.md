@@ -33,8 +33,8 @@ git root — later files override earlier ones):
 
 ```ini
 provider=anthropic
-model=claude-sonnet-4-6
-chat_model=claude-sonnet-4-6
+model=claude-sonnet-5
+chat_model=claude-sonnet-5
 api_key_env=ANTHROPIC_API_KEY
 ```
 
@@ -89,11 +89,11 @@ are rejected.
 
 | Provider | Models | Cost |
 |----------|--------|------|
-| Cerebras | zai-glm-4.7 | Free |
-| OpenAI | gpt-5.4 family, gpt-4.1 family, gpt-4o, o3, o4-mini, o1 (all tool-capable; o1-mini is not supported) | Paid |
-| Anthropic | claude-opus-4-8, claude-sonnet-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 | Paid |
+| Cerebras | gpt-oss-120b, gemma-4-31b, zai-glm-4.7 (deprecated 2026-08-17) | Paid / free tier |
+| OpenAI | gpt-5.6 family (sol/terra/luna), gpt-5.5, gpt-5.3-codex, gpt-5.4 family, gpt-4.1 family, gpt-4o, o3, o4-mini, o1 (all tool-capable; o1-mini is not supported) | Paid |
+| Anthropic | claude-fable-5, claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 | Paid |
 | Bedrock (AWS) | moonshotai.kimi-k2.5, moonshot.kimi-k2-thinking via Bedrock's OpenAI-compatible endpoint; auth is a long-term Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK` (region via `bedrock_region`, default us-east-2) | Paid (AWS) |
-| OpenRouter | moonshotai/kimi-k3 (2.8T MoE, 1M context, $3/$15 per MTok), z-ai/glm-5.2 (~750B MoE, 1M context, $0.98/$3.08 per MTok); key in `OPENROUTER_API_KEY` | Paid |
+| OpenRouter | moonshotai/kimi-k3 (2.8T MoE, 1M context, $3/$15 per MTok), z-ai/glm-5.2 (~750B MoE, 1M context, $0.98/$3.08 per MTok), deepseek/deepseek-v4-pro and deepseek/deepseek-v4-flash (1M context); key in `OPENROUTER_API_KEY` | Paid |
 | Ollama | Discovered live from your server's `/api/tags`, filtered to models that advertise the `tools` capability | Free (local) |
 | Custom | Any OpenAI-compatible endpoint (vLLM, LM Studio, llama.cpp server, a second Ollama box) via `provider=custom` + `custom_base_url` + `custom_model`; verified tool-capable by a startup probe | Depends |
 

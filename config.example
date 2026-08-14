@@ -5,8 +5,8 @@
 
 # Provider: anthropic, openai, cerebras, bedrock, openrouter, ollama, custom
 provider=anthropic
-model=claude-sonnet-4-6
-chat_model=claude-sonnet-4-6
+model=claude-sonnet-5
+chat_model=claude-sonnet-5
 api_key_env=ANTHROPIC_API_KEY
 
 # --- AWS Bedrock (Moonshot Kimi) example -------------------------------------
@@ -43,8 +43,10 @@ api_key_env=ANTHROPIC_API_KEY
 
 # --- OpenRouter ---------------------------------------------------------------
 # Frontier models not on the other providers, via openrouter.ai:
-#   moonshotai/kimi-k3  (2.8T MoE, 1M context, $3/$15 per MTok)
-#   z-ai/glm-5.2        (~750B MoE, 1M context, $0.98/$3.08 per MTok)
+#   moonshotai/kimi-k3           (2.8T MoE, 1M context, $3/$15 per MTok)
+#   z-ai/glm-5.2                 (~750B MoE, 1M context, $0.98/$3.08 per MTok)
+#   deepseek/deepseek-v4-pro     (1.6T MoE, 1M context, $0.435/$0.87 per MTok)
+#   deepseek/deepseek-v4-flash   (284B MoE, 1M context, $0.14/$0.28 per MTok)
 # Switch between them in chat with /model.
 #provider=openrouter
 #model=moonshotai/kimi-k3

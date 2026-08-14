@@ -75,7 +75,8 @@ class TestCloudContextWindows(unittest.TestCase):
                 self.assertIn(model, MODEL_CONTEXT_WINDOWS, f"{model} missing a context window")
 
     def test_lookup_uses_table(self):
-        self.assertEqual(get_context_window("anthropic", "claude-sonnet-4-6"), 200000)
+        self.assertEqual(get_context_window("anthropic", "claude-sonnet-4-6"), 1000000)
+        self.assertEqual(get_context_window("anthropic", "claude-opus-5"), 1000000)
         self.assertEqual(get_context_window("openai", "gpt-4o-mini"), 128000)
         self.assertEqual(get_context_window("cerebras", "zai-glm-4.7"), 131072)
 
@@ -166,7 +167,7 @@ class TestGetContextLimit(CtxCacheTestCase):
 
     def test_config_uses_real_window_with_headroom(self):
         config = {"provider": "anthropic", "chat_model": "claude-sonnet-4-6"}
-        self.assertEqual(get_context_limit("anthropic", config), int(200000 * 0.9))
+        self.assertEqual(get_context_limit("anthropic", config), int(1000000 * 0.9))
 
     def test_ollama_config_uses_effective_num_ctx(self):
         side_effect = _fake_show_server({"llama.context_length": 131072})
@@ -189,7 +190,7 @@ class TestBuildSelfDescription(CtxCacheTestCase):
     def test_cloud_description(self):
         text = build_self_description("anthropic", "claude-sonnet-4-6", {})
         self.assertIn("anthropic/claude-sonnet-4-6", text)
-        self.assertIn("200,000 tokens", text)
+        self.assertIn("1,000,000 tokens", text)
         self.assertIn(get_config_path(), text)
         self.assertNotIn("Ollama server", text)
 
@@ -212,7 +213,7 @@ class TestBuildSelfDescription(CtxCacheTestCase):
             "base", provider="anthropic", model="claude-sonnet-4-6", config={}
         )
         self.assertIn("anthropic/claude-sonnet-4-6", prompt)
-        self.assertIn("200,000 tokens", prompt)
+        self.assertIn("1,000,000 tokens", prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +239,7 @@ class TestStatusCommand(CtxCacheTestCase):
         self.assertIsNone(result)
         self.assertIn("anthropic", output)
         self.assertIn("claude-sonnet-4-6", output)
-        self.assertIn("200,000 tokens", output)
+        self.assertIn("1,000,000 tokens", output)
         self.assertIn(get_config_path(), output)
 
     def test_shows_context_usage_vs_window(self):

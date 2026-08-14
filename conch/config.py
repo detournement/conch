@@ -9,8 +9,8 @@ from typing import Dict
 
 DEFAULT_CONFIG: Dict[str, str] = {
     "provider": "anthropic",
-    "model": "claude-sonnet-4-6",
-    "chat_model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5",
+    "chat_model": "claude-sonnet-5",
     "api_key_env": "ANTHROPIC_API_KEY",
     # Agent mode off by default: shell commands require confirmation unless
     # the user opts in with agent_mode=true in the config file.
@@ -103,9 +103,14 @@ def load_config() -> Dict[str, str]:
     provider = config.get("provider", DEFAULT_CONFIG["provider"]).lower()
     config["provider"] = provider
     if provider == "cerebras":
-        config["api_key_env"] = config.get("api_key_env") or "CEREBRAS_API_KEY"
-        config["model"] = config.get("model") or "zai-glm-4.7"
-        config["chat_model"] = config.get("chat_model") or config["model"]
+        # Values inherited from DEFAULT_CONFIG (anthropic) don't count as
+        # user choices — replace them with Cerebras's own defaults.
+        if config.get("api_key_env") in (DEFAULT_CONFIG["api_key_env"], "", None):
+            config["api_key_env"] = "CEREBRAS_API_KEY"
+        if config.get("model") in (DEFAULT_CONFIG["model"], "", None):
+            config["model"] = "gpt-oss-120b"
+        if config.get("chat_model") in (DEFAULT_CONFIG["chat_model"], "", None):
+            config["chat_model"] = config["model"]
     elif provider == "bedrock":
         config.setdefault("api_key_env", "AWS_BEARER_TOKEN_BEDROCK")
         config.setdefault("model", "moonshotai.kimi-k2.5")
@@ -147,7 +152,7 @@ def load_config() -> Dict[str, str]:
             config["chat_model"] = model
     else:
         config.setdefault("api_key_env", "ANTHROPIC_API_KEY")
-        config.setdefault("model", "claude-sonnet-4-6")
+        config.setdefault("model", "claude-sonnet-5")
         config.setdefault("chat_model", config["model"])
     return config
 

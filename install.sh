@@ -124,8 +124,8 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
             anthropic)
                 cat > "$CONFIG_FILE" <<'CFGEOF'
 provider=anthropic
-model=claude-sonnet-4-6
-chat_model=claude-sonnet-4-6
+model=claude-sonnet-5
+chat_model=claude-sonnet-5
 api_key_env=ANTHROPIC_API_KEY
 CFGEOF
                 ;;
@@ -140,8 +140,8 @@ CFGEOF
             cerebras)
                 cat > "$CONFIG_FILE" <<'CFGEOF'
 provider=cerebras
-model=zai-glm-4.7
-chat_model=zai-glm-4.7
+model=gpt-oss-120b
+chat_model=gpt-oss-120b
 api_key_env=CEREBRAS_API_KEY
 CFGEOF
                 ;;

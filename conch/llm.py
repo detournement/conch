@@ -135,7 +135,7 @@ def call_cerebras(config: dict, messages: list) -> str:
     base = (config.get("base_url") or
             os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")).rstrip("/")
     body = {
-        "model": config.get("model", "zai-glm-4.7"),
+        "model": config.get("model", "gpt-oss-120b"),
         "messages": messages,
         "temperature": 0.2,
         "max_completion_tokens": 2048,
@@ -312,7 +312,7 @@ def call_anthropic(config: dict, messages: list) -> str:
     system = next((m["content"] for m in messages if m["role"] == "system"), "")
     user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
     body = {
-        "model": config.get("model", "claude-sonnet-4-6"),
+        "model": config.get("model", "claude-sonnet-5"),
         "max_tokens": 2048,
         "system": system,
         "messages": [{"role": "user", "content": user_content}],

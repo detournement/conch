@@ -240,12 +240,24 @@ class TestToolCapping(unittest.TestCase):
         for name in PINNED_TOOL_NAMES:
             self.assertIn(name, result_names, f"pinned tool {name} was dropped")
 
-    def test_conch_config_is_pinned(self):
-        self.assertIn("conch_config", PINNED_TOOL_NAMES)
+    def test_local_always_on_set_stays_small(self):
+        self.assertEqual(
+            PINNED_TOOL_NAMES,
+            {
+                "local_shell",
+                "manage_tools",
+                "todo_list",
+                "delegate_task",
+                "skill_manage",
+                "conch_introspect",
+            },
+        )
 
     def test_provider_tool_limits_defined(self):
         self.assertEqual(PROVIDER_TOOL_LIMITS.get("openai"), 128)
         self.assertEqual(PROVIDER_TOOL_LIMITS.get("cerebras"), 128)
+        self.assertEqual(PROVIDER_TOOL_LIMITS.get("ollama"), 12)
+        self.assertEqual(PROVIDER_TOOL_LIMITS.get("custom"), 12)
         self.assertIsNone(PROVIDER_TOOL_LIMITS.get("anthropic"))
 
 

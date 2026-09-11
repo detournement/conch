@@ -8,6 +8,7 @@ import shutil
 import sys
 import threading
 import time
+from typing import Optional
 
 try:
     from pygments import highlight as _pyg_highlight
@@ -223,7 +224,7 @@ class Spinner:
     def __init__(self, label: str):
         self.label = label
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._registered = False
 
     def _clear_line(self):

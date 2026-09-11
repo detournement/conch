@@ -12,10 +12,10 @@ import termios
 import threading
 import tty
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .commands import handle_slash_command
-from .config import get_bool, load_config
+from .config import get_bool, load_config, local_only_enabled
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
 from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS
@@ -220,7 +220,14 @@ def _load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False
                 except Exception:
                     live = []
                 for t in live:
-                    tool_map[t["function"]["name"]] = client
+                    tool_name = t.get("function", {}).get("name", "")
+                    if tool_name and tool_name not in tool_map:
+                        tool_map[tool_name] = client
+            all_tools = [
+                tool
+                for tool in all_tools
+                if tool.get("function", {}).get("name", "") in tool_map
+            ]
             inject_builtin_tools(all_tools, tool_map, builtin_clients)
             prefs = load_tool_prefs()
             prefs, _ = auto_disable_oversized_groups(all_tools, tool_map, prefs)
@@ -260,16 +267,24 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
         summary_messages.append({"role": "user", "content": summary_prompt})
         # Session summaries are a side task — use the weak model when
         # configured (plan 2.7).
-        from .runtime import is_error_response, side_task_fn
+        from .runtime import (
+            is_error_response,
+            serialized_agent_execution,
+            side_task_fn,
+        )
         summary_fn, summary_config = side_task_fn(config, raw_fn, config)
         if summary_fn is None:
             return
-        response = summary_fn(summary_config, summary_messages, None)
+        with serialized_agent_execution():
+            response = summary_fn(summary_config, summary_messages, None)
         if is_error_response(response):
             return  # never save provider errors as permanent memories
         summary = response.get("content", "").strip()
         if summary:
-            memory.add(f"[Session summary] {summary}", source="summary")
+            with serialized_agent_execution():
+                memory.add(
+                    f"[Session summary] {summary}", source="summary"
+                )
     except Exception:
         pass
 
@@ -368,7 +383,7 @@ class TypeaheadBuffer:
         self._buffer = ""
         self._queued: list[str] = []
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._old_settings = None
 
     def start(self):
@@ -437,23 +452,26 @@ class TypeaheadBuffer:
 
 def warn_unknown_cloud_model(provider: str, model_name: str) -> str:
     """Startup scrutiny for config-file model values on cloud providers
-    (warn-don't-die): "" when the model is known, otherwise a warning with
-    close-match suggestions. The model is kept — it may simply be newer
-    than conch's catalog."""
-    from .providers import KNOWN_MODELS, suggest_models
+    (warn-and-replace): "" when the model is known, otherwise a warning with
+    close-match suggestions."""
+    from .providers import (
+        KNOWN_MODELS,
+        get_fallback_model,
+        suggest_models,
+    )
 
     provider = (provider or "").lower()
     if provider in ("ollama", "custom"):
-        return ""  # ollama is resolved live; custom isn't enumerable
+        return ""  # local providers are resolved from live services
     known = KNOWN_MODELS.get(provider)
     if not known or not model_name or model_name in known:
         return ""
     suggestions = suggest_models(model_name, known)
     hint = f" — did you mean {', '.join(suggestions)}?" if suggestions else ""
+    replacement = get_fallback_model(provider)
     return (
         f"Configured model '{model_name}' isn't in conch's {provider} "
-        f"catalog{hint} (keeping it — it may be newer than this conch; "
-        f"/models to list)"
+        f"catalog of tool-capable models{hint}; using '{replacement}' instead"
     )
 
 
@@ -470,21 +488,7 @@ def resolve_ollama_startup_model(config: dict, model_name: str) -> tuple:
         get_ollama_base_url,
         list_ollama_models,
         ollama_model_matches,
-        ollama_model_supports_tools,
     )
-
-    def _tool_support_warnings(model: str) -> list:
-        # Old/limited servers can't always report capabilities; such models
-        # are kept (hotfix 151c874) but may never receive native tool
-        # schemas — they then improvise textual tool-call syntax. Say so.
-        if ollama_model_supports_tools(model, config) is None:
-            return [
-                f"Can't verify that '{model}' supports native tool calling "
-                "on this Ollama server — tool calls may degrade to text "
-                "(conch recovers well-formed ones, but consider upgrading "
-                "the server or model)"
-            ]
-        return []
 
     live_models = list_ollama_models(config)
     if live_models is None:
@@ -493,13 +497,13 @@ def resolve_ollama_startup_model(config: dict, model_name: str) -> tuple:
             f"model '{model_name}' unverified"
         ]
     if ollama_model_matches(model_name, live_models):
-        return model_name, _tool_support_warnings(model_name)
+        return model_name, []
     replacement = get_fallback_model("ollama", config)
     if replacement:
         return replacement, [
             f"Model '{model_name}' is not available/tool-capable on the "
             f"Ollama server — using '{replacement}' instead"
-        ] + _tool_support_warnings(replacement)
+        ]
     installed = list_ollama_models(config, tool_capable_only=False) or []
     if installed:
         warning = (
@@ -519,6 +523,15 @@ def chat_loop():
     config = load_config()
     agent_mode_from_config = apply_agent_mode_from_config(config)
     provider = (config.get("provider") or "openai").lower()
+    if local_only_enabled(config, provider) and provider not in (
+        "ollama",
+        "custom",
+    ):
+        print(
+            "conch: local_only=true requires provider=ollama or provider=custom",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     raw_fn = RAW_FNS.get(provider)
     if not raw_fn:
         print(f"conch: unknown provider {provider}", file=sys.stderr)
@@ -537,28 +550,55 @@ def chat_loop():
             config["model"] = resolved
             config["chat_model"] = resolved
     elif provider == "custom":
-        # Custom endpoints are assumed tool-capable, verified by a probe.
-        from .providers import probe_custom_provider
-        ok, reason = probe_custom_provider(config, timeout=5.0)
-        if not ok:
-            print(f"\033[33m  ⚠ Custom endpoint probe failed: {reason}\033[0m",
-                  file=sys.stderr)
+        from .providers import get_custom_base_url, list_custom_models
+
+        available = list_custom_models(config, timeout=3.0)
+        if available is None:
+            print(
+                f"\033[33m  ⚠ Custom endpoint unreachable at "
+                f"{get_custom_base_url(config)}; model is unverified\033[0m",
+                file=sys.stderr,
+            )
+        elif model_name not in available and available:
+            replacement = available[0]
+            print(
+                f"\033[33m  ⚠ Custom model '{model_name}' is unavailable or "
+                f"failed tool conformance; using '{replacement}'\033[0m",
+                file=sys.stderr,
+            )
+            model_name = replacement
+            config["model"] = replacement
+            config["chat_model"] = replacement
+            config["custom_model"] = replacement
+        elif not available:
+            print(
+                "\033[33m  ⚠ No custom endpoint models passed native "
+                "tool-call conformance\033[0m",
+                file=sys.stderr,
+            )
     else:
-        # Cloud providers: config-file model values get the same scrutiny as
-        # switches, but at startup we warn instead of dying (plan-0.4 spirit).
+        # Cloud config values are subject to the same tools-only catalog gate
+        # as interactive switches.
         _model_warning = warn_unknown_cloud_model(provider, model_name)
         if _model_warning:
             print(f"\033[33m  ⚠ {_model_warning}\033[0m", file=sys.stderr)
+            from .providers import get_fallback_model
+
+            model_name = get_fallback_model(provider, config)
+            config["model"] = model_name
+            config["chat_model"] = model_name
 
     from .prompts import get_chat_prompt
     base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
 
-    # Detect location in background — inject into prompt when ready
+    # Public-IP geolocation is explicitly opt-in.
     _location_result = [""]
     def _bg_location():
         _location_result[0] = _detect_location()
-    _loc_thread = threading.Thread(target=_bg_location, daemon=True)
-    _loc_thread.start()
+    _loc_thread = None
+    if get_bool(config, "detect_location", False):
+        _loc_thread = threading.Thread(target=_bg_location, daemon=True)
+        _loc_thread.start()
 
     system_prompt = _build_system_prompt(base_prompt, provider=provider, model=model_name, config=config)
     memory = MemoryStore()
@@ -743,7 +783,7 @@ def chat_loop():
             print(f"\033[2mProfile '{_config_profile}' from config — {_prof_desc}\033[0m")
         else:
             print(f"\033[33m  ⚠ {_prof_desc}\033[0m", file=sys.stderr)
-    elif provider == "ollama" and not active_profile_name():
+    elif provider in ("ollama", "custom") and not active_profile_name():
         _prof_tools, _ = profile_tool_filter(
             "minimal", chat_state.all_tools, chat_state.tool_map, config
         )
@@ -778,7 +818,8 @@ def chat_loop():
             )
 
     # Inject location now that background thread has had time
-    _loc_thread.join(timeout=0.1)
+    if _loc_thread is not None:
+        _loc_thread.join(timeout=0.1)
     if _location_result[0]:
         system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
         if messages and messages[0].get("role") == "system":
@@ -983,7 +1024,7 @@ def chat_loop():
             _printer = StreamPrinter() if _use_streaming else None
 
             if _use_streaming:
-                print(f"\n\033[1;36massistant:\033[0m")
+                print("\n\033[1;36massistant:\033[0m")
 
             try:
                 reply, turn_usage = chat_turn(
@@ -1049,13 +1090,20 @@ def chat_loop():
             used_model = turn_usage.get("model", model_name)
             if in_tok or out_tok:
                 from .providers import estimate_cost
-                from .runtime import estimate_tokens, format_context_gauge, get_context_limit
+                from .runtime import (
+                    calibration_key,
+                    estimate_tokens,
+                    format_context_gauge,
+                    get_context_limit,
+                )
                 cost = estimate_cost(used_model, in_tok, out_tok)
                 session_usage["input_tokens"] += in_tok
                 session_usage["output_tokens"] += out_tok
                 session_usage["cost"] += cost
                 session_usage["turns"] += 1
-                ctx_used = estimate_tokens(messages)
+                ctx_used = estimate_tokens(
+                    messages, key=calibration_key(provider, config)
+                )
                 ctx_window = get_context_limit(provider, config)
                 gauge = format_context_gauge(ctx_used, ctx_window)
                 cost_str = f"~${cost:.4f}" if cost > 0.0001 else "free"
@@ -1081,6 +1129,8 @@ def chat_loop():
                         config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(_new_prov, "")
                         config["chat_model"] = _new_mod
                         config["model"] = _new_mod
+                        if _new_prov == "custom":
+                            config["custom_model"] = _new_mod
                         if provider != old_provider:
                             from .runtime import normalize_messages_on_switch
                             normalize_messages_on_switch(messages, provider)
@@ -1132,6 +1182,7 @@ def chat_loop():
         except OSError:
             pass
         mcp_mod.close_all(mcp_clients)
+        conv_mgr.close()
 
 
 def main():
@@ -1143,6 +1194,15 @@ def main():
         config = load_config()
         apply_agent_mode_from_config(config)
         provider = (config.get("provider") or "openai").lower()
+        if local_only_enabled(config, provider) and provider not in (
+            "ollama",
+            "custom",
+        ):
+            print(
+                "conch: local_only=true requires provider=ollama or provider=custom",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         raw_fn = RAW_FNS.get(provider)
         if not raw_fn:
             print(f"conch: unknown provider {provider}", file=sys.stderr)
@@ -1151,8 +1211,20 @@ def main():
         _model_warning = warn_unknown_cloud_model(provider, model_name)
         if _model_warning:
             print(f"\033[33m  ⚠ {_model_warning}\033[0m", file=sys.stderr)
+            from .providers import get_fallback_model
+
+            model_name = get_fallback_model(provider, config)
+            config["model"] = model_name
+            config["chat_model"] = model_name
         base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
-        system_prompt = _build_system_prompt(base_prompt, _detect_location(), provider, model_name, config)
+        location = (
+            _detect_location()
+            if get_bool(config, "detect_location", False)
+            else ""
+        )
+        system_prompt = _build_system_prompt(
+            base_prompt, location, provider, model_name, config
+        )
         user_text = " ".join(sys.argv[1:])
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)

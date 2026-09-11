@@ -7,10 +7,53 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: python -m pip install .
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Check entrypoint syntax
+        run: sh -n docker-entrypoint.sh
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Test installed commands
+        run: |
+          python -m venv /tmp/conch-wheel
+          /tmp/conch-wheel/bin/pip install dist/*.whl
+          /tmp/conch-wheel/bin/conch --version
+          /tmp/conch-wheel/bin/conch-ask --version
+          /tmp/conch-wheel/bin/pip check
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose
+        run: docker compose config --quiet
+      - name: Build development image
+        run: docker build --target dev -t conch-shell:ci .
+      - name: Build minimal image
+        run: docker build --target minimal -t conch-shell:minimal-ci .
+      - name: Verify installed commands and non-root runtime
+        run: |
+          docker run --rm --entrypoint conch conch-shell:ci --version
+          docker run --rm --entrypoint conch-ask conch-shell:ci --version
+          test "$(docker run --rm --entrypoint id conch-shell:ci -u)" != "0"
+          docker run --rm --init --entrypoint conch conch-shell:minimal-ci --version
+          test "$(docker run --rm --entrypoint id conch-shell:minimal-ci -u)" != "0"

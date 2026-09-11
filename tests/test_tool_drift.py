@@ -1,13 +1,9 @@
 """Tests for tool-call drift control: few-shot anchor, drift detection, the
 corrective reminder, and the /resettools reset.
 
-Mechanism being defended against: small local models sometimes fall out of
-native function-calling and emit tool calls as *text*. Well-formed textual
-calls are recovered and re-stored as structured tool_calls, but malformed /
-unregistered ones become the assistant reply and are persisted as prose —
-which the model then imitates on the next turn, compounding the drift. The
-defenses are a tiny always-on few-shot exemplar (local providers only), a
-drift counter that escalates to a corrective reminder, and a manual reset.
+Small local models sometimes emit tool calls as text. Conch detects this only
+for diagnostics/display safety; textual calls are never executed. A compact
+native-call exemplar and reminder help the next turn recover.
 
 All tests here are offline: pure functions plus chat_turn driven by a fake
 provider. Nothing contacts a live Ollama server.
@@ -118,7 +114,11 @@ class TestApplyScaffolding(unittest.TestCase):
         base = _base_messages()
         out = apply_tool_call_scaffolding(list(base), "ollama", {}, _state())
         self.assertGreater(len(out), len(base))
-        self.assertEqual(out[0], base[0], "leading system message stays first")
+        self.assertEqual(out[0]["role"], "system")
+        self.assertTrue(out[0]["content"].startswith("sys"))
+        self.assertEqual(
+            sum(message.get("role") == "system" for message in out), 1
+        )
         self.assertTrue(any(m.get("tool_calls") for m in out))
 
     def test_no_injection_for_cloud_provider(self):
@@ -143,13 +143,13 @@ class TestApplyScaffolding(unittest.TestCase):
         s = _state()
         s.textual_tool_calls = DRIFT_REMINDER_THRESHOLD
         out = apply_tool_call_scaffolding(_base_messages(), "ollama", {}, s)
-        self.assertTrue(any(m.get("content") == TOOL_CALL_REMINDER for m in out))
+        self.assertIn(TOOL_CALL_REMINDER, out[0]["content"])
 
     def test_force_reminder_is_one_shot(self):
         s = _state()
         s.force_tool_reminder = True
         out = apply_tool_call_scaffolding(_base_messages(), "ollama", {}, s)
-        self.assertTrue(any(m.get("content") == TOOL_CALL_REMINDER for m in out))
+        self.assertIn(TOOL_CALL_REMINDER, out[0]["content"])
         self.assertFalse(s.force_tool_reminder, "force flag consumed after use")
 
     def test_no_chat_state_is_tolerated(self):
@@ -251,26 +251,20 @@ def _run_turn(responses, chat_state=None, messages=None):
 
 
 class TestChatTurnDrift(unittest.TestCase):
-    def test_recovered_textual_call_counts_as_drift_and_stores_structured(self):
+    def test_textual_call_is_rejected_and_never_stored_as_structured(self):
         s = _state()
         reply, messages = _run_turn([
             {"role": "assistant",
              "content": '{"name": "local_shell", "arguments": {"command": "ls"}}',
              "tool_calls": None, "_usage": {}, "_model": "m"},
-            {"role": "assistant", "content": "Done.", "tool_calls": None,
-             "_usage": {}, "_model": "m"},
         ], chat_state=s)
-        self.assertEqual(reply, "Done.")
+        self.assertIn("did not execute", reply)
         self.assertGreaterEqual(s.textual_tool_calls, 1)
-        # The recovered call is persisted as a STRUCTURED tool_calls message,
-        # never as raw JSON prose.
         assistant_calls = [m for m in messages if m.get("tool_calls")]
-        self.assertEqual(len(assistant_calls), 1)
-        self.assertEqual(assistant_calls[0].get("content"), "")
+        self.assertEqual(assistant_calls, [])
 
     def test_unrecovered_textual_reply_counts_as_drift(self):
-        # Names an unregistered tool: recovery declines it, it becomes the
-        # reply. That is the compounding-drift case — it must be counted.
+        # Names an unregistered tool: it is still rejected as text.
         s = _state()
         reply, _ = _run_turn([
             {"role": "assistant",
@@ -278,6 +272,7 @@ class TestChatTurnDrift(unittest.TestCase):
              "tool_calls": None, "_usage": {}, "_model": "m"},
         ], chat_state=s)
         self.assertEqual(s.textual_tool_calls, 1)
+        self.assertIn("did not execute", reply)
 
     def test_ordinary_reply_is_not_drift(self):
         s = _state()
@@ -293,12 +288,9 @@ class TestChatTurnDrift(unittest.TestCase):
             {"role": "assistant",
              "content": '{"name": "local_shell", "arguments": {"command": "ls"}}',
              "tool_calls": None, "_usage": {}, "_model": "m"},
-            {"role": "assistant", "content": "Done.", "tool_calls": None,
-             "_usage": {}, "_model": "m"},
         ], chat_state=s)
         blob = json.dumps(messages)
-        self.assertNotIn("FORMAT EXAMPLE", blob)
-        self.assertNotIn("(example)", blob)
+        self.assertNotIn("format example", blob)
         self.assertNotIn(TOOL_CALL_REMINDER, blob)
 
     def test_native_tool_calls_survive_ollama_normalization(self):

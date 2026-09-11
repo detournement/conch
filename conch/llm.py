@@ -347,59 +347,103 @@ def call_anthropic(config: dict, messages: list) -> str:
 
 
 def call_ollama(config: dict, messages: list) -> str:
-    import urllib.error
     import urllib.request
 
     from .providers import (
+        _clamp_output_to_context,
         apply_ollama_request_options,
-        format_http_api_error,
         get_ollama_base_url,
+        get_ollama_effective_context,
+        validate_ollama_model,
     )
 
     base = get_ollama_base_url(config)
     url = f"{base}/api/chat"
     model = config.get("model", "llama3.3")
+    ok, reason = validate_ollama_model(model, config)
+    if ok is not True:
+        print(f"conch: Ollama model rejected: {reason}", file=sys.stderr)
+        return ""
     body = {
         "model": model,
         "messages": messages,  # proper system + user roles, not a flattened prompt
         "stream": False,
-        # Structured output: Ollama constrains generation to this schema.
-        "format": COMMAND_SCHEMA,
+        "tools": [SHELL_COMMAND_TOOL],
     }
     apply_ollama_request_options(body, config, model)
-
-    def _post(payload):
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    if body.get("options", {}).get("num_predict"):
+        body["options"]["num_predict"] = _clamp_output_to_context(
+            body["options"]["num_predict"],
+            get_ollama_effective_context(model, config),
+            messages,
+            [SHELL_COMMAND_TOOL],
         )
-        with urllib.request.urlopen(req, timeout=120) as r:
-            return json.loads(r.read().decode())
-
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        data = _post(body)
-    except urllib.error.HTTPError as e:
-        detail = format_http_api_error(e)
-        # Ollama < 0.5 rejects a JSON-schema format ("cannot unmarshal object
-        # into ... format of type string"); retry with the legacy "json" mode
-        # (the system prompt already demands the {"command": ...} shape).
-        if "format" in detail.lower():
-            body["format"] = "json"
-            try:
-                data = _post(body)
-            except Exception as retry_exc:
-                print(f"conch: Ollama error: {retry_exc}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print(f"conch: Ollama error: {detail}", file=sys.stderr)
-            sys.exit(1)
+        timeout = float(config.get("ollama_timeout", 120) or 120)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode())
     except Exception as e:
         print(f"conch: Ollama error: {e}", file=sys.stderr)
-        sys.exit(1)
-    content = (data.get("message") or {}).get("content", "")
-    return parse_command_json(content)
+        return ""
+    return command_from_tool_calls(data.get("message") or {})
+
+
+def call_custom(config: dict, messages: list) -> str:
+    import urllib.request
+
+    from .providers import (
+        _clamp_output_to_context,
+        _custom_headers,
+        get_custom_context_window,
+        get_custom_base_url,
+        validate_custom_model,
+    )
+
+    base = get_custom_base_url(config)
+    model = (
+        config.get("model")
+        or config.get("chat_model")
+        or config.get("custom_model", "")
+    )
+    ok, reason = validate_custom_model(model, config)
+    if ok is not True:
+        print(f"conch: custom model rejected: {reason}", file=sys.stderr)
+        return ""
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 2048,
+        "tools": [SHELL_COMMAND_TOOL],
+        "tool_choice": "required",
+    }
+    body["max_tokens"] = _clamp_output_to_context(
+        body["max_tokens"],
+        get_custom_context_window(config, model),
+        messages,
+        [SHELL_COMMAND_TOOL],
+    )
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=_custom_headers(config),
+        method="POST",
+    )
+    try:
+        timeout = float(config.get("custom_timeout", 120) or 120)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode())
+    except Exception as exc:
+        print(f"conch: custom endpoint error: {exc}", file=sys.stderr)
+        return ""
+    message = (data.get("choices") or [{}])[0].get("message", {})
+    return command_from_tool_calls(message)
 
 
 _ASK_CALLERS = {
@@ -409,11 +453,17 @@ _ASK_CALLERS = {
     "openai": call_openai,
     "anthropic": call_anthropic,
     "ollama": call_ollama,
+    "custom": call_custom,
 }
 
 def ask(user_request: str, context: Optional[dict] = None) -> str:
     """Main entry: build context, call configured provider, return one command line."""
-    from .providers import get_fallback_chain, get_fallback_model, DEFAULT_API_KEY_ENVS
+    from .providers import (
+        DEFAULT_API_KEY_ENVS,
+        get_fallback_chain,
+        get_fallback_model,
+        validate_model_for_provider,
+    )
 
     config = load_config()
     context = context or {}
@@ -427,6 +477,25 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
 
     provider = (config.get("provider") or "openai").lower()
     current_model = config.get("model") or get_fallback_model(provider, config)
+    verified, reason = validate_model_for_provider(
+        provider, current_model, config
+    )
+    if verified is not True:
+        replacement = get_fallback_model(provider, config)
+        if not replacement:
+            print(
+                f"conch: no verified model for {provider}: {reason}",
+                file=sys.stderr,
+            )
+            return ""
+        print(
+            f"conch: model '{current_model}' rejected ({reason}); "
+            f"using {provider}/{replacement}",
+            file=sys.stderr,
+        )
+        current_model = replacement
+        config["model"] = replacement
+        config["chat_model"] = replacement
 
     caller = _ASK_CALLERS.get(provider)
     if not caller:

@@ -79,7 +79,17 @@ class TestSafeCommandDetection(unittest.TestCase):
             self.assertTrue(is_safe_command(cmd), cmd)
 
     def test_mutating_commands_not_safe(self):
-        for cmd in ("touch x", "git push", "pip install foo", "make install"):
+        for cmd in (
+            "touch x",
+            "git push",
+            "pip install foo",
+            "make install",
+            "find . -delete",
+            "find . -exec touch x ;",
+            "fd -x touch",
+            "rg --pre touch pattern",
+            "git diff --ext-diff",
+        ):
             self.assertFalse(is_safe_command(cmd), cmd)
 
     def test_chaining_disqualifies(self):

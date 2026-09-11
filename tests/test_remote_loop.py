@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -50,6 +51,33 @@ class TestApprovalStore(RemoteTestCase):
         rid = ApprovalStore().add("b", "sms", "t")  # fresh handle, same file
         self.assertEqual(rid, 2)
         self.assertEqual(len(ApprovalStore().pending()), 2)
+
+    def test_consume_is_bound_to_sender_channel_and_thread(self):
+        store = ApprovalStore()
+        rid = store.add("echo ok", "slack", "99.1", "U111")
+        entry, error = store.consume(
+            rid,
+            channel="slack",
+            thread_id="99.1",
+            sender="U222",
+        )
+        self.assertIsNone(entry)
+        self.assertEqual(error, "origin_mismatch")
+        self.assertIn(str(rid), store.pending())
+
+    def test_expired_approval_is_consumed_without_execution(self):
+        store = ApprovalStore()
+        rid = store.add("echo ok", "slack", "99.1", "U111")
+        with patch("conch.remote.time.time", return_value=time.time() + 1000):
+            entry, error = store.consume(
+                rid,
+                channel="slack",
+                thread_id="99.1",
+                sender="U111",
+                max_age=10,
+            )
+        self.assertIsNone(entry)
+        self.assertEqual(error, "expired")
 
 
 class _Notifications:
@@ -96,6 +124,22 @@ class TestRemoteShellClient(RemoteTestCase):
         result = client.call_tool("local_shell", {"command": "pip install requests"})
         self.assertIn("requires user approval", result["content"][0]["text"],
                       "remote sessions stay capped at safe_auto in agent mode")
+
+    def test_extensible_commands_are_not_remote_auto_safe(self):
+        for command in (
+            "find . -delete",
+            "rg --pre touch pattern .",
+            "git status",
+        ):
+            client, _ = self._client()
+            result = client.call_tool(
+                "local_shell", {"command": command}
+            )
+            self.assertIn(
+                "requires user approval",
+                result["content"][0]["text"],
+                command,
+            )
 
 
 def _msg(text, sender="U111", thread="99.1", channel="slack"):
@@ -219,7 +263,9 @@ class TestApprovalFlow(RemoteTestCase):
 
     def test_approve_runs_pending_command(self):
         loop, sent = self._loop()
-        rid = loop.approvals.add("echo approved-output", "slack", "99.1")
+        rid = loop.approvals.add(
+            "echo approved-output", "slack", "99.1", "U111"
+        )
         with patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
             reply = loop.handle_inbound(_msg(f"approve {rid}"))
         self.assertIn("approved-output", reply)
@@ -227,7 +273,9 @@ class TestApprovalFlow(RemoteTestCase):
 
     def test_deny_discards_command(self):
         loop, sent = self._loop()
-        rid = loop.approvals.add("touch /tmp/x", "slack", "99.1")
+        rid = loop.approvals.add(
+            "touch /tmp/x", "slack", "99.1", "U111"
+        )
         reply = loop.handle_inbound(_msg(f"deny {rid}"))
         self.assertIn("Denied", reply)
         self.assertIsNone(loop.approvals.pop(rid))

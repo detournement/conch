@@ -1,8 +1,7 @@
 """Tests for structured ask-mode output (plan 0.6).
 
-Ask mode no longer scrapes commands out of free text. Ollama requests are
-constrained by a JSON schema via the ``format`` parameter; OpenAI, Anthropic,
-and Cerebras are forced into a single shell_command tool call. These tests
+Ask mode no longer scrapes commands out of free text. All providers return
+a native shell_command tool call. These tests
 mock urlopen and verify both the request shape and the response parsing.
 """
 
@@ -16,6 +15,7 @@ from conch.llm import (
     SHELL_COMMAND_TOOL,
     call_anthropic,
     call_cerebras,
+    call_custom,
     call_ollama,
     call_openai,
     command_from_tool_calls,
@@ -100,15 +100,34 @@ class TestCommandFromToolCalls(unittest.TestCase):
 
 class TestCallOllamaStructured(unittest.TestCase):
     def setUp(self):
-        providers._ollama_ctx_cache.clear()
+        providers.clear_local_model_caches()
 
     def _serve(self, chat_payload):
         recorded = {}
 
         def side_effect(req, timeout=None):
             url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({
+                    "models": [{
+                        "name": "qwen3.6:27b",
+                        "digest": "sha256:qwen",
+                    }, {
+                        "name": "qwen3",
+                        "digest": "sha256:qwen3",
+                    }, {
+                        "name": "qwen2.5:3b",
+                        "digest": "sha256:qwen25",
+                    }, {
+                        "name": "llama3.3",
+                        "digest": "sha256:llama",
+                    }]
+                })
             if url.endswith("/api/show"):
-                return _FakeHTTPResponse({"model_info": {}})
+                return _FakeHTTPResponse({
+                    "capabilities": ["completion", "tools"],
+                    "model_info": {},
+                })
             if url.endswith("/api/chat"):
                 recorded["body"] = json.loads(req.data.decode())
                 return _FakeHTTPResponse(chat_payload)
@@ -116,23 +135,31 @@ class TestCallOllamaStructured(unittest.TestCase):
 
         return side_effect, recorded
 
-    def test_sends_schema_roles_and_options(self):
+    def test_sends_native_tool_roles_and_options(self):
         side_effect, recorded = self._serve(
-            {"message": {"content": '{"command": "ls -la"}'}}
+            {"message": {"tool_calls": [{"function": {
+                "name": "shell_command",
+                "arguments": {"command": "ls -la"},
+            }}]}}
         )
         with patch("urllib.request.urlopen", side_effect=side_effect):
             cmd = call_ollama({"provider": "ollama", "model": "qwen3.6:27b"}, MESSAGES)
         self.assertEqual(cmd, "ls -la")
         body = recorded["body"]
-        self.assertEqual(body["format"], COMMAND_SCHEMA)
+        self.assertEqual(body["tools"], [SHELL_COMMAND_TOOL])
+        self.assertNotIn("format", body)
         # System and user roles must be preserved, not flattened into one prompt
         self.assertEqual([m["role"] for m in body["messages"]], ["system", "user"])
-        # Every Ollama request carries num_ctx (plan 0.1)
-        self.assertIn("num_ctx", body.get("options", {}))
+        self.assertNotIn("num_ctx", body.get("options", {}))
         self.assertIn("keep_alive", body)
 
     def test_default_model_aligned_with_config(self):
-        side_effect, recorded = self._serve({"message": {"content": '{"command": "ls"}'}})
+        side_effect, recorded = self._serve(
+            {"message": {"tool_calls": [{"function": {
+                "name": "shell_command",
+                "arguments": {"command": "ls"},
+            }}]}}
+        )
         with patch("urllib.request.urlopen", side_effect=side_effect):
             call_ollama({"provider": "ollama"}, MESSAGES)
         self.assertEqual(recorded["body"]["model"], "llama3.3")
@@ -143,57 +170,36 @@ class TestCallOllamaStructured(unittest.TestCase):
             cmd = call_ollama({"provider": "ollama", "model": "qwen3"}, MESSAGES)
         self.assertEqual(cmd, "", "free text must not be scraped for commands")
 
-    def test_old_server_schema_format_rejected_falls_back_to_json(self):
-        # Ollama < 0.5 only accepts format="json" — a schema object gets a
-        # 400 unmarshal error. Ask mode must retry with the legacy mode
-        # instead of dying with sys.exit.
-        import io
-        import urllib.error
-
-        bodies = []
-
-        def side_effect(req, timeout=None):
-            url = _req_url(req)
-            if url.endswith("/api/show"):
-                return _FakeHTTPResponse({"model_info": {}})
-            if url.endswith("/api/chat"):
-                body = json.loads(req.data.decode())
-                bodies.append(body)
-                if isinstance(body.get("format"), dict):
-                    raise urllib.error.HTTPError(
-                        url, 400,
-                        "json: cannot unmarshal object into Go struct field "
-                        "ChatRequest.format of type string",
-                        {},
-                        io.BytesIO(json.dumps({"error": (
-                            "json: cannot unmarshal object into Go struct "
-                            "field ChatRequest.format of type string"
-                        )}).encode()),
-                    )
-                return _FakeHTTPResponse({"message": {"content": '{"command": "ls"}'}})
-            raise AssertionError(f"unexpected URL {url}")
-
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            cmd = call_ollama({"provider": "ollama", "model": "qwen2.5:3b"}, MESSAGES)
-        self.assertEqual(cmd, "ls")
-        self.assertEqual(bodies[-1]["format"], "json")
-
-    def test_non_format_http_error_still_exits(self):
+    def test_http_error_returns_empty_for_fallback(self):
         import io
         import urllib.error
 
         def side_effect(req, timeout=None):
             url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({
+                    "models": [{
+                        "name": "qwen2.5:3b",
+                        "digest": "sha256:qwen25",
+                    }]
+                })
             if url.endswith("/api/show"):
-                return _FakeHTTPResponse({"model_info": {}})
+                return _FakeHTTPResponse({
+                    "capabilities": ["completion", "tools"]
+                })
             raise urllib.error.HTTPError(
                 url, 500, "boom", {},
                 io.BytesIO(json.dumps({"error": "server exploded"}).encode()),
             )
 
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            with self.assertRaises(SystemExit):
-                call_ollama({"provider": "ollama", "model": "qwen2.5:3b"}, MESSAGES)
+            self.assertEqual(
+                call_ollama(
+                    {"provider": "ollama", "model": "qwen2.5:3b"},
+                    MESSAGES,
+                ),
+                "",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +239,42 @@ class TestCallOpenAIStructured(unittest.TestCase):
              patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
             cmd = call_openai({"provider": "openai"}, MESSAGES)
         self.assertEqual(cmd, "")
+
+
+class TestCallCustomStructured(unittest.TestCase):
+    def test_custom_ask_requires_native_tool_call(self):
+        recorded = {}
+        payload = {"choices": [{"message": {"tool_calls": [{
+            "id": "c1",
+            "type": "function",
+            "function": {
+                "name": "shell_command",
+                "arguments": '{"command":"git status"}',
+            },
+        }]}}]}
+
+        def side_effect(req, timeout=None):
+            recorded["body"] = json.loads(req.data.decode())
+            return _FakeHTTPResponse(payload)
+
+        config = {
+            "provider": "custom",
+            "custom_base_url": "http://127.0.0.1:8080/v1",
+            "model": "local",
+        }
+        with patch(
+            "conch.providers.validate_custom_model",
+            return_value=(True, ""),
+        ), patch(
+            "conch.providers.get_custom_context_window",
+            return_value=8192,
+        ), patch("urllib.request.urlopen", side_effect=side_effect):
+            command = call_custom(config, MESSAGES)
+        self.assertEqual(command, "git status")
+        self.assertEqual(recorded["body"]["tool_choice"], "required")
+        self.assertEqual(
+            recorded["body"]["tools"], [SHELL_COMMAND_TOOL]
+        )
 
 
 class TestCallCerebrasStructured(unittest.TestCase):

@@ -46,10 +46,16 @@ class TestValidateModelForProvider(unittest.TestCase):
         self.assertFalse(ok)
         mock_validate.assert_called_once()
 
-    def test_custom_unverifiable(self):
-        ok, reason = validate_model_for_provider("custom", "whatever-model")
-        self.assertIsNone(ok)
-        self.assertIn("taken as-is", reason)
+    def test_custom_requires_live_verification(self):
+        with patch(
+            "conch.providers.validate_custom_model",
+            return_value=(False, "not exposed"),
+        ):
+            ok, reason = validate_model_for_provider(
+                "custom", "whatever-model"
+            )
+        self.assertFalse(ok)
+        self.assertIn("not exposed", reason)
 
     def test_empty_model_rejected(self):
         ok, _ = validate_model_for_provider("anthropic", "  ")
@@ -97,25 +103,27 @@ class TestModelSwitchValidation(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result[:2], ("openai", "gpt-4o-mini"))
 
-    def test_force_bypasses_validation_with_warning(self):
+    def test_force_cannot_bypass_validation(self):
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
             result, output, config = self._run("/model claude-brand-new-9 --force")
-        self.assertIsNotNone(result)
-        self.assertEqual(result[:2], ("anthropic", "claude-brand-new-9"))
-        self.assertIn("Skipping model validation", output)
+        self.assertIsNone(result)
+        self.assertIn("cannot be bypassed", output)
+        self.assertNotIn("model", config)
 
-    def test_force_alone_shows_usage(self):
+    def test_force_alone_is_rejected(self):
         result, output, _ = self._run("/model --force")
         self.assertIsNone(result)
-        self.assertIn("Usage", output)
+        self.assertIn("cannot be bypassed", output)
 
 
 class TestConchConfigSuggestions(unittest.TestCase):
     def test_set_model_unknown_gets_suggestions(self):
         client = ConchConfigClient()
         client.bind("anthropic", "claude-sonnet-4-6", {}, {"provider": "anthropic"})
-        with patch("conch.providers.validate_ollama_model",
-                   return_value=(None, "Ollama server unreachable at x")):
+        with patch(
+            "conch.providers.validate_model_for_provider",
+            return_value=(False, "unreachable"),
+        ):
             result = client.call_tool("conch_config", {
                 "action": "set_model", "value": "claude-sonet-4-6",
             })
@@ -128,8 +136,10 @@ class TestConchConfigSuggestions(unittest.TestCase):
     def test_set_model_gibberish_rejected(self):
         client = ConchConfigClient()
         client.bind("anthropic", "claude-sonnet-4-6", {}, {"provider": "anthropic"})
-        with patch("conch.providers.validate_ollama_model",
-                   return_value=(None, "unreachable")):
+        with patch(
+            "conch.providers.validate_model_for_provider",
+            return_value=(False, "unreachable"),
+        ):
             result = client.call_tool("conch_config", {
                 "action": "set_model", "value": "ogooaboog",
             })
@@ -141,11 +151,11 @@ class TestStartupModelScrutiny(unittest.TestCase):
     def test_known_model_no_warning(self):
         self.assertEqual(warn_unknown_cloud_model("anthropic", "claude-sonnet-4-6"), "")
 
-    def test_unknown_model_warns_but_keeps(self):
+    def test_unknown_model_warns_and_names_safe_replacement(self):
         warning = warn_unknown_cloud_model("anthropic", "claude-sonet-4-6")
         self.assertIn("isn't in conch's anthropic catalog", warning)
         self.assertIn("did you mean claude-sonnet-4-6", warning)
-        self.assertIn("keeping it", warning)
+        self.assertIn("using 'claude-sonnet-5'", warning)
 
     def test_gibberish_warns_without_suggestions(self):
         warning = warn_unknown_cloud_model("openai", "ogooaboog")

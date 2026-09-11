@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
+import math
 import re
 import json
 import sys
+import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from . import mcp as mcp_mod
@@ -159,29 +164,43 @@ CONTEXT_LIMITS = {
     "ollama": 28000,
 }
 
-# Running (chars sent, prompt tokens reported) totals. Ollama returns
-# prompt_eval_count on every response, so the chars-per-token estimate can be
-# calibrated to the active model's real tokenizer instead of the 3.5 guess.
-_token_calibration = {"chars": 0.0, "tokens": 0}
+# Running (chars sent, prompt tokens reported) totals, isolated per
+# provider/model so switching tokenizers cannot poison later estimates.
+_token_calibration: Dict[str, dict] = {}
 _CALIBRATION_MIN_TOKENS = 200  # don't trust tiny samples
 _CALIBRATION_CLAMP = (1.5, 8.0)
 
 
-def record_token_calibration(char_count: int, token_count: int) -> None:
+def calibration_key(provider: str, config: Optional[dict] = None) -> str:
+    model = (config or {}).get(
+        "chat_model", (config or {}).get("model", "")
+    )
+    return f"{(provider or '').lower()}:{model}" if provider else "default"
+
+
+def record_token_calibration(
+    char_count: int, token_count: int, key: str = "default"
+) -> None:
     if char_count <= 0 or token_count <= 0:
         return
-    _token_calibration["chars"] += char_count
-    _token_calibration["tokens"] += token_count
+    bucket = _token_calibration.setdefault(
+        key, {"chars": 0.0, "tokens": 0}
+    )
+    bucket["chars"] += char_count
+    bucket["tokens"] += token_count
 
 
-def reset_token_calibration() -> None:
-    _token_calibration["chars"] = 0.0
-    _token_calibration["tokens"] = 0
+def reset_token_calibration(key: Optional[str] = None) -> None:
+    if key is None:
+        _token_calibration.clear()
+    else:
+        _token_calibration.pop(key, None)
 
 
-def get_chars_per_token() -> float:
-    if _token_calibration["tokens"] >= _CALIBRATION_MIN_TOKENS:
-        ratio = _token_calibration["chars"] / _token_calibration["tokens"]
+def get_chars_per_token(key: str = "default") -> float:
+    bucket = _token_calibration.get(key, {"chars": 0.0, "tokens": 0})
+    if bucket["tokens"] >= _CALIBRATION_MIN_TOKENS:
+        ratio = bucket["chars"] / bucket["tokens"]
         low, high = _CALIBRATION_CLAMP
         return max(low, min(high, ratio))
     return CHARS_PER_TOKEN
@@ -196,25 +215,29 @@ def get_context_limit(provider: str, config: Optional[dict] = None) -> int:
     from .providers import get_context_window
     model = config.get("chat_model", config.get("model", ""))
     window = get_context_window(provider, model, config)
-    return max(2048, int(window * 0.9))
+    return max(1, int(window * 0.9))
 
 
 def char_count(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
-    total = 0
-    for message in messages:
-        content = message.get("content", "")
-        if isinstance(content, str):
-            total += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                total += len(json.dumps(block)) if isinstance(block, dict) else len(str(block))
+    # Count the complete wire representation. Tool-call names/arguments and
+    # role/ID framing consume context too; counting only message.content
+    # substantially underestimates long agent loops.
+    total = sum(
+        len(json.dumps(message, ensure_ascii=False, default=str))
+        for message in messages
+    )
     if tools:
-        total += len(json.dumps(tools))
+        total += len(json.dumps(tools, ensure_ascii=False, default=str))
     return total
 
 
-def estimate_tokens(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
-    return int(char_count(messages, tools) / get_chars_per_token())
+def estimate_tokens(
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+    *,
+    key: str = "default",
+) -> int:
+    return int(char_count(messages, tools) / get_chars_per_token(key))
 
 
 def format_context_gauge(used_tokens: int, window: int) -> str:
@@ -239,12 +262,29 @@ def truncate_middle(text: str, budget_chars: int) -> str:
     command output are usually at both ends)."""
     if budget_chars <= 0 or len(text) <= budget_chars:
         return text
-    head = int(budget_chars * 0.67)
-    tail = max(0, budget_chars - head)
+    marker = "\n... [truncated — head and tail kept] ...\n"
+    if budget_chars <= len(marker) + 20:
+        return text[:budget_chars]
+    usable = budget_chars - len(marker)
+    head = int(usable * 0.67)
+    tail = max(0, usable - head)
     omitted = len(text) - head - tail
+    marker = (
+        f"\n... [truncated {omitted:,} chars — head and tail kept] ...\n"
+    )
+    # The digit count changes marker length, so recalculate once.
+    usable = max(1, budget_chars - len(marker))
+    head = int(usable * 0.67)
+    tail = max(0, usable - head)
+    omitted = len(text) - head - tail
+    marker = (
+        f"\n... [truncated {omitted:,} chars — head and tail kept] ...\n"
+    )
+    if head + tail + len(marker) > budget_chars:
+        tail = max(0, budget_chars - head - len(marker))
     return (
         text[:head]
-        + f"\n... [truncated {omitted:,} chars — head and tail kept] ...\n"
+        + marker
         + (text[-tail:] if tail else "")
     )
 
@@ -253,7 +293,9 @@ def tool_result_char_budget(provider: str, config: Optional[dict] = None) -> int
     """Char budget for a single tool result, scaled to the model's window."""
     limit = get_context_limit(provider, config)
     tokens = max(_TOOL_RESULT_MIN_TOKENS, int(limit * TOOL_RESULT_BUDGET_FRACTION))
-    return int(tokens * get_chars_per_token())
+    return int(
+        tokens * get_chars_per_token(calibration_key(provider, config))
+    )
 
 
 def truncate_tool_result(text: str, provider: str, config: Optional[dict] = None) -> str:
@@ -278,12 +320,84 @@ _COMPACT_SYSTEM_PROMPT = (
 def _message_as_text(message: dict) -> str:
     content = message.get("content", "")
     if isinstance(content, list):
-        content = " ".join(
-            block.get("text", "") for block in content if isinstance(block, dict)
-        )
+        rendered = []
+        for block in content:
+            if not isinstance(block, dict):
+                rendered.append(str(block))
+            elif block.get("type") == "text":
+                rendered.append(str(block.get("text", "")))
+            elif block.get("type") == "tool_use":
+                rendered.append(
+                    f"tool call {block.get('name', '')}: "
+                    f"{json.dumps(block.get('input', {}), ensure_ascii=False)}"
+                )
+            elif block.get("type") == "tool_result":
+                rendered.append(
+                    f"tool result {block.get('tool_use_id', '')}: "
+                    f"{block.get('content', '')}"
+                )
+        content = " ".join(rendered)
     if not isinstance(content, str):
         content = str(content)
-    return content.strip()
+    parts = [content.strip()] if content.strip() else []
+    for tool_call in message.get("tool_calls") or []:
+        fn = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+        parts.append(
+            f"tool call {fn.get('name', '')}: "
+            f"{str(fn.get('arguments', '{}'))[:2000]}"
+        )
+    if message.get("role") == "tool" and message.get("tool_call_id"):
+        parts.insert(0, f"tool result {message['tool_call_id']}:")
+    return " ".join(part for part in parts if part).strip()
+
+
+def _history_group_spans(messages: List[dict], start: int = 0) -> List[tuple]:
+    """Return half-open spans that never split a tool call from its results."""
+    spans: List[tuple] = []
+    i = start
+    while i < len(messages):
+        begin = i
+        message = messages[i]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            i += 1
+            while i < len(messages) and messages[i].get("role") == "tool":
+                i += 1
+        elif has_anthropic_tool_use(message):
+            i += 1
+            if i < len(messages) and is_anthropic_tool_result(messages[i]):
+                i += 1
+        else:
+            i += 1
+        spans.append((begin, i))
+    return spans
+
+
+def _recent_group_start(
+    messages: List[dict], start: int, minimum_messages: int
+) -> int:
+    spans = _history_group_spans(messages, start)
+    if not spans:
+        return len(messages)
+    count = 0
+    recent_start = len(messages)
+    for begin, end in reversed(spans):
+        recent_start = begin
+        count += end - begin
+        if count >= minimum_messages:
+            break
+    return recent_start
+
+
+def _prepend_history_note(recent: List[dict], text: str) -> List[dict]:
+    """Insert a compaction note without creating a second system message."""
+    note = f"[Earlier conversation context]\n{text}"
+    if recent and recent[0].get("role") == "user" and isinstance(
+        recent[0].get("content"), str
+    ):
+        first = dict(recent[0])
+        first["content"] = note + "\n\n" + first.get("content", "")
+        return [first] + recent[1:]
+    return [{"role": "user", "content": note}] + recent
 
 
 def auto_compact(
@@ -302,16 +416,14 @@ def auto_compact(
     compress_context still runs afterwards as a backstop.
     """
     limit = get_context_limit(provider, config)
-    if estimate_tokens(messages, tools) < limit * AUTO_COMPACT_THRESHOLD:
+    key = calibration_key(provider, config)
+    if estimate_tokens(
+        messages, tools, key=key
+    ) < limit * AUTO_COMPACT_THRESHOLD:
         return False
     has_system = bool(messages) and messages[0].get("role") == "system"
     start = 1 if has_system else 0
-    cut = len(messages) - AUTO_COMPACT_KEEP_RECENT
-    # Never split an assistant tool_call from its tool results.
-    while cut > start and (
-        messages[cut].get("role") == "tool" or is_anthropic_tool_result(messages[cut])
-    ):
-        cut -= 1
+    cut = _recent_group_start(messages, start, AUTO_COMPACT_KEEP_RECENT)
     if cut - start < 4:
         return False  # too little old history to be worth an LLM call
     old = messages[start:cut]
@@ -327,18 +439,22 @@ def auto_compact(
     transcript = "\n".join(lines)
     if not transcript.strip():
         return False
-    # Keep the summary request itself well inside the window.
-    transcript = truncate_middle(transcript, int(limit * 2))
-
-    summary_messages = [
-        {"role": "system", "content": _COMPACT_SYSTEM_PROMPT},
-        {"role": "user", "content": transcript},
-    ]
     # Compaction is a side task: run it on the weak model when configured
     # (plan 2.7) so the main model's KV cache and VRAM stay untouched.
     summary_fn, summary_config = side_task_fn(config, raw_fn, config)
     if summary_fn is None:
         return False
+    summary_provider = str(
+        (summary_config or {}).get("provider", provider) or provider
+    ).lower()
+    summary_limit = get_context_limit(summary_provider, summary_config)
+    # Size the transcript for the side model, which may have a much smaller
+    # context than the main model.
+    transcript = truncate_middle(transcript, int(summary_limit * 2))
+    summary_messages = [
+        {"role": "system", "content": _COMPACT_SYSTEM_PROMPT},
+        {"role": "user", "content": transcript},
+    ]
     try:
         response = summary_fn(summary_config, summary_messages, None)
     except Exception:
@@ -349,12 +465,10 @@ def auto_compact(
     if not summary:
         return False
 
-    note = {
-        "role": "system",
-        "content": f"[Earlier conversation summarized]\n{summary}",
-    }
-    kept_recent = messages[cut:]
-    new_messages = ([messages[0]] if has_system else []) + [note] + kept_recent
+    kept_recent = _prepend_history_note(
+        list(messages[cut:]), f"Summary:\n{summary}"
+    )
+    new_messages = ([messages[0]] if has_system else []) + kept_recent
     messages.clear()
     messages.extend(new_messages)
     return True
@@ -385,29 +499,114 @@ def compress_context(
     config: Optional[dict] = None,
 ) -> List[dict]:
     limit = get_context_limit(provider, config)
-    if estimate_tokens(messages, tools) <= limit:
+    key = calibration_key(provider, config)
+    if estimate_tokens(messages, tools, key=key) <= limit:
         return messages
-    if len(messages) <= 5:
-        return [summarize_message(message) for message in messages]
-    system = messages[0]
-    recent = messages[-4:]
-    middle = messages[1:-4]
-    compressed = [system] + [summarize_message(message) for message in middle] + recent
-    if estimate_tokens(compressed, tools) <= limit:
-        return compressed
-    while middle and estimate_tokens([system] + [summarize_message(message) for message in middle] + recent, tools) > limit:
-        middle.pop(0)
-    if middle:
-        note = {"role": "system", "content": f"[Earlier conversation compressed — {len(messages) - len(middle) - 5} messages summarized]"}
-        return [system, note] + [summarize_message(message) for message in middle] + recent
-    note = {"role": "system", "content": f"[Conversation history compressed — {len(messages) - 5} older messages dropped to fit context]"}
-    return [system, note] + [summarize_message(message) for message in recent]
+    has_system = bool(messages) and messages[0].get("role") == "system"
+    start = 1 if has_system else 0
+    system = [messages[0]] if has_system else []
+    spans = _history_group_spans(messages, start)
+    groups = [
+        [summarize_message(message) for message in messages[begin:end]]
+        for begin, end in spans
+    ]
+    dropped_messages = 0
+
+    def candidate() -> List[dict]:
+        body = [message for group in groups for message in group]
+        if dropped_messages:
+            body = _prepend_history_note(
+                body,
+                f"{dropped_messages} older messages were dropped to fit "
+                "the active model context window.",
+            )
+        return system + body
+
+    compressed = candidate()
+    while (
+        len(groups) > 1
+        and estimate_tokens(compressed, tools, key=key) > limit
+    ):
+        dropped_messages += len(groups.pop(0))
+        compressed = candidate()
+    return compressed
+
+
+def canonical_tool_call(raw: dict, index: int) -> dict:
+    """Coerce one tool call into the canonical OpenAI history shape."""
+    fn = (raw or {}).get("function")
+    if not isinstance(fn, dict):
+        fn = {}
+    name = fn.get("name") or (raw or {}).get("name") or ""
+    if "arguments" in fn:
+        args = fn["arguments"]
+    elif "arguments" in (raw or {}):
+        args = (raw or {})["arguments"]
+    else:
+        args = "{}"
+    if isinstance(args, (dict, list)):
+        args = json.dumps(args)
+    elif args is None or not isinstance(args, str):
+        args = json.dumps(args)
+    if not args.strip():
+        args = "{}"
+    return {
+        "id": str((raw or {}).get("id") or f"call_{index}"),
+        "type": "function",
+        "function": {"name": name, "arguments": args},
+    }
+
+
+def _existing_tool_call_ids(messages: List[dict]) -> set:
+    ids = set()
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            if isinstance(tool_call, dict) and tool_call.get("id"):
+                ids.add(str(tool_call["id"]))
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("id")
+                ):
+                    ids.add(str(block["id"]))
+    return ids
+
+
+def canonicalize_tool_calls(
+    raw_tool_calls: Any, messages: Optional[List[dict]] = None
+) -> List[dict]:
+    """Canonicalize calls once, assigning collision-free IDs before execution."""
+    if isinstance(raw_tool_calls, dict):
+        raw_tool_calls = [raw_tool_calls]
+    if not isinstance(raw_tool_calls, list):
+        return []
+    used = _existing_tool_call_ids(messages or [])
+    canonical: List[dict] = []
+    for index, raw in enumerate(raw_tool_calls):
+        if not isinstance(raw, dict):
+            raw = {"name": "", "arguments": raw}
+        tool_call = canonical_tool_call(raw, index)
+        tool_id = str(raw.get("id") or "")
+        if not tool_id or tool_id in used:
+            tool_id = f"call_{uuid.uuid4().hex}"
+        tool_call["id"] = tool_id
+        used.add(tool_id)
+        canonical.append(tool_call)
+    return canonical
 
 
 def append_results_openai(messages: List[dict], response: dict, results: List[dict]):
     assistant_message: Dict[str, Any] = {"role": "assistant", "content": response.get("content") or ""}
-    if response.get("tool_calls"):
-        assistant_message["tool_calls"] = response["tool_calls"]
+    raw_tool_calls = response.get("tool_calls")
+    if raw_tool_calls:
+        assistant_message["tool_calls"] = [
+            canonical_tool_call(tool_call, index)
+            for index, tool_call in enumerate(raw_tool_calls)
+            if isinstance(tool_call, dict)
+        ]
     messages.append(assistant_message)
     for result in results:
         messages.append({"role": "tool", "tool_call_id": result["id"], "content": result["content"]})
@@ -760,6 +959,25 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
         if content.strip():
             normalized.append({"role": role, "content": content})
         i += 1
+    if provider in ("ollama", "custom"):
+        # Local Jinja templates generally require exactly one leading system
+        # role. Convert legacy mid-history system notes into ordinary context
+        # rather than sending an invalid role sequence.
+        leading_system = None
+        body = []
+        for message in normalized:
+            if message.get("role") != "system":
+                body.append(message)
+                continue
+            text = str(message.get("content") or "")
+            if leading_system is None and not body:
+                leading_system = {"role": "system", "content": text}
+            else:
+                body.append({
+                    "role": "user",
+                    "content": f"[conversation context]\n{text}",
+                })
+        return ([leading_system] if leading_system else []) + body
     return normalized
 
 
@@ -879,6 +1097,11 @@ TOOL_CALL_REMINDER = (
     "blocks. Either call a tool natively or reply in plain prose."
 )
 
+TOOL_CALL_EXEMPLAR_INSTRUCTION = (
+    "The following short exchange is a format example. Tool use must be sent "
+    "through native structured tool_calls, never written as JSON/XML/text."
+)
+
 # Prefixes that mark content as a *textual* tool-call attempt rather than an
 # ordinary reply (mirrors providers._TEXTUAL_TOOL_MARKERS).
 _TEXTUAL_TOOL_CALL_PREFIXES = ("{", "[", "<tool_call", "<function_calls", "```")
@@ -928,10 +1151,19 @@ def build_tool_call_exemplar(provider: str) -> List[dict]:
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"function": {"name": "local_shell", "arguments": {"command": "date"}}}
+                {
+                    "function": {
+                        "name": "local_shell",
+                        "arguments": {"command": "printf conch-tool-example"},
+                    }
+                }
             ],
         }
-        result = {"role": "tool", "content": "Wed Jul 15 2026", "tool_name": "local_shell"}
+        result = {
+            "role": "tool",
+            "content": "conch-tool-example",
+            "tool_name": "local_shell",
+        }
     else:
         # OpenAI wire shape for custom endpoints: arguments MUST be a JSON
         # string and results link via tool_call_id — strict backends (e.g.
@@ -942,23 +1174,22 @@ def build_tool_call_exemplar(provider: str) -> List[dict]:
             "tool_calls": [{
                 "id": "exemplar_call_0",
                 "type": "function",
-                "function": {"name": "local_shell", "arguments": "{\"command\": \"date\"}"},
+                "function": {
+                    "name": "local_shell",
+                    "arguments": "{\"command\": \"printf conch-tool-example\"}",
+                },
             }],
         }
-        result = {"role": "tool", "content": "Wed Jul 15 2026", "tool_call_id": "exemplar_call_0"}
+        result = {
+            "role": "tool",
+            "content": "conch-tool-example",
+            "tool_call_id": "exemplar_call_0",
+        }
     return [
-        {
-            "role": "system",
-            "content": (
-                "The next four messages are a FORMAT EXAMPLE, not part of the "
-                "conversation — they show the ONLY correct way to call a tool: "
-                "as a native structured tool call, never as text."
-            ),
-        },
-        {"role": "user", "content": "(example) what is today's date?"},
+        {"role": "user", "content": "(format example) print a marker"},
         call,
         result,
-        {"role": "assistant", "content": "(example) Today is Wed Jul 15 2026."},
+        {"role": "assistant", "content": "(format example) Marker printed."},
     ]
 
 
@@ -966,11 +1197,22 @@ def _leading_system_count(messages: List[dict]) -> int:
     return 1 if messages and messages[0].get("role") == "system" else 0
 
 
+def _append_leading_system_context(messages: List[dict], text: str) -> None:
+    """Keep local chat templates to one leading system message."""
+    if messages and messages[0].get("role") == "system":
+        first = dict(messages[0])
+        first["content"] = str(first.get("content") or "") + "\n\n" + text
+        messages[0] = first
+    else:
+        messages.insert(0, {"role": "system", "content": text})
+
+
 def apply_tool_call_scaffolding(
     send_messages: List[dict],
     provider: str,
     config: Optional[dict],
     chat_state=None,
+    available_tool_names: Optional[set] = None,
 ) -> List[dict]:
     """Inject the few-shot exemplar (always, for local providers) and — when
     the session is drifting — the corrective reminder into a *copy-safe*
@@ -985,7 +1227,12 @@ def apply_tool_call_scaffolding(
     exemplar_enabled = str(cfg.get("local_tool_exemplar", "true")).strip().lower() not in (
         "false", "0", "no", "off",
     )
-    if exemplar_enabled:
+    if exemplar_enabled and (
+        available_tool_names is None or "local_shell" in available_tool_names
+    ):
+        _append_leading_system_context(
+            send_messages, TOOL_CALL_EXEMPLAR_INSTRUCTION
+        )
         insert_at = _leading_system_count(send_messages)
         exemplar = build_tool_call_exemplar(provider)
         if exemplar:
@@ -997,7 +1244,7 @@ def apply_tool_call_scaffolding(
         drift = int(getattr(chat_state, "textual_tool_calls", 0) or 0)
         force = bool(getattr(chat_state, "force_tool_reminder", False))
     if force or drift >= DRIFT_REMINDER_THRESHOLD:
-        send_messages.append({"role": "system", "content": TOOL_CALL_REMINDER})
+        _append_leading_system_context(send_messages, TOOL_CALL_REMINDER)
         if chat_state is not None:
             # One-shot force flag: consumed once the reminder is sent.
             chat_state.force_tool_reminder = False
@@ -1048,9 +1295,21 @@ def weak_model_config(config: Optional[dict]) -> Optional[dict]:
         return None
     cfg = dict(config)
     provider = str(config.get("weak_provider", "") or config.get("provider", "") or "").lower()
+    from .config import local_only_enabled
+
+    if local_only_enabled(config, config.get("provider", "")) and provider not in (
+        "ollama",
+        "custom",
+    ):
+        return None
     cfg["provider"] = provider
     cfg["model"] = weak
     cfg["chat_model"] = weak
+    from .providers import validate_model_for_provider
+
+    verified, _ = validate_model_for_provider(provider, weak, cfg)
+    if verified is not True:
+        return None
     return cfg
 
 
@@ -1101,6 +1360,229 @@ def _graceful_exhaustion(
     return f"{content}\n\n({reason} reached — reply to continue)"
 
 
+def select_request_tools(
+    tools: Optional[List[dict]],
+    provider: str,
+    messages: List[dict],
+    provider_tool_limits: Dict[str, int],
+) -> Optional[List[dict]]:
+    """Select the exact tools offered to the model for this request."""
+    send_tools = list(tools or [])
+    tool_limit = provider_tool_limits.get(provider)
+    if tool_limit and len(send_tools) > tool_limit:
+        from .tooling import select_relevant_tools
+
+        user_text = next(
+            (
+                message.get("content", "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+            ),
+            "",
+        )
+        send_tools = select_relevant_tools(send_tools, user_text, tool_limit)
+    return send_tools or None
+
+
+def _tool_name(tool: dict) -> str:
+    fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+    return str(fn.get("name") or "")
+
+
+def _schema_type_matches(value: Any, expected: str) -> bool:
+    if expected == "null":
+        return value is None
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return True
+
+
+def _validate_schema_value(
+    value: Any, schema: Any, path: str = "arguments", depth: int = 0
+) -> Optional[str]:
+    """Small dependency-free JSON Schema validator for tool inputs."""
+    if not isinstance(schema, dict) or depth > 16:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"{path} contains a non-finite number"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path} must be one of {schema['enum']!r}"
+    alternatives = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(alternatives, list) and alternatives:
+        errors = [
+            _validate_schema_value(value, option, path, depth + 1)
+            for option in alternatives
+        ]
+        if all(error is not None for error in errors):
+            return errors[0]
+        return None
+    expected = schema.get("type")
+    expected_types = expected if isinstance(expected, list) else [expected]
+    expected_types = [item for item in expected_types if isinstance(item, str)]
+    if expected_types and not any(
+        _schema_type_matches(value, item) for item in expected_types
+    ):
+        return f"{path} must be {' or '.join(expected_types)}"
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            missing = [key for key in required if key not in value]
+            if missing:
+                return f"{path} is missing required field(s): {', '.join(missing)}"
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            for key, item in value.items():
+                if key in properties:
+                    error = _validate_schema_value(
+                        item, properties[key], f"{path}.{key}", depth + 1
+                    )
+                    if error:
+                        return error
+                elif schema.get("additionalProperties") is False:
+                    return f"{path} contains unsupported field: {key}"
+    elif isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for index, item in enumerate(value):
+            error = _validate_schema_value(
+                item, schema["items"], f"{path}[{index}]", depth + 1
+            )
+            if error:
+                return error
+    return None
+
+
+def parse_and_validate_tool_arguments(
+    tool_call: dict, tool_definition: dict
+) -> tuple:
+    fn = tool_call.get("function", {})
+    raw_arguments = fn.get("arguments")
+    if isinstance(raw_arguments, str):
+        if len(raw_arguments) > 262144:
+            return None, "arguments exceed the 262144-character safety limit"
+
+        def reject_constant(value):
+            raise ValueError(f"non-JSON numeric constant {value}")
+
+        def reject_duplicate_keys(pairs):
+            parsed = {}
+            for key, value in pairs:
+                if key in parsed:
+                    raise ValueError(f"duplicate object key {key!r}")
+                parsed[key] = value
+            return parsed
+
+        try:
+            arguments = json.loads(
+                raw_arguments,
+                parse_constant=reject_constant,
+                object_pairs_hook=reject_duplicate_keys,
+            )
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            detail = getattr(exc, "msg", str(exc))
+            return None, f"arguments are not valid JSON: {detail}"
+    elif isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    else:
+        return None, "arguments must be a JSON object"
+    if not isinstance(arguments, dict):
+        return None, "arguments must be a JSON object"
+    try:
+        normalized = json.dumps(
+            arguments, ensure_ascii=False, allow_nan=False
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        return None, f"arguments are not valid JSON: {exc}"
+    if len(normalized) > 262144:
+        return None, "arguments exceed the 262144-character safety limit"
+    parameters = (
+        tool_definition.get("function", {}).get("parameters", {})
+        if isinstance(tool_definition, dict)
+        else {}
+    )
+    error = _validate_schema_value(arguments, parameters)
+    return (None, error) if error else (arguments, None)
+
+
+def _tool_batch_fingerprint(tool_calls: List[dict]) -> str:
+    items = []
+    for tool_call in tool_calls:
+        fn = tool_call.get("function", {})
+        raw = fn.get("arguments", "{}")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            raw = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raw = str(raw)
+        items.append((str(fn.get("name") or ""), raw))
+    return json.dumps(items, ensure_ascii=False)
+
+
+def _sync_anthropic_tool_call_ids(response: dict, tool_calls: List[dict]) -> None:
+    blocks = response.get("_anthropic_content")
+    if not isinstance(blocks, list):
+        blocks = []
+        if response.get("content"):
+            blocks.append({"type": "text", "text": response["content"]})
+        for tool_call in tool_calls:
+            fn = tool_call.get("function", {})
+            try:
+                arguments = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_call["id"],
+                    "name": fn.get("name", ""),
+                    "input": arguments,
+                }
+            )
+    call_index = 0
+    synced = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            if call_index >= len(tool_calls):
+                continue
+            block = dict(block)
+            block["id"] = tool_calls[call_index]["id"]
+            call_index += 1
+        synced.append(block)
+    response["_anthropic_content"] = synced
+
+
+_AGENT_TURN_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def serialized_agent_execution():
+    """Serialize inference/agent state that is still process-global."""
+    with _AGENT_TURN_LOCK:
+        yield
+
+
+def _serialized_agent_turn(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        # Conch currently has process-global shell policy, cwd, and runtime
+        # clients. Serialize turns until those become explicit per-session
+        # capabilities. RLock permits same-thread delegation.
+        with serialized_agent_execution():
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
+@_serialized_agent_turn
 def chat_turn(
     config: dict,
     provider: str,
@@ -1128,6 +1610,20 @@ def chat_turn(
         token_budget = int(config.get("turn_token_budget", 0) or 0)
     except (TypeError, ValueError):
         token_budget = 0
+    try:
+        max_identical_batches = max(
+            2, int(config.get("max_identical_tool_batches", 3) or 3)
+        )
+    except (TypeError, ValueError):
+        max_identical_batches = 3
+    try:
+        max_parallel_tool_calls = max(
+            1, int(config.get("max_parallel_tool_calls", 16) or 16)
+        )
+    except (TypeError, ValueError):
+        max_parallel_tool_calls = 16
+    previous_batch = ""
+    identical_batches = 0
     for _round in range(max_tool_rounds):
         if (
             token_budget
@@ -1149,15 +1645,22 @@ def chat_turn(
         if chat_state and getattr(chat_state, "needs_tool_refresh", False):
             tools = chat_state.tools
             chat_state.needs_tool_refresh = False
+        send_tools = select_request_tools(
+            tools, provider, messages, PROVIDER_TOOL_LIMITS
+        )
         # Model-generated compaction first (plan 1.4); char-capping
         # compress_context stays as the cheap backstop below.
         if raw_fn is not None:
             try:
-                if auto_compact(messages, tools, provider, config, raw_fn):
+                if auto_compact(
+                    messages, send_tools, provider, config, raw_fn
+                ):
                     print("  \033[2m(older history auto-compacted)\033[0m", file=sys.stderr)
             except Exception:
                 pass
-        compressed = compress_context(messages, tools, provider, config)
+        compressed = compress_context(
+            messages, send_tools, provider, config
+        )
         if len(compressed) < len(messages):
             messages.clear()
             messages.extend(compressed)
@@ -1165,10 +1668,33 @@ def chat_turn(
                 sanitize_anthropic_messages(messages)
         send_messages = normalize_messages_for_provider(messages, provider)
 
+        # Keep model-facing self-knowledge accurate after fallback and after a
+        # local server reports its loaded context. This is request-scoped so
+        # persisted history remains portable.
+        from .prompts import build_self_description
+
+        active_model = config.get(
+            "chat_model", config.get("model", "")
+        )
+        _append_leading_system_context(
+            send_messages,
+            "[Current runtime state] "
+            + build_self_description(
+                provider, active_model, config
+            ),
+        )
+
         # Few-shot tool-call anchor + corrective reminder for local models
         # (transient: added to the request only, never persisted).
+        available_tool_names = {
+            _tool_name(tool) for tool in (send_tools or []) if _tool_name(tool)
+        }
         send_messages = apply_tool_call_scaffolding(
-            send_messages, provider, config, chat_state
+            send_messages,
+            provider,
+            config,
+            chat_state,
+            available_tool_names,
         )
 
         # Re-inject the plan scratchpad every round (plan 2.5) — it lives
@@ -1176,32 +1702,7 @@ def chat_turn(
         todo_client = (builtin_clients or {}).get("todo_list")
         todo_block = todo_client.render() if hasattr(todo_client, "render") else ""
         if todo_block:
-            if provider == "anthropic":
-                # Anthropic takes one system string; append to it.
-                if send_messages and send_messages[0].get("role") == "system":
-                    send_messages[0] = dict(send_messages[0])
-                    send_messages[0]["content"] = (
-                        str(send_messages[0]["content"]) + "\n\n" + todo_block
-                    )
-                else:
-                    send_messages.insert(0, {"role": "system", "content": todo_block})
-            else:
-                # Trailing system message: keeps the KV prefix intact and the
-                # plan close to the model's attention.
-                send_messages.append({"role": "system", "content": todo_block})
-
-        send_tools = tools
-        tool_limit = PROVIDER_TOOL_LIMITS.get(provider)
-        if tool_limit and send_tools and len(send_tools) > tool_limit:
-            # Over the provider cap: keep pinned tools and fill the rest by
-            # relevance to the current user turn (plan 1.6), not list order.
-            from .tooling import select_relevant_tools
-            user_text = next(
-                (m.get("content", "") for m in reversed(messages)
-                 if m.get("role") == "user" and isinstance(m.get("content"), str)),
-                "",
-            )
-            send_tools = select_relevant_tools(send_tools, user_text, tool_limit)
+            _append_leading_system_context(send_messages, todo_block)
 
         stream_fn = STREAM_FNS.get(provider) if on_token else None
         if stream_fn:
@@ -1218,9 +1719,10 @@ def chat_turn(
         # token count (Ollama reports prompt_eval_count on every response).
         if usage.get("input_tokens"):
             record_token_calibration(
-                char_count(send_messages, send_tools), usage["input_tokens"]
+                char_count(send_messages, send_tools),
+                usage["input_tokens"],
+                calibration_key(provider, config),
             )
-        content = response.get("content", "")
         if is_error_response(response) and on_token is not None:
             sp = getattr(on_token, "__self__", None)
             if isinstance(sp, StreamPrinter):
@@ -1229,16 +1731,25 @@ def chat_turn(
             # Retry once on same provider with 1s backoff (transient errors:
             # rate limits, 5xx, connection refused/timeout, missing model)
             if is_transient_error(error_detail(response)):
-                print(f"  \033[33m\u26a0 Transient error, retrying in 1s...\033[0m", file=sys.stderr)
+                print(
+                    "  \033[33m\u26a0 Transient error, retrying in "
+                    "1s...\033[0m",
+                    file=sys.stderr,
+                )
                 time.sleep(1)
                 if stream_fn:
-                    response = stream_fn(config, send_messages, tools if tools else None, on_token)
+                    response = stream_fn(
+                        config, send_messages, send_tools, on_token
+                    )
                 else:
                     with Spinner("Retrying"):
-                        response = raw_fn(config, send_messages, tools if tools else None)
+                        response = raw_fn(config, send_messages, send_tools)
                 usage = response.get("_usage", {})
                 total_usage["input_tokens"] += usage.get("input_tokens", 0)
                 total_usage["output_tokens"] += usage.get("output_tokens", 0)
+                total_usage["model"] = response.get(
+                    "_model", total_usage["model"]
+                )
             if is_error_response(response):
                 err_detail = error_detail(response)
                 print(f"  \033[33m⚠ {err_detail}\033[0m", file=sys.stderr)
@@ -1285,18 +1796,34 @@ def chat_turn(
                     if needs_ctx_switch:
                         normalize_messages_on_switch(messages, fb_provider)
                     fb_messages = normalize_messages_for_provider(messages, fb_provider)
-                    fb_tool_limit = PROVIDER_TOOL_LIMITS.get(fb_provider)
-                    fb_tools = tools
-                    if fb_tool_limit and fb_tools and len(fb_tools) > fb_tool_limit:
-                        from .tooling import select_relevant_tools as _select
-                        _user_text = next(
-                            (m.get("content", "") for m in reversed(messages)
-                             if m.get("role") == "user" and isinstance(m.get("content"), str)),
-                            "",
+                    fb_tools = select_request_tools(
+                        tools, fb_provider, messages, PROVIDER_TOOL_LIMITS
+                    )
+                    fb_tool_names = {
+                        _tool_name(tool)
+                        for tool in (fb_tools or [])
+                        if _tool_name(tool)
+                    }
+                    _append_leading_system_context(
+                        fb_messages,
+                        "[Current runtime state] "
+                        + build_self_description(
+                            fb_provider, fb_model, fb_config
+                        ),
+                    )
+                    fb_messages = apply_tool_call_scaffolding(
+                        fb_messages,
+                        fb_provider,
+                        fb_config,
+                        chat_state,
+                        fb_tool_names,
+                    )
+                    if todo_block:
+                        _append_leading_system_context(
+                            fb_messages, todo_block
                         )
-                        fb_tools = _select(fb_tools, _user_text, fb_tool_limit)
                     with Spinner(f"Retrying with {fb_provider}/{fb_model}"):
-                        response = fb_fn(fb_config, fb_messages, fb_tools if fb_tools else None)
+                        response = fb_fn(fb_config, fb_messages, fb_tools)
                     if not is_error_response(response):
                         provider = fb_provider
                         config["provider"] = fb_provider
@@ -1305,6 +1832,24 @@ def chat_turn(
                         config["model"] = fb_model
                         stream_fn = STREAM_FNS.get(provider) if on_token else None
                         raw_fn = RAW_FNS.get(provider)
+                        send_messages = fb_messages
+                        send_tools = fb_tools
+                        usage = response.get("_usage", {})
+                        total_usage["input_tokens"] += usage.get(
+                            "input_tokens", 0
+                        )
+                        total_usage["output_tokens"] += usage.get(
+                            "output_tokens", 0
+                        )
+                        total_usage["model"] = response.get(
+                            "_model", total_usage["model"]
+                        )
+                        if usage.get("input_tokens"):
+                            record_token_calibration(
+                                char_count(send_messages, send_tools),
+                                usage["input_tokens"],
+                                calibration_key(provider, config),
+                            )
                         break
                     failed_provider, failed_model = fb_provider, fb_model
             if is_error_response(response):
@@ -1329,67 +1874,154 @@ def chat_turn(
                 # backend before the next one (plan 3.3).
                 total_usage["error"] = final_detail
                 return "", total_usage
-        tool_calls = response.get("tool_calls")
+        raw_tool_calls = response.get("tool_calls")
+        too_many_tool_calls = (
+            isinstance(raw_tool_calls, list)
+            and len(raw_tool_calls) > max_parallel_tool_calls
+        )
+        if too_many_tool_calls:
+            raw_tool_calls = raw_tool_calls[:max_parallel_tool_calls]
+            total_usage["tool_protocol_error"] = (
+                f"more than {max_parallel_tool_calls} parallel tool calls"
+            )
+        tool_calls = canonicalize_tool_calls(raw_tool_calls, messages)
+        if tool_calls:
+            response["tool_calls"] = tool_calls
+            if provider == "anthropic":
+                _sync_anthropic_tool_call_ids(response, tool_calls)
         if on_token is not None:
             sp = getattr(on_token, "__self__", None)
             if hasattr(sp, "end_waiting"):
                 sp.end_waiting()
         if not tool_calls:
-            # Recovery only ever targets tools that actually exist this turn.
-            known_tool_names = set(builtin_clients or {}) | set(tool_map or {})
-            for t in tools or []:
-                tool_fn_name = t.get("function", {}).get("name", "")
-                if tool_fn_name:
-                    known_tool_names.add(tool_fn_name)
-            recovered = extract_textual_tool_use_blocks(
-                response.get("content", ""), known_tool_names
-            )
-            if not recovered:
-                reply = response.get("content", "")
-                # A reply that is itself a malformed/unregistered textual tool
-                # call is drift: recovery declined it and it will be persisted
-                # as prose. Flag it so the next turn gets the corrective
-                # reminder (the exemplar is already always present locally).
-                if looks_like_textual_tool_call(reply):
-                    note_textual_tool_call(chat_state)
-                    print(
-                        "  \033[2m(reply looks like a textual tool call — will "
-                        "reinforce native tool-calling next turn; /resettools "
-                        "to reset)\033[0m",
-                        file=sys.stderr,
-                    )
-                from .tooling import run_hook
-                run_hook("on_turn_end", {"reply": reply}, config)
-                return reply, total_usage
-            tool_calls = [{
-                "id": str(block.get("id")),
-                "type": "function",
-                "function": {
-                    "name": block.get("name", ""),
-                    "arguments": json.dumps(block.get("input", {})),
-                },
-            } for block in recovered]
-            response["tool_calls"] = tool_calls
-            if provider == "anthropic":
-                response["_anthropic_content"] = recovered
-            response["content"] = ""
-            # Recovery re-stores this as a structured tool_call (so replay is
-            # clean), but the model still *emitted* it as text — count it as
-            # drift so sustained textual calling triggers the reminder.
-            note_textual_tool_call(chat_state)
-            print("  \033[2m(recovered textual tool call)\033[0m", file=sys.stderr)
+            reply = response.get("content", "")
+            if looks_like_textual_tool_call(reply):
+                note_textual_tool_call(chat_state)
+                total_usage["tool_protocol_error"] = (
+                    "model emitted a textual tool call"
+                )
+                reply = (
+                    "The model emitted a textual tool call, so Conch did not "
+                    "execute it. Use a verified native tool-calling model and "
+                    "check the inference server's chat template."
+                )
+                print(
+                    "  \033[33m⚠ rejected textual tool call; nothing "
+                    "executed\033[0m",
+                    file=sys.stderr,
+                )
+            from .tooling import run_hook
+
+            run_hook("on_turn_end", {"reply": reply}, config)
+            return reply, total_usage
+
+        fingerprint = _tool_batch_fingerprint(tool_calls)
+        if fingerprint == previous_batch:
+            identical_batches += 1
+        else:
+            previous_batch = fingerprint
+            identical_batches = 1
+
+        tool_definitions = {
+            _tool_name(tool): tool
+            for tool in (send_tools or [])
+            if _tool_name(tool)
+        }
+        allowed_tool_names = set(tool_definitions)
+        round_result_budget = max(
+            256,
+            int(
+                get_context_limit(provider, config)
+                * get_chars_per_token(calibration_key(provider, config))
+                * TOOL_RESULT_BUDGET_FRACTION
+            ),
+        )
+        shell_client = (builtin_clients or {}).get("local_shell")
+        if hasattr(shell_client, "set_result_budget"):
+            shell_client.set_result_budget(round_result_budget)
+        remaining_result_budget = round_result_budget
+        remaining_result_count = len(tool_calls)
         results = []
+
+        def add_result(tool_call: dict, result_text: Any) -> None:
+            nonlocal remaining_result_budget, remaining_result_count
+            share = max(
+                1,
+                remaining_result_budget // max(1, remaining_result_count),
+            )
+            bounded = truncate_middle(str(result_text), share)
+            results.append(
+                {"id": tool_call["id"], "content": bounded}
+            )
+            remaining_result_budget = max(
+                0, remaining_result_budget - len(bounded)
+            )
+            remaining_result_count = max(0, remaining_result_count - 1)
+
+        if too_many_tool_calls:
+            reason = (
+                f"Rejected tool batch: the model exceeded the "
+                f"{max_parallel_tool_calls}-call per-round safety limit."
+            )
+            for tool_call in tool_calls:
+                add_result(tool_call, reason)
+            if provider == "anthropic":
+                append_results_anthropic(messages, response, results)
+            else:
+                append_results_openai(messages, response, results)
+            continue
+
+        if identical_batches >= max_identical_batches:
+            reason = (
+                "Rejected repeated identical tool-call batch; inspect the "
+                "previous results and choose a different next action."
+            )
+            for tool_call in tool_calls:
+                add_result(tool_call, reason)
+            if provider == "anthropic":
+                append_results_anthropic(messages, response, results)
+            else:
+                append_results_openai(messages, response, results)
+            if identical_batches > max_identical_batches:
+                return (
+                    "Stopped this turn because the model repeatedly requested "
+                    "the same tool calls without making progress.",
+                    total_usage,
+                )
+            continue
+
+        from .tooling import run_hook
+
         for tool_call in tool_calls:
             fn = tool_call.get("function", {})
-            name = fn.get("name", "unknown")
-            try:
-                arguments = json.loads(fn.get("arguments", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                arguments = {}
+            name = str(fn.get("name") or "")
+            if name not in allowed_tool_names:
+                result_text = (
+                    f"Rejected tool call: {name or '(missing name)'} was not "
+                    "offered to the model for this request."
+                )
+                print(
+                    f"  \033[33m⚠ blocked unoffered tool "
+                    f"{name or '(missing name)'}\033[0m",
+                    file=sys.stderr,
+                )
+                add_result(tool_call, result_text)
+                continue
+            arguments, argument_error = parse_and_validate_tool_arguments(
+                tool_call, tool_definitions[name]
+            )
+            if argument_error:
+                result_text = f"Rejected tool arguments for {name}: {argument_error}"
+                print(
+                    f"  \033[33m⚠ invalid arguments for {name}: "
+                    f"{argument_error}\033[0m",
+                    file=sys.stderr,
+                )
+                add_result(tool_call, result_text)
+                continue
             _print_tool_preview(name, arguments, verbose=_verbose_tools)
             # pre_tool_use hook (plan 2.2): deterministic gate around the
             # loop — non-zero exit blocks, JSON stdout rewrites arguments.
-            from .tooling import run_hook
             allowed, hook_out = run_hook(
                 "pre_tool_use", {"tool": name, "arguments": arguments}, config
             )
@@ -1397,27 +2029,69 @@ def chat_turn(
                 reason = hook_out or "blocked by pre_tool_use hook"
                 result_text = f"Blocked by pre_tool_use hook: {reason}"
                 print(f"  \033[33m⚠ {name} blocked by hook\033[0m", file=sys.stderr)
-                results.append({"id": tool_call.get("id", ""), "content": result_text})
+                add_result(tool_call, result_text)
                 continue
             if hook_out:
                 try:
                     rewritten = json.loads(hook_out)
                 except json.JSONDecodeError:
                     rewritten = None
-                if isinstance(rewritten, dict):
-                    arguments = rewritten
-                    print("  \033[2m(arguments rewritten by pre_tool_use hook)\033[0m",
-                          file=sys.stderr)
+                if not isinstance(rewritten, dict):
+                    add_result(
+                        tool_call,
+                        f"Rejected tool call {name}: pre_tool_use hook returned "
+                        "invalid replacement arguments.",
+                    )
+                    continue
+                rewrite_error = _validate_schema_value(
+                    rewritten,
+                    tool_definitions[name]
+                    .get("function", {})
+                    .get("parameters", {}),
+                )
+                if rewrite_error:
+                    add_result(
+                        tool_call,
+                        f"Rejected rewritten arguments for {name}: "
+                        f"{rewrite_error}",
+                    )
+                    continue
+                arguments = rewritten
+                print("  \033[2m(arguments rewritten by pre_tool_use hook)\033[0m",
+                      file=sys.stderr)
             try:
                 if name in builtin_clients:
                     raw_result = builtin_clients[name].call_tool(name, arguments)
-                    result_text = raw_result.get("content", [{}])[0].get("text", "")
-                else:
+                    content_blocks = raw_result.get("content", [])
+                    if isinstance(content_blocks, list):
+                        result_text = "\n".join(
+                            str(
+                                block.get("text", block.get("content", ""))
+                                if isinstance(block, dict)
+                                else block
+                            )
+                            for block in content_blocks
+                        ).strip()
+                    else:
+                        result_text = str(content_blocks)
+                elif name in tool_map:
                     with Spinner(f"Running {name}"):
                         result_text = mcp_mod.execute_tool(tool_map, name, arguments)
+                else:
+                    result_text = (
+                        f"Error: {name} is no longer connected. Refresh tools "
+                        "and try again."
+                    )
             except KeyboardInterrupt:
                 result_text = "Tool execution cancelled by user."
                 print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
+            except Exception as exc:
+                result_text = f"Error executing {name}: {exc}"
+                print(
+                    f"  \033[31m✗ {name} failed: {exc}\033[0m",
+                    file=sys.stderr,
+                )
+            result_text = str(result_text or "(no output)")
             run_hook(
                 "post_tool_use",
                 {"tool": name, "arguments": arguments, "result": result_text},
@@ -1425,10 +2099,7 @@ def chat_turn(
             )
             is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
             _print_tool_result(result_text, verbose=_verbose_tools, error=is_error)
-            # Budget scaled to the model's context window (plan 1.5), not a
-            # fixed char cap; keeps head + tail of oversized output.
-            result_text = truncate_tool_result(result_text, provider, config)
-            results.append({"id": tool_call.get("id", ""), "content": result_text})
+            add_result(tool_call, result_text)
         if provider == "anthropic":
             append_results_anthropic(messages, response, results)
         else:

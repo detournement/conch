@@ -84,7 +84,7 @@ class TestProfileToolFilter(unittest.TestCase):
         with patch("conch.tooling.load_tool_prefs", return_value={}):
             filtered, desc = profile_tool_filter("minimal", tools, tool_map)
         names = {t["function"]["name"] for t in filtered}
-        self.assertEqual(names, {"local_shell", "save_memory"})
+        self.assertEqual(names, {"local_shell"})
 
     def test_config_profile_selects_groups(self):
         tools, tool_map = self._tools()

@@ -46,8 +46,9 @@ class TestCompressContext(unittest.TestCase):
         for i in range(100):
             msgs.append({"role": "user", "content": "x" * 10000})
             msgs.append({"role": "assistant", "content": "y" * 10000})
+        before = estimate_tokens(msgs)
         result = compress_context(msgs, None, "ollama")
-        self.assertLess(len(result), len(msgs))
+        self.assertLess(estimate_tokens(result), before)
 
     def test_keeps_system_and_recent(self):
         msgs = [{"role": "system", "content": "sys"}]

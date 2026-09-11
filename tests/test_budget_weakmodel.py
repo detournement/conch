@@ -118,7 +118,21 @@ class TestWeakModelConfig(unittest.TestCase):
         self.assertIsNone(weak_model_config({}))
         self.assertIsNone(weak_model_config({"weak_model": "  "}))
 
-    def test_same_provider_by_default(self):
+    @patch(
+        "conch.providers.validate_model_for_provider",
+        return_value=(False, "not tool capable"),
+    )
+    def test_unverified_weak_model_is_rejected(self, _validate):
+        self.assertIsNone(weak_model_config({
+            "provider": "ollama",
+            "weak_model": "plain-model",
+        }))
+
+    @patch(
+        "conch.providers.validate_model_for_provider",
+        return_value=(True, ""),
+    )
+    def test_same_provider_by_default(self, _validate):
         cfg = weak_model_config({
             "provider": "ollama", "chat_model": "qwen3.5:122b",
             "weak_model": "qwen3-8b",
@@ -127,14 +141,22 @@ class TestWeakModelConfig(unittest.TestCase):
         self.assertEqual(cfg["chat_model"], "qwen3-8b")
         self.assertEqual(cfg["model"], "qwen3-8b")
 
-    def test_weak_provider_override(self):
+    @patch(
+        "conch.providers.validate_model_for_provider",
+        return_value=(True, ""),
+    )
+    def test_weak_provider_override(self, _validate):
         cfg = weak_model_config({
             "provider": "anthropic", "weak_model": "qwen3-8b",
             "weak_provider": "ollama",
         })
         self.assertEqual(cfg["provider"], "ollama")
 
-    def test_parent_config_untouched(self):
+    @patch(
+        "conch.providers.validate_model_for_provider",
+        return_value=(True, ""),
+    )
+    def test_parent_config_untouched(self, _validate):
         parent = {"provider": "ollama", "chat_model": "big", "weak_model": "small"}
         weak_model_config(parent)
         self.assertEqual(parent["chat_model"], "big")
@@ -146,7 +168,11 @@ class TestSideTaskFn(unittest.TestCase):
         fn, cfg = side_task_fn({"provider": "ollama"}, sentinel_fn, {"provider": "ollama"})
         self.assertIs(fn, sentinel_fn)
 
-    def test_weak_model_selected(self):
+    @patch(
+        "conch.providers.validate_model_for_provider",
+        return_value=(True, ""),
+    )
+    def test_weak_model_selected(self, _validate):
         from conch.providers import RAW_FNS
         fn, cfg = side_task_fn(
             {"provider": "ollama", "weak_model": "qwen3-8b"}, object(), {}
@@ -173,7 +199,9 @@ class TestWeakModelCompaction(unittest.TestCase):
         config = {"provider": "ollama", "chat_model": "qwen3.5:122b",
                   "weak_model": "qwen3-8b"}
         with patch("conch.runtime.get_context_limit", return_value=100), \
-             patch.dict("conch.providers.RAW_FNS", {"ollama": weak_raw_fn}):
+             patch.dict("conch.providers.RAW_FNS", {"ollama": weak_raw_fn}), \
+             patch("conch.providers.validate_model_for_provider",
+                   return_value=(True, "")):
             changed = auto_compact(msgs, None, "ollama", config, main_raw_fn)
         self.assertTrue(changed)
         self.assertEqual(seen["model"], "qwen3-8b")
@@ -205,7 +233,9 @@ class TestWeakModelCompaction(unittest.TestCase):
             {"role": "user", "content": "two"},
         ]
         config = {"provider": "ollama", "weak_model": "qwen3-8b"}
-        with patch.dict("conch.providers.RAW_FNS", {"ollama": weak_raw_fn}):
+        with patch.dict("conch.providers.RAW_FNS", {"ollama": weak_raw_fn}), \
+             patch("conch.providers.validate_model_for_provider",
+                   return_value=(True, "")):
             _summarize_and_save(messages, config, main_raw_fn, memory)
         self.assertEqual(seen["model"], "qwen3-8b")
         self.assertEqual(len(memory.saved), 1)

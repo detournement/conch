@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
+import ipaddress
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -104,7 +109,7 @@ PROVIDER_TOOL_LIMITS = {
     # relevant tools per turn (see tooling.select_relevant_tools).
     "ollama": 12,
     # Custom endpoints usually front local models too — stay conservative.
-    "custom": 32,
+    "custom": 12,
 }
 
 # Used for `/provider` and tool `set_provider` — stable defaults, not KNOWN_MODELS[0].
@@ -196,9 +201,49 @@ PROVIDER_DEFAULT_CONTEXT_WINDOWS = {
 OLLAMA_TAGS_TIMEOUT = 2.0  # short so the UI never hangs on an unreachable server
 _OLLAMA_TAGS_TTL_OK = 30.0
 _OLLAMA_TAGS_TTL_FAIL = 5.0
-_ollama_tags_cache: Dict[str, tuple] = {}  # base_url -> (fetched_at, models-or-None)
-_ollama_caps_cache: Dict[tuple, tuple] = {}  # (base_url, model) -> (checked_at, supports_tools-or-None)
-_ollama_ctx_cache: Dict[tuple, tuple] = {}  # (base_url, model) -> (checked_at, context_length-or-None)
+_ollama_tags_cache: Dict[str, tuple] = {}  # base_url -> (fetched_at, records-or-None)
+_ollama_caps_cache: Dict[tuple, tuple] = {}  # (base_url, digest) -> (checked_at, bool-or-None)
+_ollama_ctx_cache: Dict[tuple, tuple] = {}  # (base_url, digest) -> (checked_at, context-or-None)
+_ollama_show_cache: Dict[tuple, tuple] = {}  # (base_url, digest) -> (checked_at, payload-or-None)
+_ollama_ps_cache: Dict[str, tuple] = {}  # base_url -> (checked_at, payload-or-None)
+_local_model_cache_lock = threading.RLock()
+
+
+def is_local_inference_url(url: str) -> bool:
+    """Conservative local/LAN URL check used by local_only mode."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not hostname:
+        return False
+    if hostname in ("localhost", "host.docker.internal"):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+        return not address.is_global
+    except ValueError:
+        pass
+    return (
+        "." not in hostname
+        or hostname.endswith(
+            (".local", ".lan", ".internal", ".home.arpa")
+        )
+    )
+
+
+def local_endpoint_policy_error(
+    provider: str, url: str, config: Optional[dict]
+) -> str:
+    from .config import local_only_enabled
+
+    if local_only_enabled(config or {}, provider) and not is_local_inference_url(url):
+        return (
+            f"local_only blocks non-local {provider} endpoint {url}; "
+            "set local_only=false only if this is intentional"
+        )
+    return ""
 
 
 def get_ollama_base_url(config: Optional[dict] = None) -> str:
@@ -230,6 +275,103 @@ def _ollama_show(model: str, base_url: str, timeout: float) -> dict:
         return json.loads(response.read().decode())
 
 
+def _ollama_model_records(
+    config: Optional[dict] = None,
+    *,
+    timeout: float = OLLAMA_TAGS_TIMEOUT,
+    force_refresh: bool = False,
+) -> Optional[List[dict]]:
+    base_url = get_ollama_base_url(config)
+    if local_endpoint_policy_error("ollama", base_url, config):
+        return None
+    now = time.monotonic()
+    with _local_model_cache_lock:
+        cached = _ollama_tags_cache.get(base_url)
+        if cached is not None and not force_refresh:
+            fetched_at, records = cached
+            ttl = (
+                _OLLAMA_TAGS_TTL_OK
+                if records is not None
+                else _OLLAMA_TAGS_TTL_FAIL
+            )
+            if now - fetched_at < ttl:
+                return records
+    try:
+        with urllib.request.urlopen(
+            f"{base_url}/api/tags", timeout=timeout
+        ) as response:
+            data = json.loads(response.read().decode())
+        records = []
+        for item in data.get("models", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("model") or "").strip()
+            if not name:
+                continue
+            records.append(
+                {
+                    "name": name,
+                    "digest": str(item.get("digest") or "").strip(),
+                    "size": item.get("size"),
+                    "modified_at": item.get("modified_at"),
+                }
+            )
+    except Exception:
+        records = None
+    with _local_model_cache_lock:
+        _ollama_tags_cache[base_url] = (now, records)
+    return records
+
+
+def _resolve_ollama_record(model: str, records: List[dict]) -> Optional[dict]:
+    for record in records:
+        if record["name"] == model:
+            return record
+    if ":" not in model:
+        for record in records:
+            if record["name"].split(":", 1)[0] == model:
+                return record
+    return None
+
+
+def _ollama_show_cached(
+    model: str,
+    config: Optional[dict] = None,
+    *,
+    timeout: float = OLLAMA_TAGS_TIMEOUT,
+) -> tuple:
+    records = _ollama_model_records(config, timeout=timeout)
+    if records is None:
+        return None, None
+    record = _resolve_ollama_record(model, records)
+    if record is None:
+        return None, None
+    base_url = get_ollama_base_url(config)
+    identity = record.get("digest") or record["name"]
+    key = (base_url, identity)
+    now = time.monotonic()
+    with _local_model_cache_lock:
+        cached = _ollama_show_cache.get(key)
+        if cached is not None:
+            checked_at, payload = cached
+            ttl = (
+                _OLLAMA_TAGS_TTL_OK
+                if payload is not None
+                else _OLLAMA_TAGS_TTL_FAIL
+            )
+            if now - checked_at < ttl:
+                return payload, record
+    try:
+        payload = _ollama_show(record["name"], base_url, timeout)
+        if not isinstance(payload, dict):
+            payload = None
+    except Exception:
+        payload = None
+    with _local_model_cache_lock:
+        _ollama_show_cache[key] = (now, payload)
+    return payload, record
+
+
 def ollama_model_supports_tools(
     model: str,
     config: Optional[dict] = None,
@@ -238,30 +380,36 @@ def ollama_model_supports_tools(
 ) -> Optional[bool]:
     """Check via POST /api/show whether *model* advertises the "tools" capability.
 
-    Returns None when the server can't be asked. Positive/negative answers are
-    cached for the session (capabilities don't change for an installed model);
-    failures are retried after a short TTL.
+    Returns True only for an explicit ``tools`` capability. Missing capability
+    metadata is not guessed from templates: Conch supports only models the
+    configured server positively identifies as native tool callers.
     """
     base_url = get_ollama_base_url(config)
-    key = (base_url, model)
+    data, record = _ollama_show_cached(model, config, timeout=timeout)
+    if record is None:
+        return None
+    key = (base_url, record.get("digest") or record["name"])
     now = time.monotonic()
-    cached = _ollama_caps_cache.get(key)
+    with _local_model_cache_lock:
+        cached = _ollama_caps_cache.get(key)
     if cached is not None:
-        checked_at, supports = cached
-        if supports is not None or now - checked_at < _OLLAMA_TAGS_TTL_FAIL:
-            return supports
-    try:
-        data = _ollama_show(model, base_url, timeout)
-        caps = data.get("capabilities")
-        if isinstance(caps, list):
-            supports = "tools" in caps
-        else:
-            # Older Ollama servers don't report capabilities; fall back to
-            # checking whether the model's template renders tools.
-            supports = ".Tools" in (data.get("template") or "")
-    except Exception:
+        ttl = (
+            _OLLAMA_TAGS_TTL_OK
+            if cached[1] is not None
+            else _OLLAMA_TAGS_TTL_FAIL
+        )
+        if now - cached[0] < ttl:
+            return cached[1]
+    if data is None:
         supports = None
-    _ollama_caps_cache[key] = (now, supports)
+    else:
+        caps = data.get("capabilities")
+        supports = bool(
+            isinstance(caps, list)
+            and any(str(cap).lower() == "tools" for cap in caps)
+        )
+    with _local_model_cache_lock:
+        _ollama_caps_cache[key] = (now, supports)
     return supports
 
 
@@ -279,67 +427,182 @@ def get_ollama_context_length(
     short TTL, mirroring ollama_model_supports_tools.
     """
     base_url = get_ollama_base_url(config)
-    key = (base_url, model)
+    data, record = _ollama_show_cached(model, config, timeout=timeout)
+    if record is None:
+        return None
+    key = (base_url, record.get("digest") or record["name"])
     now = time.monotonic()
-    cached = _ollama_ctx_cache.get(key)
+    with _local_model_cache_lock:
+        cached = _ollama_ctx_cache.get(key)
     if cached is not None:
-        checked_at, ctx = cached
-        if ctx is not None or now - checked_at < _OLLAMA_TAGS_TTL_FAIL:
-            return ctx
+        ttl = (
+            _OLLAMA_TAGS_TTL_OK
+            if cached[1] is not None
+            else _OLLAMA_TAGS_TTL_FAIL
+        )
+        if now - cached[0] < ttl:
+            return cached[1]
     ctx = None
-    try:
-        data = _ollama_show(model, base_url, timeout)
+    if data is not None:
         # Older servers don't return model_info at all — treated as unknown.
         model_info = data.get("model_info") or {}
         for info_key, value in model_info.items():
             if info_key.endswith(".context_length") and isinstance(value, int) and value > 0:
                 ctx = value
                 break
-    except Exception:
-        ctx = None
-    _ollama_ctx_cache[key] = (now, ctx)
+    with _local_model_cache_lock:
+        _ollama_ctx_cache[key] = (now, ctx)
     return ctx
 
 
-# Default num_ctx sent on every Ollama request. Without an explicit num_ctx
-# Ollama silently defaults to a small window (4k under 24 GiB VRAM) and
-# truncates from the top, evicting the system prompt and tool schemas.
-DEFAULT_OLLAMA_NUM_CTX = 32768
-# Conservative default when the model's max context is unknown (older server
-# without model_info, or /api/show unreachable): a blind 32k num_ctx can make
-# the model fail to load or thrash on a modest machine, so don't gamble.
-DEFAULT_OLLAMA_NUM_CTX_UNKNOWN = 8192
+DEFAULT_OLLAMA_CONTEXT_WINDOW = 4096
 # keep_alive keeps the model loaded between turns so the KV cache survives.
 DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
 
 
-def get_ollama_num_ctx(model: str, config: Optional[dict] = None) -> int:
-    """The num_ctx actually sent on Ollama requests.
-
-    An explicit config ``ollama_num_ctx`` always wins (clamped to the model's
-    max context when the server reports it). Without config, the default is
-    min(32768, model max) — or a conservative 8192 when the model's max is
-    unknown, so an old/small local setup isn't asked for more KV cache than
-    it can handle. The runtime context window derives from this same number
-    so the token budget always matches what requests run with.
-    """
+def get_ollama_num_ctx(
+    model: str, config: Optional[dict] = None
+) -> Optional[int]:
+    """Return an explicit num_ctx override, or None for server-managed sizing."""
     try:
         num_ctx = int((config or {}).get("ollama_num_ctx", 0) or 0)
     except (TypeError, ValueError):
         num_ctx = 0
-    explicit = num_ctx > 0
+    if num_ctx <= 0:
+        return None
     model_max = get_ollama_context_length(model, config)
-    if not explicit:
-        num_ctx = DEFAULT_OLLAMA_NUM_CTX if model_max else DEFAULT_OLLAMA_NUM_CTX_UNKNOWN
     if model_max:
         num_ctx = min(num_ctx, model_max)
     return num_ctx
 
 
+def get_ollama_running_context(
+    model: str,
+    config: Optional[dict] = None,
+    *,
+    timeout: float = OLLAMA_TAGS_TIMEOUT,
+) -> Optional[int]:
+    """Read the effective loaded context from /api/ps when available."""
+    base_url = get_ollama_base_url(config)
+    if local_endpoint_policy_error("ollama", base_url, config):
+        return None
+    now = time.monotonic()
+    with _local_model_cache_lock:
+        cached = _ollama_ps_cache.get(base_url)
+        if cached is not None and now - cached[0] < _OLLAMA_TAGS_TTL_FAIL:
+            data = cached[1]
+        else:
+            data = None
+            cached = None
+    if cached is None:
+        try:
+            with urllib.request.urlopen(
+                f"{base_url}/api/ps", timeout=timeout
+            ) as response:
+                data = json.loads(response.read().decode())
+        except Exception:
+            data = None
+        with _local_model_cache_lock:
+            _ollama_ps_cache[base_url] = (now, data)
+    for item in (data or {}).get("models", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "")
+        if ollama_model_matches(model, [name]):
+            value = item.get("context_length")
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def get_ollama_effective_context(
+    model: str, config: Optional[dict] = None
+) -> int:
+    explicit = get_ollama_num_ctx(model, config)
+    if explicit:
+        return explicit
+    running = get_ollama_running_context(model, config)
+    if running:
+        return running
+    try:
+        configured = int(
+            (config or {}).get("ollama_context_window", 0) or 0
+        )
+    except (TypeError, ValueError):
+        configured = 0
+    model_max = get_ollama_context_length(model, config)
+    if configured > 0:
+        return min(configured, model_max) if model_max else configured
+    return min(
+        DEFAULT_OLLAMA_CONTEXT_WINDOW,
+        model_max or DEFAULT_OLLAMA_CONTEXT_WINDOW,
+    )
+
+
+def _config_float(
+    config: Optional[dict], key: str, default: float
+) -> float:
+    try:
+        return float((config or {}).get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _estimated_local_prompt_tokens(
+    messages: List[dict], tools: Optional[List[dict]]
+) -> int:
+    payload = json.dumps(
+        {"messages": messages, "tools": tools or []},
+        ensure_ascii=False,
+        default=str,
+    )
+    # Conservative before model-specific runtime calibration is available.
+    return max(1, (len(payload) + 2) // 3)
+
+
+def _clamp_output_to_context(
+    requested: int,
+    context_window: int,
+    messages: List[dict],
+    tools: Optional[List[dict]],
+) -> int:
+    prompt = _estimated_local_prompt_tokens(messages, tools)
+    safety = min(128, max(1, context_window // 20))
+    return max(1, min(requested, context_window - prompt - safety))
+
+
 def apply_ollama_request_options(body: Dict[str, Any], config: dict, model: str) -> None:
-    """Set options.num_ctx and keep_alive on an /api/chat request body."""
-    options = body.setdefault("options", {})
-    options["num_ctx"] = get_ollama_num_ctx(model, config)
+    """Apply explicit/local-friendly generation options to /api/chat."""
+    options: Dict[str, Any] = {}
+    num_ctx = get_ollama_num_ctx(model, config)
+    if num_ctx:
+        options["num_ctx"] = num_ctx
+    options["temperature"] = _config_float(
+        config,
+        "ollama_temperature",
+        _config_float(config, "temperature", 0.2),
+    )
+    try:
+        num_predict = int(
+            config.get(
+                "ollama_num_predict",
+                config.get("max_output_tokens", 0),
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        num_predict = 0
+    if num_predict > 0:
+        options["num_predict"] = num_predict
+    body["options"] = options
+    if "ollama_think" in config:
+        value = str(config.get("ollama_think", "")).strip().lower()
+        if value in ("true", "1", "yes", "on"):
+            body["think"] = True
+        elif value in ("false", "0", "no", "off"):
+            body["think"] = False
+        elif value:
+            body["think"] = value
     keep_alive = str((config or {}).get("ollama_keep_alive", "") or "").strip()
     body["keep_alive"] = keep_alive or DEFAULT_OLLAMA_KEEP_ALIVE
 
@@ -347,19 +610,15 @@ def apply_ollama_request_options(body: Dict[str, Any], config: dict, model: str)
 def get_context_window(provider: str, model: str, config: Optional[dict] = None) -> int:
     """Best-known context window (tokens) for *model* on *provider*.
 
-    Cloud providers use the static MODEL_CONTEXT_WINDOWS table. For Ollama
-    the effective window is whatever num_ctx requests run with (see
-    get_ollama_num_ctx), not the model's theoretical max.
+    Cloud providers use the static MODEL_CONTEXT_WINDOWS table. Ollama uses
+    an explicit num_ctx, the loaded /api/ps value, or a conservative pre-load
+    fallback. Custom providers use llama.cpp props/config metadata.
     """
     provider = (provider or "").lower()
     if provider == "ollama":
-        return get_ollama_num_ctx(model, config)
+        return get_ollama_effective_context(model, config)
     if provider == "custom":
-        try:
-            window = int((config or {}).get("custom_context_window", 0) or 0)
-        except (TypeError, ValueError):
-            window = 0
-        return window if window > 0 else PROVIDER_DEFAULT_CONTEXT_WINDOWS["custom"]
+        return get_custom_context_window(config, model)
     if model in MODEL_CONTEXT_WINDOWS:
         return MODEL_CONTEXT_WINDOWS[model]
     return PROVIDER_DEFAULT_CONTEXT_WINDOWS.get(provider, 128000)
@@ -374,41 +633,32 @@ def list_ollama_models(
 ) -> Optional[List[str]]:
     """Return model names installed on the Ollama server, or None if unreachable.
 
-    By default models known NOT to support tool calling (per /api/show
-    capabilities) are excluded, since Conch requires tool support. Models
-    whose support can't be determined (per-model /api/show failure on an
-    otherwise reachable server) are kept: wrongly filtering everything out
-    would make Conch unusable, while a wrongly kept model just fails one
-    request with a clear server error. Results (including failures) are
-    cached briefly per base URL so repeated UI actions don't re-hit the
-    network.
+    The default is fail closed: only models with a positive ``tools``
+    capability from /api/show are returned.
     """
-    base_url = get_ollama_base_url(config)
-    now = time.monotonic()
-    cached = _ollama_tags_cache.get(base_url)
-    if cached is not None and not force_refresh:
-        fetched_at, models = cached
-        ttl = _OLLAMA_TAGS_TTL_OK if models is not None else _OLLAMA_TAGS_TTL_FAIL
-        if now - fetched_at >= ttl:
-            cached = None
-    else:
-        cached = None
-    if cached is None:
-        try:
-            with urllib.request.urlopen(f"{base_url}/api/tags", timeout=timeout) as response:
-                data = json.loads(response.read().decode())
-            models = [m["name"] for m in data.get("models", []) if isinstance(m, dict) and m.get("name")]
-        except Exception:
-            models = None
-        _ollama_tags_cache[base_url] = (now, models)
-    else:
-        models = cached[1]
-    if models is None:
+    records = _ollama_model_records(
+        config, timeout=timeout, force_refresh=force_refresh
+    )
+    if records is None:
         return None
+    models = [record["name"] for record in records]
     if tool_capable_only:
+        workers = min(8, max(1, len(models)))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers
+        ) as pool:
+            support = list(
+                pool.map(
+                    lambda name: ollama_model_supports_tools(
+                        name, config, timeout=timeout
+                    ),
+                    models,
+                )
+            )
         models = [
-            m for m in models
-            if ollama_model_supports_tools(m, config, timeout=timeout) is not False
+            model
+            for model, supports in zip(models, support)
+            if supports is True
         ]
     return models
 
@@ -422,10 +672,8 @@ def suggest_models(model: str, candidates: List[str], limit: int = 3) -> List[st
 def validate_model_for_provider(provider: str, model: str, config: Optional[dict] = None) -> tuple:
     """Validate that *model* exists for *provider* on a switch.
 
-    Returns (ok, reason): True when valid; False when it must be rejected
-    (*reason* explains and suggests close matches); None when it can't be
-    verified (custom endpoints don't publish an enumerable list; unreachable
-    Ollama servers are reported by validate_ollama_model itself).
+    Returns (ok, reason): True when valid; False when it must be rejected;
+    None only when a live local service cannot be reached.
     """
     provider = (provider or "").lower()
     model = (model or "").strip()
@@ -434,8 +682,7 @@ def validate_model_for_provider(provider: str, model: str, config: Optional[dict
     if provider == "ollama":
         return validate_ollama_model(model, config)
     if provider == "custom":
-        return None, ("custom endpoints don't publish a model list — "
-                      "the name is taken as-is")
+        return validate_custom_model(model, config)
     known = KNOWN_MODELS.get(provider)
     if known is None:
         return None, f"unknown provider '{provider}'"
@@ -490,6 +737,11 @@ def validate_ollama_model(model: str, config: Optional[dict] = None) -> tuple:
     must be rejected, None when the server is unreachable. *reason* explains
     rejections.
     """
+    policy_error = local_endpoint_policy_error(
+        "ollama", get_ollama_base_url(config), config
+    )
+    if policy_error:
+        return False, policy_error
     installed = list_ollama_models(config, tool_capable_only=False)
     if installed is None:
         return None, f"Ollama server unreachable at {get_ollama_base_url(config)}"
@@ -498,7 +750,13 @@ def validate_ollama_model(model: str, config: Optional[dict] = None) -> tuple:
     resolved = model if model in installed else next(
         (name for name in installed if name.split(":", 1)[0] == model), model
     )
-    if ollama_model_supports_tools(resolved, config) is False:
+    support = ollama_model_supports_tools(resolved, config)
+    if support is not True:
+        if support is None:
+            return (
+                False,
+                f"model '{model}' has no verifiable native tool capability",
+            )
         return False, f"model '{model}' doesn't support tool calling"
     return True, ""
 
@@ -688,7 +946,15 @@ def _normalize_usage(data: dict, provider: str) -> dict:
     return {"input_tokens": 0, "output_tokens": 0}
 
 
-CROSS_PROVIDER_FALLBACK_ORDER = ["cerebras", "anthropic", "openai", "bedrock", "openrouter", "ollama"]
+CROSS_PROVIDER_FALLBACK_ORDER = [
+    "cerebras",
+    "anthropic",
+    "openai",
+    "bedrock",
+    "openrouter",
+    "ollama",
+    "custom",
+]
 
 
 def _has_key(provider: str) -> bool:
@@ -703,8 +969,7 @@ def _provider_models(provider: str, config: Optional[dict] = None) -> List[str]:
     if provider == "ollama":
         return list_ollama_models(config) or []
     if provider == "custom":
-        model = ((config or {}).get("custom_model") or "").strip()
-        return [model] if model else []
+        return list_custom_models(config) or []
     return KNOWN_MODELS.get(provider, [])
 
 
@@ -733,9 +998,15 @@ def get_fallback_chain(current_provider: str, current_model: str, config: Option
             if alt_model != current_model:
                 chain.append((current_provider, alt_model, False))
 
-    # Step 2: cross-provider fallbacks
+    # Step 2: cross-provider fallbacks. Local sessions are isolated from
+    # cloud providers by default; opting out requires local_only=false.
+    from .config import local_only_enabled
+
+    local_only = local_only_enabled(config or {}, current_provider)
     for provider in CROSS_PROVIDER_FALLBACK_ORDER:
         if provider == current_provider:
+            continue
+        if local_only and provider not in ("ollama", "custom"):
             continue
         if not _has_key(provider):
             continue
@@ -760,9 +1031,16 @@ def get_fallback_model(provider: str, config: Optional[dict] = None) -> str:
             return preferred
         return available[0] if available else ""
     if provider == "custom":
-        # The endpoint defines its model: custom_model in config, or "" when
-        # unconfigured (switching to custom is then rejected).
-        return ((config or {}).get("custom_model") or "").strip()
+        available = list_custom_models(config) or []
+        configured = (
+            (config or {}).get("custom_model")
+            or (config or {}).get("chat_model")
+            or (config or {}).get("model")
+            or ""
+        ).strip()
+        return configured if configured in available else (
+            available[0] if available else ""
+        )
     if provider in DEFAULT_CHAT_MODEL_BY_PROVIDER:
         return DEFAULT_CHAT_MODEL_BY_PROVIDER[provider]
     models = KNOWN_MODELS.get(provider, [])
@@ -952,11 +1230,19 @@ def _convert_ollama_tool_calls(raw_tool_calls: list) -> Optional[List[dict]]:
     Ollama returns ``function.arguments`` as a dict; some models/versions
     return a JSON string instead — handle both without double-encoding.
     """
-    if not raw_tool_calls:
+    if isinstance(raw_tool_calls, dict):
+        raw_tool_calls = [raw_tool_calls]
+    if not isinstance(raw_tool_calls, list) or not raw_tool_calls:
         return None
     tool_calls = []
     for i, tool_call in enumerate(raw_tool_calls):
-        fn = (tool_call or {}).get("function", {})
+        fn = (
+            tool_call.get("function", {})
+            if isinstance(tool_call, dict)
+            else {}
+        )
+        if not isinstance(fn, dict):
+            fn = {}
         arguments = fn.get("arguments", {})
         if isinstance(arguments, str):
             args_str = arguments if arguments.strip() else "{}"
@@ -976,6 +1262,9 @@ def _convert_ollama_tool_calls(raw_tool_calls: list) -> Optional[List[dict]]:
 def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     base_url = get_ollama_base_url(config)
     model = config.get("chat_model", config.get("model", "llama3.3"))
+    ok, reason = validate_ollama_model(model, config)
+    if ok is not True:
+        return error_response(reason or f"Ollama model '{model}' is not verified")
     body: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -983,7 +1272,14 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     }
     apply_ollama_request_options(body, config, model)
     if tools:
-        body["tools"] = tools
+        body["tools"] = _sanitize_tools_for_openai(tools)
+    if body.get("options", {}).get("num_predict"):
+        body["options"]["num_predict"] = _clamp_output_to_context(
+            body["options"]["num_predict"],
+            get_ollama_effective_context(model, config),
+            messages,
+            tools,
+        )
     req = urllib.request.Request(
         f"{base_url}/api/chat",
         data=json.dumps(body).encode(),
@@ -991,10 +1287,14 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with urllib.request.urlopen(
+            req, timeout=_config_float(config, "ollama_timeout", 120.0)
+        ) as response:
             data = json.loads(response.read().decode())
     except Exception as exc:
         return error_response(str(exc))
+    with _local_model_cache_lock:
+        _ollama_ps_cache.pop(base_url, None)
     message = data.get("message", {})
     return {
         "role": "assistant",
@@ -1257,9 +1557,33 @@ def stream_openrouter(config: dict, messages: list, tools=None, on_token=None) -
 #   custom_base_url=http://host:port/v1   (or base_url when provider=custom)
 #   custom_model=<model>                  (also accepts model/chat_model)
 #   api_key_env=<ENV VAR>                 (optional)
-# Custom endpoints are assumed tool-capable (tools-only directive), verified
-# by a startup probe.
+# Custom endpoints are enumerated and conformance-tested. Only models that
+# return a real native forced tool call are selectable.
 # ---------------------------------------------------------------------------
+
+CUSTOM_DISCOVERY_TIMEOUT = 3.0
+_CUSTOM_CACHE_TTL_OK = 60.0
+_CUSTOM_CACHE_TTL_FAIL = 5.0
+_custom_models_cache: Dict[str, tuple] = {}
+_custom_probe_cache: Dict[tuple, tuple] = {}
+_custom_props_cache: Dict[str, tuple] = {}
+
+
+def clear_local_model_caches() -> None:
+    """Clear live discovery/probe caches (used by refresh and tests)."""
+    with _local_model_cache_lock:
+        for cache in (
+            _ollama_tags_cache,
+            _ollama_caps_cache,
+            _ollama_ctx_cache,
+            _ollama_show_cache,
+            _ollama_ps_cache,
+            _custom_models_cache,
+            _custom_probe_cache,
+            _custom_props_cache,
+        ):
+            cache.clear()
+
 
 def get_custom_base_url(config: Optional[dict] = None) -> str:
     config = config or {}
@@ -1282,25 +1606,154 @@ def _custom_headers(config: dict) -> Dict[str, str]:
     return headers
 
 
-def _custom_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
-    body: Dict[str, Any] = {
-        "model": config.get("chat_model") or config.get("model") or config.get("custom_model", ""),
-        "messages": messages,
-        "temperature": 0.7,
-        # max_tokens is the widely-supported spelling on OpenAI-compatible
-        # local servers (vLLM, LM Studio, llama.cpp).
-        "max_tokens": 8192,
-    }
-    if tools:
-        body["tools"] = tools
-    return body
+def _custom_root_url(config: Optional[dict] = None) -> str:
+    base = get_custom_base_url(config)
+    return base[:-3] if base.endswith("/v1") else base
 
 
-def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
+def _custom_model_records(
+    config: Optional[dict] = None,
+    *,
+    timeout: float = CUSTOM_DISCOVERY_TIMEOUT,
+    force_refresh: bool = False,
+) -> Optional[List[dict]]:
+    config = config or {}
     base_url = get_custom_base_url(config)
     if not base_url:
-        return error_response("custom provider requires custom_base_url in config")
-    body = _custom_body(config, messages, tools)
+        return None
+    if local_endpoint_policy_error("custom", base_url, config):
+        return None
+    now = time.monotonic()
+    with _local_model_cache_lock:
+        cached = _custom_models_cache.get(base_url)
+        if cached is not None and not force_refresh:
+            ttl = (
+                _CUSTOM_CACHE_TTL_OK
+                if cached[1] is not None
+                else _CUSTOM_CACHE_TTL_FAIL
+            )
+            if now - cached[0] < ttl:
+                return cached[1]
+    req = urllib.request.Request(
+        f"{base_url}/models",
+        headers=_custom_headers(config),
+        method="GET",
+    )
+    try:
+        from .runtime import serialized_agent_execution
+
+        with serialized_agent_execution():
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                payload = json.loads(response.read().decode())
+        data = (
+            payload.get("data", payload.get("models", []))
+            if isinstance(payload, dict)
+            else []
+        )
+        records = []
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, str):
+                item = {"id": item}
+            if not isinstance(item, dict):
+                continue
+            model_id = str(
+                item.get("id") or item.get("model") or item.get("name") or ""
+            ).strip()
+            if not model_id:
+                continue
+            identity = hashlib.sha256(
+                json.dumps(item, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            records.append(
+                {
+                    "id": model_id,
+                    "identity": identity,
+                    "context_length": item.get("context_length")
+                    or item.get("max_model_len"),
+                }
+            )
+    except Exception:
+        records = None
+    with _local_model_cache_lock:
+        _custom_models_cache[base_url] = (now, records)
+    return records
+
+
+def _custom_probe_key(
+    config: dict, model: str, identity: str = ""
+) -> tuple:
+    return (get_custom_base_url(config), model, identity or model)
+
+
+def probe_custom_model(
+    config: Optional[dict],
+    model: str,
+    *,
+    timeout: float = 10.0,
+    identity: str = "",
+    force_refresh: bool = False,
+) -> tuple:
+    """Require a valid forced native tool call from one custom model."""
+    config = config or {}
+    base_url = get_custom_base_url(config)
+    if not base_url:
+        return False, "custom_base_url is not configured"
+    policy_error = local_endpoint_policy_error("custom", base_url, config)
+    if policy_error:
+        return False, policy_error
+    if not model:
+        return False, "no model given"
+    key = _custom_probe_key(config, model, identity)
+    now = time.monotonic()
+    with _local_model_cache_lock:
+        cached = _custom_probe_cache.get(key)
+        if cached is not None and not force_refresh:
+            ttl = (
+                _CUSTOM_CACHE_TTL_OK
+                if cached[1][0]
+                else _CUSTOM_CACHE_TTL_FAIL
+            )
+            if now - cached[0] < ttl:
+                return cached[1]
+    probe_name = "conch_tool_probe"
+    body = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Call conch_tool_probe with token conch-ok. "
+                    "Do not answer in text."
+                ),
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 64,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": probe_name,
+                    "description": "Verify native tool-call support.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "token": {
+                                "type": "string",
+                                "enum": ["conch-ok"],
+                            }
+                        },
+                        "required": ["token"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+        # One tool is offered, so the broadly-supported string form is both
+        # forced and compatible with llama.cpp builds that reject named
+        # tool_choice objects.
+        "tool_choice": "required",
+    }
     req = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode(),
@@ -1308,7 +1761,248 @@ def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        from .runtime import serialized_agent_execution
+
+        with serialized_agent_execution():
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                payload = json.loads(response.read().decode())
+        message = (payload.get("choices") or [{}])[0].get("message", {})
+        verified = False
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function", {}) if isinstance(call, dict) else {}
+            if fn.get("name") != probe_name:
+                continue
+            arguments = fn.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = None
+            if isinstance(arguments, dict) and arguments.get("token") == "conch-ok":
+                verified = True
+                break
+        result = (
+            (True, "")
+            if verified
+            else (
+                False,
+                "model did not return the required native tool call",
+            )
+        )
+    except urllib.error.HTTPError as exc:
+        result = (False, format_http_api_error(exc))
+    except Exception as exc:
+        result = (False, f"endpoint unreachable at {base_url}: {exc}")
+    with _local_model_cache_lock:
+        _custom_probe_cache[key] = (now, result)
+    return result
+
+
+def list_custom_models(
+    config: Optional[dict] = None,
+    *,
+    timeout: float = CUSTOM_DISCOVERY_TIMEOUT,
+    force_refresh: bool = False,
+    tool_capable_only: bool = True,
+) -> Optional[List[str]]:
+    """Enumerate /v1/models, optionally retaining only conformance passes."""
+    records = _custom_model_records(
+        config, timeout=timeout, force_refresh=force_refresh
+    )
+    if records is None:
+        return None
+    if not tool_capable_only:
+        return [record["id"] for record in records]
+    # Capability probes generate tokens and may load/swap models. Run them
+    # serially so one local GPU is never thrashed by discovery.
+    verdicts = [
+        probe_custom_model(
+            config,
+            record["id"],
+            timeout=max(timeout, 5.0),
+            identity=record["identity"],
+            force_refresh=force_refresh,
+        )[0]
+        for record in records
+    ]
+    return [
+        record["id"]
+        for record, ok in zip(records, verdicts)
+        if ok is True
+    ]
+
+
+def get_custom_server_props(
+    config: Optional[dict] = None,
+    *,
+    timeout: float = CUSTOM_DISCOVERY_TIMEOUT,
+    force_refresh: bool = False,
+) -> Optional[dict]:
+    """Read llama.cpp-compatible properties from /v1/props then /props."""
+    config = config or {}
+    root = _custom_root_url(config)
+    if not root:
+        return None
+    if local_endpoint_policy_error(
+        "custom", get_custom_base_url(config), config
+    ):
+        return None
+    now = time.monotonic()
+    with _local_model_cache_lock:
+        cached = _custom_props_cache.get(root)
+        if cached is not None and not force_refresh:
+            ttl = (
+                _CUSTOM_CACHE_TTL_OK
+                if cached[1] is not None
+                else _CUSTOM_CACHE_TTL_FAIL
+            )
+            if now - cached[0] < ttl:
+                return cached[1]
+    props = None
+    for url in (f"{root}/v1/props", f"{root}/props"):
+        req = urllib.request.Request(
+            url, headers=_custom_headers(config), method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                candidate = json.loads(response.read().decode())
+            if isinstance(candidate, dict):
+                props = candidate
+                break
+        except Exception:
+            continue
+    with _local_model_cache_lock:
+        _custom_props_cache[root] = (now, props)
+    return props
+
+
+def get_custom_context_window(
+    config: Optional[dict] = None, model: str = ""
+) -> int:
+    config = config or {}
+    try:
+        configured = int(config.get("custom_context_window", 0) or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    props = get_custom_server_props(config) or {}
+    settings = props.get("default_generation_settings") or {}
+    candidates = [
+        settings.get("n_ctx") if isinstance(settings, dict) else None,
+        props.get("n_ctx"),
+        props.get("context_length"),
+    ]
+    discovered = next(
+        (
+            value
+            for value in candidates
+            if isinstance(value, int) and value > 0
+        ),
+        0,
+    )
+    if not discovered and model:
+        records = _custom_model_records(config) or []
+        record = next(
+            (item for item in records if item["id"] == model), None
+        )
+        value = (record or {}).get("context_length")
+        if isinstance(value, int) and value > 0:
+            discovered = value
+    if configured and discovered:
+        return min(configured, discovered)
+    return (
+        configured
+        or discovered
+        or PROVIDER_DEFAULT_CONTEXT_WINDOWS["custom"]
+    )
+
+
+def validate_custom_model(
+    model: str, config: Optional[dict] = None
+) -> tuple:
+    policy_error = local_endpoint_policy_error(
+        "custom", get_custom_base_url(config), config
+    )
+    if policy_error:
+        return False, policy_error
+    records = _custom_model_records(config)
+    if records is None:
+        return (
+            None,
+            f"custom endpoint unreachable at {get_custom_base_url(config)}",
+        )
+    record = next((item for item in records if item["id"] == model), None)
+    if record is None:
+        return False, f"model '{model}' is not exposed by /v1/models"
+    return probe_custom_model(
+        config, model, identity=record["identity"]
+    )
+
+
+def _custom_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
+    model = (
+        config.get("chat_model")
+        or config.get("model")
+        or config.get("custom_model", "")
+    )
+    context_window = get_custom_context_window(config, model)
+    try:
+        max_tokens = int(
+            config.get(
+                "custom_max_tokens",
+                config.get(
+                    "max_output_tokens",
+                    min(4096, max(256, context_window // 4)),
+                ),
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        max_tokens = min(4096, max(256, context_window // 4))
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": _config_float(
+            config,
+            "custom_temperature",
+            _config_float(config, "temperature", 0.2),
+        ),
+        "max_tokens": max(1, max_tokens),
+    }
+    if tools:
+        body["tools"] = _sanitize_tools_for_openai(tools)
+    if "custom_parallel_tool_calls" in config:
+        body["parallel_tool_calls"] = str(
+            config["custom_parallel_tool_calls"]
+        ).lower() in ("true", "1", "yes", "on")
+    body["max_tokens"] = _clamp_output_to_context(
+        body["max_tokens"], context_window, messages, tools
+    )
+    return body
+
+
+def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
+    base_url = get_custom_base_url(config)
+    if not base_url:
+        return error_response("custom provider requires custom_base_url in config")
+    policy_error = local_endpoint_policy_error("custom", base_url, config)
+    if policy_error:
+        return error_response(policy_error)
+    body = _custom_body(config, messages, tools)
+    ok, reason = validate_custom_model(body["model"], config)
+    if ok is not True:
+        return error_response(
+            reason or f"custom model '{body['model']}' is not verified"
+        )
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=_custom_headers(config),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=_config_float(config, "custom_timeout", 120.0)
+        ) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         return error_response(format_http_api_error(exc))
@@ -1329,7 +2023,15 @@ def stream_custom(config: dict, messages: list, tools=None, on_token=None) -> di
     base_url = get_custom_base_url(config)
     if not base_url:
         return error_response("custom provider requires custom_base_url in config")
+    policy_error = local_endpoint_policy_error("custom", base_url, config)
+    if policy_error:
+        return error_response(policy_error)
     body = _custom_body(config, messages, tools)
+    ok, reason = validate_custom_model(body["model"], config)
+    if ok is not True:
+        return error_response(
+            reason or f"custom model '{body['model']}' is not verified"
+        )
     return _stream_openai_compat(
         f"{base_url}/chat/completions",
         _custom_headers(config),
@@ -1337,12 +2039,12 @@ def stream_custom(config: dict, messages: list, tools=None, on_token=None) -> di
         body["model"],
         "custom",
         on_token,
+        timeout=_config_float(config, "custom_timeout", 120.0),
     )
 
 
 def probe_custom_provider(config: Optional[dict] = None, *, timeout: float = 10.0) -> tuple:
-    """Startup probe: verify the endpoint speaks OpenAI chat completions and
-    accepts a tools array (tools-only directive). Returns (ok, reason)."""
+    """Verify that the configured model is enumerated and natively calls tools."""
     config = config or {}
     base_url = get_custom_base_url(config)
     if not base_url:
@@ -1350,33 +2052,21 @@ def probe_custom_provider(config: Optional[dict] = None, *, timeout: float = 10.
     model = config.get("chat_model") or config.get("model") or config.get("custom_model", "")
     if not model:
         return False, "custom_model is not configured"
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "probe",
-                "description": "capability probe",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }],
-    }
-    req = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=json.dumps(body).encode(),
-        headers=_custom_headers(config),
-        method="POST",
+    records = _custom_model_records(
+        config, timeout=min(timeout, 5.0), force_refresh=True
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            json.loads(response.read().decode())
-    except urllib.error.HTTPError as exc:
-        return False, format_http_api_error(exc)
-    except Exception as exc:
-        return False, f"endpoint unreachable at {base_url}: {exc}"
-    return True, ""
+    if records is None:
+        return False, f"endpoint unreachable at {base_url}"
+    record = next((item for item in records if item["id"] == model), None)
+    if record is None:
+        return False, f"model '{model}' is not exposed by /v1/models"
+    return probe_custom_model(
+        config,
+        model,
+        timeout=timeout,
+        identity=record["identity"],
+        force_refresh=True,
+    )
 
 
 RAW_FNS = {
@@ -1418,6 +2108,7 @@ def _stream_openai_compat(
     model: str,
     provider: str,
     on_token,
+    timeout: float = 120.0,
 ) -> dict:
     """Shared streaming implementation for OpenAI-compatible APIs."""
     body["stream"] = True
@@ -1434,7 +2125,7 @@ def _stream_openai_compat(
     usage = {"input_tokens": 0, "output_tokens": 0}
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             for chunk in _iter_sse(response):
                 if chunk.get("error"):
                     err = chunk["error"]
@@ -1457,16 +2148,57 @@ def _stream_openai_compat(
                         on_token(text)
 
                 for tc in delta.get("tool_calls", []):
-                    idx = tc.get("index", 0)
+                    idx = tc.get("index")
+                    if not isinstance(idx, int):
+                        incoming_id = str(tc.get("id") or "")
+                        matching = next(
+                            (
+                                key
+                                for key, value in tool_calls_acc.items()
+                                if incoming_id
+                                and value.get("id") == incoming_id
+                            ),
+                            None,
+                        )
+                        idx = (
+                            matching
+                            if matching is not None
+                            else (
+                                0
+                                if not incoming_id and len(tool_calls_acc) <= 1
+                                else max(tool_calls_acc, default=-1) + 1
+                            )
+                        )
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
                     if tc.get("id"):
                         tool_calls_acc[idx]["id"] = tc["id"]
                     fn = tc.get("function", {})
                     if fn.get("name"):
-                        tool_calls_acc[idx]["name"] = fn["name"]
+                        incoming_name = str(fn["name"])
+                        current_name = tool_calls_acc[idx]["name"]
+                        if (
+                            not current_name
+                            or incoming_name.startswith(current_name)
+                        ):
+                            tool_calls_acc[idx]["name"] = incoming_name
+                        elif incoming_name != current_name:
+                            tool_calls_acc[idx]["name"] += incoming_name
                     if fn.get("arguments") is not None:
-                        tool_calls_acc[idx]["arguments"] += fn["arguments"]
+                        incoming_args = fn["arguments"]
+                        if not isinstance(incoming_args, str):
+                            incoming_args = json.dumps(incoming_args)
+                        current_args = tool_calls_acc[idx]["arguments"]
+                        if not current_args:
+                            tool_calls_acc[idx]["arguments"] = incoming_args
+                        elif incoming_args == current_args:
+                            pass
+                        elif incoming_args.startswith(current_args):
+                            # Some servers send cumulative snapshots rather
+                            # than OpenAI-style deltas.
+                            tool_calls_acc[idx]["arguments"] = incoming_args
+                        else:
+                            tool_calls_acc[idx]["arguments"] += incoming_args
 
                 if chunk.get("usage"):
                     u = chunk["usage"]
@@ -1746,12 +2478,9 @@ class _StreamDisplayGate:
     """Withhold streamed content from the terminal while it might be a
     textual tool call.
 
-    Without this, the raw JSON/XML of a textual tool call is printed live to
-    the user's screen before the guarded recovery in chat_turn executes it —
-    which reads as "the model printed the command instead of running it".
-    Withheld content is never lost: if it turns out to be an ordinary reply
-    (recovery declines it), the app prints the full reply after the stream
-    ends (the printed-vs-streamed fallback in app.py).
+    Without this, malformed JSON/XML tool syntax is printed live before
+    chat_turn can reject it. Withheld content is never lost: ordinary replies
+    are returned and the app prints them after the stream ends.
     """
 
     def __init__(self, on_token):
@@ -1799,6 +2528,9 @@ def stream_ollama(
 ) -> dict:
     base_url = get_ollama_base_url(config)
     model = config.get("chat_model", config.get("model", "llama3.3"))
+    ok, reason = validate_ollama_model(model, config)
+    if ok is not True:
+        return error_response(reason or f"Ollama model '{model}' is not verified")
     body: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -1806,7 +2538,14 @@ def stream_ollama(
     }
     apply_ollama_request_options(body, config, model)
     if tools:
-        body["tools"] = tools
+        body["tools"] = _sanitize_tools_for_openai(tools)
+    if body.get("options", {}).get("num_predict"):
+        body["options"]["num_predict"] = _clamp_output_to_context(
+            body["options"]["num_predict"],
+            get_ollama_effective_context(model, config),
+            messages,
+            tools,
+        )
 
     req = urllib.request.Request(
         f"{base_url}/api/chat",
@@ -1817,16 +2556,18 @@ def stream_ollama(
 
     content_parts: list[str] = []
     raw_tool_calls: list = []
+    seen_tool_calls: set[str] = set()
     final_data: dict = {}
-    # Route display through the gate so the raw JSON/XML of a *textual* tool
-    # call is withheld from the terminal instead of being printed live before
-    # chat_turn's recovery can execute it. The full raw content is still
-    # accumulated in content_parts and returned for recovery — the gate only
-    # affects what reaches the screen.
+    # Route display through the gate so malformed textual JSON/XML calls are
+    # withheld from the terminal. The full content is returned to chat_turn,
+    # which rejects textual calls without executing them. The gate affects
+    # display only.
     gate = _StreamDisplayGate(on_token) if on_token else None
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with urllib.request.urlopen(
+            req, timeout=_config_float(config, "ollama_timeout", 120.0)
+        ) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -1842,8 +2583,13 @@ def stream_ollama(
                 msg = data.get("message", {})
                 # Tool calls arrive in intermediate chunks (done:false), NOT in
                 # the final done chunk — accumulate them across the stream.
-                if msg.get("tool_calls"):
-                    raw_tool_calls.extend(msg["tool_calls"])
+                for tool_call in msg.get("tool_calls") or []:
+                    fingerprint = json.dumps(
+                        tool_call, sort_keys=True, default=str
+                    )
+                    if fingerprint not in seen_tool_calls:
+                        seen_tool_calls.add(fingerprint)
+                        raw_tool_calls.append(tool_call)
                 # Skip msg.get("thinking") tokens (qwen3 et al.) — reasoning is
                 # not part of the reply.
                 if msg.get("content"):
@@ -1861,6 +2607,8 @@ def stream_ollama(
         gate.finish()
 
     full_text = strip_think_blocks("".join(content_parts).strip())
+    with _local_model_cache_lock:
+        _ollama_ps_cache.pop(base_url, None)
 
     return {
         "role": "assistant",

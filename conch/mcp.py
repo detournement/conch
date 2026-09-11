@@ -199,13 +199,23 @@ def collect_tools(clients: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
         except Exception:
             return name, client, []
 
+    loaded: Dict[str, tuple] = {}
     with ThreadPoolExecutor(max_workers=max(len(clients), 1)) as pool:
         futures = [pool.submit(_load_one, n, c) for n, c in clients.items()]
         for future in as_completed(futures):
             name, client, client_tools = future.result()
-            for tool in client_tools:
-                tools.append(tool)
-                tool_map[tool["function"]["name"]] = client
+            loaded[name] = (client, client_tools)
+    # Preserve config order even though discovery is parallel. Duplicate names
+    # are skipped after the first server so an offered schema can never route
+    # to a different, nondeterministically selected client.
+    for name in clients:
+        client, client_tools = loaded.get(name, (clients[name], []))
+        for tool in client_tools:
+            tool_name = tool.get("function", {}).get("name", "")
+            if not tool_name or tool_name in tool_map:
+                continue
+            tools.append(tool)
+            tool_map[tool_name] = client
     return tools, tool_map
 
 

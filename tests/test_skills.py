@@ -29,7 +29,7 @@ SKILL_MD = """---
 name: deploy-check
 description: Verify a deployment is healthy
 tools: local_shell, public_api
-model: qwen3-8b
+model: gpt-4o-mini
 rounds: 6
 ---
 1. Check the pods: `kubectl get pods`
@@ -58,7 +58,7 @@ class TestParseSkill(unittest.TestCase):
         self.assertEqual(skill["name"], "deploy-check")
         self.assertEqual(skill["description"], "Verify a deployment is healthy")
         self.assertEqual(skill["tools"], ["local_shell", "public_api"])
-        self.assertEqual(skill["model"], "qwen3-8b")
+        self.assertEqual(skill["model"], "gpt-4o-mini")
         self.assertEqual(skill["rounds"], 6)
         self.assertIn("kubectl get pods", skill["body"])
 
@@ -155,7 +155,7 @@ class TestSkillManageTool(SkillsDirTestCase):
         text = self._call(self._client(), {"action": "list"})
         self.assertIn("deploy-check", text)
         self.assertIn("local_shell, public_api", text)
-        self.assertIn("model=qwen3-8b", text)
+        self.assertIn("model=gpt-4o-mini", text)
 
     def test_use_injects_body(self):
         self._write("deploy-check", SKILL_MD)
@@ -256,7 +256,7 @@ class TestSkillScopedDelegate(SkillsDirTestCase):
         self.assertEqual(names, {"local_shell", "public_api"})
         self.assertNotIn("skill_manage", seen["clients"])
         # model preference and round budget from the skill
-        self.assertEqual(seen["config"]["chat_model"], "qwen3-8b")
+        self.assertEqual(seen["config"]["chat_model"], "gpt-4o-mini")
         self.assertEqual(seen["rounds"], 6)
 
     def test_skill_tools_never_include_excluded(self):

@@ -143,6 +143,21 @@ class TestReadSource(IsolatedConfigTestCase):
         report = _call(_client(), {"action": "read_source"})
         self.assertIn("Error", report)
 
+    def test_checkout_style_path_works_for_installed_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package_root = Path(tmp) / "conch"
+            package_root.mkdir()
+            (package_root / "runtime.py").write_text("INSTALLED_SENTINEL = 1\n")
+            with patch(
+                "conch.tooling.conch_source_root",
+                return_value=package_root,
+            ):
+                report = _call(
+                    _client(),
+                    {"action": "read_source", "path": "conch/runtime.py"},
+                )
+        self.assertIn("INSTALLED_SENTINEL", report)
+
 
 class TestWiring(IsolatedConfigTestCase):
     def test_injected_as_builtin_and_pinned(self):

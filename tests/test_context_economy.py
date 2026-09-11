@@ -20,6 +20,7 @@ from conch.providers import error_response
 from conch.runtime import (
     CHARS_PER_TOKEN,
     auto_compact,
+    char_count,
     estimate_tokens,
     format_context_gauge,
     get_chars_per_token,
@@ -131,7 +132,8 @@ class TestTokenCalibration(CalibrationTestCase):
     def test_estimate_tokens_uses_calibration(self):
         msgs = [{"role": "user", "content": "x" * 3000}]
         before = estimate_tokens(msgs)
-        record_token_calibration(3000, 1500)  # 2.0 chars/token
+        wire_chars = char_count(msgs)
+        record_token_calibration(wire_chars, 1500)
         after = estimate_tokens(msgs)
         self.assertEqual(after, 1500)
         self.assertGreater(after, before)
@@ -159,7 +161,7 @@ class TestToolResultTruncation(CalibrationTestCase):
     def test_keeps_head_and_tail(self):
         text = "HEAD" + "x" * 10000 + "TAIL"
         result = truncate_middle(text, 1000)
-        self.assertLess(len(result), 1200)
+        self.assertLessEqual(len(result), 1000)
         self.assertTrue(result.startswith("HEAD"))
         self.assertTrue(result.endswith("TAIL"))
         self.assertIn("truncated", result)
@@ -212,11 +214,15 @@ class TestAutoCompact(CalibrationTestCase):
             changed = auto_compact(msgs, None, "ollama", {}, raw_fn)
         self.assertTrue(changed)
         self.assertEqual(msgs[0]["content"], "sys prompt", "system prompt kept verbatim")
-        self.assertIn("[Earlier conversation summarized]", msgs[1]["content"])
+        self.assertEqual(msgs[1]["role"], "user")
+        self.assertIn("[Earlier conversation context]", msgs[1]["content"])
+        self.assertEqual(
+            sum(message["role"] == "system" for message in msgs), 1
+        )
         self.assertIn("fact one", msgs[1]["content"])
         # last 6 messages kept verbatim
         self.assertEqual(msgs[-1]["content"], "answer 9 " + "y" * 200)
-        self.assertEqual(len(msgs), 1 + 1 + 6)
+        self.assertEqual(len(msgs), 1 + 6)
         # The summarizer saw the *old* turns
         transcript = seen["messages"][1]["content"]
         self.assertIn("question 0", transcript)

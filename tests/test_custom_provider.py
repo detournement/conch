@@ -10,11 +10,15 @@ from unittest.mock import patch
 
 from conch.config import load_config
 from conch.providers import (
+    _custom_body,
     RAW_FNS,
     STREAM_FNS,
+    clear_local_model_caches,
     get_context_window,
     get_custom_base_url,
+    get_custom_server_props,
     get_fallback_model,
+    list_custom_models,
     probe_custom_provider,
     raw_custom,
     stream_custom,
@@ -48,6 +52,74 @@ CONFIG = {
 }
 
 
+def _custom_server(
+    *,
+    chat_payload=None,
+    stream_lines=None,
+    props=None,
+    models=("qwen2.5-32b-vllm",),
+    tool_capable=True,
+    recorded=None,
+):
+    recorded = recorded if recorded is not None else {}
+
+    def side_effect(req, timeout=None):
+        url = req.full_url
+        if url.endswith("/models"):
+            return _FakeHTTPResponse({
+                "data": [
+                    {"id": model, "context_length": 32768}
+                    for model in models
+                ]
+            })
+        if url.endswith("/v1/props") or url.endswith("/props"):
+            return _FakeHTTPResponse(
+                props
+                if props is not None
+                else {"default_generation_settings": {"n_ctx": 32768}}
+            )
+        if url.endswith("/chat/completions"):
+            body = json.loads(req.data.decode())
+            if body.get("tools", [{}])[0].get("function", {}).get("name") == "conch_tool_probe":
+                if tool_capable:
+                    payload = {
+                        "choices": [{
+                            "message": {
+                                "tool_calls": [{
+                                    "id": "probe-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "conch_tool_probe",
+                                        "arguments": '{"token":"conch-ok"}',
+                                    },
+                                }]
+                            }
+                        }]
+                    }
+                else:
+                    payload = {"choices": [{"message": {"content": "conch-ok"}}]}
+                return _FakeHTTPResponse(payload)
+            recorded["url"] = url
+            recorded["body"] = body
+            recorded["headers"] = dict(req.headers)
+            return _FakeHTTPResponse(
+                chat_payload
+                or {
+                    "choices": [{"message": {"content": "hi there"}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+                },
+                lines=stream_lines,
+            )
+        raise AssertionError(f"unexpected URL {url}")
+
+    return side_effect
+
+
+class CustomCacheTestCase(unittest.TestCase):
+    def setUp(self):
+        clear_local_model_caches()
+
+
 class TestCustomBaseUrl(unittest.TestCase):
     def test_custom_base_url_key(self):
         self.assertEqual(get_custom_base_url(CONFIG), "http://192.168.1.50:8000/v1")
@@ -65,7 +137,7 @@ class TestCustomBaseUrl(unittest.TestCase):
         self.assertEqual(get_custom_base_url(cfg), "http://host:8000/v1")
 
 
-class TestRawCustom(unittest.TestCase):
+class TestRawCustom(CustomCacheTestCase):
     def test_registered_in_provider_tables(self):
         self.assertIn("custom", RAW_FNS)
         self.assertIn("custom", STREAM_FNS)
@@ -77,13 +149,12 @@ class TestRawCustom(unittest.TestCase):
             "usage": {"prompt_tokens": 5, "completion_tokens": 2},
         }
 
-        def side_effect(req, timeout=None):
-            recorded["url"] = req.full_url
-            recorded["body"] = json.loads(req.data.decode())
-            recorded["headers"] = dict(req.headers)
-            return _FakeHTTPResponse(payload)
-
-        with patch("urllib.request.urlopen", side_effect=side_effect):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(
+                chat_payload=payload, recorded=recorded
+            ),
+        ):
             result = raw_custom(CONFIG, [{"role": "user", "content": "hi"}])
         self.assertEqual(recorded["url"], "http://192.168.1.50:8000/v1/chat/completions")
         self.assertEqual(recorded["body"]["model"], "qwen2.5-32b-vllm")
@@ -95,12 +166,11 @@ class TestRawCustom(unittest.TestCase):
     def test_api_key_env_used_when_set(self):
         recorded = {}
 
-        def side_effect(req, timeout=None):
-            recorded["headers"] = dict(req.headers)
-            return _FakeHTTPResponse({"choices": [{"message": {"content": "x"}}]})
-
         cfg = dict(CONFIG, api_key_env="MY_VLLM_KEY")
-        with patch("urllib.request.urlopen", side_effect=side_effect), \
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(recorded=recorded),
+        ), \
              patch.dict("os.environ", {"MY_VLLM_KEY": "sk-local"}):
             raw_custom(cfg, [])
         self.assertEqual(recorded["headers"].get("Authorization"), "Bearer sk-local")
@@ -124,24 +194,74 @@ class TestRawCustom(unittest.TestCase):
             b"data: [DONE]\n",
         ]
         tokens = []
-        with patch("urllib.request.urlopen", return_value=_FakeHTTPResponse(lines=lines)):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(stream_lines=lines),
+        ):
             result = stream_custom(CONFIG, [], on_token=tokens.append)
         self.assertEqual(result["content"], "streamed")
         self.assertEqual("".join(tokens), "streamed")
 
+    def test_streaming_merges_fragmented_tool_arguments(self):
+        lines = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"local_shell","arguments":"{\\"value\\":"}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"ok\\"}"}}]}}]}\n',
+            b"data: [DONE]\n",
+        ]
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(stream_lines=lines),
+        ):
+            result = stream_custom(CONFIG, [])
+        self.assertEqual(
+            json.loads(
+                result["tool_calls"][0]["function"]["arguments"]
+            ),
+            {"value": "ok"},
+        )
 
-class TestCustomProbe(unittest.TestCase):
+    def test_streaming_deduplicates_cumulative_argument_snapshots(self):
+        lines = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"local_shell","arguments":"{\\"value\\""}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"value\\":\\"ok\\"}"}}]}}]}\n',
+            b"data: [DONE]\n",
+        ]
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(stream_lines=lines),
+        ):
+            result = stream_custom(CONFIG, [])
+        self.assertEqual(
+            json.loads(
+                result["tool_calls"][0]["function"]["arguments"]
+            ),
+            {"value": "ok"},
+        )
+
+
+class TestCustomProbe(CustomCacheTestCase):
     def test_probe_sends_tools(self):
         recorded = {}
 
         def side_effect(req, timeout=None):
-            recorded["body"] = json.loads(req.data.decode())
-            return _FakeHTTPResponse({"choices": [{"message": {"content": ""}}]})
+            if req.full_url.endswith("/chat/completions"):
+                recorded["body"] = json.loads(req.data.decode())
+            return _custom_server()(req, timeout)
 
         with patch("urllib.request.urlopen", side_effect=side_effect):
             ok, reason = probe_custom_provider(CONFIG)
         self.assertTrue(ok)
         self.assertIn("tools", recorded["body"])
+        self.assertIn("tool_choice", recorded["body"])
+
+    def test_probe_rejects_prose_only_response(self):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(tool_capable=False),
+        ):
+            ok, reason = probe_custom_provider(CONFIG)
+        self.assertFalse(ok)
+        self.assertIn("native tool call", reason)
 
     def test_probe_fails_on_unreachable(self):
         with patch("urllib.request.urlopen",
@@ -156,17 +276,63 @@ class TestCustomProbe(unittest.TestCase):
         self.assertIn("custom_base_url", reason)
 
 
-class TestCustomFallbackAndWindow(unittest.TestCase):
+class TestCustomFallbackAndWindow(CustomCacheTestCase):
     def test_fallback_model_from_config(self):
-        self.assertEqual(get_fallback_model("custom", CONFIG), "qwen2.5-32b-vllm")
+        with patch(
+            "urllib.request.urlopen", side_effect=_custom_server()
+        ):
+            self.assertEqual(
+                get_fallback_model("custom", CONFIG),
+                "qwen2.5-32b-vllm",
+            )
         self.assertEqual(get_fallback_model("custom", {}), "")
 
     def test_context_window_default_and_override(self):
-        self.assertEqual(get_context_window("custom", "m", {}), 32768)
-        self.assertEqual(
-            get_context_window("custom", "m", {"custom_context_window": "65536"}),
-            65536,
+        with patch("conch.providers.get_custom_server_props", return_value=None), \
+             patch("conch.providers._custom_model_records", return_value=[]):
+            self.assertEqual(get_context_window("custom", "m", {}), 32768)
+            self.assertEqual(
+                get_context_window(
+                    "custom", "m", {"custom_context_window": "65536"}
+                ),
+                65536,
+            )
+
+    def test_llamacpp_props_define_effective_context(self):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(
+                props={"default_generation_settings": {"n_ctx": 24576}}
+            ),
+        ):
+            self.assertEqual(get_context_window("custom", "m", CONFIG), 24576)
+
+    def test_lists_only_models_that_pass_conformance(self):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(models=("llama",), tool_capable=True),
+        ):
+            self.assertEqual(list_custom_models(CONFIG), ["llama"])
+
+    def test_generation_limit_is_clamped_to_remaining_context(self):
+        config = dict(
+            CONFIG,
+            custom_context_window="1024",
+            custom_max_tokens="1000",
         )
+        with patch(
+            "conch.providers.get_custom_server_props",
+            return_value=None,
+        ), patch(
+            "conch.providers._custom_model_records",
+            return_value=[],
+        ):
+            body = _custom_body(
+                config,
+                [{"role": "user", "content": "x" * 2400}],
+                [],
+            )
+        self.assertLess(body["max_tokens"], 200)
 
 
 class TestCustomProviderSwitch(unittest.TestCase):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import sys
@@ -16,9 +17,14 @@ from typing import Any, Dict, List, Optional
 MAX_GROUP_TOOLS = 200
 MAX_ACTIVE_TOOLS = 300
 PINNED_TOOL_NAMES = {
-    "local_shell", "manage_tools", "save_memory", "public_api", "conch_config",
-    "search_conversations", "api_layer", "todo_list", "delegate_task",
-    "skill_manage", "conch_introspect",
+    # Keep the always-on schema budget deliberately small. Everything else is
+    # routed by relevance and can still be pinned explicitly by a profile.
+    "local_shell",
+    "manage_tools",
+    "todo_list",
+    "delegate_task",
+    "skill_manage",
+    "conch_introspect",
 }
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
@@ -70,6 +76,29 @@ SAFE_COMMAND_PREFIXES = (
     "git remote", "git stash list",
 )
 
+REMOTE_SAFE_COMMAND_PREFIXES = (
+    "ls",
+    "pwd",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "echo",
+    "date",
+    "cal",
+    "whoami",
+    "id",
+    "uname",
+    "hostname",
+    "uptime",
+    "df",
+    "du",
+    "stat",
+    "printenv",
+    "ps",
+    "grep",
+)
+
 _SHELL_CHAIN_RE = re.compile(r"[;&|`><]|\$\(")
 
 _DESTRUCTIVE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
@@ -95,9 +124,56 @@ def is_safe_command(cmd: str) -> bool:
     text = (cmd or "").strip()
     if not text or _SHELL_CHAIN_RE.search(text):
         return False
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return False
+    lowered = {token.lower() for token in tokens[1:]}
+    if tokens:
+        executable = tokens[0].lower()
+        if executable == "find" and any(
+            token in lowered
+            for token in (
+                "-delete",
+                "-exec",
+                "-execdir",
+                "-ok",
+                "-okdir",
+                "-fprint",
+                "-fprint0",
+                "-fprintf",
+                "-fls",
+            )
+        ):
+            return False
+        if executable == "fd" and any(
+            token in lowered
+            for token in ("-x", "-X", "--exec", "--exec-batch")
+        ):
+            return False
+        if executable in ("rg", "ripgrep") and any(
+            token == "--pre" or token.startswith("--pre=")
+            for token in lowered
+        ):
+            return False
+        if executable == "git" and any(
+            token in ("--ext-diff", "--textconv") for token in lowered
+        ):
+            return False
     return any(
         text == prefix or text.startswith(prefix + " ")
         for prefix in SAFE_COMMAND_PREFIXES
+    )
+
+
+def is_remote_safe_command(cmd: str) -> bool:
+    """Narrow non-extensible subset safe for unattended remote sessions."""
+    text = (cmd or "").strip()
+    if not is_safe_command(text):
+        return False
+    return any(
+        text == prefix or text.startswith(prefix + " ")
+        for prefix in REMOTE_SAFE_COMMAND_PREFIXES
     )
 
 
@@ -203,7 +279,7 @@ def apply_filter(all_tools: List[dict], tool_map: dict, prefs: dict) -> List[dic
     for tool in all_tools:
         name = tool["function"]["name"]
         grp = tool_group(name, tool_map)
-        if grp not in disabled or name in picked:
+        if name in PINNED_TOOL_NAMES or grp not in disabled or name in picked:
             result.append(tool)
     return result
 
@@ -272,7 +348,7 @@ def auto_disable_oversized_groups(all_tools: List[dict], tool_map: dict, prefs: 
 
 BUILTIN_PROFILES: Dict[str, Dict[str, Any]] = {
     "minimal": {
-        "description": "Shell tools only",
+        "description": "Core local-agent tools",
         "groups": None,
     },
     "dev": {
@@ -491,7 +567,23 @@ class LocalShellClient:
         # Use a PTY so interactive programs (sudo, passwd, ssh, expect) get a
         # real terminal — prevents dropped characters and hanging prompts.
         master_fd, slave_fd = pty.openpty()
-        output_parts: list[str] = []
+        capture_budget = max(256, int(self._result_budget))
+        head_cap = max(1, int(capture_budget * 0.67))
+        tail_cap = max(1, int(capture_budget * 0.23))
+        captured_head = ""
+        captured_tail = ""
+        captured_total = 0
+
+        def capture(chunk: str) -> None:
+            nonlocal captured_head, captured_tail, captured_total
+            captured_total += len(chunk)
+            if len(captured_head) < head_cap:
+                take = min(head_cap - len(captured_head), len(chunk))
+                captured_head += chunk[:take]
+                chunk = chunk[take:]
+            if chunk:
+                captured_tail = (captured_tail + chunk)[-tail_cap:]
+
         try:
             proc = subprocess.Popen(
                 cmd, shell=True,
@@ -507,7 +599,9 @@ class LocalShellClient:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         proc.kill()
-                        output_parts.append(f"\nCommand timed out after {effective_timeout}s")
+                        capture(
+                            f"\nCommand timed out after {effective_timeout}s"
+                        )
                         break
                     try:
                         rlist, _, _ = select.select([master_fd], [], [], min(remaining, 0.5))
@@ -523,7 +617,7 @@ class LocalShellClient:
                         if not data:
                             break
                         chunk = data.decode("utf-8", errors="replace")
-                        output_parts.append(chunk)
+                        capture(chunk)
                         sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
                         sys.stderr.flush()
                     if proc.poll() is not None:
@@ -536,7 +630,7 @@ class LocalShellClient:
                                 if not data:
                                     break
                                 chunk = data.decode("utf-8", errors="replace")
-                                output_parts.append(chunk)
+                                capture(chunk)
                         except OSError:
                             pass
                         break
@@ -555,7 +649,15 @@ class LocalShellClient:
                     pass
 
         proc.wait()
-        output = "".join(output_parts)
+        if captured_total <= len(captured_head) + len(captured_tail):
+            output = captured_head + captured_tail
+        else:
+            omitted = captured_total - len(captured_head) - len(captured_tail)
+            output = (
+                captured_head
+                + f"\n... [truncated {omitted:,} streamed chars] ...\n"
+                + captured_tail
+            )
         output = _re.sub(r"\r", "\n", output)
         output = _re.sub(r"\x1b\[[0-9;]*[mABCDEFGHJKLMSTfhilnprsu]", "", output)
         output = _re.sub(r"\n{3,}", "\n\n", output).strip()
@@ -1231,27 +1333,62 @@ class DelegateTaskClient:
         capability-gated (plan 0.4); unusable preferences fall back to the
         parent's model with a warning.
         """
-        from .providers import RAW_FNS
+        from .config import local_only_enabled
+        from .providers import (
+            DEFAULT_API_KEY_ENVS,
+            RAW_FNS,
+            get_fallback_model,
+            validate_model_for_provider,
+        )
 
         config = dict(self._config)
-        provider = (config.get("provider") or "").lower()
+        parent_provider = (config.get("provider") or "").lower()
+        provider = parent_provider
         if preferred_provider and preferred_provider in RAW_FNS:
-            provider = preferred_provider
-            config["provider"] = preferred_provider
+            if (
+                local_only_enabled(config, parent_provider)
+                and preferred_provider not in ("ollama", "custom")
+            ):
+                print(
+                    f"  \033[33m⚠ subagent provider "
+                    f"'{preferred_provider}' blocked by local_only — using "
+                    f"{parent_provider}\033[0m",
+                    file=sys.stderr,
+                )
+            else:
+                candidate_model = get_fallback_model(
+                    preferred_provider, config
+                )
+                if candidate_model:
+                    provider = preferred_provider
+                    config["provider"] = preferred_provider
+                    config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(
+                        preferred_provider, ""
+                    )
+                    config["model"] = candidate_model
+                    config["chat_model"] = candidate_model
+                else:
+                    print(
+                        f"  \033[33m⚠ subagent provider "
+                        f"'{preferred_provider}' has no verified model — "
+                        f"using {parent_provider}\033[0m",
+                        file=sys.stderr,
+                    )
         sub_model = (preferred_model or config.get("subagent_model") or "").strip()
         if sub_model:
-            usable = True
-            if provider == "ollama":
-                from .providers import validate_ollama_model
-                ok, reason = validate_ollama_model(sub_model, config)
-                if ok is not True:
-                    usable = False
-                    print(f"  \033[33m⚠ subagent model '{sub_model}' unusable "
-                          f"({reason or 'unverified'}) — using parent model\033[0m",
-                          file=sys.stderr)
-            if usable:
+            ok, reason = validate_model_for_provider(
+                provider, sub_model, config
+            )
+            if ok is True:
                 config["model"] = sub_model
                 config["chat_model"] = sub_model
+                if provider == "custom":
+                    config["custom_model"] = sub_model
+            else:
+                print(f"  \033[33m⚠ subagent model '{sub_model}' unusable "
+                      f"({reason or 'unverified'}) — using "
+                      f"{config.get('chat_model') or 'parent model'}\033[0m",
+                      file=sys.stderr)
         return config, provider
 
     def call_tool(self, name: str, arguments: dict) -> dict:
@@ -1462,6 +1599,16 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(SKILL_MANAGE_TOOL)
     if "conch_introspect" in clients:
         builtin.append(CONCH_INTROSPECT_TOOL)
+    builtin_names = {
+        tool_def["function"]["name"] for tool_def in builtin
+    }
+    all_tools[:] = [
+        tool_def
+        for tool_def in all_tools
+        if tool_def.get("function", {}).get("name") not in builtin_names
+    ]
+    for builtin_name in builtin_names:
+        tool_map.pop(builtin_name, None)
     all_tools.extend(builtin)
     for tool_def in builtin:
         name = tool_def["function"]["name"]
@@ -1470,8 +1617,11 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
     # Executable user tools (plan 2.3), grouped as "user" for profiles
     user_tool_defs, user_client = discover_user_tools()
     for tool_def in user_tool_defs:
+        tool_name = tool_def["function"]["name"]
+        if tool_name in tool_map:
+            continue
         all_tools.append(tool_def)
-        tool_map[tool_def["function"]["name"]] = user_client
+        tool_map[tool_name] = user_client
 
 
 
@@ -1548,10 +1698,12 @@ class ConchConfigClient:
             MODEL_PRICING,
             DEFAULT_API_KEY_ENVS,
             get_fallback_model,
+            get_custom_base_url,
             get_ollama_base_url,
+            list_custom_models,
             list_ollama_models,
             ollama_model_matches,
-            validate_ollama_model,
+            validate_model_for_provider,
         )
         import os
 
@@ -1567,10 +1719,13 @@ class ConchConfigClient:
                 f"model: {self._model}",
                 f"context_window: {get_context_window(self._provider, self._model, self._config):,} tokens",
                 f"agent_mode: {agent}",
+                f"local_only: {self._config.get('local_only', 'auto')}",
                 f"config_file: {get_config_path()}",
             ]
             if self._provider == "ollama":
                 lines.append(f"ollama_base_url: {get_ollama_base_url(self._config)}")
+            elif self._provider == "custom":
+                lines.append(f"custom_base_url: {get_custom_base_url(self._config)}")
             u = self._session_usage
             if u.get("turns"):
                 lines.append(f"session_turns: {u['turns']}")
@@ -1594,6 +1749,19 @@ class ConchConfigClient:
                     if not models:
                         lines.append("\nollama (reachable): no tool-capable models installed")
                         continue
+                elif prov == "custom":
+                    models = list_custom_models(self._config)
+                    if models is None:
+                        lines.append(
+                            f"\ncustom (unreachable at "
+                            f"{get_custom_base_url(self._config)}): no models"
+                        )
+                        continue
+                    if not models:
+                        lines.append(
+                            "\ncustom: no models passed native tool-call conformance"
+                        )
+                        continue
                 lines.append(f"\n{prov} ({status}):")
                 for m in models:
                     price = MODEL_PRICING.get(m, (0, 0))
@@ -1613,19 +1781,28 @@ class ConchConfigClient:
                 return self._text("Error: provide a model name in 'value'")
             target_provider = None
             for prov, models in KNOWN_MODELS.items():
-                if prov != "ollama" and value in models:
+                if prov not in ("ollama", "custom") and value in models:
                     target_provider = prov
                     break
             if not target_provider:
-                ok, reason = validate_ollama_model(value, self._config)
-                if ok:
+                ok, reason = validate_model_for_provider(
+                    "ollama", value, self._config
+                )
+                if ok is True:
                     target_provider = "ollama"
-                elif ok is False and "tool calling" in reason:
-                    return self._text(f"Cannot switch: {reason}.")
                 elif self._provider == "ollama":
-                    if ok is None:
-                        return self._text(f"Cannot verify model '{value}': {reason}.")
                     return self._text(f"Cannot switch: {reason}. Use action=list_models to see options.")
+            if not target_provider:
+                ok, reason = validate_model_for_provider(
+                    "custom", value, self._config
+                )
+                if ok is True:
+                    target_provider = "custom"
+                elif self._provider == "custom":
+                    return self._text(
+                        f"Cannot switch: {reason}. "
+                        "Use action=list_models to see options."
+                    )
             if not target_provider:
                 from .providers import suggest_models
                 pool = [
@@ -1637,6 +1814,14 @@ class ConchConfigClient:
                 return self._text(
                     f"Unknown model '{value}'.{hint} "
                     "Use action=list_models to see options."
+                )
+            from .config import local_only_enabled
+
+            if local_only_enabled(self._config, self._provider) and (
+                target_provider not in ("ollama", "custom")
+            ):
+                return self._text(
+                    "Cannot switch to a cloud model while local_only is enabled."
                 )
             if value == self._model and target_provider == self._provider:
                 return self._text(f"Already using {target_provider}/{value}. No change needed.")
@@ -1661,6 +1846,15 @@ class ConchConfigClient:
                 return self._text(f"Unknown provider '{value}'. Options: {', '.join(KNOWN_MODELS)}")
             if value == self._provider:
                 return self._text(f"Already using provider {value}/{self._model}. No change needed.")
+            from .config import local_only_enabled
+
+            if local_only_enabled(self._config, self._provider) and value not in (
+                "ollama",
+                "custom",
+            ):
+                return self._text(
+                    "Cannot switch to a cloud provider while local_only is enabled."
+                )
             key_env = DEFAULT_API_KEY_ENVS.get(value, "")
             if key_env and not os.environ.get(key_env, "").strip():
                 return self._text(f"Cannot switch to {value}: {key_env} not set.")
@@ -1820,7 +2014,7 @@ class ConchIntrospectClient:
             lines.append(f"- {spec}: {description}")
         user_commands = load_user_commands()
         if user_commands:
-            lines.append(f"- custom commands from ~/.config/conch/commands/: "
+            lines.append("- custom commands from ~/.config/conch/commands/: "
                          + ", ".join("/" + n for n in sorted(user_commands)))
 
         lines.append("\n## Tools (callable by the model)")
@@ -1879,8 +2073,16 @@ class ConchIntrospectClient:
     # --- config -------------------------------------------------------------
 
     def _config_report(self) -> str:
-        from .config import find_project_rc, get_config_path
-        from .providers import get_context_window, get_ollama_base_url
+        from .config import (
+            find_project_rc,
+            get_config_path,
+            local_only_enabled,
+        )
+        from .providers import (
+            get_context_window,
+            get_custom_base_url,
+            get_ollama_base_url,
+        )
 
         lines = ["Effective configuration:"]
         lines.append(f"- provider: {self._provider}")
@@ -1889,6 +2091,15 @@ class ConchIntrospectClient:
                      f"{get_context_window(self._provider, self._model, self._config):,} tokens")
         if self._provider == "ollama":
             lines.append(f"- ollama server: {get_ollama_base_url(self._config)}")
+        elif self._provider == "custom":
+            lines.append(
+                f"- inference server: "
+                f"{get_custom_base_url(self._config)}"
+            )
+        lines.append(
+            f"- local only: "
+            f"{'on' if local_only_enabled(self._config, self._provider) else 'off'}"
+        )
         lines.append(f"- agent mode: {'on' if get_agent_mode() else 'off'}; "
                      f"permission mode: {get_permission_mode()}")
         config_path = get_config_path()
@@ -1924,7 +2135,7 @@ class ConchIntrospectClient:
         from . import __version__
         from .repomap import build_map_for_root
 
-        root = conch_source_root()
+        root = conch_source_root().resolve()
         is_checkout = (root / ".git").exists()
         lines = [f"Conch v{__version__} source at {root} "
                  f"({'git checkout' if is_checkout else 'installed package'})"]
@@ -1954,8 +2165,18 @@ class ConchIntrospectClient:
         rel_path = (rel_path or "").strip()
         if not rel_path:
             return self._text("Error: provide 'path' (e.g. conch/runtime.py)")
-        root = conch_source_root()
-        target = (root / rel_path).resolve()
+        root = conch_source_root().resolve()
+        normalized = rel_path
+        # In a checkout root/conch/runtime.py exists; in an installed wheel
+        # root itself is site-packages/conch. Accept the same user-facing path
+        # in both layouts.
+        if (
+            not (root / ".git").exists()
+            and root.name == "conch"
+            and normalized.startswith("conch/")
+        ):
+            normalized = normalized[len("conch/"):]
+        target = (root / normalized).resolve()
         try:
             inside = target.is_relative_to(root)
         except AttributeError:  # python < 3.9 fallback (not expected)

@@ -9,24 +9,21 @@ tool-calling-capable models, on every provider. Non-tool models are out of
 scope. Enforcement mechanism on Ollama: `POST /api/show` → `capabilities`
 array must contain `"tools"`. Consequences baked into this plan:
 
-- Textual/regex tool-call recovery (`extract_textual_tool_use_blocks`) is
-  **removed**, not improved.
+- Textual/regex tool-call execution and recovery is **removed**, not improved.
+  Legacy shape detection remains diagnostic-only and cannot call a tool.
 - Ask-mode free-text command scraping in `llm.py` (`extract_command`,
-  `_SHELL_PREFIXES`, fenced-block/backtick regexes) is **replaced** with
-  structured output: Ollama's `format` JSON-schema parameter locally, a forced
-  tool call / structured response format on cloud providers. No classifier
-  model.
+  `_SHELL_PREFIXES`, fenced-block/backtick regexes) is **replaced** with a
+  native `shell_command` call on every provider. No classifier model.
 
 Effort scale: **S** = hours, **M** = 1–3 days, **L** = a week or more.
 
-**Status (July 2026):** Phases 0–4 are complete (✅ markers below); Phase 5
-is not started. One deliberate deviation from the text of 0.5 is noted
-inline; 2.7 applies the weak model to summaries and compaction (conversation
-titles never used an LLM — they come from the first user message). Hotfix
-f3ad212 (older/smaller local Ollama servers: /api/show name compat,
-unknown-capability models kept, conservative num_ctx when the model max is
-unknown, ask-mode legacy format fallback, graceful startup resolution) is
-folded into the 0.1/0.4/0.6 behavior described here.
+**Status (September 2026, `edge` hardening):** Phases 0–4 are implemented;
+Phase 5 is not started. The edge audit tightened several earlier
+implementations: unknown local capabilities now fail closed, textual calls
+cannot execute, request-specific tool authorization and schema validation are
+enforced, context compaction preserves complete protocol groups, local-only
+sessions cannot fall through to cloud providers, and supported container
+topologies are now non-root and data-preserving.
 
 ---
 
@@ -35,16 +32,17 @@ folded into the 0.1/0.4/0.6 behavior described here.
 These fix defects that make local sessions appear randomly broken today, plus
 the tools-only enforcement. All are small and independent.
 
-### 0.1 Set `num_ctx` and `keep_alive` on every Ollama request — **S** ✅
+### 0.1 Discover effective context; keep `num_ctx` optional — **S** ✅
 - **Problem:** `raw_ollama` / `stream_ollama` never pass `options.num_ctx`.
   Ollama defaults to 4k context under 24 GiB VRAM and truncates silently from
   the top (evicting system prompt + tool schemas), while
   `CONTEXT_LIMITS["ollama"] = 28000` in `runtime.py` assumes 28k. Result:
   tool calling "inexplicably" stops after a few exchanges.
-- **Fix:** config key `ollama_num_ctx` (default 32768) passed as
-  `options.num_ctx`; set `keep_alive` to keep the model warm; read the model's
-  max context from `/api/show` (`model_info`) and clamp; derive the runtime
-  context limit from the same number.
+- **Fix:** let Ollama choose `num_ctx` by default so Conch does not force a
+  large KV allocation on unknown hardware. An explicit `ollama_num_ctx` is
+  passed and clamped to the model maximum. Read the loaded effective context
+  from `/api/ps`, use a conservative pre-load accounting fallback, and keep
+  the model warm with `keep_alive`.
 - **Modules:** `providers.py`, `runtime.py`, `config.py`.
 
 ### 0.2 Accumulate streamed tool calls from every chunk — **S** ✅
@@ -71,32 +69,23 @@ the tools-only enforcement. All are small and independent.
 - **Fix:** on model selection, verify `capabilities` contains `"tools"`;
   reject non-tool models with a clear message. Enforce at startup config
   validation, `/model`, `/provider`, `conch_config` `set_model`/`set_provider`,
-  and in the fallback chain. Cache the result per model name. Apply the same
-  tool-capable-only rule to model lists for all providers.
+  and in the fallback chain. Cache the result by installed model digest so a
+  retagged/replaced model is revalidated. Missing capability metadata is a
+  rejection, not an optimistic guess.
 - **Modules:** `providers.py`, `commands.py`, `tooling.py`, `config.py`.
 
-### 0.5 Remove textual tool-call recovery — **S** ✅
-- **Fix:** delete `extract_textual_tool_use_blocks` and its call site in
-  `chat_turn` (the `<tool_called .../>` XML and `ast.literal_eval` paths).
-  Native `tool_calls` only. Also removes the hazard of executing tool-call
-  syntax merely *quoted* in prose.
+### 0.5 Remove textual tool-call execution — **S** ✅
+- **Fix:** remove every textual-call execution path from `chat_turn`.
+  Native `tool_calls` only. A conservative detector remains for display
+  suppression, diagnostics, and `/resettools`; it never supplies arguments to
+  a tool.
 - **Modules:** `runtime.py`.
-- **As implemented (deviation):** the `<tool_called>` XML and
-  `ast.literal_eval` paths are deleted as specified, but the strict
-  JSON-only recovery (bare `{"name": ..., "arguments": ...}` content and
-  `<tool_call>` JSON tags) is kept: live testing showed qwen2.5-coder via
-  Ollama emitting real tool calls this way that Ollama fails to parse into
-  structured `tool_calls`. The guard requires exact tool-call shape, so
-  quoted prose and ordinary JSON replies are never executed.
 
 ### 0.6 Replace ask-mode regex extraction with structured output — **M** ✅
 - **Fix:** delete `_SHELL_PREFIXES` / `extract_command` and the per-provider
-  extraction heuristics. Ask mode requests
-  `format: {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`
-  on Ollama, and a forced single tool call (or JSON response format) on
-  OpenAI/Anthropic/Cerebras. Also fix `call_ollama`: send proper system+user
-  roles (it currently flattens both into one user message) and align its
-  default model with `config.py`.
+  extraction heuristics. Ask mode requires a native `shell_command` call on
+  Ollama, custom/llama.cpp, and cloud providers. `call_ollama` sends proper
+  system+user roles and shares chat-mode request options.
 - **Modules:** `llm.py`, `prompts.py`.
 
 ### 0.7 Local fallback chain from live model list — **S–M** ✅
@@ -134,23 +123,25 @@ plumbing and immediately improve daily use.
 
 ### 1.3 Real token accounting + context gauge — **M** ✅
 - **Fix:** calibrate `estimate_tokens` against the `prompt_eval_count` Ollama
-  returns on every response; show a context-usage gauge in the per-turn usage
-  line; warn at ~80% of `num_ctx`.
+  returns on every response, isolated by provider/model tokenizer; show a
+  context-usage gauge in the per-turn usage line; warn at ~80% of the
+  effective context.
 - **Modules:** `runtime.py`, `app.py`.
 
 ### 1.4 Model-generated compaction (auto-compact) — **M** ✅
 - **Problem:** `compress_context` char-slices messages (first 200 + last 100
   chars) and drops middles — garbage input for small models.
 - **Fix:** at ~70% of `num_ctx`, summarize older history with the LLM into a
-  single summary message; keep system + last N turns verbatim. Keep cheap
+  single summary message; keep system + last N turns verbatim. Tool-call and
+  tool-result groups are atomic and never split. Keep cheap
   char-capping only as a first layer for oversized single messages
   (Claude Code auto-compact / Hermes compressor pattern).
 - **Modules:** `runtime.py`.
 
 ### 1.5 Token-aware tool-result truncation — **S** ✅
-- **Fix:** replace fixed char caps (15,000 in `local_shell`, 8,000 in
-  `chat_turn`) with a budget scaled to context (e.g. ≤10% of `num_ctx` per
-  result), keeping head + tail.
+- **Fix:** replace fixed char caps with a budget scaled to context. Parallel
+  results share one aggregate round budget, keeping head + tail, so many
+  simultaneous calls cannot each consume 10% of the window.
 - **Modules:** `runtime.py`, `tooling.py`.
 
 ### 1.6 Small relevant tool set for local + config-defined profiles — **M** ✅
@@ -220,9 +211,10 @@ plumbing and immediately improve daily use.
   `base_url` + optional `api_key_env` + model name, reusing the existing
   OpenAI adapter and `_stream_openai_compat`. Supports vLLM, LM Studio,
   llama.cpp server, or a second Ollama box via its OpenAI endpoint.
-  Capability gating (Phase 0.4) applies: custom endpoints are assumed
-  tool-capable, verified by a startup probe call. Independent of other Phase 2
-  items — can be pulled forward if a non-Ollama local backend is needed.
+  Capability gating (Phase 0.4) applies: enumerate `/v1/models` and retain only
+  models that produce the required forced native tool call. llama.cpp context
+  is discovered through `/v1/props` then `/props`; unavailable endpoints
+  expose no models.
 - **Modules:** `providers.py`, `config.py`, `commands.py` (`/provider`).
 
 ### 2.5 Plan/todo scratchpad tool — **M** ✅
@@ -370,6 +362,24 @@ within the phase matters: 4.1 (skills) before 4.2 (skill-scoped subagents);
 - **Modules:** new `channels.py` (gateway abstraction: poll/receive/send per
   channel), `scheduler.py`, `composio.py`, `app.py`, `conversations.py`
   (channel↔conversation mapping), `tooling.py` (approval flow).
+
+### Edge hardening gates — ✅
+- **Per-request authority:** a model call may execute only a tool definition
+  included in that exact request after profile/relevance selection. Retries,
+  fallbacks, skill scopes, and remote sessions preserve that exact set.
+- **Protocol integrity:** tool calls are canonicalized before execution,
+  collision-free IDs are shared by assistant calls/results, malformed or
+  schema-invalid arguments become tool errors, and repetitive batches stop.
+- **Privacy:** local providers imply `local_only=auto`; cloud fallback,
+  cloud model switches, cloud weak models, and startup IP geolocation are off
+  unless explicitly enabled.
+- **Execution isolation:** process-global shell/runtime state is serialized
+  across local, scheduled, delegated, and remote turns. Remote approvals are
+  single-use, expiring, origin-bound, and hook-gated.
+- **Containers:** non-root wheel install, bridge networking, narrow workspace
+  mount, named config/state volumes, read-only root filesystem, and documented
+  host/LAN/Ollama-sidecar/llama.cpp-sidecar topologies. Entrypoint startup
+  never rewrites config or deletes data.
 
 ---
 

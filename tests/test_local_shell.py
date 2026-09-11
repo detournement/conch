@@ -208,6 +208,27 @@ class TestLocalShellExecution(unittest.TestCase):
             )
         self.assertIn("done", result["content"][0]["text"])
 
+    def test_large_output_is_bounded_while_streaming(self):
+        client = LocalShellClient()
+        client.set_policy(
+            LocalShellPolicy(interactive=False, allow_auto_execute=True)
+        )
+        client.set_result_budget(1000)
+        with _CaptureStderr():
+            result = client.call_tool(
+                "local_shell",
+                {
+                    "command": (
+                        "python3 -c \"print('HEAD' + 'x' * 50000 + 'TAIL')\""
+                    )
+                },
+            )
+        text = result["content"][0]["text"]
+        self.assertLessEqual(len(text), 1000)
+        self.assertTrue(text.startswith("HEAD"))
+        self.assertIn("truncated", text)
+        self.assertTrue(text.endswith("TAIL"))
+
 
 if __name__ == "__main__":
     unittest.main()

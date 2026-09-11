@@ -111,10 +111,21 @@ class TestChatTurnHookDispatch(unittest.TestCase):
             return responses.pop(0)
 
         messages = [{"role": "user", "content": "go"}]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "my_tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            },
+        }]
         with patch("sys.stderr", io.StringIO()):
             reply, _ = chat_turn(
                 config=config, provider="openai", raw_fn=raw_fn,
-                messages=messages, tools=None, tool_map={},
+                messages=messages, tools=tools, tool_map={},
                 builtin_clients={"my_tool": client}, max_tool_rounds=3,
             )
         return reply, messages

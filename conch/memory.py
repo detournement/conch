@@ -8,7 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Union
 
 
 def _state_dir() -> Path:
@@ -77,7 +77,7 @@ class MemoryEntry:
     created_at: str
     source: str
 
-    def as_dict(self) -> Dict[str, str | int]:
+    def as_dict(self) -> Dict[str, Union[str, int]]:
         return {
             "id": self.id,
             "content": self.content,
@@ -91,7 +91,7 @@ class MemoryStore:
         self._path = _memory_path()
         self._entries = self._load()
 
-    def _load(self) -> List[Dict[str, str | int]]:
+    def _load(self) -> List[Dict[str, Union[str, int]]]:
         try:
             return json.loads(self._path.read_text())
         except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -103,10 +103,12 @@ class MemoryStore:
         tmp.write_text(json.dumps(self._entries, indent=2))
         tmp.replace(self._path)
 
-    def get_all(self) -> List[Dict[str, str | int]]:
+    def get_all(self) -> List[Dict[str, Union[str, int]]]:
         return list(self._entries)
 
-    def add(self, content: str, source: str = "user") -> Dict[str, str | int]:
+    def add(
+        self, content: str, source: str = "user"
+    ) -> Dict[str, Union[str, int]]:
         new_id = max((int(item["id"]) for item in self._entries), default=0) + 1
         entry = MemoryEntry(
             id=new_id,
@@ -140,13 +142,16 @@ class MemoryStore:
         lines.extend(f"- {content}" for content in contents)
         return "\n".join(lines)
 
-    def _fts_rank(self, query: str, limit: int) -> List[str] | None:
+    def _fts_rank(
+        self, query: str, limit: int
+    ) -> Optional[List[str]]:
         """bm25-ranked entry contents via an in-memory FTS5 table, or None
         when FTS5 isn't compiled into this sqlite."""
         keywords = [kw for kw in query.lower().split() if kw]
         if not keywords:
             return []
         match = " OR ".join('"%s"*' % kw.replace('"', '""') for kw in keywords)
+        conn = None
         try:
             conn = sqlite3.connect(":memory:")
             conn.execute("CREATE VIRTUAL TABLE mem USING fts5(content)")
@@ -161,6 +166,9 @@ class MemoryStore:
             ).fetchall()
         except sqlite3.Error:
             return None
+        finally:
+            if conn is not None:
+                conn.close()
         return [row[0] for row in rows]
 
     def _keyword_rank(self, query: str, limit: int) -> List[str]:

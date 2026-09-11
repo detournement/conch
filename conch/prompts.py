@@ -7,10 +7,8 @@ from __future__ import annotations
 # ASK mode -- one-shot command generation
 # ---------------------------------------------------------------------------
 
-# Ask mode uses structured output (plan 0.6): tool-calling providers are
-# forced into a shell_command tool call; Ollama is constrained to a
-# {"command": ...} JSON schema. The prompt describes the task, not the
-# output format — the format is enforced by the API.
+# Ask mode uses structured output (plan 0.6): every provider must return a
+# native shell_command tool call. There is no free-text command scraping.
 _ASK_BASE = (
     "You are an expert shell, DevOps, cloud, and security assistant. "
     "Produce exactly one shell command that satisfies the user's request, "
@@ -32,11 +30,8 @@ ASK_PROMPTS = {
     "openrouter": _ASK_TOOL_CALL,
     "anthropic": _ASK_TOOL_CALL,
     "openai": _ASK_TOOL_CALL,
-    "ollama": (
-        _ASK_BASE
-        + "\n\nRespond with a JSON object of the form "
-        '{"command": "<the shell command>"} and nothing else.'
-    ),
+    "ollama": _ASK_TOOL_CALL,
+    "custom": _ASK_TOOL_CALL,
 }
 
 
@@ -118,7 +113,7 @@ _CHAT_BASE = (
 # explicitly told not to handle. Roughly 250 tokens vs ~990.
 _CHAT_LOCAL = (
     "You are Conch, an LLM-powered shell assistant running in the user's "
-    "terminal on a local Ollama model. Keep replies short and direct; use "
+    "terminal on a local inference model. Keep replies short and direct; use "
     "markdown sparingly (this is a terminal).\n\n"
 
     "Tools (via function calling):\n"
@@ -186,6 +181,7 @@ CHAT_PROMPTS = {
         + _CHAT_BASE
     ),
     "ollama": _CHAT_LOCAL,
+    "custom": _CHAT_LOCAL,
 }
 
 
@@ -197,17 +193,32 @@ def build_self_description(provider: str, model: str, config: dict = None) -> st
     lives. Rebuilt whenever the user switches provider/model mid-session.
     """
     from .providers import get_context_window
-    from .config import get_config_path
+    from .config import get_config_path, local_only_enabled
 
     window = get_context_window(provider, model, config)
     text = (
         f"You are currently running as {provider}/{model} "
         f"(context window ~{window:,} tokens). "
-        f"Your config file is {get_config_path()}."
+        f"Your config file is {get_config_path()}. "
+        f"Local-only mode is "
+        f"{'on' if local_only_enabled(config or {}, provider) else 'off'}."
     )
     if (provider or "").lower() == "ollama":
-        from .providers import get_ollama_base_url
-        text += f" Ollama server: {get_ollama_base_url(config)}."
+        from .providers import get_ollama_base_url, get_ollama_num_ctx
+        num_ctx = get_ollama_num_ctx(model, config)
+        text += (
+            f" Ollama server: {get_ollama_base_url(config)}; "
+            f"num_ctx: {num_ctx or 'server-managed'}; "
+            f"temperature: {(config or {}).get('ollama_temperature', (config or {}).get('temperature', '0.2'))}; "
+            f"think: {(config or {}).get('ollama_think', 'server default')}."
+        )
+    elif (provider or "").lower() == "custom":
+        from .providers import get_custom_base_url
+        text += (
+            f" Inference server: {get_custom_base_url(config)}; "
+            f"temperature: {(config or {}).get('custom_temperature', (config or {}).get('temperature', '0.2'))}; "
+            f"max output: {(config or {}).get('custom_max_tokens', (config or {}).get('max_output_tokens', 'automatic'))}."
+        )
     return text
 
 

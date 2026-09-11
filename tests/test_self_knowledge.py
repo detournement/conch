@@ -40,15 +40,36 @@ class _FakeHTTPResponse:
         return False
 
 
-def _fake_show_server(model_info, reachable=True):
-    """urlopen side_effect emulating POST /api/show with given model_info."""
+def _fake_show_server(model_info, reachable=True, running_context=None):
+    """urlopen side_effect emulating Ollama discovery/show/ps."""
 
     def side_effect(req, timeout=None):
         if not reachable:
             raise urllib.error.URLError("connection refused")
         url = req if isinstance(req, str) else req.full_url
+        if url.endswith("/api/tags"):
+            return _FakeHTTPResponse({
+                "models": [
+                    {"name": "llama3.3", "digest": "sha256:llama"},
+                    {
+                        "name": "qwen2.5-coder",
+                        "digest": "sha256:qwen",
+                    },
+                ]
+            })
         if url.endswith("/api/show"):
-            return _FakeHTTPResponse({"model_info": model_info})
+            return _FakeHTTPResponse({
+                "capabilities": ["completion", "tools"],
+                "model_info": model_info,
+            })
+        if url.endswith("/api/ps"):
+            models = []
+            if running_context:
+                models.append({
+                    "name": "llama3.3",
+                    "context_length": running_context,
+                })
+            return _FakeHTTPResponse({"models": models})
         raise AssertionError(f"unexpected URL {url}")
 
     return side_effect
@@ -58,7 +79,7 @@ class CtxCacheTestCase(unittest.TestCase):
     """Isolates the module-level context cache between tests."""
 
     def setUp(self):
-        providers._ollama_ctx_cache.clear()
+        providers.clear_local_model_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -119,19 +140,29 @@ class TestOllamaContextLength(CtxCacheTestCase):
             self.assertEqual(mock_urlopen.call_count, calls, "second call must hit the cache")
 
     def test_ollama_window_is_effective_num_ctx(self):
-        # The window is what requests actually run with: the default num_ctx
-        # clamped to the model max — not the model's theoretical maximum.
-        from conch.providers import DEFAULT_OLLAMA_NUM_CTX
+        # Before a model is loaded, use a conservative budget while leaving
+        # Ollama itself free to choose the KV-cache size.
+        from conch.providers import DEFAULT_OLLAMA_CONTEXT_WINDOW
         side_effect = _fake_show_server({"llama.context_length": 131072})
         with patch("urllib.request.urlopen", side_effect=side_effect):
             self.assertEqual(
-                get_context_window("ollama", "llama3.3", {}), DEFAULT_OLLAMA_NUM_CTX
+                get_context_window("ollama", "llama3.3", {}),
+                DEFAULT_OLLAMA_CONTEXT_WINDOW,
             )
 
     def test_small_model_max_clamps_default(self):
         side_effect = _fake_show_server({"llama.context_length": 8192})
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            self.assertEqual(get_context_window("ollama", "llama3.3", {}), 8192)
+            self.assertEqual(get_context_window("ollama", "llama3.3", {}), 4096)
+
+    def test_loaded_context_comes_from_api_ps(self):
+        side_effect = _fake_show_server(
+            {"llama.context_length": 131072}, running_context=24576
+        )
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            self.assertEqual(
+                get_context_window("ollama", "llama3.3", {}), 24576
+            )
 
     def test_num_ctx_clamps_model_max(self):
         side_effect = _fake_show_server({"llama.context_length": 131072})
@@ -149,11 +180,11 @@ class TestOllamaContextLength(CtxCacheTestCase):
         # When the model's max context is unknown (unreachable server or old
         # server without model_info) the default degrades to a conservative
         # num_ctx instead of gambling on 32k the machine may not handle.
-        from conch.providers import DEFAULT_OLLAMA_NUM_CTX_UNKNOWN
+        from conch.providers import DEFAULT_OLLAMA_CONTEXT_WINDOW
         side_effect = _fake_show_server({}, reachable=False)
         with patch("urllib.request.urlopen", side_effect=side_effect):
             window = get_context_window("ollama", "llama3.3", {})
-        self.assertEqual(window, DEFAULT_OLLAMA_NUM_CTX_UNKNOWN)
+        self.assertEqual(window, DEFAULT_OLLAMA_CONTEXT_WINDOW)
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +206,11 @@ class TestGetContextLimit(CtxCacheTestCase):
         with patch("urllib.request.urlopen", side_effect=side_effect):
             self.assertEqual(get_context_limit("ollama", config), int(16384 * 0.9))
 
-    def test_tiny_window_floors_at_minimum(self):
+    def test_tiny_window_is_not_overstated(self):
         side_effect = _fake_show_server({}, reachable=False)
         config = {"provider": "ollama", "chat_model": "llama3.3", "ollama_num_ctx": "512"}
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            self.assertEqual(get_context_limit("ollama", config), 2048)
+            self.assertEqual(get_context_limit("ollama", config), int(512 * 0.9))
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +231,7 @@ class TestBuildSelfDescription(CtxCacheTestCase):
         with patch("urllib.request.urlopen", side_effect=side_effect):
             text = build_self_description("ollama", "llama3.3", config)
         self.assertIn("ollama/llama3.3", text)
-        self.assertIn("32,768 tokens", text)  # effective num_ctx, not model max
+        self.assertIn("4,096 tokens", text)
         self.assertIn("http://192.168.1.247:11434", text)
 
     def test_description_stays_compact(self):
@@ -248,7 +279,7 @@ class TestStatusCommand(CtxCacheTestCase):
             {"provider": "anthropic"}, "anthropic", "claude-sonnet-4-6", messages=messages,
         )
         self.assertIn("Context used", output)
-        self.assertIn("~1,000 tokens", output)
+        self.assertIn("~1,008 tokens", output)
         self.assertIn("of window", output)
 
     def test_shows_session_usage(self):
@@ -265,7 +296,7 @@ class TestStatusCommand(CtxCacheTestCase):
         with patch("urllib.request.urlopen", side_effect=side_effect):
             result, output = self._run(config, "ollama", "llama3.3")
         self.assertIn("http://192.168.1.247:11434", output)
-        self.assertIn("32,768 tokens", output)  # effective num_ctx, not model max
+        self.assertIn("4,096 tokens", output)
 
     def test_secretlike_settings_hidden(self):
         config = {

@@ -193,11 +193,31 @@ class SearchIndex:
             (match, limit),
         ).fetchall()
 
+    def close(self):
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 class ConversationManager:
     def __init__(self):
         self._index = self._load_index()
         self._search_index = SearchIndex()
+
+    def close(self):
+        self._search_index.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _load_index(self) -> Dict[str, Any]:
         try:

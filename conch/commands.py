@@ -15,7 +15,9 @@ from .providers import (
     KNOWN_MODELS,
     RAW_FNS,
     get_fallback_model,
+    get_custom_base_url,
     get_ollama_base_url,
+    list_custom_models,
     list_ollama_models,
     ollama_model_matches,
     validate_ollama_model,
@@ -451,10 +453,9 @@ def handle_slash_command(
         print()
         for provider_name, models in KNOWN_MODELS.items():
             if provider_name == "ollama":
-                models = list_ollama_models(config)
+                models = list_ollama_models(config, force_refresh=True)
             elif provider_name == "custom":
-                custom_model = (config.get("custom_model") or "").strip()
-                models = [custom_model] if custom_model else []
+                models = list_custom_models(config, force_refresh=True)
             marker = " \033[1;33m← active\033[0m" if provider_name == provider else ""
             print(f"  \033[1;36m{provider_name}\033[0m{marker}")
             if provider_name == "ollama":
@@ -465,7 +466,12 @@ def handle_slash_command(
                     print("    \033[2m(no tool-capable models installed)\033[0m")
                     continue
             if provider_name == "custom" and not models:
-                print("    \033[2m(not configured — set custom_base_url + custom_model)\033[0m")
+                if not get_custom_base_url(config):
+                    print("    \033[2m(not configured — set custom_base_url)\033[0m")
+                elif models is None:
+                    print("    \033[2m(endpoint unreachable or /v1/models unavailable)\033[0m")
+                else:
+                    print("    \033[2m(no models passed native tool-call conformance)\033[0m")
                 continue
             for model in models:
                 current = model == model_name or (
@@ -482,13 +488,15 @@ def handle_slash_command(
         if not arg:
             print(f"\n  \033[2mCurrent model:\033[0m \033[1m{model_name}\033[0m ({provider})\n")
             return None
-        tokens = arg.split()
-        force = "--force" in tokens
-        if force:
-            tokens = [t for t in tokens if t != "--force"]
-        new_model = " ".join(tokens)
+        if "--force" in arg.split():
+            print(
+                "\n  \033[31mModel validation cannot be bypassed: Conch "
+                "supports only available native tool-calling models.\033[0m\n"
+            )
+            return None
+        new_model = arg
         if not new_model:
-            print("\n  \033[2mUsage: /model <name> [--force]\033[0m\n")
+            print("\n  \033[2mUsage: /model <verified-name>\033[0m\n")
             return None
         new_provider = None
         for provider_name, models in KNOWN_MODELS.items():
@@ -496,17 +504,18 @@ def handle_slash_command(
                 new_provider = provider_name
                 break
         if new_provider is None:
-            ollama_models = list_ollama_models(config)
+            ollama_models = list_ollama_models(config, force_refresh=True)
             if ollama_models and ollama_model_matches(new_model, ollama_models):
                 new_provider = "ollama"
+        if new_provider is None:
+            custom_models = list_custom_models(config, force_refresh=True)
+            if custom_models and new_model in custom_models:
+                new_provider = "custom"
         if new_provider is None:
             # Not in any catalog — assume the current provider; the model
             # must then pass that provider's validation below.
             new_provider = provider
-        if force:
-            print(f"\n  \033[33m⚠ Skipping model validation for '{new_model}' (--force) — "
-                  f"requests will fail if {new_provider} doesn't know it\033[0m")
-        elif new_provider == "ollama":
+        if new_provider == "ollama":
             ok, reason = validate_ollama_model(new_model, config)
             if ok is None:
                 print(f"\n  \033[31m{reason} — cannot verify model '{new_model}'\033[0m\n")
@@ -522,16 +531,24 @@ def handle_slash_command(
         else:
             from .providers import validate_model_for_provider
             ok, reason = validate_model_for_provider(new_provider, new_model, config)
-            if ok is False:
+            if ok is not True:
                 print(f"\n  \033[31mCannot switch: {reason}\033[0m")
-                print("  \033[2mUse /models to list, or '/model <name> --force' if the "
-                      "model is newer than conch's catalog.\033[0m\n")
+                print("  \033[2mUse /models to list verified models.\033[0m\n")
                 return None
-            if ok is None and reason:
-                print(f"\n  \033[33m⚠ {reason}\033[0m")
         new_fn = RAW_FNS.get(new_provider)
         if not new_fn:
             print(f"\n  \033[31mUnknown provider for model '{new_model}'\033[0m\n")
+            return None
+        from .config import local_only_enabled
+
+        if local_only_enabled(config, provider) and new_provider not in (
+            "ollama",
+            "custom",
+        ):
+            print(
+                "\n  \033[31mCannot switch to a cloud model while "
+                "local_only is enabled.\033[0m\n"
+            )
             return None
         key_env = DEFAULT_API_KEY_ENVS.get(new_provider, "")
         if key_env and not os.environ.get(key_env, "").strip():
@@ -541,6 +558,8 @@ def handle_slash_command(
         config["api_key_env"] = key_env
         config["chat_model"] = new_model
         config["model"] = new_model
+        if new_provider == "custom":
+            config["custom_model"] = new_model
         print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
         return (new_provider, new_model, new_fn)
 
@@ -551,6 +570,17 @@ def handle_slash_command(
         new_provider = arg.lower()
         if new_provider not in RAW_FNS:
             print(f"\n  \033[31mUnknown provider '{new_provider}'\033[0m\n")
+            return None
+        from .config import local_only_enabled
+
+        if local_only_enabled(config, provider) and new_provider not in (
+            "ollama",
+            "custom",
+        ):
+            print(
+                "\n  \033[31mCannot switch to a cloud provider while "
+                "local_only is enabled.\033[0m\n"
+            )
             return None
         key_env = DEFAULT_API_KEY_ENVS.get(new_provider, "")
         if key_env and not os.environ.get(key_env, "").strip():
@@ -564,7 +594,7 @@ def handle_slash_command(
                 print("\n  \033[31mNo tool-capable models installed on the Ollama server — cannot switch\033[0m\n")
             return None
         if new_provider == "custom":
-            from .providers import get_custom_base_url, probe_custom_provider
+            from .providers import probe_custom_provider
             if not new_model or not get_custom_base_url(config):
                 print("\n  \033[31mSet custom_base_url and custom_model in "
                       "~/.config/conch/config before switching to custom\033[0m\n")
@@ -577,6 +607,8 @@ def handle_slash_command(
         config["api_key_env"] = key_env
         config["chat_model"] = new_model
         config["model"] = new_model
+        if new_provider == "custom":
+            config["custom_model"] = new_model
         print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
         return (new_provider, new_model, RAW_FNS[new_provider])
 
@@ -584,7 +616,7 @@ def handle_slash_command(
         prefs = load_tool_prefs()
         disabled = set(prefs.get("disabled_groups", []))
         groups = group_tools(all_tools, tool_map)
-        print(f"\n  \033[1;36mTool groups:\033[0m")
+        print("\n  \033[1;36mTool groups:\033[0m")
         for grp in sorted(groups):
             status = "\033[31m OFF\033[0m" if grp in disabled else "\033[32m ON \033[0m"
             print(f"    {status}  \033[1m{grp:<20}\033[0m \033[2m{len(groups[grp])} tools\033[0m")
@@ -647,19 +679,36 @@ def handle_slash_command(
         return None
 
     if command == "/status":
-        from .config import get_config_path
-        from .providers import get_context_window
-        from .runtime import estimate_tokens
+        from .config import get_config_path, local_only_enabled
+        from .providers import (
+            get_context_window,
+            validate_model_for_provider,
+        )
+        from .runtime import calibration_key, estimate_tokens
 
         from . import __version__
         window = get_context_window(provider, model_name, config)
-        print(f"\n  \033[1;36mConch status:\033[0m")
+        print("\n  \033[1;36mConch status:\033[0m")
         print(f"    Version:        {__version__}")
         print(f"    Provider:       {provider}")
         print(f"    Model:          {model_name}")
         print(f"    Context window: {window:,} tokens")
+        print(
+            f"    Local only:     "
+            f"{'on' if local_only_enabled(config, provider) else 'off'}"
+        )
+        if provider in ("ollama", "custom"):
+            verified, reason = validate_model_for_provider(
+                provider, model_name, config
+            )
+            verification = "verified" if verified is True else (
+                reason or "unverified"
+            )
+            print(f"    Tool calling:   {verification}")
         if messages is not None:
-            used = estimate_tokens(messages)
+            used = estimate_tokens(
+                messages, key=calibration_key(provider, config)
+            )
             pct = (used / window * 100) if window else 0
             bar_color = "\033[31m" if pct >= 80 else "\033[33m" if pct >= 60 else "\033[32m"
             print(f"    Context used:   ~{used:,} tokens ({bar_color}{pct:.0f}%\033[0m of window, estimated)")
@@ -675,6 +724,8 @@ def handle_slash_command(
         print(f"    Config file:    {config_path}{exists}")
         if provider == "ollama":
             print(f"    Ollama server:  {get_ollama_base_url(config)}")
+        elif provider == "custom":
+            print(f"    Inference URL:  {get_custom_base_url(config)}")
         _skip_keys = {"provider", "model", "chat_model"}
         _hide = ("token", "key", "password", "secret", "credential")
 
@@ -698,14 +749,14 @@ def handle_slash_command(
         total_out = session_usage.get("output_tokens", 0)
         total_cost = session_usage.get("cost", 0.0)
         turns = session_usage.get("turns", 0)
-        print(f"\n  \033[1;36mSession usage:\033[0m")
+        print("\n  \033[1;36mSession usage:\033[0m")
         print(f"    Turns:         {turns}")
         print(f"    Input tokens:  {total_in:,}")
         print(f"    Output tokens: {total_out:,}")
         if total_cost > 0.0001:
             print(f"    Est. cost:     ${total_cost:.4f}")
         else:
-            print(f"    Est. cost:     free")
+            print("    Est. cost:     free")
         print()
         return None
 

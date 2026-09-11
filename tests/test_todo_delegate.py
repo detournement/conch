@@ -109,7 +109,10 @@ class TestTodoInjection(unittest.TestCase):
                 tools=None, tool_map={},
                 builtin_clients={"todo_list": todo}, max_tool_rounds=2,
             )
-        self.assertEqual(len(seen[0]), 1)
+        self.assertFalse(
+            any("[Plan]" in str(message.get("content", ""))
+                for message in seen[0])
+        )
 
     def test_anthropic_gets_todo_in_system_string(self):
         todo = TodoListClient()
@@ -246,6 +249,20 @@ class TestDelegateTask(unittest.TestCase):
             client.call_tool("delegate_task", {"task": "t"})
         self.assertEqual(seen["config"]["chat_model"], "qwen3.6:27b",
                          "invalid subagent model must fall back to the parent's")
+
+    def test_local_only_blocks_cloud_subagent_provider(self):
+        client = _make_delegate(config={
+            "provider": "ollama",
+            "chat_model": "qwen3.6:27b",
+            "model": "qwen3.6:27b",
+            "local_only": "true",
+        })
+        with patch("sys.stderr", io.StringIO()):
+            config, provider = client._subagent_config(
+                preferred_provider="openai"
+            )
+        self.assertEqual(provider, "ollama")
+        self.assertEqual(config["chat_model"], "qwen3.6:27b")
 
     def test_serialized_execution(self):
         client = _make_delegate()

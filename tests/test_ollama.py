@@ -10,11 +10,11 @@ Covers the failure modes fixed in the ollama-tools work:
 - hardcoded model list allowing switches to models the server doesn't have
 - models without the "tools" capability being offered/accepted
 
-Plus the local-Ollama hotfix (older/smaller servers on localhost):
-- /api/show requests rejected by pre-rename servers that only accept "name"
-- per-model /api/show failures filtering out ALL models (conch unusable)
-- num_ctx=32768 blindly sent when the model's max context is unknown
-- startup model validation dead-ending instead of degrading gracefully
+Plus strict local safety:
+- capability metadata is keyed by the installed model digest
+- missing/unknown capability metadata fails closed
+- num_ctx is server-managed unless explicitly configured
+- startup validation never sends an unverified model to /api/chat
 """
 
 import io
@@ -85,7 +85,12 @@ def _fake_ollama_server(installed, tool_capable=(), reachable=True):
             raise urllib.error.URLError("connection refused")
         url = _req_url(req)
         if url.endswith("/api/tags"):
-            return _FakeHTTPResponse({"models": [{"name": n} for n in installed]})
+            return _FakeHTTPResponse({
+                "models": [
+                    {"name": n, "digest": f"sha256:{index}"}
+                    for index, n in enumerate(installed)
+                ]
+            })
         if url.endswith("/api/show"):
             model = json.loads(req.data.decode())["model"]
             caps = ["completion"]
@@ -101,9 +106,7 @@ class OllamaCacheTestCase(unittest.TestCase):
     """Base that isolates the module-level caches between tests."""
 
     def setUp(self):
-        providers._ollama_tags_cache.clear()
-        providers._ollama_caps_cache.clear()
-        providers._ollama_ctx_cache.clear()
+        providers.clear_local_model_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +141,16 @@ class TestStripThinkBlocks(unittest.TestCase):
 # raw_ollama response parsing
 # ---------------------------------------------------------------------------
 
-class TestRawOllama(unittest.TestCase):
+class TestRawOllama(OllamaCacheTestCase):
     def _call(self, api_response):
-        with patch("urllib.request.urlopen", return_value=_FakeHTTPResponse(api_response)):
+        local = _fake_ollama_server(["qwen3"], ["qwen3"])
+
+        def side_effect(req, timeout=None):
+            if _req_url(req).endswith("/api/chat"):
+                return _FakeHTTPResponse(api_response)
+            return local(req, timeout)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
             return raw_ollama({"provider": "ollama", "model": "qwen3"}, [])
 
     def test_dict_arguments_serialized(self):
@@ -188,12 +198,11 @@ class TestRawOllama(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Request options: num_ctx + keep_alive must go out on every request
+# Request options: server-managed num_ctx by default, explicit override
 # ---------------------------------------------------------------------------
 
 class TestOllamaRequestOptions(OllamaCacheTestCase):
-    """raw_ollama and stream_ollama must send options.num_ctx and keep_alive;
-    otherwise Ollama silently truncates at its own (tiny) default window."""
+    """Avoid forcing a large KV cache while retaining explicit control."""
 
     def _serve(self, model_info=None, chat_payload=None, chat_lines=None):
         """urlopen side_effect answering /api/show and /api/chat, recording
@@ -202,8 +211,15 @@ class TestOllamaRequestOptions(OllamaCacheTestCase):
 
         def side_effect(req, timeout=None):
             url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({
+                    "models": [{"name": "qwen3", "digest": "sha256:qwen3"}]
+                })
             if url.endswith("/api/show"):
-                return _FakeHTTPResponse({"model_info": model_info or {}})
+                return _FakeHTTPResponse({
+                    "capabilities": ["completion", "tools"],
+                    "model_info": model_info or {},
+                })
             if url.endswith("/api/chat"):
                 recorded["body"] = json.loads(req.data.decode())
                 return _FakeHTTPResponse(
@@ -214,24 +230,20 @@ class TestOllamaRequestOptions(OllamaCacheTestCase):
 
         return side_effect, recorded
 
-    def test_raw_ollama_sends_default_num_ctx_and_keep_alive(self):
+    def test_raw_ollama_leaves_num_ctx_server_managed(self):
         side_effect, recorded = self._serve(model_info={"qwen2.context_length": 131072})
         with patch("urllib.request.urlopen", side_effect=side_effect):
             raw_ollama({"provider": "ollama", "model": "qwen3"}, [])
         body = recorded["body"]
-        self.assertEqual(body["options"]["num_ctx"], providers.DEFAULT_OLLAMA_NUM_CTX)
+        self.assertNotIn("num_ctx", body["options"])
+        self.assertEqual(body["options"]["temperature"], 0.2)
         self.assertEqual(body["keep_alive"], providers.DEFAULT_OLLAMA_KEEP_ALIVE)
 
-    def test_raw_ollama_conservative_num_ctx_when_model_max_unknown(self):
-        # Older servers don't report model_info: don't gamble on a 32k KV
-        # cache the machine may not survive — send the conservative default.
+    def test_raw_ollama_does_not_guess_num_ctx_when_model_max_unknown(self):
         side_effect, recorded = self._serve(model_info={})
         with patch("urllib.request.urlopen", side_effect=side_effect):
             raw_ollama({"provider": "ollama", "model": "qwen3"}, [])
-        self.assertEqual(
-            recorded["body"]["options"]["num_ctx"],
-            providers.DEFAULT_OLLAMA_NUM_CTX_UNKNOWN,
-        )
+        self.assertNotIn("num_ctx", recorded["body"]["options"])
 
     def test_explicit_config_num_ctx_wins_when_model_max_unknown(self):
         side_effect, recorded = self._serve(model_info={})
@@ -267,25 +279,53 @@ class TestOllamaRequestOptions(OllamaCacheTestCase):
         with patch("urllib.request.urlopen", side_effect=side_effect):
             stream_ollama({"provider": "ollama", "model": "qwen3"}, [])
         body = recorded["body"]
-        self.assertEqual(body["options"]["num_ctx"], providers.DEFAULT_OLLAMA_NUM_CTX)
+        self.assertNotIn("num_ctx", body["options"])
         self.assertEqual(body["keep_alive"], providers.DEFAULT_OLLAMA_KEEP_ALIVE)
 
-    def test_get_ollama_num_ctx_invalid_config_falls_back(self):
+    def test_get_ollama_num_ctx_invalid_config_is_server_managed(self):
         with patch("conch.providers.get_ollama_context_length", return_value=None):
             self.assertEqual(
                 providers.get_ollama_num_ctx("m", {"ollama_num_ctx": "not-a-number"}),
-                providers.DEFAULT_OLLAMA_NUM_CTX_UNKNOWN,
+                None,
             )
+
+    def test_num_predict_is_clamped_to_remaining_context(self):
+        side_effect, recorded = self._serve(
+            model_info={"qwen2.context_length": 8192}
+        )
+        config = {
+            "provider": "ollama",
+            "model": "qwen3",
+            "ollama_num_ctx": "1024",
+            "ollama_num_predict": "1000",
+        }
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            raw_ollama(
+                config,
+                [{"role": "user", "content": "x" * 2400}],
+            )
+        self.assertLess(
+            recorded["body"]["options"]["num_predict"], 200
+        )
 
 
 # ---------------------------------------------------------------------------
 # stream_ollama: tool calls arrive mid-stream, not in the final done chunk
 # ---------------------------------------------------------------------------
 
-class TestStreamOllama(unittest.TestCase):
+class TestStreamOllama(OllamaCacheTestCase):
     def _stream(self, chunks, on_token=None):
         response = _FakeHTTPResponse(lines=_stream_lines(chunks))
-        with patch("urllib.request.urlopen", return_value=response):
+        local = _fake_ollama_server(
+            ["qwen2.5-coder"], ["qwen2.5-coder"]
+        )
+
+        def side_effect(req, timeout=None):
+            if _req_url(req).endswith("/api/chat"):
+                return response
+            return local(req, timeout)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
             return stream_ollama(
                 {"provider": "ollama", "model": "qwen2.5-coder"}, [], tools=[{}], on_token=on_token
             )
@@ -323,6 +363,20 @@ class TestStreamOllama(unittest.TestCase):
         self.assertEqual(names, ["a", "b"])
         ids = [tc["id"] for tc in result["tool_calls"]]
         self.assertEqual(len(set(ids)), 2, "tool call ids must be unique")
+
+    def test_repeated_stream_chunk_does_not_duplicate_call(self):
+        tool_call = {
+            "function": {
+                "name": "local_shell",
+                "arguments": {"command": "pwd"},
+            }
+        }
+        result = self._stream([
+            {"message": {"tool_calls": [tool_call]}, "done": False},
+            {"message": {"tool_calls": [tool_call]}, "done": False},
+            {"done": True},
+        ])
+        self.assertEqual(len(result["tool_calls"]), 1)
 
     def test_content_streams_and_think_stripped(self):
         tokens = []
@@ -362,7 +416,7 @@ class TestStreamOllama(unittest.TestCase):
 
     def test_textual_tool_call_not_streamed_but_returned(self):
         """A bare-JSON textual tool call must NOT reach the terminal, yet the
-        full raw content must still be returned so recovery can execute it."""
+        full raw content is returned so chat_turn can reject it explicitly."""
         tokens = []
         payload = '{"name": "local_shell", "arguments": {"command": "ls /tmp"}}'
         result = self._stream([
@@ -453,12 +507,11 @@ class TestStreamDisplayGate(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: streamed textual tool call is recovered + executed WITHOUT the
-# raw JSON being displayed, while a normal reply IS displayed.
+# End-to-end: only native streamed tool calls execute.
 # ---------------------------------------------------------------------------
 
-class TestStreamedRecoveryIntegration(unittest.TestCase):
-    def test_streamed_bare_json_tool_call_recovered_not_displayed(self):
+class TestStreamedProtocolIntegration(OllamaCacheTestCase):
+    def test_streamed_native_tool_call_executes(self):
         class RecordingShell:
             def __init__(self):
                 self.calls = []
@@ -468,12 +521,14 @@ class TestStreamedRecoveryIntegration(unittest.TestCase):
                 return {"content": [{"text": "a.txt\nb.txt"}]}
 
         shell = RecordingShell()
-        tool_json = '{"name": "local_shell", "arguments": {"command": "ls /tmp"}}'
-        # Round 1: model emits the tool call as bare JSON content (qwen2.5-coder
-        # style). Round 2: model emits the ordinary reply.
         streams = [
             _FakeHTTPResponse(lines=_stream_lines([
-                {"message": {"content": tool_json}, "done": False},
+                {"message": {"tool_calls": [{
+                    "function": {
+                        "name": "local_shell",
+                        "arguments": {"command": "ls /tmp"},
+                    }
+                }]}, "done": False},
                 {"done": True},
             ])),
             _FakeHTTPResponse(lines=_stream_lines([
@@ -482,16 +537,36 @@ class TestStreamedRecoveryIntegration(unittest.TestCase):
                 {"done": True},
             ])),
         ]
+        stream_iter = iter(streams)
+        local = _fake_ollama_server(
+            ["qwen2.5-coder"], ["qwen2.5-coder"]
+        )
+
+        def side_effect(req, timeout=None):
+            if _req_url(req).endswith("/api/chat"):
+                return next(stream_iter)
+            return local(req, timeout)
 
         tokens = []
-        with patch("urllib.request.urlopen", side_effect=streams), \
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "local_shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }]
+        with patch("urllib.request.urlopen", side_effect=side_effect), \
                 patch("sys.stderr", io.StringIO()):
             reply, _usage = chat_turn(
                 config={"provider": "ollama", "chat_model": "qwen2.5-coder"},
                 provider="ollama",
                 raw_fn=raw_ollama,
                 messages=[{"role": "user", "content": "list files in /tmp"}],
-                tools=None,
+                tools=tools,
                 tool_map={},
                 builtin_clients={"local_shell": shell},
                 max_tool_rounds=5,
@@ -499,8 +574,7 @@ class TestStreamedRecoveryIntegration(unittest.TestCase):
             )
 
         displayed = "".join(tokens)
-        self.assertEqual(shell.calls, [("local_shell", {"command": "ls /tmp"})],
-                         "the recovered tool call must actually execute")
+        self.assertEqual(shell.calls, [("local_shell", {"command": "ls /tmp"})])
         self.assertNotIn("local_shell", displayed,
                          "raw tool-call JSON must never reach the terminal")
         self.assertNotIn("{", displayed)
@@ -519,8 +593,18 @@ class TestStreamedRecoveryIntegration(unittest.TestCase):
                 {"done": True},
             ])),
         ]
+        stream_iter = iter(streams)
+        local = _fake_ollama_server(
+            ["qwen2.5-coder"], ["qwen2.5-coder"]
+        )
+
+        def side_effect(req, timeout=None):
+            if _req_url(req).endswith("/api/chat"):
+                return next(stream_iter)
+            return local(req, timeout)
+
         tokens = []
-        with patch("urllib.request.urlopen", side_effect=streams), \
+        with patch("urllib.request.urlopen", side_effect=side_effect), \
                 patch("sys.stderr", io.StringIO()):
             reply, _usage = chat_turn(
                 config={"provider": "ollama", "chat_model": "qwen2.5-coder"},
@@ -782,6 +866,25 @@ class TestListOllamaModels(OllamaCacheTestCase):
         with patch("urllib.request.urlopen", side_effect=_fake_ollama_server([], reachable=False)):
             self.assertIsNone(list_ollama_models({}))
 
+    def test_force_refresh_recovers_after_outage(self):
+        online = [False]
+        healthy = _fake_ollama_server(
+            ["qwen3:latest"], ["qwen3:latest"]
+        )
+
+        def side_effect(req, timeout=None):
+            if not online[0]:
+                raise urllib.error.URLError("connection refused")
+            return healthy(req, timeout)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            self.assertIsNone(list_ollama_models({}))
+            online[0] = True
+            self.assertEqual(
+                list_ollama_models({}, force_refresh=True),
+                ["qwen3:latest"],
+            )
+
     def test_tags_result_cached(self):
         side_effect = _fake_ollama_server(installed=["qwen3:latest"], tool_capable=["qwen3:latest"])
         with patch("urllib.request.urlopen", side_effect=side_effect) as mock_urlopen:
@@ -809,20 +912,57 @@ class TestListOllamaModels(OllamaCacheTestCase):
             self.assertTrue(ollama_model_supports_tools("qwen3:latest", {}))
             self.assertEqual(mock_urlopen.call_count, calls)
 
-    def test_old_server_without_capabilities_uses_template(self):
+    def test_digest_change_invalidates_capability_verdict(self):
+        digest = ["sha256:one"]
+
         def side_effect(req, timeout=None):
             url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({
+                    "models": [{
+                        "name": "qwen3:latest",
+                        "digest": digest[0],
+                    }]
+                })
+            if url.endswith("/api/show"):
+                capabilities = ["completion"]
+                if digest[0] == "sha256:one":
+                    capabilities.append("tools")
+                return _FakeHTTPResponse({"capabilities": capabilities})
+            raise AssertionError(url)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            self.assertEqual(
+                list_ollama_models({}), ["qwen3:latest"]
+            )
+            digest[0] = "sha256:two"
+            self.assertEqual(
+                list_ollama_models({}, force_refresh=True), []
+            )
+
+    def test_old_server_without_capabilities_is_not_assumed_capable(self):
+        def side_effect(req, timeout=None):
+            url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({
+                    "models": [
+                        {
+                            "name": "qwen2.5:latest",
+                            "digest": "sha256:qwen25",
+                        }
+                    ]
+                })
             if url.endswith("/api/show"):
                 return _FakeHTTPResponse({"template": "{{ if .Tools }}...{{ end }}"})
             raise AssertionError(url)
 
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            self.assertTrue(ollama_model_supports_tools("qwen2.5:latest", {}))
+            self.assertFalse(ollama_model_supports_tools("qwen2.5:latest", {}))
 
 
 # ---------------------------------------------------------------------------
-# Older localhost servers: /api/show name/model compat + unknown-capability
-# models must never all be filtered out
+# Older localhost servers: request compatibility is retained, but capability
+# discovery fails closed.
 # ---------------------------------------------------------------------------
 
 def _http_error(code, message):
@@ -857,6 +997,15 @@ class TestOldLocalOllamaServer(OllamaCacheTestCase):
 
         def side_effect(req, timeout=None):
             url = _req_url(req)
+            if url.endswith("/api/tags"):
+                return _FakeHTTPResponse({
+                    "models": [
+                        {
+                            "name": "qwen2.5:3b",
+                            "digest": "sha256:qwen25",
+                        }
+                    ]
+                })
             if url.endswith("/api/show"):
                 bodies.append(json.loads(req.data.decode()))
                 return _FakeHTTPResponse({"capabilities": ["completion", "tools"]})
@@ -867,14 +1016,10 @@ class TestOldLocalOllamaServer(OllamaCacheTestCase):
         self.assertEqual(bodies[0]["model"], "qwen2.5:3b")
         self.assertEqual(bodies[0]["name"], "qwen2.5:3b")
 
-    def test_old_server_requiring_name_still_lists_models(self):
-        # Regression: sending only {"model": ...} made every /api/show fail
-        # on old servers, filtering ALL models out and leaving conch unusable.
+    def test_old_server_without_capabilities_lists_no_verified_models(self):
         side_effect = _old_ollama_server(["qwen2.5:3b", "llama3.2:1b"])
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            self.assertEqual(
-                list_ollama_models({}), ["qwen2.5:3b", "llama3.2:1b"]
-            )
+            self.assertEqual(list_ollama_models({}), [])
 
     def test_old_server_context_length_unknown_not_crash(self):
         from conch.providers import get_ollama_context_length
@@ -882,10 +1027,7 @@ class TestOldLocalOllamaServer(OllamaCacheTestCase):
         with patch("urllib.request.urlopen", side_effect=side_effect):
             self.assertIsNone(get_ollama_context_length("qwen2.5:3b", {}))
 
-    def test_unknown_capability_models_kept_in_list(self):
-        # A reachable server whose per-model /api/show fails (500, timeout)
-        # yields supports=None — those models must stay listed rather than
-        # rendering the whole provider empty.
+    def test_unknown_capability_models_are_excluded(self):
         def side_effect(req, timeout=None):
             url = _req_url(req)
             if url.endswith("/api/tags"):
@@ -895,7 +1037,7 @@ class TestOldLocalOllamaServer(OllamaCacheTestCase):
             raise AssertionError(url)
 
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            self.assertEqual(list_ollama_models({}), ["qwen2.5:3b"])
+            self.assertEqual(list_ollama_models({}), [])
 
     def test_known_non_tool_models_still_excluded(self):
         side_effect = _fake_ollama_server(
@@ -904,9 +1046,7 @@ class TestOldLocalOllamaServer(OllamaCacheTestCase):
         with patch("urllib.request.urlopen", side_effect=side_effect):
             self.assertEqual(list_ollama_models({}), ["qwen2.5:3b"])
 
-    def test_validate_accepts_model_with_unknown_capabilities(self):
-        # Installed model whose /api/show fails: capability unknown — the
-        # switch must be allowed (only affirmative "no tools" is rejected).
+    def test_validate_rejects_model_with_unknown_capabilities(self):
         def side_effect(req, timeout=None):
             url = _req_url(req)
             if url.endswith("/api/tags"):
@@ -917,7 +1057,8 @@ class TestOldLocalOllamaServer(OllamaCacheTestCase):
 
         with patch("urllib.request.urlopen", side_effect=side_effect):
             ok, reason = validate_ollama_model("qwen2.5:3b", {})
-        self.assertTrue(ok)
+        self.assertFalse(ok)
+        self.assertIn("verifiable", reason)
 
     def test_validate_still_rejects_missing_model_on_old_server(self):
         side_effect = _old_ollama_server(["qwen2.5:3b"])
@@ -957,13 +1098,12 @@ class TestResolveOllamaStartupModel(OllamaCacheTestCase):
         self.assertIn("qwen3.5:122b", warnings[0])
         self.assertIn("qwen2.5:3b", warnings[0])
 
-    def test_missing_model_substituted_on_old_server(self):
-        # End-to-end localhost regression: old server + missing configured
-        # model must still yield a usable substitute.
+    def test_missing_model_not_substituted_on_unverifiable_old_server(self):
         side_effect = _old_ollama_server(["qwen2.5:3b"])
         with patch("urllib.request.urlopen", side_effect=side_effect):
             model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
-        self.assertEqual(model, "qwen2.5:3b")
+        self.assertEqual(model, "qwen3.5:122b")
+        self.assertTrue(any("tool" in warning.lower() for warning in warnings))
 
     def test_unreachable_server_keeps_model_with_warning(self):
         side_effect = _fake_ollama_server([], reachable=False)

@@ -2023,6 +2023,25 @@ def chat_turn(
                 add_result(tool_call, result_text)
                 continue
             _print_tool_preview(name, arguments, verbose=_verbose_tools)
+            # Required policy (Swarm Phase 0): in-code deterministic checks
+            # that FAIL CLOSED (deny on exception/timeout/invalid decision),
+            # unlike the user pre_tool_use hook below which stays fail-open.
+            from .policy import evaluate_required_policy
+
+            decision = evaluate_required_policy(
+                "pre_tool_use", {"tool": name, "arguments": arguments}
+            )
+            if not decision.allowed:
+                result_text = (
+                    "Denied by required policy: "
+                    f"{decision.reason or decision.check or 'no reason given'}"
+                )
+                print(
+                    f"  \033[33m⚠ {name} denied by required policy\033[0m",
+                    file=sys.stderr,
+                )
+                add_result(tool_call, result_text)
+                continue
             # pre_tool_use hook (plan 2.2): deterministic gate around the
             # loop — non-zero exit blocks, JSON stdout rewrites arguments.
             allowed, hook_out = run_hook(

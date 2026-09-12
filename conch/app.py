@@ -675,6 +675,19 @@ def chat_loop():
         if client is None:
             print(f"\n  \033[31m{tool_name} is unavailable.\033[0m\n")
             return
+        # Required policy fails closed; the user hook below stays fail-open.
+        from .policy import evaluate_required_policy
+
+        decision = evaluate_required_policy(
+            "pre_tool_use",
+            {"tool": tool_name, "arguments": arguments, "slash_command": True},
+        )
+        if not decision.allowed:
+            print(
+                "\n  \033[31mDenied by required policy:\033[0m "
+                f"{decision.reason or decision.check or 'no reason given'}\n"
+            )
+            return
         allowed, hook_out = run_hook(
             "pre_tool_use",
             {"tool": tool_name, "arguments": arguments, "slash_command": True},

@@ -410,6 +410,28 @@ class RemoteLoop:
             "command": command,
             "timeout": int(entry.get("timeout", 60) or 60),
         }
+        # Even an explicitly user-approved command passes required policy:
+        # deterministic policy authorizes, and it fails closed.
+        from .policy import evaluate_required_policy
+
+        decision = evaluate_required_policy(
+            "pre_tool_use",
+            {
+                "tool": "local_shell",
+                "arguments": arguments,
+                "remote_approval": {
+                    "id": request_id,
+                    "channel": message.channel,
+                    "thread_id": message.thread_id,
+                    "sender": message.sender,
+                },
+            },
+        )
+        if not decision.allowed:
+            return (
+                f"Approval #{request_id} denied by required policy: "
+                f"{decision.reason or decision.check or 'no reason given'}"
+            )
         allowed, hook_out = run_hook(
             "pre_tool_use",
             {

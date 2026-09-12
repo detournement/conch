@@ -581,6 +581,12 @@ class EdgeDaemon:
 def run_edge_daemon(config: dict, *, foreground: bool = True,
                     once: bool = False) -> int:
     """Entry for ``conch-edge``: start, supervise, exit cleanly."""
+    # Honor agent_mode/permission_mode from config exactly like the
+    # interactive shell does at startup — mission sessions execute headless
+    # with the same authority scheduled tasks have always had.
+    from ..bootstrap import apply_agent_mode_from_config
+
+    apply_agent_mode_from_config(config)
     daemon = EdgeDaemon(config)
     try:
         daemon.start()

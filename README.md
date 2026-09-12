@@ -295,6 +295,52 @@ Connect OAuth services like Gmail, GitHub, and Slack with `/connect <app>`. Uses
 ### Scheduling
 Run recurring prompts with `/schedule 10m check disk usage` or natural language like `/schedule daily email report`.
 
+### Edge daemon and missions
+Opt-in (`edge_daemon = true` in the config): the `conch-edge` daemon keeps
+long-horizon missions running when the terminal closes. Everything durable
+lives in one transactional SQLite kernel under
+`~/.local/state/conch/kernel/kernel.db` — missions, plans, tasks, timers,
+checkpoints, integer-unit budgets (reserve/commit/release), origin-bound
+approvals with one-use nonces, an external-action ledger, a transactional
+inbox/outbox, artifacts, and an immutable hash-chained event journal that
+projections replay from exactly. Missions run as bounded, checkpointed work
+sessions (fresh rehydrated context each time, never a growing transcript)
+with hard wall/token/round caps; the model schedules its own next wake via
+the `mission_control` tool or falls back to the mission cadence.
+
+Quickstart:
+
+```bash
+# 1. enable in ~/.config/conch/config
+echo "edge_daemon = true" >> ~/.config/conch/config
+# 2. run the daemon (foreground; see deploy/ for launchd/systemd templates)
+conch-edge
+# 3. from the conch shell, attach
+#    /missions               list missions and next wakes
+#    /mission new <goal>     start a durable mission (daily cadence default)
+#    /mission show <id>      spec, plan, budgets, checkpoint, recent events
+#    /mission pause|resume|abort <id>
+#    /approvals              pending exact-action approvals
+#    /approve <id>           decide one (origin-bound, expiring, one-use)
+```
+
+The first daemon start migrates existing `tasks.json` schedules into the
+kernel (original preserved as `tasks.json.bak`); `/schedule`, `/tasks`, and
+`/cancel` keep their exact UX, now executed by the daemon. Two daemons can
+never share a kernel (OS lock + controller epoch fencing); `kill -9` is
+recoverable by design — timers fire exactly once in the ledger, interrupted
+sessions are abandoned by lease expiry and retried from the last
+checkpoint, and notifications ride the outbox with dedupe keys.
+Notifications deliver over `notify_channel` (Slack/SMS/email) when
+configured; without one they land in the daemon log
+(`~/.local/state/conch/kernel/daemon.log`) as delivered records, and
+configuring Slack later upgrades delivery with no mission changes.
+Emergency stop: `touch ~/.local/state/conch/kernel/STOP` halts every
+mission session (checked at session start and, through the fail-closed
+required-policy layer, before each tool round). Without `edge_daemon`
+enabled, none of this loads — the interactive shell and its in-process
+scheduler behave exactly as they always have.
+
 ### Cost tracking
 See token usage and estimated cost per turn and per session. `/cost` for session totals.
 
@@ -370,6 +416,10 @@ target directly, pass Docker's `--init`.
 | `/ssh exec <command>` | Run a captured, permission-gated command over the control connection |
 | `/ssh shell [command]` | Open an uncaptured remote TTY (including remote sudo) |
 | `/ssh disconnect` | Close the active SSH control connection |
+| `/missions` | List durable missions (edge daemon) |
+| `/mission show\|new\|pause\|resume\|abort\|input …` | Manage a mission |
+| `/approvals` | List pending mission approvals |
+| `/approve <id>` / `/deny <id>` | Decide a pending mission action |
 | `/ebay <photo...> [-- notes]` | Draft and publish an eBay listing through a Capitol workflow |
 | `/new` | Start a new conversation |
 | `/clear` | Wipe history (keep conversation) |

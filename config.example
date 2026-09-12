@@ -93,6 +93,22 @@ api_key_env=ANTHROPIC_API_KEY
 #subagent_model=qwen3-8b
 #subagent_rounds=10
 
+# --- Edge daemon and missions (Swarm Phase 1) ----------------------------------
+# Off by default: the shell keeps its classic in-process scheduler and never
+# loads the mission kernel. Setting edge_daemon=true moves scheduled tasks
+# and durable missions into the transactional SQLite kernel under
+# ~/.local/state/conch/kernel/, owned by the `conch-edge` daemon (launchd/
+# systemd templates in deploy/). The shell attaches with /missions,
+# /mission, /approvals; /schedule keeps working unchanged, executed by the
+# daemon. On first daemon start, existing tasks.json schedules migrate into
+# the kernel (original preserved as tasks.json.bak). Mission notifications
+# ride notify_channel when configured (Slack/SMS/email); without one they
+# land in the daemon log as delivered records — configuring a channel
+# upgrades delivery with no other changes. Emergency stop: create
+# ~/.local/state/conch/kernel/STOP (checked at session start and before
+# every tool round) or /mission abort <id>.
+#edge_daemon=false
+
 # --- Remote loop (Slack / SMS / email) ----------------------------------------
 # Opt-in remote operation: scheduled output is delivered over notify_channel,
 # and inbound replies are polled and routed into conversations. SAFETY:

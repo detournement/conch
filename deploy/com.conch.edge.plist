@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for the conch-edge daemon (macOS, per-user agent).
+
+  Install:
+    1. Adjust ProgramArguments below to the absolute path of conch-edge
+       (`which conch-edge`).
+    2. cp deploy/com.conch.edge.plist ~/Library/LaunchAgents/
+    3. launchctl load -w ~/Library/LaunchAgents/com.conch.edge.plist
+
+  Manage:
+    launchctl kickstart -k gui/$(id -u)/com.conch.edge   # restart
+    launchctl unload -w ~/Library/LaunchAgents/com.conch.edge.plist
+
+  The daemon requires `edge_daemon = true` in ~/.config/conch/config (it
+  exits with EX_CONFIG otherwise), runs unprivileged as you, writes its log
+  to ~/.local/state/conch/kernel/daemon.log, and exposes only a local
+  0700-protected control socket — never a network port.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.conch.edge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/conch-edge</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart on crash, but respect a clean exit (config disabled,
+             another daemon holds the lock). -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/conch-edge.launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/conch-edge.launchd.err</string>
+</dict>
+</plist>

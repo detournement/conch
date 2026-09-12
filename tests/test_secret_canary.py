@@ -274,5 +274,73 @@ class TestToolResultsNeverContainCanary(SecretCanaryCase):
         manager.close()
 
 
+class TestKernelNeverContainsCanary(SecretCanaryCase):
+    """Swarm Phase 1 extension: secret bytes never reach kernel rows,
+    events, the daemon log, or control-socket responses — even when the
+    environment and config carry live credentials the whole time."""
+
+    def test_kernel_daemon_log_and_socket_sweep(self):
+        from conch.kernel import control
+        from conch.kernel.daemon import EdgeDaemon
+
+        root = Path(self._tmp.name) / "edge"
+        socket_path = root / "run" / "edge.sock"
+
+        def factory(mission, messages, control_client, caps):
+            # the model summarizes without ever seeing credentials; assert
+            # its inputs were clean too
+            for message in messages:
+                self._assert_clean(
+                    json.dumps(message), "mission session messages"
+                )
+            return "session complete", {"total_tokens": 11}
+
+        daemon = EdgeDaemon(
+            self.config, kernel_dir=root / "kernel", state_dir=root,
+            socket_path=socket_path, session_factory=factory,
+        )
+        daemon.start()
+        try:
+            mission_id = control.request("mission.new", {"spec": {
+                "goal": "sweep probe", "budgets": {"sessions": 3},
+                "cadence_seconds": 3600,
+            }}, socket_path=socket_path)["mission_id"]
+            grant = daemon.store.request_approval(
+                mission_id, "publish", {"item": "x"},
+                notify_payload={"text": "approval needed"},
+            )
+            daemon.tick()  # runs the session, delivers outbox to the log
+            control.request("approval.decide", {
+                "approval_id": grant["approval_id"], "verb": "deny",
+                "nonce": grant["nonce"],
+            }, socket_path=socket_path)
+            for op in ("status", "missions.list", "schedule.list",
+                       "approvals.list"):
+                self._assert_clean(
+                    json.dumps(control.request(
+                        op, socket_path=socket_path
+                    )),
+                    f"control response for {op}",
+                )
+            self._assert_clean(
+                json.dumps(control.request(
+                    "mission.get", {"mission_id": mission_id},
+                    socket_path=socket_path,
+                )),
+                "control response for mission.get",
+            )
+        finally:
+            daemon.shutdown()
+        # sweep every kernel byte on disk: database, WAL, log, lock
+        swept = 0
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            swept += 1
+            content = path.read_bytes().decode("utf-8", errors="replace")
+            self._assert_clean(content, f"kernel file {path.name}")
+        self.assertGreaterEqual(swept, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

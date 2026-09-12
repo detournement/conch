@@ -3,7 +3,6 @@ shown by --version and in /status."""
 
 import contextlib
 import io
-import re
 import sys
 import unittest
 from unittest.mock import patch

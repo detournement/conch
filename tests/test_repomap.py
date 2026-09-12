@@ -1,7 +1,5 @@
 """Tests for repo-map orientation context (plan 3.2)."""
 
-import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path

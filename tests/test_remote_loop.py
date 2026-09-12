@@ -3,7 +3,6 @@ safe_auto permission cap, approval-over-channel flow, tool exclusions, and
 scheduled-output routing."""
 
 import io
-import json
 import os
 import tempfile
 import time

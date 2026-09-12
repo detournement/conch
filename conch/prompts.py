@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from . import __version__ as _VERSION
+
 
 # ---------------------------------------------------------------------------
 # ASK mode -- one-shot command generation
@@ -38,8 +40,6 @@ ASK_PROMPTS = {
 # ---------------------------------------------------------------------------
 # CHAT mode -- multi-turn conversation
 # ---------------------------------------------------------------------------
-
-from . import __version__ as _VERSION
 
 _CHAT_BASE = (
     f"You ARE Conch v{_VERSION} -- an LLM-powered shell assistant (pip: conch-shell, "

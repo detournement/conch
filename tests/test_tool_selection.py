@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 from conch.providers import PROVIDER_TOOL_LIMITS
 from conch.tooling import (
-    PINNED_TOOL_NAMES,
     config_profiles,
     list_profiles,
     profile_tool_filter,

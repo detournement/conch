@@ -2,7 +2,6 @@
 (plan 3.1)."""
 
 import io
-import json
 import unittest
 from unittest.mock import patch
 

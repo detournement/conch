@@ -656,7 +656,11 @@ class LocalShellClient:
         return {"content": [{"type": "text", "text": msg}]}
 
     def _run_process(self, command, timeout: int, *, shell: bool) -> dict:
-        import os, pty, select, errno, re as _re
+        import os
+        import pty
+        import select
+        import errno
+        import re as _re
         effective_timeout = timeout if timeout > 0 else 60
 
         # A PTY preserves useful terminal-formatted output, but stdin is

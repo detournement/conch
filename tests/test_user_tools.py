@@ -1,7 +1,6 @@
 """Tests for the executable tools directory (plan 2.3): executables in
 ~/.config/conch/tools/ become tools via --schema, invoked with JSON on stdin."""
 
-import json
 import os
 import stat
 import tempfile
@@ -82,7 +81,7 @@ class TestDiscoverUserTools(UserToolsTestCase):
         self.assertEqual(tools, [])
 
     def test_invalid_schema_skipped(self):
-        import io, sys
+        import io
         self._write_tool("broken", BROKEN_TOOL)
         with patch("sys.stderr", io.StringIO()):
             tools, _ = discover_user_tools()

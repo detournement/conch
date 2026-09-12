@@ -2,7 +2,6 @@
 (plan 2.7)."""
 
 import io
-import json
 import unittest
 from unittest.mock import patch
 

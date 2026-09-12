@@ -175,7 +175,8 @@ class TestStreamOpenRouter(unittest.TestCase):
 
 class TestOpenRouterConfigLoading(unittest.TestCase):
     def test_defaults_applied(self):
-        import os, tempfile
+        import os
+        import tempfile
         from pathlib import Path
         from unittest import mock
 

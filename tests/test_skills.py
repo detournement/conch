@@ -10,13 +10,11 @@ from unittest.mock import patch
 from conch.skills import (
     build_skills_context,
     delete_skill,
-    format_skill_file,
     get_skill,
     load_skills,
     parse_skill,
     render_skill,
     save_skill,
-    skills_dir,
 )
 from conch.tooling import (
     DelegateTaskClient,

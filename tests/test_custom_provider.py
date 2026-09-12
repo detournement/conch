@@ -16,7 +16,6 @@ from conch.providers import (
     clear_local_model_caches,
     get_context_window,
     get_custom_base_url,
-    get_custom_server_props,
     get_fallback_model,
     list_custom_models,
     probe_custom_provider,
@@ -364,7 +363,8 @@ class TestCustomProviderSwitch(unittest.TestCase):
 
 class TestCustomConfigLoading(unittest.TestCase):
     def test_base_url_and_model_normalized(self):
-        import os, tempfile
+        import os
+        import tempfile
         from pathlib import Path
         from unittest import mock
 

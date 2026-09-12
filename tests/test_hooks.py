@@ -3,7 +3,6 @@ on_turn_end shell scripts configured in ~/.config/conch/config."""
 
 import io
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path

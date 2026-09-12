@@ -7,13 +7,11 @@ import os
 import tempfile
 import unittest
 import urllib.parse
-from pathlib import Path
 from unittest.mock import patch
 
 from conch.channels import (
     ChannelManager,
     EmailChannel,
-    InboundMessage,
     SlackChannel,
     TwilioSMSChannel,
     load_cursor_state,

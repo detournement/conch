@@ -13,7 +13,6 @@ import unittest
 from unittest.mock import patch
 
 from conch import app as app_mod
-from conch import runtime
 from conch.app import _augment_user_message, _build_system_prompt
 from conch.prompts import get_chat_prompt
 from conch.providers import error_response

@@ -97,7 +97,7 @@ class TestMemoryFtsRecall(TempDirsTestCase):
         for i in range(10):
             store.add(f"database note number {i}")
         context = store.build_context("database", )
-        entries = [l for l in context.splitlines() if l.startswith("- ")]
+        entries = [line for line in context.splitlines() if line.startswith("- ")]
         self.assertLessEqual(len(entries), 5)
 
 

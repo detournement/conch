@@ -1,6 +1,5 @@
 import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from conch.conversations import ConversationManager, _extract_searchable_text, _extract_snippet

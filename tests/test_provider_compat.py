@@ -13,7 +13,6 @@ Covers the failure modes fixed in the openai-models work:
 - HTTP error body parsing
 """
 
-import copy
 import io
 import json
 import unittest
@@ -371,7 +370,6 @@ class TestFallbackChain(unittest.TestCase):
         same_provider = [(p, m) for p, m, _ in chain if p == "openai"]
         cross_provider = [(p, m) for p, m, _ in chain if p != "openai"]
         self.assertTrue(len(same_provider) > 0)
-        all_indices = [i for i, (p, m, _) in enumerate(chain)]
         if same_provider and cross_provider:
             last_same = max(i for i, (p, m, _) in enumerate(chain) if p == "openai")
             first_cross = min(i for i, (p, m, _) in enumerate(chain) if p != "openai")
@@ -471,7 +469,7 @@ class TestConchConfigClient(unittest.TestCase):
 
     def test_set_model_queues_action(self):
         with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
-            result = self.client.call_tool("conch_config", {
+            self.client.call_tool("conch_config", {
                 "action": "set_model", "value": "gpt-4o",
             })
         self.assertEqual(len(self.client.pending_actions), 1)
@@ -497,7 +495,7 @@ class TestConchConfigClient(unittest.TestCase):
 
     def test_set_provider_queues_default_model(self):
         with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
-            result = self.client.call_tool("conch_config", {
+            self.client.call_tool("conch_config", {
                 "action": "set_provider", "value": "openai",
             })
         self.assertEqual(len(self.client.pending_actions), 1)

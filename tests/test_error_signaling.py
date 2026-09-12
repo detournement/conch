@@ -7,8 +7,6 @@ is never returned as a chat reply, appended to history, or saved to memory.
 """
 
 import io
-import json
-import sys
 import unittest
 import urllib.error
 from unittest.mock import patch

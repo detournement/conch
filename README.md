@@ -457,7 +457,18 @@ final verification.
 See token usage and estimated cost per turn and per session. `/cost` for session totals.
 
 ### Background input
-Type your next message while the LLM is still working — it queues and runs next. Toggle with `/queue`.
+Type your next message while the LLM is still working — it queues and runs next. Toggle with `/queue`. A block pasted while the model is working queues as one message instead of one per line.
+
+### Multiline input & paste
+Pasting a block of text (logs, code, a long prompt) sends it as **one** message, never one per line, and interior lines are never interpreted as slash commands. Layers, all stdlib:
+
+- **Paste at the prompt.** On GNU readline 8.1+ true bracketed paste is enabled: the paste lands in the edit buffer as a unit and one Enter sends it. macOS system Pythons link libedit, which can't do bracketed paste; there Conch detects the paste as it arrives, reassembles it (tabs and all), shows the captured lines with a dim `...` gutter, and waits for a single Enter to send — same shape, either backend. A pasted trailing newline never auto-sends. Escape hatch: `multiline_paste=false` in config.
+- **Code fences.** A line opening a ``` fence keeps reading at a `...` prompt until the closing fence, then sends the whole block.
+- **Backslash continuation.** End a typed line with `\` to continue it on the next line.
+- **`/paste`.** Reads raw lines — no completion, no history, nothing interpreted — until a line that is exactly `.` or Ctrl+D; Ctrl+C cancels.
+- **`/edit`** (also `/paste --editor`). Composes the message in your editor, git-commit style: config `editor`, then `$VISUAL`, then `$EDITOR`, then `vi`. Save and quit to send; an empty file or nonzero exit aborts.
+
+Ctrl+C during any continuation discards the pending block and returns to the prompt — nothing partial is ever sent. Multiline messages are stored as a single history entry with newlines shown as ` ⏎ ` (readline history files are newline-delimited).
 
 ### Automatic retry and clean failure
 Transient API errors (429, 5xx, connection refused, timeouts, missing models) are retried once with a 1-second backoff before falling through to the provider fallback chain. All providers signal failure uniformly; error text is never saved into conversation history or memories — a dead Ollama server prints "server unreachable at <url>" and the session stays alive so you can just send your message again.
@@ -559,6 +570,8 @@ target directly, pass Docker's `--init`.
 | `/verbose` | Toggle showing tool args and results |
 | `/rounds <n>` | Set max tool call rounds |
 | `/queue` | Toggle typeahead input |
+| `/paste` | Paste lines literally; end with a lone `.` or Ctrl+D |
+| `/edit` | Compose the next message in `$EDITOR` |
 | `/reload` | Reload MCP tools |
 | `/resettools` | Reset tool-calling when a local model drifts into writing tool calls as text |
 | `/search <query>` | Search conversations, memories, and config |

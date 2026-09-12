@@ -83,6 +83,16 @@ api_key_env=ANTHROPIC_API_KEY
 # makes the model summarize progress instead of stopping abruptly.
 #turn_token_budget=40000
 
+# Editor used by /edit (message composer). Falls back to $VISUAL, then
+# $EDITOR, then vi. Arguments are allowed ("code --wait").
+#editor=vim
+
+# Reassemble multi-line pastes at the chat prompt into one message (on by
+# default; GNU readline 8.1+ additionally gets true bracketed paste). Turn
+# off only if your terminal delivers typed input in bursts that get
+# mistaken for pastes. /paste and /edit always work regardless.
+#multiline_paste=true
+
 # Small fast model for side tasks (session summaries, history compaction).
 #weak_model=qwen3-8b
 #weak_provider=ollama

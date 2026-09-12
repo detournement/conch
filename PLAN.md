@@ -28,6 +28,37 @@ is also implemented: credential-aware commands receive a direct, uncaptured
 local terminal handoff, and validated OpenSSH ControlMaster sessions provide
 connect/exec/shell/status/disconnect semantics without storing credentials.
 
+**Swarm Phase 0 (September 2026): landed.** Foundation work from the Conch
+Swarm roadmap (separate document), implemented without changing interactive
+CLI behavior:
+
+- `conch/session.py`: `AgentSession` owns provider/model config, tool
+  clients, permission/agent mode, cwd, and budgets per session, wrapping the
+  existing `chat_turn`. The `_agent_mode`/`_permission_mode` module globals
+  became a per-session `PermissionState` (module helpers keep operating on
+  the process default). chat_loop, scheduled runs, remote turns, and
+  delegated subagents all construct or receive sessions; tests prove two
+  simultaneous sessions cannot leak policy/cwd/tool state.
+- `conch/bootstrap.py`: reusable startup wiring (config/provider/model
+  resolution, client construction, MCP/tool state, session factory,
+  scheduler/remote startup) callable headlessly — importing it pulls in
+  neither readline nor `conch.app`; `chat_loop` is now the interactive
+  composition of it.
+- Dormant entrypoints `conch-controller`, `conch-edge`, `conch-worker`, and
+  `conch-hostctl` (pyproject scripts + argparse): each prints a "not yet
+  enabled" notice and exits 69 until its phase lands. `conch` is untouched.
+- `conch/swarm/protocol.py`: versioned task envelope / event / receipt /
+  lease dataclasses with canonical JSON, canonical IDs, failure-class and
+  action-class taxonomies, and data classifications; unknown fields and
+  unknown/newer versions fail closed.
+- `conch/policy.py`: required-policy registry that denies on exception,
+  timeout, or invalid decision — wired ahead of the (still fail-open) user
+  `pre_tool_use` hook in all three dispatch paths; empty registry preserves
+  today's behavior.
+- Gates in tests: session isolation, secret-canary sweep (prompts,
+  transcripts, terminal output, tool results, state files), and protocol
+  round-trip/version-rejection.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

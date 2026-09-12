@@ -127,6 +127,9 @@ class EdgeDaemon:
         self._lock = _KernelLock(self.kernel_dir)
         self.store: Optional[MissionStore] = None
         self.engine: Optional[MissionEngine] = None
+        self._capitol = None
+        self._capitol_last_poll = 0.0
+        self._capitol_error = ""
         self.epoch = 0
         self._stop = threading.Event()
         self._server: Optional[socket.socket] = None
@@ -279,11 +282,61 @@ class EdgeDaemon:
                     + (f" ({result['error']})" if result.get("error") else "")
                 )
         stats["delivered"] = self.deliver_outbox()
+        self._capitol_tick(stats)
         self._tick_count += 1
         if self._tick_count % 60 == 0:
             self.store.reconcile(self.holder)
             self.store.expire_approvals()
         return stats
+
+    # -- Capitol supervision (Swarm Phase 3) -----------------------------------
+
+    def _capitol_configured(self) -> bool:
+        return bool(
+            str(self.config.get("capitol_base_url") or "").strip()
+            and str(self.config.get("capitol_org") or "").strip()
+            and str(self.config.get("capitol_agent") or "").strip()
+        )
+
+    def _capitol_tick(self, stats: Dict[str, int]) -> None:
+        """Run one Capitol supervision pass on its own cadence.
+
+        Unconfigured installs never import the adapter; a failing pass
+        logs once per distinct error and retries on cadence — Capitol
+        being down degrades bindings, never the daemon.
+        """
+        if not self._capitol_configured():
+            return
+        now = float(self.clock())
+        try:
+            poll_seconds = float(
+                self.config.get("capitol_poll_seconds") or 10.0
+            )
+        except (TypeError, ValueError):
+            poll_seconds = 10.0
+        if now - self._capitol_last_poll < max(poll_seconds, 1.0):
+            return
+        self._capitol_last_poll = now
+        try:
+            if self._capitol is None:
+                from ..capitol.supervisor import CapitolSupervisor
+
+                self._capitol = CapitolSupervisor(
+                    self.store, self.config, log=self.log,
+                    clock=self.clock,
+                )
+            capitol_stats = self._capitol.tick()
+            self._capitol_error = ""
+            for key, value in capitol_stats.items():
+                if value:
+                    stats[f"capitol_{key}"] = (
+                        stats.get(f"capitol_{key}", 0) + value
+                    )
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            if message != self._capitol_error:
+                self._capitol_error = message
+                self.log(f"capitol supervision error: {message}")
 
     # -- outbox delivery ---------------------------------------------------------
 

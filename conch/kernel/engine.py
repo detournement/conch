@@ -163,6 +163,9 @@ class MissionControlClient:
         self._store = store
         self._mission_id = mission_id
         self._session_id = session_id
+        #: Bounded Capitol tool client, set by the engine only when the
+        #: mission spec's ``capitol`` envelope grants authority.
+        self.capitol = None
         self.staged: Dict[str, Any] = {
             "next_wake_seconds": None,
             "outcome": None,
@@ -267,6 +270,11 @@ def _default_session_factory(config: dict) -> Callable:
             session.builtin_clients["mission_control"] = control
             tools = list(getattr(session.chat_state, "tools", None) or [])
             tools.append(MISSION_CONTROL_TOOL)
+            if getattr(control, "capitol", None) is not None:
+                from ..capitol.supervisor import CAPITOL_CONTROL_TOOL
+
+                session.builtin_clients["capitol_control"] = control.capitol
+                tools.append(CAPITOL_CONTROL_TOOL)
             return session.run_turn(
                 messages, tools=tools,
                 max_tool_rounds=caps["max_tool_rounds"],
@@ -570,6 +578,17 @@ class MissionEngine:
             return {"mission_id": mission_id, "outcome": "failed",
                     "error": f"budget exhausted: {exc}"}
         control = MissionControlClient(self.store, mission_id, session_id)
+        capitol_spec = spec.get("capitol") or {}
+        if capitol_spec.get("allow_start") or capitol_spec.get(
+            "allow_respond"
+        ):
+            # Import stays lazy: missions without Capitol authority never
+            # load the adapter (shell-first invariant).
+            from ..capitol.supervisor import CapitolControlClient
+
+            control.capitol = CapitolControlClient(
+                self.store, mission, session_id, self.config
+            )
         caps = {
             "max_tool_rounds": int(spec["session_max_tool_rounds"]),
             "token_budget": int(spec["session_token_budget"]),

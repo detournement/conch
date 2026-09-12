@@ -49,6 +49,13 @@ ENV_CONFIG_KEYS = {
     "CONCH_PERMISSION_MODE": "permission_mode",
     "CONCH_TOOL_PROFILE": "tool_profile",
     "CONCH_SSH_CONTROL_PERSIST": "ssh_control_persist",
+    # Capitol A2A adapter (Swarm Phase 3 seed). The bearer itself is never
+    # a config value: capitol_bearer_env names the environment variable it
+    # is read from (or the ~/.capitol-a2a registry supplies it).
+    "CONCH_CAPITOL_BASE_URL": "capitol_base_url",
+    "CONCH_CAPITOL_ORG": "capitol_org",
+    "CONCH_CAPITOL_AGENT": "capitol_agent",
+    "CONCH_CAPITOL_BEARER_ENV": "capitol_bearer_env",
 }
 
 

@@ -125,6 +125,38 @@ api_key_env=ANTHROPIC_API_KEY
 # Repository map injected when cwd is a git repo (~1k tokens). On by default.
 #repo_map=true
 
+# --- Capitol A2A (eBay pilot) --------------------------------------------------
+# Conch drives governed Capitol workflows over the A2A gateway. The bearer
+# token is NEVER stored here: capitol_bearer_env names the environment
+# variable it is read from; if that is unset, the A2Actrl registry
+# (~/.capitol-a2a/agents.yaml) entry matching the org+agent is used.
+# Under local_only, only localhost/LAN Capitol endpoints are permitted.
+#capitol_base_url=http://localhost:8300
+#capitol_org=00000000-0000-0000-0000-000000000000
+#capitol_agent=00000000-0000-0000-0000-000000000000
+#capitol_bearer_env=CAPITOL_A2A_BEARER
+
+# eBay pilot (/ebay <photo...> [-- notes]): sandbox photo→listing driver.
+# Identity + seller prerequisites for ebay.draft_request.v1 (ask the org
+# operator; the sandbox seller-policy IDs come from the provisioned org).
+#ebay_app_id=conch-ebay
+#ebay_account_ref=org-ebay-sandbox
+#ebay_actor_id=00000000-0000-0000-0000-000000000000
+#ebay_fulfillment_policy_id=6244379000
+#ebay_payment_policy_id=6244377000
+#ebay_return_policy_id=6244378000
+#ebay_merchant_location_key=sandbox-location
+# Optional workflow pins; discovered from the agent's allowlist when unset.
+#ebay_draft_workflow=
+#ebay_publish_workflow=
+# Deterministic caps policy: auto-publish is allowed only when every
+# configured cap passes (sandbox default: allowed, no caps configured).
+# Outside the caps the driver demands the exact approval phrase instead.
+#ebay_auto_publish=true
+#ebay_allowed_category_ids=
+#ebay_max_price_usd=
+#ebay_min_price_usd=
+
 # --- Lifecycle hooks -----------------------------------------------------------
 # Shell scripts run around the agent loop; payload arrives as JSON on stdin.
 # pre_tool_use: non-zero exit blocks the tool call; JSON stdout rewrites args.

@@ -79,10 +79,13 @@ def edge_main(argv: Optional[List[str]] = None) -> int:
         prog="conch-edge",
         description=(
             "Personal Conch edge daemon: owns the durable mission kernel, "
-            "fires scheduled work sessions, delivers notifications, and "
-            "serves the shell's /missions attach surface over a local "
-            "control socket. It keeps missions running when the terminal "
-            "closes, sharing the shell's config and state."
+            "fires scheduled work sessions, answers channel messages, "
+            "delivers notifications, and serves the shell's /missions "
+            "attach surface over a local control socket. It keeps missions "
+            "running when the terminal closes, sharing the shell's config "
+            "and state. The documented default is to run it supervised: "
+            "`conch-edge install` sets up launchd (macOS) or a systemd "
+            "user unit (Linux) so it survives crashes and reboots."
         ),
     )
     parser.add_argument(
@@ -96,6 +99,17 @@ def edge_main(argv: Optional[List[str]] = None) -> int:
         "--once", action="store_true",
         help="Run a single supervision tick and exit (smoke testing).",
     )
+    parser.add_argument(
+        "command", nargs="?", default="run", metavar="command",
+        choices=("run", "install", "uninstall", "status"),
+        help=(
+            "run (default): run the daemon in the foreground. "
+            "install: set up and start the launchd/systemd-supervised "
+            "daemon (the default way to run it). uninstall: stop and "
+            "remove the supervised daemon. status: supervisor state and "
+            "daemon health."
+        ),
+    )
     args = parser.parse_args(argv)
     from .config import get_bool, load_config
 
@@ -106,7 +120,17 @@ def edge_main(argv: Optional[List[str]] = None) -> int:
         from .config import _parse_config_file
 
         config.update(_parse_config_file(Path(args.config)))
-    if not get_bool(config, "edge_daemon"):
+    if args.command == "status":
+        from .kernel.install import status_cmd
+
+        return status_cmd(config)
+    if args.command == "uninstall":
+        from .kernel.install import uninstall_cmd
+
+        return uninstall_cmd(config)
+    if args.command in ("run", "install") and not get_bool(
+        config, "edge_daemon"
+    ):
         print(
             "conch-edge: the edge daemon is not enabled. Set "
             "`edge_daemon = true` in your conch config (or "
@@ -116,6 +140,10 @@ def edge_main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
         return EDGE_DISABLED_EXIT_CODE
+    if args.command == "install":
+        from .kernel.install import install_cmd
+
+        return install_cmd(config)
     from .kernel.daemon import run_edge_daemon
 
     return run_edge_daemon(config, once=args.once)

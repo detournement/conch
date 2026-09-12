@@ -97,14 +97,21 @@ api_key_env=ANTHROPIC_API_KEY
 # Off by default: the shell keeps its classic in-process scheduler and never
 # loads the mission kernel. Setting edge_daemon=true moves scheduled tasks
 # and durable missions into the transactional SQLite kernel under
-# ~/.local/state/conch/kernel/, owned by the `conch-edge` daemon (launchd/
-# systemd templates in deploy/). The shell attaches with /missions,
-# /mission, /approvals; /schedule keeps working unchanged, executed by the
-# daemon. On first daemon start, existing tasks.json schedules migrate into
-# the kernel (original preserved as tasks.json.bak). Mission notifications
-# ride notify_channel when configured (Slack/SMS/email); without one they
-# land in the daemon log as delivered records — configuring a channel
-# upgrades delivery with no other changes. Emergency stop: create
+# ~/.local/state/conch/kernel/, owned by the `conch-edge` daemon. The
+# documented default way to run the daemon is supervised — `conch-edge
+# install` renders the launchd (macOS) or systemd user-unit (Linux)
+# template from deploy/ with this machine's paths, loads it, and verifies
+# health, so the daemon restarts on crash and survives reboots
+# (`conch-edge status` / `conch-edge uninstall` manage it). The shell
+# attaches with /missions, /mission, /approvals; /schedule keeps working
+# unchanged, executed by the daemon. On first daemon start, existing
+# tasks.json schedules migrate into the kernel (original preserved as
+# tasks.json.bak). Mission notifications ride notify_channel when
+# configured (Slack/SMS/email); without one they land in the daemon log as
+# delivered records — configuring a channel upgrades delivery with no
+# other changes. External events (inbound channel messages, event.post on
+# the control socket) wake parked missions immediately — no waiting out
+# the cadence timer. Emergency stop: create
 # ~/.local/state/conch/kernel/STOP (checked at session start and before
 # every tool round) or /mission abort <id>.
 #edge_daemon=false
@@ -147,6 +154,23 @@ api_key_env=ANTHROPIC_API_KEY
 #notify_channel=slack
 #remote_poll_interval=60
 #remote_rounds=8
+
+# Who hosts channel intake when edge_daemon=true: `daemon` (default — the
+# conch-edge daemon answers messages 24/7 with no shell attached) or
+# `shell` (the interactive shell keeps its classic loop). Exactly one
+# consumer polls either way: every host must hold the kernel
+# channel_intake lease per pass, so messages are never double-answered nor
+# dropped across handoffs. `input msn-<id> <text>` from an allowlisted
+# sender answers that mission and wakes it immediately.
+#remote_host=daemon
+
+# Fake loopback channel — tests, demos, and acceptance drills ONLY. Inbound
+# messages are JSON lines ({"sender","text","thread_id"}) appended to
+# <dir>/inbound.jsonl; replies append to <dir>/outbound.jsonl. The sender
+# allowlist fails closed exactly like the real transports. Never configure
+# it alongside production traffic.
+#fake_channel_dir=/tmp/conch-fake-channel
+#fake_allowed_senders=me
 
 # Slack: create a bot, set SLACK_BOT_TOKEN in the environment.
 # Bot scopes: chat:write + the history scope for your channel type

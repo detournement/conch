@@ -4,20 +4,26 @@
 <!--
   launchd template for the conch-edge daemon (macOS, per-user agent).
 
-  Install:
-    1. Adjust ProgramArguments below to the absolute path of conch-edge
+  The default way to install and manage the daemon is the built-in
+  installer, which renders this template with your machine's paths:
+
+      conch-edge install     # render + load + verify
+      conch-edge status      # launchd state + daemon health
+      conch-edge uninstall   # stop + remove
+
+  Manual install (this file carries the documentation defaults):
+    1. Adjust ProgramArguments to the absolute path of conch-edge
        (`which conch-edge`).
     2. cp deploy/com.conch.edge.plist ~/Library/LaunchAgents/
-    3. launchctl load -w ~/Library/LaunchAgents/com.conch.edge.plist
-
-  Manage:
-    launchctl kickstart -k gui/$(id -u)/com.conch.edge   # restart
-    launchctl unload -w ~/Library/LaunchAgents/com.conch.edge.plist
+    3. launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.conch.edge.plist
 
   The daemon requires `edge_daemon = true` in ~/.config/conch/config (it
   exits with EX_CONFIG otherwise), runs unprivileged as you, writes its log
   to ~/.local/state/conch/kernel/daemon.log, and exposes only a local
-  0700-protected control socket — never a network port.
+  0700-protected control socket - never a network port. Secrets stay by
+  reference: this file carries only PATH; hand the daemon channel/provider
+  tokens with `launchctl setenv NAME value`, never by editing this file.
 -->
 <plist version="1.0">
 <dict>
@@ -27,6 +33,11 @@
     <array>
         <string>/usr/local/bin/conch-edge</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

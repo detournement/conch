@@ -1,6 +1,13 @@
 # systemd user-unit template for the conch-edge daemon (Linux).
 #
-# Install:
+# The default way to install and manage the daemon is the built-in
+# installer, which renders this template with your machine's paths:
+#
+#     conch-edge install     # render + enable --now + verify
+#     conch-edge status      # unit state + daemon health
+#     conch-edge uninstall   # stop + remove
+#
+# Manual install (this file carries the documentation defaults):
 #   1. Adjust ExecStart to the absolute path of conch-edge
 #      (`which conch-edge`).
 #   2. cp deploy/conch-edge.service ~/.config/systemd/user/
@@ -14,7 +21,9 @@
 # The daemon requires `edge_daemon = true` in ~/.config/conch/config (it
 # exits with EX_CONFIG otherwise), runs unprivileged as your user, keeps
 # its kernel + log under ~/.local/state/conch/kernel/, and exposes only a
-# local 0700-protected control socket — never a network port.
+# local 0700-protected control socket - never a network port. Secrets stay
+# by reference: give the daemon tokens via a drop-in with EnvironmentFile=
+# pointing at a 0600 file, never inline in this unit.
 
 [Unit]
 Description=Conch edge daemon (durable mission kernel)

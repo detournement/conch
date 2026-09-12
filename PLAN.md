@@ -356,6 +356,44 @@ protocol and required-policy substrate, the mission kernel and `conch-edge`
 daemon, the trusted SSH fleet, and the generic Capitol integration; notes
 in `CHANGELOG.md`.
 
+**Always-on daemon (September 2026): landed.** The roadmap's
+always-on work item (Sequencing and critical path), building directly on
+Milestone A. Three pieces. (1) *Daemon-hosted channel intake*: the edge
+daemon hosts the remote channel loop (`conch/kernel/intake.py`), so
+inbound Slack/SMS/email get full agent turns 24/7 with no interactive
+shell; every remote-safety invariant is `RemoteLoop`'s own, unchanged —
+fail-closed sender allowlists, the safe_auto cap, origin-bound expiring
+approvals, `REMOTE_EXCLUDED_TOOLS`, bounded replies, thread ==
+conversation — and each inbound turn builds a fresh fully-wired host
+session from the daemon's config exactly like its mission sessions.
+Single-consumer coordination is a kernel `channel_intake` lease every
+would-be host must hold per polling pass (cursors advance only under the
+lease → no drops, no double answers; zombies are epoch-fenced out
+immediately) with `remote_host = daemon|shell` choosing the host —
+daemon by default whenever `edge_daemon` is on, released on graceful stop
+for instant handoff. (2) *Event-driven wakes*:
+`MissionEngine.deliver_event` routes external events (channel messages,
+webhooks, watches; `event.post` on the control socket) through the kernel
+inbox idempotently and wakes timer-/input-parked missions the same call —
+never paused missions or approval gates — and the daemon tick runs event
+sources (timers, Capitol supervision, channel intake) ahead of the
+session slot, so a `waiting_input` mission answered via `input msn-<id>
+<text>` (or a Capitol HITL/terminal event on a bound run) fires its
+session in the same tick, no timer wait. (3) *Managed uptime as default*:
+`conch-edge install|uninstall|status` renders the launchd/systemd
+templates with resolved paths and whitelist-only env (secrets stay by
+reference; deploy/ files are the same templates rendered with
+documentation defaults, kept byte-identical by test), loads, and verifies
+health. Gates in tests (55 new): inbound answered with no shell attached
+over a file-backed fake channel with real allowlist/cursor semantics,
+same-tick event-to-wake latency asserted via kernel events, exactly one
+reply per message with the lease contended in both directions plus
+handoff both ways, zombie fencing, installer sequences/rendering, and the
+existing kill -9/epoch/reconcile suites unchanged. Verified live on this
+machine: the daemon now runs under launchd (`conch-edge install`
+round-trip), and a fake-channel drill answered inbound messages and woke
+a parked mission with no shell attached.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

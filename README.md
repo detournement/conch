@@ -89,6 +89,7 @@ you explicitly configure or approve.
 | `custom_temperature` / `custom_max_tokens` | `0.2` / automatic | Local OpenAI-compatible generation settings |
 | `subagent_model` / `subagent_rounds` | parent model / `10` | Model and tool-round budget for `delegate_task` subagents (a skill's `model`/`rounds` override these) |
 | `remote_enabled` | `false` | Start the remote loop (channel polling + replies) |
+| `remote_host` | `daemon` | Who polls channels when `edge_daemon` is on: the daemon (default) or `shell`; a kernel lease enforces exactly one consumer either way |
 | `notify_channel` | — | Channel for scheduled-task output and notifications: `slack`, `sms`, or `email` |
 | `remote_poll_interval` / `remote_rounds` | `60` / `8` | Inbound poll cadence (seconds) and tool-round cap for remote turns |
 | `slack_channel` / `slack_allowed_senders` | — | Slack channel id + allowlisted user ids (token: `SLACK_BOT_TOKEN`) |
@@ -195,6 +196,22 @@ Reusable procedures live in `~/.config/conch/skills/` — one markdown file per 
 With `remote_enabled=true`, conch messages you proactively and you can steer it from anywhere: scheduled task output is delivered over your `notify_channel`, and inbound replies are polled (Slack bot channel, Twilio SMS, IMAP inbox) and routed into conversations — a channel thread *is* a conch conversation, so replies resume it. Safety is enforced in code, not prompts: inbound senders must be on a per-channel allowlist (no allowlist = no inbound, fail closed); remote sessions are capped at **safe_auto** permissions regardless of local agent mode; and remote sessions never see self-management, delegation, direct-terminal, or SSH-control tools. Mutating local commands create short-lived approvals bound to the exact channel, sender, thread, command, and timeout. Approval execution reruns lifecycle hooks, and approvals cannot be replayed from another conversation. Channel approvals can never produce a local password/passphrase prompt.
 
 Slack photo attachments are captured too: message `files[]` from allowlisted senders are downloaded with the bot bearer, validated by content (JPEG/PNG/GIF/WebP magic bytes, 12 MB cap, ≤12 per message), and quarantined under the XDG state dir before any flow may use them. This needs the **`files:read`** bot scope on the Slack app (plus the usual `chat:write` and `channels:history`/`groups:history`/`im:history` for the channel type) — add it to the app manifest and reinstall the app. Because Slack's `conversations.history` never returns replies inside threads, conch also remembers each thread it posts into and polls `conversations.replies` for those, so a thread can carry a full back-and-forth.
+
+**Who hosts the loop:** with `edge_daemon` enabled the `conch-edge` daemon
+hosts channel intake by default, so inbound messages are answered 24/7
+with no shell attached — same allowlists, same safe_auto cap, same
+excluded tools, same approval binding. Set `remote_host = shell` to keep
+the loop in the interactive shell instead. Either way, exactly one process
+polls: every would-be host must hold the kernel `channel_intake` lease for
+each pass (cursors advance only under the lease), so messages are never
+double-answered, and a graceful stop releases the lease for immediate
+handoff — pending messages simply wait on the transport for the next
+holder. Messages of the form `input msn-<id> <your text>` from an
+allowlisted sender are delivered to that mission through the kernel inbox
+and wake it immediately (a parked `waiting_input`/`waiting_timer` mission
+runs its next session at the next scheduler slot — no timer wait). Local
+processes can post arbitrary events the same way through the control
+socket's `event.post` op.
 
 ### Capitol as a governed execution fabric
 Conch drives
@@ -320,16 +337,36 @@ Quickstart:
 ```bash
 # 1. enable in ~/.config/conch/config
 echo "edge_daemon = true" >> ~/.config/conch/config
-# 2. run the daemon (foreground; see deploy/ for launchd/systemd templates)
-conch-edge
+# 2. install the supervised daemon — the default way to run it: launchd
+#    (macOS) or a systemd user unit (Linux) restarts it on crash and
+#    brings it back after reboot
+conch-edge install
+conch-edge status          # supervisor state + daemon health
+# (conch-edge with no subcommand still runs it in the foreground;
+#  conch-edge uninstall stops and removes the supervised daemon)
 # 3. from the conch shell, attach
 #    /missions               list missions and next wakes
 #    /mission new <goal>     start a durable mission (daily cadence default)
 #    /mission show <id>      spec, plan, budgets, checkpoint, recent events
 #    /mission pause|resume|abort <id>
+#    /mission input <id> <answer>   answer a parked mission (wakes it now)
 #    /approvals              pending exact-action approvals
 #    /approve <id>           decide one (origin-bound, expiring, one-use)
 ```
+
+`conch-edge install` renders the template in `deploy/` with this machine's
+paths (resolved program, PATH, log files under the kernel dir), loads it,
+and verifies the daemon answers its control socket. The rendered unit
+carries no secrets — supervised daemons start with a minimal environment,
+so channel/provider tokens must be supplied by reference:
+`launchctl setenv SLACK_BOT_TOKEN ...` on macOS, or a systemd user drop-in
+with `EnvironmentFile=` pointing at a 0600 file on Linux. (Capitol bearers
+resolve from the A2Actrl registry file, which needs no environment.)
+
+With `remote_enabled = true` the daemon also hosts channel intake (see the
+remote loop section): inbound Slack/SMS/email get full agent turns around
+the clock, no shell attached, and external events wake parked missions
+immediately instead of waiting out their timers.
 
 The first daemon start migrates existing `tasks.json` schedules into the
 kernel (original preserved as `tasks.json.bak`); `/schedule`, `/tasks`, and

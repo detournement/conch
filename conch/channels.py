@@ -23,7 +23,7 @@ import json
 import os
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +34,11 @@ def _state_dir() -> Path:
 
 def _cursor_path() -> Path:
     return _state_dir() / "channels.json"
+
+
+def quarantine_dir() -> Path:
+    """Where inbound channel attachments land before anything trusts them."""
+    return _state_dir() / "quarantine"
 
 
 def load_cursor_state() -> Dict[str, Any]:
@@ -54,12 +59,65 @@ def _split_list(value: str) -> List[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
+# ---------------------------------------------------------------------------
+# Attachments (Slack first — eBay pilot Milestone 1b)
+# ---------------------------------------------------------------------------
+
+#: Inbound attachment cap, aligned with the oversight app's image proxy.
+ATTACHMENT_MAX_BYTES = 12 * 1024 * 1024
+#: Per-message attachment cap, aligned with the eBay media contract limit.
+MAX_ATTACHMENTS_PER_MESSAGE = 12
+#: This flow accepts images only; anything else is ignored, never fetched.
+IMAGE_MIME_ALLOWLIST = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+)
+
+_IMAGE_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def sniff_image_mime(data: bytes) -> str:
+    """MIME type from magic bytes — the declared type is remote-controlled
+    data, so quarantined files are admitted on content, never on labels."""
+    for magic, mime in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def _safe_filename(name: str, fallback: str = "attachment") -> str:
+    base = Path(str(name or "")).name
+    cleaned = "".join(
+        c if (c.isalnum() or c in "._-") else "_" for c in base
+    ).strip("._") or fallback
+    return cleaned[:80]
+
+
+@dataclass
+class Attachment:
+    """One validated inbound file, already written to the quarantine dir."""
+
+    filename: str
+    mime_type: str   # sniffed from content, not the sender's label
+    size_bytes: int
+    path: str        # local quarantine path
+    remote_id: str = ""
+
+
 @dataclass
 class InboundMessage:
     channel: str    # "slack" | "sms" | "email"
     sender: str     # slack user id / phone number / email address
     text: str
     thread_id: str  # slack thread ts / phone number / email address
+    ts: str = ""    # transport message id/timestamp (slack message ts)
+    attachments: List[Attachment] = field(default_factory=list)
 
 
 class Channel:
@@ -96,10 +154,23 @@ class Channel:
 class SlackChannel(Channel):
     """Slack via a bot token. Config: slack_channel (channel id),
     slack_allowed_senders (Slack user ids). Token: SLACK_BOT_TOKEN (or the
-    env var named by slack_token_env)."""
+    env var named by slack_token_env).
+
+    Attachments: message ``files[]`` from allowlisted senders are fetched
+    via ``url_private_download`` with the bot bearer (requires the
+    ``files:read`` bot scope), validated (image magic bytes, 12 MB cap,
+    ≤12 per message), and quarantined under the XDG state dir. The bearer
+    is sent only as a request header and never logged.
+
+    Thread replies: ``conversations.history`` does not return replies
+    inside threads, so every thread the bot posts into is remembered in
+    cursor state and polled via ``conversations.replies`` until it ages
+    out — this is what lets a Slack thread carry a whole conversation.
+    """
 
     name = "slack"
     API = "https://slack.com/api"
+    MAX_WATCHED_THREADS = 20
 
     def _token(self) -> str:
         env = (self.config.get("slack_token_env") or "SLACK_BOT_TOKEN").strip()
@@ -139,11 +210,127 @@ class SlackChannel(Channel):
             return False, f"slack send failed: {exc}"
         if not result.get("ok"):
             return False, f"slack send failed: {result.get('error', 'unknown')}"
-        return True, result.get("ts", "")
+        ts = result.get("ts", "")
+        if thread_id:
+            # We just posted into a thread: watch it so the user's replies
+            # (which conversations.history never returns) are polled.
+            self._watch_thread(thread_id, ts)
+        return True, ts
+
+    # -- thread watching ----------------------------------------------------
+
+    def _watch_thread(self, thread_ts: str, last_ts: str):
+        try:
+            state = load_cursor_state()
+            threads = dict(state.get("slack_threads") or {})
+            threads[thread_ts] = _max_ts(threads.get(thread_ts, ""), last_ts or thread_ts)
+            state["slack_threads"] = _prune_threads(threads, self.MAX_WATCHED_THREADS)
+            save_cursor_state(state)
+        except OSError:
+            pass  # watching is best-effort; sending must never fail on it
+
+    # -- attachments ----------------------------------------------------------
+
+    def _download_file(self, url: str) -> bytes:
+        """Fetch a private Slack file with the bot bearer. The token rides
+        only the Authorization header; it is never logged or echoed."""
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {self._token()}"}
+        )
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            return resp.read(ATTACHMENT_MAX_BYTES + 1)
+
+    def _capture_file(self, file_obj: dict, ts: str, index: int) -> Optional[Attachment]:
+        name = _safe_filename(file_obj.get("name"), fallback=f"file-{index}")
+        declared_mime = str(file_obj.get("mimetype") or "").lower()
+        if declared_mime not in IMAGE_MIME_ALLOWLIST:
+            return None  # not an image: not for this flow, never fetched
+        try:
+            declared_size = int(file_obj.get("size") or 0)
+        except (TypeError, ValueError):
+            declared_size = 0
+        if declared_size > ATTACHMENT_MAX_BYTES:
+            _warn(f"slack: {name} over the "
+                  f"{ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB cap, skipped")
+            return None
+        url = file_obj.get("url_private_download") or file_obj.get("url_private")
+        if not url:
+            return None
+        try:
+            data = self._download_file(url)
+        except Exception:
+            _warn(f"slack: download failed for attachment {name!r}, skipped")
+            return None
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            _warn(f"slack: {name} over the size cap after download, skipped")
+            return None
+        sniffed = sniff_image_mime(data)
+        if sniffed not in IMAGE_MIME_ALLOWLIST:
+            _warn(f"slack: {name} is not a recognized image, skipped")
+            return None
+        directory = quarantine_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"slack-{(ts or 'msg').replace('.', '-')}-{index}-{name}"
+        path.write_bytes(data)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return Attachment(
+            filename=name,
+            mime_type=sniffed,
+            size_bytes=len(data),
+            path=str(path),
+            remote_id=str(file_obj.get("id") or ""),
+        )
+
+    def _capture_files(self, files: list, ts: str) -> List[Attachment]:
+        captured: List[Attachment] = []
+        for index, file_obj in enumerate(files):
+            if len(captured) >= MAX_ATTACHMENTS_PER_MESSAGE:
+                _warn("slack: attachment cap reached, extra files skipped")
+                break
+            if not isinstance(file_obj, dict):
+                continue
+            attachment = self._capture_file(file_obj, ts, index)
+            if attachment is not None:
+                captured.append(attachment)
+        return captured
+
+    # -- polling ---------------------------------------------------------------
+
+    def _inbound_from(self, msg: dict) -> Optional[InboundMessage]:
+        """One history/replies message → InboundMessage, or None to skip.
+
+        Files are fetched only for allowlisted senders — a non-allowlisted
+        sender's message is dropped later anyway, so its bytes are never
+        downloaded (fail closed, and no quarantine writes for strangers).
+        """
+        if msg.get("bot_id") or not msg.get("user"):
+            return None  # never react to our own (or other bots') messages
+        ts = msg.get("ts", "")
+        sender = msg["user"]
+        text = (msg.get("text") or "").strip()
+        attachments: List[Attachment] = []
+        files = msg.get("files") or []
+        if files and self.sender_allowed(sender):
+            attachments = self._capture_files(files, ts)
+        if not text and not attachments:
+            return None
+        return InboundMessage(
+            channel="slack",
+            sender=sender,
+            text=text,
+            thread_id=msg.get("thread_ts") or ts,
+            ts=ts,
+            attachments=attachments,
+        )
 
     def poll(self, state: Dict[str, Any]) -> List[InboundMessage]:
         if not self.is_configured():
             return []
+        collected: List[InboundMessage] = []
+
         params = {"channel": self._channel_id(), "limit": 50}
         oldest = state.get("slack_last_ts", "")
         if oldest:
@@ -151,32 +338,90 @@ class SlackChannel(Channel):
         try:
             result = self._api("conversations.history", params=params)
         except Exception:
+            result = {}
+        if result.get("ok"):
+            max_ts = oldest
+            for msg in result.get("messages", []):
+                ts = msg.get("ts", "")
+                max_ts = _max_ts(max_ts, ts)
+                if oldest and ts and float(ts) <= float(oldest):
+                    continue
+                inbound = self._inbound_from(msg)
+                if inbound is not None:
+                    collected.append(inbound)
+            if max_ts:
+                state["slack_last_ts"] = max_ts
+
+        collected.extend(self._poll_watched_threads(state))
+        collected.sort(key=lambda m: float(m.ts or 0))  # oldest first
+        return collected
+
+    def _poll_watched_threads(self, state: Dict[str, Any]) -> List[InboundMessage]:
+        threads = dict(state.get("slack_threads") or {})
+        if not threads:
             return []
-        if not result.get("ok"):
-            return []
-        messages: List[InboundMessage] = []
-        max_ts = oldest
-        for msg in result.get("messages", []):
-            ts = msg.get("ts", "")
-            if ts and (not max_ts or float(ts) > float(max_ts)):
-                max_ts = ts
-            if msg.get("bot_id") or not msg.get("user"):
-                continue  # never react to our own (or other bots') messages
-            if oldest and ts and float(ts) <= float(oldest):
+        collected: List[InboundMessage] = []
+        for thread_ts, cursor in list(threads.items()):
+            try:
+                result = self._api("conversations.replies", params={
+                    "channel": self._channel_id(),
+                    "ts": thread_ts,
+                    "oldest": cursor or thread_ts,
+                    "limit": 50,
+                })
+            except Exception:
                 continue
-            text = (msg.get("text") or "").strip()
-            if not text:
+            if not result.get("ok"):
                 continue
-            messages.append(InboundMessage(
-                channel="slack",
-                sender=msg["user"],
-                text=text,
-                thread_id=msg.get("thread_ts") or ts,
-            ))
-        if max_ts:
-            state["slack_last_ts"] = max_ts
-        messages.reverse()  # oldest first
-        return messages
+            newest = cursor
+            for msg in result.get("messages", []):
+                ts = msg.get("ts", "")
+                newest = _max_ts(newest, ts)
+                if ts == thread_ts:
+                    continue  # the thread parent came through history
+                if cursor and ts and float(ts) <= float(cursor):
+                    continue
+                if msg.get("subtype") == "thread_broadcast":
+                    continue  # broadcast replies arrive via history
+                inbound = self._inbound_from(msg)
+                if inbound is not None:
+                    inbound.thread_id = thread_ts
+                    collected.append(inbound)
+            threads[thread_ts] = newest
+        state["slack_threads"] = _prune_threads(threads, self.MAX_WATCHED_THREADS)
+        return collected
+
+
+def _max_ts(current: str, candidate: str) -> str:
+    """The larger of two Slack ts strings, tolerating junk."""
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    try:
+        return candidate if float(candidate) > float(current) else current
+    except (TypeError, ValueError):
+        return current
+
+
+def _prune_threads(threads: Dict[str, str], keep: int) -> Dict[str, str]:
+    """Keep the *keep* most recently active watched threads."""
+    if len(threads) <= keep:
+        return threads
+
+    def activity(item):
+        try:
+            return float(item[1] or item[0])
+        except (TypeError, ValueError):
+            return 0.0
+
+    newest = sorted(threads.items(), key=activity, reverse=True)[:keep]
+    return dict(newest)
+
+
+def _warn(text: str):
+    import sys
+    print(f"  \033[33m⚠ {text}\033[0m", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

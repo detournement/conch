@@ -107,6 +107,13 @@ api_key_env=ANTHROPIC_API_KEY
 #remote_rounds=8
 
 # Slack: create a bot, set SLACK_BOT_TOKEN in the environment.
+# Bot scopes: chat:write + the history scope for your channel type
+# (channels:history public / groups:history private / im:history DM), plus
+# files:read for photo attachments (eBay pilot intake). After adding a
+# scope, reinstall the app to the workspace to mint a fresh bot token.
+# Attachments from allowlisted senders are downloaded to the quarantine
+# dir under the XDG state dir and validated (JPEG/PNG/GIF/WebP by magic
+# bytes, 12 MB cap, at most 12 per message) before anything uses them.
 #slack_channel=C0123456789
 #slack_allowed_senders=U0AAAAAAA, U0BBBBBBB
 

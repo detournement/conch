@@ -216,7 +216,16 @@ class RemoteLoop:
     """Polls channels, maps threads to conversations, runs turns, replies."""
 
     def __init__(self, config: dict, conv_mgr=None, chat_state=None,
-                 builtin_clients: Optional[Dict[str, Any]] = None):
+                 builtin_clients: Optional[Dict[str, Any]] = None,
+                 session=None):
+        # An AgentSession may be passed instead of loose config/state; the
+        # explicit keyword arguments still win so tests and older callers
+        # keep working unchanged.
+        self._session = session
+        if session is not None:
+            config = config or session.config
+            chat_state = chat_state or session.chat_state
+            builtin_clients = builtin_clients or session.builtin_clients
         self.config = config or {}
         self.manager = ChannelManager(self.config)
         self.approvals = ApprovalStore()
@@ -293,7 +302,8 @@ class RemoteLoop:
 
     def _run_turn(self, message: InboundMessage) -> str:
         from .providers import RAW_FNS
-        from .runtime import chat_turn
+        from .session import AgentSession
+        from .tooling import PermissionState
 
         provider = (self.config.get("provider") or "").lower()
         raw_fn = RAW_FNS.get(provider)
@@ -308,17 +318,26 @@ class RemoteLoop:
             messages[0]["content"] = system_prompt
         messages.append({"role": "user", "content": message.text})
 
-        config = dict(self.config)
-        reply, usage = chat_turn(
-            config,
-            provider,
-            raw_fn,
-            messages,
-            self._remote_tools(),
-            getattr(self._chat_state, "tool_map", {}) or {},
+        # Each inbound turn is its own child session with a fresh, never-
+        # agent-mode permission state: the local /agent toggle can never lift
+        # the remote safe_auto cap, and remote turns cannot mutate the
+        # interactive session's policy. Shared clients keep their own
+        # bindings (bind=False); the shell is a per-turn RemoteShellClient.
+        session = AgentSession(
+            dict(self.config),
+            interactive=False,
+            permissions=PermissionState(),
+        )
+        session.attach_clients(
             self._remote_clients(
                 message.channel, message.thread_id, message.sender
             ),
+            bind=False,
+        )
+        reply, usage = session.run_turn(
+            messages,
+            tools=self._remote_tools(),
+            tool_map=getattr(self._chat_state, "tool_map", {}) or {},
             max_tool_rounds=int(self.config.get("remote_rounds", 8) or 8),
         )
         if usage.get("error"):

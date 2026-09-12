@@ -1573,9 +1573,12 @@ def serialized_agent_execution():
 def _serialized_agent_turn(fn):
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
-        # Conch currently has process-global shell policy, cwd, and runtime
-        # clients. Serialize turns until those become explicit per-session
-        # capabilities. RLock permits same-thread delegation.
+        # Policy, cwd, and tool clients are session-scoped now (see
+        # conch.session.AgentSession), but inference and the terminal are
+        # still shared process resources — one local model server's KV cache,
+        # one stdout/stderr for streaming output. Serialize turns until the
+        # mission kernel introduces real concurrency on top of sessions.
+        # RLock permits same-thread delegation.
         with serialized_agent_execution():
             return fn(*args, **kwargs)
 

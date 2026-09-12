@@ -21,8 +21,9 @@ from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
 from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS
 from .render import highlight, StreamPrinter
-from .runtime import chat_turn, sanitize_anthropic_messages
+from .runtime import sanitize_anthropic_messages
 from .scheduler import Scheduler
+from .session import AgentSession
 from .tooling import (
     ApiLayerClient,
     ConchConfigClient,
@@ -42,6 +43,7 @@ from .tooling import (
     apply_filter,
     auto_disable_oversized_groups,
     cap_tools,
+    default_permissions,
     get_agent_mode,
     inject_builtin_tools,
     load_tool_prefs,
@@ -170,9 +172,15 @@ def _history_path() -> str:
     )
 
 
-def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool = True) -> Dict[str, Any]:
-    local_shell = LocalShellClient()
-    local_shell.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=get_agent_mode()))
+def _make_builtin_clients(
+    memory: MemoryStore,
+    config: dict,
+    interactive: bool = True,
+    permissions=None,
+) -> Dict[str, Any]:
+    perms = permissions if permissions is not None else default_permissions()
+    local_shell = LocalShellClient(permissions=perms)
+    local_shell.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=perms.get_agent_mode()))
     # Scale shell-output budget to the active model's context window (plan 1.5)
     from .runtime import tool_result_char_budget
 
@@ -193,10 +201,11 @@ def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool =
     ssh_remote = SSHRemoteClient(
         manager=SSHControlManager(persist_seconds=ssh_persist)
     )
+    ssh_remote.bind_permissions(perms)
     ssh_remote.set_policy(
         LocalShellPolicy(
             interactive=interactive,
-            allow_auto_execute=get_agent_mode(),
+            allow_auto_execute=perms.get_agent_mode(),
         )
     )
     ssh_remote.set_result_budget(result_budget)
@@ -646,7 +655,20 @@ def chat_loop():
 
     system_prompt = _build_system_prompt(base_prompt, provider=provider, model=model_name, config=config)
     memory = MemoryStore()
-    builtin_clients = _make_builtin_clients(memory, config, interactive=True)
+    # The interactive session wraps the process-default permission state so
+    # /agent, the 'A' approval answer, and config defaults keep operating on
+    # the same state the module-level helpers expose.
+    session = AgentSession(
+        config,
+        interactive=True,
+        permissions=default_permissions(),
+        memory=memory,
+    )
+    session.budgets.max_tool_rounds = MAX_TOOL_ROUNDS
+    builtin_clients = _make_builtin_clients(
+        memory, config, interactive=True, permissions=session.permissions
+    )
+    session.attach_clients(builtin_clients)
 
     # Load tools in background; show prompt immediately
     _tools_ready = threading.Event()
@@ -665,38 +687,44 @@ def chat_loop():
     sched = Scheduler()
 
     def _scheduled_executor(prompt: str, _task):
+        # Each scheduled run is its own session with fresh clients and tool
+        # state; it shares the process-default permission state so a /agent
+        # toggle keeps applying to scheduled work exactly as before.
         scheduled_memory = MemoryStore()
-        scheduled_builtins = _make_builtin_clients(scheduled_memory, config, interactive=False)
+        scheduled_session = AgentSession(
+            config,
+            interactive=False,
+            permissions=default_permissions(),
+            memory=scheduled_memory,
+        )
+        scheduled_builtins = _make_builtin_clients(
+            scheduled_memory, config, interactive=False,
+            permissions=scheduled_session.permissions,
+        )
         scheduled_clients, scheduled_state = _load_runtime_tools(scheduled_builtins)
-        scheduled_builtins["delegate_task"].bind(config, scheduled_state, scheduled_builtins)
+        scheduled_session.attach_clients(
+            scheduled_builtins, chat_state=scheduled_state,
+            mcp_clients=scheduled_clients,
+        )
+        scheduled_builtins["delegate_task"].bind_session(scheduled_session)
         scheduled_builtins["conch_introspect"].bind(
             provider, config.get("chat_model", ""), config, scheduled_state
         )
         try:
             scheduled_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
-            reply, usage = chat_turn(
-                config,
-                provider,
-                raw_fn,
-                scheduled_messages,
-                scheduled_state.tools,
-                scheduled_state.tool_map,
-                scheduled_builtins,
-                max_tool_rounds=MAX_TOOL_ROUNDS,
-                chat_state=scheduled_state,
+            reply, usage = scheduled_session.run_turn(
+                scheduled_messages, max_tool_rounds=MAX_TOOL_ROUNDS
             )
             # Route scheduled output over the notify channel (plan 4.3)
             # instead of discarding it.
             _route_scheduled_output(config, _task, reply, usage)
             return reply, usage
         finally:
-            scheduled_builtins["ssh_remote"].close()
-            mcp_mod.close_all(scheduled_clients)
+            scheduled_session.close()
 
     sched.set_executor(_scheduled_executor)
     sched.start()
 
-    max_tool_rounds = MAX_TOOL_ROUNDS
     session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
 
     conv_mgr = ConversationManager()
@@ -774,6 +802,7 @@ def chat_loop():
         print("  \033[2mReloading MCP tools...\033[0m")
         mcp_mod.close_all(mcp_clients)
         mcp_clients, new_state = _load_runtime_tools(builtin_clients)
+        session.mcp_clients = mcp_clients
         chat_state.all_tools = new_state.all_tools
         chat_state.tool_map = new_state.tool_map
         chat_state.tools = new_state.tools
@@ -817,6 +846,9 @@ def chat_loop():
             _tools_ready.wait(timeout=30)
     mcp_clients = _bg_mcp_clients[0] or {}
     chat_state = _bg_chat_state[0] or ToolRuntimeState(all_tools=[], tool_map={}, tools=[])
+    session.attach_clients(
+        builtin_clients, chat_state=chat_state, mcp_clients=mcp_clients
+    )
 
     # Session-only profile selection (plan 1.6): a `tool_profile` config key
     # wins; otherwise local models default to the minimal profile unless the
@@ -844,15 +876,13 @@ def chat_loop():
             )
 
     # Subagent delegation reads live config/tool state (plan 3.1)
-    builtin_clients["delegate_task"].bind(config, chat_state, builtin_clients)
+    builtin_clients["delegate_task"].bind_session(session)
 
     # Remote agentic loop (plan 4.3): opt-in via remote_enabled=true.
     _remote_loop = None
     if get_bool(config, "remote_enabled"):
         from .remote import RemoteLoop
-        _remote_loop = RemoteLoop(config, conv_mgr=conv_mgr,
-                                  chat_state=chat_state,
-                                  builtin_clients=builtin_clients)
+        _remote_loop = RemoteLoop(config, conv_mgr=conv_mgr, session=session)
         if _remote_loop.start():
             print(
                 f"\033[2mRemote loop active on: {', '.join(_remote_loop.manager.configured())} "
@@ -1136,7 +1166,7 @@ def chat_loop():
                 elif result == "queue_off":
                     _typeahead_enabled = False
                 elif isinstance(result, int):
-                    max_tool_rounds = result
+                    session.budgets.max_tool_rounds = result
                 elif result is not None:
                     old_provider = provider
                     provider, model_name, raw_fn = result
@@ -1192,16 +1222,8 @@ def chat_loop():
                 print("\n\033[1;36massistant:\033[0m")
 
             try:
-                reply, turn_usage = chat_turn(
-                    config,
-                    provider,
-                    raw_fn,
+                reply, turn_usage = session.run_turn(
                     messages,
-                    chat_state.tools,
-                    chat_state.tool_map,
-                    builtin_clients,
-                    max_tool_rounds=max_tool_rounds,
-                    chat_state=chat_state,
                     on_token=_printer.feed if _printer else None,
                     input_fn=_safe_input,
                 )
@@ -1308,7 +1330,7 @@ def chat_loop():
                         _cfg_client.update(provider, model_name)
                         print(f"  \033[1;32m\u2713 Now using {provider}/{model_name}\033[0m")
                 elif _action[0] == "set_rounds":
-                    max_tool_rounds = _action[1]
+                    session.budgets.max_tool_rounds = _action[1]
                 elif _action[0] == "clear_history":
                     old_count = len([m for m in messages if m.get("role") == "user"])
                     messages.clear()
@@ -1347,8 +1369,8 @@ def chat_loop():
             readline.write_history_file(history_file)
         except OSError:
             pass
-        builtin_clients["ssh_remote"].close()
-        mcp_mod.close_all(mcp_clients)
+        session.mcp_clients = mcp_clients
+        session.close()
         conv_mgr.close()
 
 
@@ -1395,25 +1417,28 @@ def main():
         user_text = " ".join(sys.argv[1:])
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)
-        builtin_clients = _make_builtin_clients(memory, config, interactive=True)
+        session = AgentSession(
+            config,
+            interactive=True,
+            permissions=default_permissions(),
+            memory=memory,
+        )
+        builtin_clients = _make_builtin_clients(
+            memory, config, interactive=True, permissions=session.permissions
+        )
         mcp_clients, chat_state = _load_runtime_tools(builtin_clients)
-        builtin_clients["delegate_task"].bind(config, chat_state, builtin_clients)
+        session.attach_clients(
+            builtin_clients, chat_state=chat_state, mcp_clients=mcp_clients
+        )
+        builtin_clients["delegate_task"].bind_session(session)
         builtin_clients["conch_introspect"].bind(provider, model_name, config, chat_state)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _augment_user_message(user_text, mem_context)},
         ]
         try:
-            reply, _usage = chat_turn(
-                config,
-                provider,
-                raw_fn,
-                messages,
-                chat_state.tools,
-                chat_state.tool_map,
-                builtin_clients,
-                max_tool_rounds=MAX_TOOL_ROUNDS,
-                chat_state=chat_state,
+            reply, _usage = session.run_turn(
+                messages, max_tool_rounds=MAX_TOOL_ROUNDS
             )
             if reply:
                 print(highlight(reply))
@@ -1421,7 +1446,6 @@ def main():
                 print("[no response]", file=sys.stderr)
                 sys.exit(1)
         finally:
-            builtin_clients["ssh_remote"].close()
-            mcp_mod.close_all(mcp_clients)
+            session.close()
     else:
         chat_loop()

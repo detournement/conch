@@ -31,39 +31,72 @@ PINNED_TOOL_NAMES = {
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
 
-_agent_mode = False
-
-
-def set_agent_mode(enabled: bool):
-    global _agent_mode
-    _agent_mode = enabled
-
-
-def get_agent_mode() -> bool:
-    return _agent_mode
-
-
 # ---------------------------------------------------------------------------
 # Permission model (plan 2.1): graded modes + prefix allowlists + a
 # destructive-command check that prompts even in agent mode.
+#
+# Swarm Phase 0: agent/permission mode is per-session state (PermissionState)
+# instead of module globals. The module-level set/get helpers operate on the
+# process-default instance, so the interactive CLI and existing callers keep
+# their exact behavior, while concurrent sessions (scheduled, remote,
+# delegated, future controller work) own private instances via AgentSession.
 # ---------------------------------------------------------------------------
 
 PERMISSION_MODES = ("prompt_all", "safe_auto", "yolo")
-_permission_mode = "prompt_all"
+
+
+class PermissionState:
+    """Agent/permission mode owned by one session."""
+
+    __slots__ = ("_agent_mode", "_permission_mode")
+
+    def __init__(self, agent_mode: bool = False,
+                 permission_mode: str = "prompt_all"):
+        self._agent_mode = bool(agent_mode)
+        self._permission_mode = "prompt_all"
+        self.set_permission_mode(permission_mode)
+
+    def set_agent_mode(self, enabled: bool):
+        self._agent_mode = bool(enabled)
+
+    def get_agent_mode(self) -> bool:
+        return self._agent_mode
+
+    def set_permission_mode(self, mode: str):
+        normalized = (mode or "").strip().lower().replace("-", "_")
+        if normalized in PERMISSION_MODES:
+            self._permission_mode = normalized
+
+    def get_permission_mode(self) -> str:
+        """Effective mode: agent mode (from /agent, A, or config) means yolo."""
+        if self._agent_mode:
+            return "yolo"
+        return self._permission_mode
+
+
+_DEFAULT_PERMISSIONS = PermissionState()
+
+
+def default_permissions() -> PermissionState:
+    """The process-default permission state used by the interactive CLI."""
+    return _DEFAULT_PERMISSIONS
+
+
+def set_agent_mode(enabled: bool):
+    _DEFAULT_PERMISSIONS.set_agent_mode(enabled)
+
+
+def get_agent_mode() -> bool:
+    return _DEFAULT_PERMISSIONS.get_agent_mode()
 
 
 def set_permission_mode(mode: str):
-    global _permission_mode
-    normalized = (mode or "").strip().lower().replace("-", "_")
-    if normalized in PERMISSION_MODES:
-        _permission_mode = normalized
+    _DEFAULT_PERMISSIONS.set_permission_mode(mode)
 
 
 def get_permission_mode() -> str:
-    """Effective mode: agent mode (from /agent, A, or config) means yolo."""
-    if _agent_mode:
-        return "yolo"
-    return _permission_mode
+    """Effective mode of the process-default session."""
+    return _DEFAULT_PERMISSIONS.get_permission_mode()
 
 
 # Read-only commands auto-approved in safe_auto mode. Matched against the
@@ -629,10 +662,23 @@ class LocalShellClient:
     # this to the active model's context window (see set_result_budget).
     DEFAULT_RESULT_BUDGET = 15000
 
-    def __init__(self):
+    def __init__(self, permissions: Optional[PermissionState] = None):
         self.policy = LocalShellPolicy()
         self._allowed_prefixes: set[str] = set()
         self._result_budget = self.DEFAULT_RESULT_BUDGET
+        self._permissions = permissions
+        self._cwd: Optional[str] = None
+
+    def bind_permissions(self, permissions: Optional[PermissionState]):
+        """Adopt a session's permission state (None = process default)."""
+        self._permissions = permissions
+
+    def permissions(self) -> PermissionState:
+        return self._permissions or _DEFAULT_PERMISSIONS
+
+    def set_cwd(self, cwd):
+        """Working directory for executed commands (None = process cwd)."""
+        self._cwd = str(cwd) if cwd else None
 
     def set_policy(self, policy: LocalShellPolicy):
         self.policy = policy
@@ -686,7 +732,7 @@ class LocalShellClient:
 
         try:
             proc = subprocess.Popen(
-                command, shell=shell,
+                command, shell=shell, cwd=self._cwd,
                 stdin=subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd,
                 close_fds=True,
                 preexec_fn=os.setsid,
@@ -788,7 +834,7 @@ class LocalShellClient:
         print(f"\n  \033[1;33m\u26a0 Run locally:\033[0m \033[1m{cmd}\033[0m", flush=True)
 
         destructive = is_destructive_command(cmd)
-        mode = get_permission_mode()
+        mode = self.permissions().get_permission_mode()
         auto_execute = self.policy.allow_auto_execute or mode == "yolo"
 
         # Decide whether this command may run without a prompt.
@@ -847,7 +893,7 @@ class LocalShellClient:
             return self._run_command(cmd, timeout)
 
         if answer == "A":
-            set_agent_mode(True)
+            self.permissions().set_agent_mode(True)
             self.policy = LocalShellPolicy(
                 interactive=self.policy.interactive,
                 allow_auto_execute=True,
@@ -1097,7 +1143,7 @@ class SSHRemoteClient(LocalShellClient):
 
     def _permission_allows(self, command: str) -> tuple:
         destructive = is_destructive_command(command)
-        mode = get_permission_mode()
+        mode = self.permissions().get_permission_mode()
         auto_execute = self.policy.allow_auto_execute or mode == "yolo"
         if destructive:
             return False, "destructive"
@@ -1778,14 +1824,26 @@ class DelegateTaskClient:
         self._config: dict = {}
         self._chat_state = None
         self._builtin_clients: Dict[str, Any] = {}
+        self._session = None
         self._lock = threading.Lock()
 
-    def bind(self, config: dict, chat_state, builtin_clients: Dict[str, Any]):
+    def bind(self, config: dict, chat_state, builtin_clients: Dict[str, Any],
+             session=None):
         """Bind live references: config/provider/tools are read at call time
         so mid-session model switches carry over to subagents."""
         self._config = config
         self._chat_state = chat_state
         self._builtin_clients = builtin_clients
+        self._session = session
+
+    def bind_session(self, session):
+        """Bind a parent AgentSession; delegated turns become child sessions
+        that share its permission state (child authority never exceeds the
+        parent's)."""
+        self.bind(
+            session.config, session.chat_state, session.builtin_clients,
+            session=session,
+        )
 
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
@@ -1886,7 +1944,8 @@ class DelegateTaskClient:
     def _run(self, task: str, context: str, skill: Optional[dict] = None) -> dict:
         from .config import get_int
         from .providers import RAW_FNS
-        from .runtime import chat_turn, truncate_tool_result
+        from .runtime import truncate_tool_result
+        from .session import AgentSession
 
         config, provider = self._subagent_config(
             preferred_model=(skill or {}).get("model", ""),
@@ -1937,16 +1996,27 @@ class DelegateTaskClient:
         ]
         label = f"subagent[{skill['name']}]" if skill else "subagent"
         print(f"  \033[2m({label}: {task[:70]})\033[0m", file=sys.stderr)
+        # Child session: shares the parent's permission state (a subagent's
+        # authority is never wider than its parent's) but owns its own config
+        # copy, toolset, and budget. Clients are the parent's objects, so they
+        # keep the parent's bindings (attach with bind=False).
+        parent = self._session
+        child = AgentSession(
+            config,
+            interactive=False,
+            permissions=(
+                parent.permissions if parent is not None
+                else default_permissions()
+            ),
+            cwd=(parent.cwd if parent is not None else None),
+        )
+        child.budgets.max_tool_rounds = rounds
+        child.attach_clients(sub_clients, bind=False)
         try:
-            reply, usage = chat_turn(
-                config,
-                provider,
-                raw_fn,
+            reply, usage = child.run_turn(
                 messages,
-                sub_tools or None,
-                getattr(self._chat_state, "tool_map", {}) or {},
-                sub_clients,
-                max_tool_rounds=rounds,
+                tools=sub_tools or None,
+                tool_map=getattr(self._chat_state, "tool_map", {}) or {},
             )
         except Exception as exc:
             return self._text(f"Error: subagent failed: {exc}")
@@ -2145,6 +2215,7 @@ class ConchConfigClient:
         self._model = ""
         self._session_usage = {}
         self._config: dict = {}
+        self._permissions: Optional[PermissionState] = None
         self.pending_actions: List[tuple] = []
 
     def bind(self, provider: str, model: str, session_usage: dict, config: Optional[dict] = None):
@@ -2153,6 +2224,12 @@ class ConchConfigClient:
         self._session_usage = session_usage
         if config is not None:
             self._config = config
+
+    def bind_permissions(self, permissions: Optional[PermissionState]):
+        self._permissions = permissions
+
+    def permissions(self) -> PermissionState:
+        return self._permissions or _DEFAULT_PERMISSIONS
 
     def update(self, provider: str, model: str):
         self._provider = provider
@@ -2182,7 +2259,7 @@ class ConchConfigClient:
         if action == "get":
             from .config import get_config_path
             from .providers import get_context_window
-            agent = "ON" if get_agent_mode() else "OFF"
+            agent = "ON" if self.permissions().get_agent_mode() else "OFF"
             lines = [
                 f"provider: {self._provider}",
                 f"model: {self._model}",
@@ -2349,7 +2426,7 @@ class ConchConfigClient:
 
         if action == "set_agent_mode":
             enabled = value.lower() in ("on", "true", "1", "yes")
-            set_agent_mode(enabled)
+            self.permissions().set_agent_mode(enabled)
             return self._text(f"Agent mode {'ON' if enabled else 'OFF'}.")
 
         if action == "set_rounds":

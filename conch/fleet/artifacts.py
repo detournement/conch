@@ -202,11 +202,18 @@ def sign_manifest(manifest_path, key_path) -> Path:
     manifest_path = Path(manifest_path)
     if not manifest_path.is_file():
         raise ArtifactError(f"manifest {manifest_path} does not exist")
+    sig_path = manifest_path.with_name(manifest_path.name + ".sig")
+    # ssh-keygen interactively prompts (and silently skips with rc=0 when
+    # stdin is closed) rather than overwrite an existing .sig — remove it
+    # so signing is deterministic.
+    try:
+        sig_path.unlink()
+    except OSError:
+        pass
     _run_ssh_keygen([
         "ssh-keygen", "-Y", "sign", "-f", str(key_path),
         "-n", SSHSIG_NAMESPACE, str(manifest_path),
     ])
-    sig_path = manifest_path.with_name(manifest_path.name + ".sig")
     if not sig_path.is_file():
         raise ArtifactError("ssh-keygen reported success but wrote no .sig")
     return sig_path

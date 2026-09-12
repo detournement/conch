@@ -2,10 +2,10 @@
 
 ``conch-edge`` is live (Swarm Phase 1) but gated on ``edge_daemon=true`` —
 without it the command refuses with a clear pointer, so shell-only users
-cannot start a daemon by accident. The still-dormant entrypoints
-(controller, worker, hostctl) must exist, parse arguments, and refuse to
-run with a pointer to the plan — exiting nonzero so scripts and supervisors
-can't mistake a dormant mode for a working one.
+cannot start a daemon by accident. ``conch-hostctl`` is live (Swarm
+Phase 2). Still-dormant entrypoints must exist, parse arguments, and
+refuse to run with a pointer to the plan — exiting nonzero so scripts and
+supervisors can't mistake a dormant mode for a working one.
 """
 
 import contextlib
@@ -28,11 +28,11 @@ from conch.entrypoints import (
 DORMANT_MAINS = {
     "conch-controller": controller_main,
     "conch-worker": worker_main,
-    "conch-hostctl": hostctl_main,
 }
 
 ALL_MAINS = dict(DORMANT_MAINS)
 ALL_MAINS["conch-edge"] = edge_main
+ALL_MAINS["conch-hostctl"] = hostctl_main
 
 
 class TestDormantEntrypoints(unittest.TestCase):
@@ -73,14 +73,21 @@ class TestDormantEntrypoints(unittest.TestCase):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             with self.assertRaises(SystemExit) as ctx:
-                worker_main(["--definitely-not-a-flag"])
+                controller_main(["--definitely-not-a-flag"])
         self.assertEqual(ctx.exception.code, 2)
 
     def test_config_override_accepted(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            code = hostctl_main(["--config", "/tmp/some.conf"])
+            code = controller_main(["--config", "/tmp/some.conf"])
         self.assertEqual(code, DORMANT_EXIT_CODE)
+
+    def test_hostctl_without_subcommand_shows_help_and_fails(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = hostctl_main([])
+        self.assertEqual(code, 2)
+        self.assertIn("probe", stderr.getvalue())
 
 
 class TestEdgeEntrypoint(unittest.TestCase):

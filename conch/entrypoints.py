@@ -5,10 +5,12 @@ owns the mission kernel and keeps missions running when the terminal
 closes. It refuses to start unless ``edge_daemon=true`` is configured (or
 ``CONCH_EDGE_DAEMON=true``), so nothing changes for shell-only users.
 
-``conch-controller``, ``conch-worker``, and ``conch-hostctl`` remain
-dormant: each prints a clear "not yet enabled" message and exits nonzero
-until its phase lands. The interactive ``conch`` entrypoint is untouched
-and never depends on any of these.
+``conch-hostctl`` and ``conch-worker`` are live as of Swarm Phase 2: the
+on-host fleet control utility (install/probe/deploy/rollback/RPC relay)
+and the bounded worker supervisor. ``conch-controller`` remains dormant:
+it prints a clear "not yet enabled" message and exits nonzero until its
+phase lands. The interactive ``conch`` entrypoint is untouched and never
+depends on any of these.
 """
 
 from __future__ import annotations
@@ -130,10 +132,11 @@ def worker_main(argv: Optional[List[str]] = None) -> int:
 
 
 def hostctl_main(argv: Optional[List[str]] = None) -> int:
-    parser = _build_parser(
-        "conch-hostctl",
-        "Conch host control utility: enrollment, capability probing, "
-        "artifact deployment, and rollback on fleet hosts (dormant).",
-    )
-    parser.parse_args(argv)
-    return _dormant("conch-hostctl", "the host control utility")
+    """The on-host fleet control utility (live as of Swarm Phase 2).
+
+    Delegates to :mod:`conch.fleet.hostctl`, which is stdlib-only and
+    single-file so enrollment can bootstrap it onto bare hosts.
+    """
+    from .fleet.hostctl import main as fleet_hostctl_main
+
+    return fleet_hostctl_main(argv)

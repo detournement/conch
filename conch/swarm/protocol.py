@@ -104,17 +104,33 @@ def classification_rank(value: str) -> int:
 
 EVENT_KINDS = frozenset({
     "started", "progress", "log", "heartbeat", "result", "failed",
-    "cancelled",
+    "cancelled", "delegation_requested",
 })
 
 RECEIPT_OUTCOMES = frozenset({"success", "failure", "unknown"})
+
+#: Worker RPC operations (Swarm Phase 2). The transport is fixed:
+#: ``conch-hostctl rpc <worker>`` relaying one bounded JSON line each way
+#: over SSH stdio. Anything not in this set fails closed on both ends.
+RPC_OPS = frozenset({
+    "worker.status",
+    "task.offer",
+    "task.start",
+    "task.cancel",
+    "task.status",
+    "task.events",
+    "task.events_ack",
+    "task.resume",
+    "artifact.put",
+    "artifact.get",
+})
 
 
 # ---------------------------------------------------------------------------
 # Canonical IDs
 # ---------------------------------------------------------------------------
 
-ID_KINDS = frozenset({"msn", "task", "evt", "rcpt", "lease", "wrk"})
+ID_KINDS = frozenset({"msn", "task", "evt", "rcpt", "lease", "wrk", "rpc"})
 
 _ID_RE = re.compile(r"^([a-z]{2,8})-([0-9a-f]{13})-([0-9a-f]{16})$")
 
@@ -190,6 +206,10 @@ def _coerce(cls_name: str, name: str, kind: str, value):
     if kind == "str":
         if not isinstance(value, str):
             raise ProtocolError(f"{cls_name}.{name} must be a string")
+        return value
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise ProtocolError(f"{cls_name}.{name} must be a boolean")
         return value
     if kind == "int":
         if _is_bool(value) or not isinstance(value, int):
@@ -517,6 +537,86 @@ class TaskReceipt(_WireShape):
                 "TaskReceipt.artifact_digest must be a lowercase sha256 hex "
                 "digest"
             )
+
+
+@dataclass(frozen=True)
+class RpcRequest(_WireShape):
+    """One controller→worker request over the fixed SSH-stdio transport.
+
+    ``args`` carries op-specific JSON (envelopes travel as validated
+    ``TaskEnvelope`` dicts inside it). No secrets, ever — the transport
+    equals argv+stdio on a remote host.
+    """
+
+    rpc_id: str
+    op: str
+    args: Dict[str, Any] = field(default_factory=dict)
+    schema_version: int = 1
+    protocol_version: int = PROTOCOL_VERSION
+
+    SCHEMA_VERSION = 1
+    _KINDS = {
+        "rpc_id": "str", "op": "str", "args": "dict",
+        "schema_version": "int", "protocol_version": "int",
+    }
+
+    def _validate(self):
+        _check_id("rpc_id", self.rpc_id, "rpc")
+        if self.op not in RPC_OPS:
+            raise ProtocolError(
+                f"RpcRequest.op must be one of {sorted(RPC_OPS)},"
+                f" got {self.op!r}"
+            )
+
+
+@dataclass(frozen=True)
+class RpcResponse(_WireShape):
+    """One worker→controller reply.
+
+    Failures always carry a :class:`FailureClass` so retry policy is
+    deterministic; ``retry_after`` lets a loaded worker push back
+    (bounded-queue rejection) without the controller guessing.
+    """
+
+    rpc_id: str
+    ok: bool
+    result: Dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+    error_class: str = ""
+    retry_after: float = 0.0
+    schema_version: int = 1
+    protocol_version: int = PROTOCOL_VERSION
+
+    SCHEMA_VERSION = 1
+    _KINDS = {
+        "rpc_id": "str", "ok": "bool", "result": "dict", "error": "str",
+        "error_class": "str", "retry_after": "num",
+        "schema_version": "int", "protocol_version": "int",
+    }
+
+    def _validate(self):
+        _check_id("rpc_id", self.rpc_id, "rpc")
+        if self.retry_after < 0:
+            raise ProtocolError(
+                "RpcResponse.retry_after must not be negative"
+            )
+        if self.ok:
+            if self.error or self.error_class:
+                raise ProtocolError(
+                    "RpcResponse: a successful response must not carry an"
+                    " error or error_class"
+                )
+        else:
+            if not self.error.strip():
+                raise ProtocolError(
+                    "RpcResponse: a failed response requires an error"
+                    " message"
+                )
+            if self.error_class not in FailureClass.ALL:
+                raise ProtocolError(
+                    "RpcResponse: a failed response requires a"
+                    f" failure class from {sorted(FailureClass.ALL)}"
+                )
 
 
 @dataclass(frozen=True)

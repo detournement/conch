@@ -2,10 +2,10 @@
 
 ``conch-edge`` is live (Swarm Phase 1) but gated on ``edge_daemon=true`` —
 without it the command refuses with a clear pointer, so shell-only users
-cannot start a daemon by accident. ``conch-hostctl`` is live (Swarm
-Phase 2). Still-dormant entrypoints must exist, parse arguments, and
-refuse to run with a pointer to the plan — exiting nonzero so scripts and
-supervisors can't mistake a dormant mode for a working one.
+cannot start a daemon by accident. ``conch-hostctl`` and ``conch-worker``
+are live (Swarm Phase 2). Still-dormant entrypoints must exist, parse
+arguments, and refuse to run with a pointer to the plan — exiting nonzero
+so scripts and supervisors can't mistake a dormant mode for a working one.
 """
 
 import contextlib
@@ -27,12 +27,12 @@ from conch.entrypoints import (
 
 DORMANT_MAINS = {
     "conch-controller": controller_main,
-    "conch-worker": worker_main,
 }
 
 ALL_MAINS = dict(DORMANT_MAINS)
 ALL_MAINS["conch-edge"] = edge_main
 ALL_MAINS["conch-hostctl"] = hostctl_main
+ALL_MAINS["conch-worker"] = worker_main
 
 
 class TestDormantEntrypoints(unittest.TestCase):
@@ -88,6 +88,14 @@ class TestDormantEntrypoints(unittest.TestCase):
             code = hostctl_main([])
         self.assertEqual(code, 2)
         self.assertIn("probe", stderr.getvalue())
+
+    def test_worker_requires_home(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                worker_main([])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("home", stderr.getvalue().lower())
 
 
 class TestEdgeEntrypoint(unittest.TestCase):

@@ -122,13 +122,10 @@ def edge_main(argv: Optional[List[str]] = None) -> int:
 
 
 def worker_main(argv: Optional[List[str]] = None) -> int:
-    parser = _build_parser(
-        "conch-worker",
-        "Bounded Conch fleet worker: executes versioned task envelopes "
-        "received over SSH stdin/stdout (dormant).",
-    )
-    parser.parse_args(argv)
-    return _dormant("conch-worker", "the fleet worker runtime")
+    """The bounded fleet worker supervisor (live as of Swarm Phase 2)."""
+    from .fleet.worker import main as fleet_worker_main
+
+    return fleet_worker_main(argv)
 
 
 def hostctl_main(argv: Optional[List[str]] = None) -> int:

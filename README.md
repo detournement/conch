@@ -194,6 +194,25 @@ Reusable procedures live in `~/.config/conch/skills/` — one markdown file per 
 ### Remote loop (Slack, SMS, email)
 With `remote_enabled=true`, conch messages you proactively and you can steer it from anywhere: scheduled task output is delivered over your `notify_channel`, and inbound replies are polled (Slack bot channel, Twilio SMS, IMAP inbox) and routed into conversations — a channel thread *is* a conch conversation, so replies resume it. Safety is enforced in code, not prompts: inbound senders must be on a per-channel allowlist (no allowlist = no inbound, fail closed); remote sessions are capped at **safe_auto** permissions regardless of local agent mode; and remote sessions never see self-management, delegation, direct-terminal, or SSH-control tools. Mutating local commands create short-lived approvals bound to the exact channel, sender, thread, command, and timeout. Approval execution reruns lifecycle hooks, and approvals cannot be replayed from another conversation. Channel approvals can never produce a local password/passphrase prompt.
 
+### eBay pilot over Capitol workflows
+`/ebay <photo...> [-- notes]` sells an item photo-first through a governed
+Capitol A2A workflow (sandbox Milestone 1). Conch talks to the gateway with a
+stdlib-only adapter (`conch/capitol/`): agent-card discovery, handshake,
+idempotent workflow calls, SSE event streaming with resume, HITL
+clarification/intervention relay, and artifact upload. The workflow's model
+owns all listing judgment — what the item is, title, description, category,
+price, and when to ask you a clarifying question (relayed in the shell).
+Deterministic machinery exists only at the money boundary: publishing requires
+the exact-approval challenge (`proceed to post` + `POST r{rev} {hash[-12:]}`
+over the immutable revision hash), an idempotency key so retries can never
+double-post, a thin caps clamp (optional price ceiling + category allowlist
+deciding auto vs. explicit approval), and a required-policy consult. Configure
+`capitol_base_url` / `capitol_org` / `capitol_agent` / `capitol_bearer_env`
+(the bearer is read from that env var or `~/.capitol-a2a/agents.yaml`, never
+stored in config) plus the `ebay_*` keys in `config.example`. Run linkage
+(run ids, revision hashes, listing ids) persists as a tiny JSON file under the
+XDG state dir.
+
 ### Budget-aware turns
 Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
 
@@ -327,6 +346,7 @@ target directly, pass Docker's `--init`.
 | `/ssh exec <command>` | Run a captured, permission-gated command over the control connection |
 | `/ssh shell [command]` | Open an uncaptured remote TTY (including remote sudo) |
 | `/ssh disconnect` | Close the active SSH control connection |
+| `/ebay <photo...> [-- notes]` | Draft and publish an eBay listing through a Capitol workflow |
 | `/new` | Start a new conversation |
 | `/clear` | Wipe history (keep conversation) |
 | `/convos` | List conversations |
@@ -379,6 +399,7 @@ approvals, and the existing UI/storage/tooling surfaces.
 ```
 conch/
 ├── app.py           Main chat loop and CLI entrypoint
+├── capitol/         Capitol A2A adapter + eBay pilot driver
 ├── channels.py      Slack/SMS/email gateways + sender allowlists
 ├── cli.py           One-shot ask entrypoint
 ├── commands.py      Slash command handlers (+ user-defined commands)

@@ -59,6 +59,19 @@ CLI behavior:
   transcripts, terminal output, tool results, state files), and protocol
   round-trip/version-rejection.
 
+**eBay pilot / Capitol adapter (September 2026): landed.** Milestone 1 of the
+Capitol contract: a stdlib-only A2A adapter (`conch/capitol/` — discovery,
+handshake, idempotent workflow calls, SSE resume, HITL relay, artifacts) and
+the `/ebay` photo→listing driver. Listing judgment (content, price, when to
+clarify) belongs to the workflow's model; determinism lives only at the money
+boundary (exact-approval challenge over the immutable revision hash, publish
+idempotency key, thin caps clamp, required-policy consult) and in the tiny
+XDG run-linkage state file. Live sandbox conformance reached the publish
+effect: draft, clarify, and the exact-approval gate all passed; replay and
+stale-approval zero-write proofs captured. Publishing itself is parked on an
+expired eBay sandbox user token (no refresh token in the org credential
+bundle) — an operator re-auth, not a code gap.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

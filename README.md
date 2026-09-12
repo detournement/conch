@@ -196,49 +196,8 @@ With `remote_enabled=true`, conch messages you proactively and you can steer it 
 
 Slack photo attachments are captured too: message `files[]` from allowlisted senders are downloaded with the bot bearer, validated by content (JPEG/PNG/GIF/WebP magic bytes, 12 MB cap, ≤12 per message), and quarantined under the XDG state dir before any flow may use them. This needs the **`files:read`** bot scope on the Slack app (plus the usual `chat:write` and `channels:history`/`groups:history`/`im:history` for the channel type) — add it to the app manifest and reinstall the app. Because Slack's `conversations.history` never returns replies inside threads, conch also remembers each thread it posts into and polls `conversations.replies` for those, so a thread can carry a full back-and-forth.
 
-### eBay pilot over Capitol workflows
-`/ebay <photo...> [-- notes]` sells an item photo-first through a governed
-Capitol A2A workflow (sandbox Milestone 1). Conch talks to the gateway with a
-stdlib-only adapter (`conch/capitol/`): agent-card discovery, handshake,
-idempotent workflow calls, SSE event streaming with resume, HITL
-clarification/intervention relay, and artifact upload. The workflow's model
-owns all listing judgment — what the item is, title, description, category,
-price, and when to ask you a clarifying question (relayed in the shell).
-Deterministic machinery exists only at the money boundary: publishing requires
-the exact-approval challenge (`proceed to post` + `POST r{rev} {hash[-12:]}`
-over the immutable revision hash), an idempotency key so retries can never
-double-post, a thin caps clamp (optional price ceiling + category allowlist
-deciding auto vs. explicit approval), and a required-policy consult. Configure
-`capitol_base_url` / `capitol_org` / `capitol_agent` / `capitol_bearer_env`
-(the bearer is read from that env var or `~/.capitol-a2a/agents.yaml`, never
-stored in config) plus the `ebay_*` keys in `config.example`. Run linkage
-(run ids, revision hashes, listing ids) persists as a tiny JSON file under the
-XDG state dir.
-
-**Message-first Slack intake (Milestone 1b).** With the remote loop running,
-a Slack message containing item photo(s) plus whatever you know about the item
-*is* the intake: conch quarantines and validates the photos, starts a listing
-session in the same governed pipeline, and the message's thread carries
-everything that follows — clarifying questions (reply in-thread to answer,
-including mid-run HITL checkpoints, which park durably and survive restarts),
-the drafted-revision review, and the publish decision. The caps clamp decides
-auto vs. approval: within caps *and* with the explicit
-`ebay_channel_auto_publish=true` opt-in it publishes and confirms in-thread;
-otherwise it posts an origin-bound approval — the immutable revision summary
-plus the exact challenge (`POST r{rev} {hash[-12:]}`) — that only `approve N`
-from the same channel, thread, and sender can consume (TTL'd; expired ones are
-reissued). Consuming the approval *constructs* the publish request from the
-pinned revision, and Capitol's approval node re-verifies the same identity —
-two staleness checks in series; any new revision voids the pending approval.
-Inbound text is item data, never control: only the anchored `approve N` /
-`deny N` replies carry control semantics, so approval-like text buried in a
-message body, sent from the wrong thread, or from a non-allowlisted sender
-publishes nothing. Slack app requirements: the `files:read` bot scope (plus
-`chat:write` and your channel type's history scope), then reinstall the app;
-see `config.example` for `ebay_channel_intake` / `ebay_channel_auto_publish`.
-
 ### Capitol as a governed execution fabric
-The eBay pilot is one consumer of a general integration: Conch drives
+Conch drives
 [Capitol](https://capitol.ai) — A2A orchestrator agents and durable Temporal
 workflows — as a subordinate, governed process-execution fabric while mission
 truth, policy, budgets, approvals, and the external-action ledger stay on the
@@ -565,6 +524,61 @@ target directly, pass Docker's `--init`.
 | `/browse` | Interactive conversation browser |
 | `/<custom>` | Any markdown file in `~/.config/conch/commands/` |
 
+## Use cases
+
+Complete flows built by composing the core product — the Capitol
+integration, channels, origin-bound approvals, and the mission kernel.
+These are worked examples, not core product surface.
+
+### eBay listing pilot (photo → listing over Capitol workflows)
+`/ebay <photo...> [-- notes]` sells an item photo-first through a governed
+Capitol A2A workflow. Conch talks to the gateway with the stdlib-only
+adapter (`conch/capitol/`): agent-card discovery, handshake, idempotent
+workflow calls, SSE event streaming with resume, HITL
+clarification/intervention relay, and artifact upload. The workflow's model
+owns all listing judgment — what the item is, title, description, category,
+price, and when to ask you a clarifying question (relayed in the shell).
+Deterministic machinery exists only at the money boundary: publishing requires
+the exact-approval challenge (`proceed to post` + `POST r{rev} {hash[-12:]}`
+over the immutable revision hash), an idempotency key so retries can never
+double-post, a thin caps clamp (optional price ceiling + category allowlist
+deciding auto vs. explicit approval), and a required-policy consult. Configure
+`capitol_base_url` / `capitol_org` / `capitol_agent` / `capitol_bearer_env`
+(the bearer is read from that env var or `~/.capitol-a2a/agents.yaml`, never
+stored in config) plus the `ebay_*` keys in `config.example`. Run linkage
+(run ids, revision hashes, listing ids) persists as a tiny JSON file under the
+XDG state dir.
+
+**Message-first Slack intake.** With the remote loop running,
+a Slack message containing item photo(s) plus whatever you know about the item
+*is* the intake: conch quarantines and validates the photos, starts a listing
+session in the same governed pipeline, and the message's thread carries
+everything that follows — clarifying questions (reply in-thread to answer,
+including mid-run HITL checkpoints, which park durably and survive restarts),
+the drafted-revision review, and the publish decision. The caps clamp decides
+auto vs. approval: within caps *and* with the explicit
+`ebay_channel_auto_publish=true` opt-in it publishes and confirms in-thread;
+otherwise it posts an origin-bound approval — the immutable revision summary
+plus the exact challenge (`POST r{rev} {hash[-12:]}`) — that only `approve N`
+from the same channel, thread, and sender can consume (TTL'd; expired ones are
+reissued). Consuming the approval *constructs* the publish request from the
+pinned revision, and Capitol's approval node re-verifies the same identity —
+two staleness checks in series; any new revision voids the pending approval.
+Inbound text is item data, never control: only the anchored `approve N` /
+`deny N` replies carry control semantics, so approval-like text buried in a
+message body, sent from the wrong thread, or from a non-allowlisted sender
+publishes nothing. Slack app requirements: the `files:read` bot scope (plus
+`chat:write` and your channel type's history scope), then reinstall the app;
+see `config.example` for `ebay_channel_intake` / `ebay_channel_auto_publish`.
+
+### Funding-intake pipeline
+`conch/capitol/together_funding.py` builds a scheduled email-intake →
+research → document pipeline entirely out of the same primitives:
+`CapitolAdmin` provisions the versioned workflows, schedule, and ledger
+collection idempotently, and mission supervision binds the scheduled runs.
+It is an example of provisioning and supervising a multi-stage Capitol
+pipeline from Conch, not a core feature.
+
 ## Development
 
 ```bash
@@ -585,7 +599,7 @@ approvals, and the existing UI/storage/tooling surfaces.
 ```
 conch/
 ├── app.py           Main chat loop and CLI entrypoint
-├── capitol/         Capitol A2A adapter + eBay pilot driver
+├── capitol/         Capitol A2A adapter, admin, supervision + use-case drivers
 ├── channels.py      Slack/SMS/email gateways + sender allowlists
 ├── cli.py           One-shot ask entrypoint
 ├── commands.py      Slash command handlers (+ user-defined commands)

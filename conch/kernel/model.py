@@ -98,7 +98,9 @@ MISSION_TRANSITIONS = {
         MissionState.READY, MissionState.CANCELLED,
     }),
     MissionState.READY: frozenset({
-        MissionState.ACTIVE, MissionState.PAUSED, MissionState.CANCELLED,
+        MissionState.ACTIVE, MissionState.WAITING_TIMER,
+        MissionState.PAUSED, MissionState.CANCELLED,
+        MissionState.FAILED,  # e.g. budget exhausted before a session
     }),
     MissionState.ACTIVE: frozenset({
         MissionState.WAITING_TIMER, MissionState.WAITING_INPUT,

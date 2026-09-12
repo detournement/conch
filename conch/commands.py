@@ -108,6 +108,11 @@ SLASH_COMMANDS = [
     ("/schedule <interval> <prompt>", "Schedule a recurring task"),
     ("/tasks", "List scheduled tasks"),
     ("/cancel <id>", "Cancel a scheduled task"),
+    ("/missions", "List durable missions (edge daemon)"),
+    ("/mission <show|new|pause|resume|abort|input> ...", "Manage a mission"),
+    ("/approvals", "List pending mission approvals"),
+    ("/approve <id>", "Approve a pending mission action"),
+    ("/deny <id>", "Deny a pending mission action"),
     ("/tools", "List tool groups"),
     ("/enable <group>", "Enable a tool group"),
     ("/disable <group>", "Disable a tool group"),
@@ -128,6 +133,286 @@ SLASH_COMMANDS = [
 def slash_command_names() -> List[str]:
     """Bare command names (first word of each registry entry)."""
     return [entry[0].split()[0] for entry in SLASH_COMMANDS]
+
+
+# ---------------------------------------------------------------------------
+# Mission attach commands (Swarm Phase 1): /missions /mission /approvals
+# /approve /deny — served over the daemon socket when conch-edge runs, else
+# directly against the kernel database. The same client abstraction backs
+# both, so the UX is identical either way.
+# ---------------------------------------------------------------------------
+
+def _kernel_attach(config: dict, sched):
+    """Kernel client for attach commands, or None after printing why not.
+
+    conch.kernel is only imported when edge_daemon=true — the no-daemon
+    invariant keeps the classic shell entirely kernel-free."""
+    from .config import get_bool
+
+    if not get_bool(config, "edge_daemon"):
+        print(
+            "\n  \033[2mMissions live in the edge daemon, which is not "
+            "enabled.\n  Set `edge_daemon = true` in your conch config and "
+            "run `conch-edge`\n  (see README \"Edge daemon and missions\") "
+            "to turn it on.\033[0m\n"
+        )
+        return None
+    if sched is not None and hasattr(sched, "client"):
+        try:
+            return sched.client()
+        except Exception as exc:
+            print(f"\n  \033[31mKernel unavailable: {exc}\033[0m\n")
+            return None
+    try:
+        from .kernel.client import attach_kernel
+
+        return attach_kernel(config)
+    except Exception as exc:
+        print(f"\n  \033[31mKernel unavailable: {exc}\033[0m\n")
+        return None
+
+
+def _format_eta(timestamp) -> str:
+    import time as _time
+
+    if not timestamp:
+        return "-"
+    delta = float(timestamp) - _time.time()
+    if delta <= 0:
+        return "due"
+    if delta < 90:
+        return f"in {int(delta)}s"
+    if delta < 5400:
+        return f"in {int(delta // 60)}m"
+    if delta < 172800:
+        return f"in {delta / 3600:.1f}h"
+    return f"in {delta / 86400:.1f}d"
+
+
+def _resolve_mission(client, ref: str) -> Optional[str]:
+    """Mission id from a full id, unique prefix, or legacy #<int> alias."""
+    ref = (ref or "").strip().lstrip("#")
+    if not ref:
+        return None
+    missions = client.list_missions()
+    if ref.isdigit():
+        for mission in missions:
+            if int(mission.get("task_seq") or 0) == int(ref):
+                return mission["mission_id"]
+        return None
+    matches = [
+        mission["mission_id"] for mission in missions
+        if mission["mission_id"] == ref
+        or mission["mission_id"].startswith(ref)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+_MISSION_STATUS_COLORS = {
+    "ready": "36", "active": "32", "waiting_timer": "2",
+    "waiting_input": "33", "waiting_approval": "33", "paused": "35",
+    "succeeded": "32", "failed": "31", "cancelled": "31", "draft": "2",
+}
+
+
+def _print_mission_line(mission: Dict[str, Any]):
+    color = _MISSION_STATUS_COLORS.get(mission["status"], "0")
+    wake = ""
+    if mission.get("next_wake_at") and mission["status"] in (
+        "ready", "waiting_timer", "active"
+    ):
+        wake = f"  wake {_format_eta(mission['next_wake_at'])}"
+    goal = mission.get("goal", "")
+    if len(goal) > 60:
+        goal = goal[:57] + "..."
+    print(
+        f"    \033[1m#{mission.get('task_seq', '?')}\033[0m "
+        f"\033[{color}m[{mission['status']}]\033[0m {goal}"
+        f"  \033[2m{mission['mission_id'][:20]}…  runs={mission['runs']}"
+        f"{wake}\033[0m"
+    )
+
+
+def _handle_mission_command(command: str, arg: str, config: dict, sched):
+    client = _kernel_attach(config, sched)
+    if client is None:
+        return
+    from .kernel.model import KernelError
+
+    try:
+        if command == "/missions":
+            missions = client.list_missions()
+            if not missions:
+                print(
+                    "\n  \033[2mNo missions yet. Start one with "
+                    "/mission new <goal>.\033[0m\n"
+                )
+                return
+            mode = getattr(client, "mode", "?")
+            attach = (
+                "daemon socket" if mode == "socket"
+                else "direct kernel — daemon not running"
+            )
+            print(f"\n  \033[1;36mMissions ({len(missions)})\033[0m "
+                  f"\033[2m[{attach}]\033[0m")
+            for mission in missions:
+                _print_mission_line(mission)
+            print()
+            return
+        if command == "/approvals":
+            approvals = client.list_approvals()
+            if not approvals:
+                print("\n  \033[2mNo pending approvals.\033[0m\n")
+                return
+            print(f"\n  \033[1;36mPending approvals ({len(approvals)}):\033[0m")
+            for row in approvals:
+                print(
+                    f"    \033[1m{row['approval_id']}\033[0m "
+                    f"{row['action_kind']} \033[2m(mission "
+                    f"{row['mission_id'][:20]}…, expires "
+                    f"{_format_eta(row['expires_at'])})\033[0m\n"
+                    f"      \033[2margs {row['action_args']}\033[0m"
+                )
+            print(
+                "  \033[2mDecide with /approve <id> or /deny <id> "
+                "(unique prefix ok).\033[0m\n"
+            )
+            return
+        if command in ("/approve", "/deny"):
+            ref = arg.strip()
+            if not ref:
+                print(f"\n  \033[2mUsage: {command} <approval-id>\033[0m\n")
+                return
+            approvals = client.list_approvals()
+            matches = [
+                row for row in approvals
+                if row["approval_id"] == ref
+                or row["approval_id"].startswith(ref)
+                or ref in row["approval_id"]
+            ]
+            if not matches:
+                print(f"\n  \033[31mNo pending approval matching "
+                      f"{ref!r}.\033[0m\n")
+                return
+            if len(matches) > 1:
+                print(f"\n  \033[31m{len(matches)} approvals match "
+                      f"{ref!r}; be more specific.\033[0m\n")
+                return
+            row = matches[0]
+            verb = "approve" if command == "/approve" else "deny"
+            result = client.decide_approval(
+                row["approval_id"], verb, row["nonce"],
+                decided_by=os.environ.get("USER", "shell"),
+            )
+            symbol = "✓" if verb == "approve" else "✗"
+            print(
+                f"\n  \033[1;32m{symbol} {result['status']}\033[0m "
+                f"{row['action_kind']} \033[2m({row['approval_id']})\033[0m\n"
+            )
+            return
+        # /mission <sub> ...
+        parts = arg.split(None, 1)
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if sub == "new":
+            if not rest:
+                print(
+                    "\n  \033[2mUsage: /mission new <goal>  (or a JSON "
+                    "spec: /mission new {\"goal\": ..., "
+                    "\"cadence_seconds\": ...})\033[0m\n"
+                )
+                return
+            if rest.startswith("{"):
+                try:
+                    spec = json.loads(rest)
+                except json.JSONDecodeError as exc:
+                    print(f"\n  \033[31mInvalid JSON spec: {exc}\033[0m\n")
+                    return
+            else:
+                spec = {"goal": rest, "budgets": {},
+                        "cadence_seconds": 86400}
+            mission_id = client.new_mission(spec)
+            mission = client.get_mission(mission_id)
+            print(
+                f"\n  \033[1;32m✓ Mission #{mission.get('task_seq', '?')} "
+                f"created\033[0m \033[2m({mission_id})\033[0m\n"
+                f"  \033[2m{mission['goal']} — status {mission['status']}, "
+                f"next wake {_format_eta(mission.get('next_wake_at'))}"
+                "\033[0m\n"
+            )
+            return
+        if sub in ("show", "pause", "resume", "abort", "input"):
+            ref_parts = rest.split(None, 1) if sub == "input" else [rest]
+            mission_id = _resolve_mission(client, ref_parts[0])
+            if mission_id is None:
+                print(
+                    f"\n  \033[31mNo mission matching "
+                    f"{ref_parts[0]!r}.\033[0m\n"
+                )
+                return
+            if sub == "show":
+                detail = client.get_mission(mission_id)
+                print(f"\n  \033[1;36mMission #{detail.get('task_seq')}"
+                      f"\033[0m \033[2m{mission_id}\033[0m")
+                _print_mission_line(detail)
+                spec = detail.get("spec") or {}
+                if spec.get("success_criteria"):
+                    print("    \033[2mcriteria: "
+                          + "; ".join(spec["success_criteria"]) + "\033[0m")
+                budgets = detail.get("budgets") or {}
+                for line, values in budgets.items():
+                    print(
+                        f"    \033[2mbudget {line}: "
+                        f"{values['available']}/{values['cap']} left\033[0m"
+                    )
+                plan = detail.get("plan") or {}
+                for index, step in enumerate(plan.get("steps", [])[:8]):
+                    print(f"    \033[2mplan {index + 1}. {step}\033[0m")
+                for task in detail.get("open_tasks", [])[:8]:
+                    print(f"    \033[2mtask [{task['state']}] "
+                          f"{task['title']}\033[0m")
+                checkpoint = detail.get("checkpoint")
+                if checkpoint:
+                    summary = checkpoint["summary"]
+                    if len(summary) > 500:
+                        summary = summary[:500] + "…"
+                    print(f"    \033[2mlast checkpoint: {summary}\033[0m")
+                if detail.get("last_error"):
+                    print(f"    \033[31mlast error: "
+                          f"{detail['last_error']}\033[0m")
+                events = detail.get("events") or []
+                if events:
+                    print("    \033[2mrecent events: " + ", ".join(
+                        event["kind"] for event in events[-8:]
+                    ) + "\033[0m")
+                print()
+                return
+            if sub == "input":
+                if len(ref_parts) < 2 or not ref_parts[1].strip():
+                    print("\n  \033[2mUsage: /mission input <id> "
+                          "<answer>\033[0m\n")
+                    return
+                client.provide_input(mission_id, ref_parts[1].strip())
+                print(f"\n  \033[1;32m✓ Input recorded\033[0m \033[2m— "
+                      f"{mission_id} will pick it up next session\033[0m\n")
+                return
+            action = {
+                "pause": client.pause, "resume": client.resume,
+                "abort": client.abort,
+            }[sub]
+            action(mission_id)
+            mission = client.get_mission(mission_id)
+            print(f"\n  \033[1;32m✓ {sub}\033[0m \033[2m{mission_id} is now "
+                  f"{mission['status']}\033[0m\n")
+            return
+        print(
+            "\n  \033[2mUsage: /mission show|new|pause|resume|abort|input "
+            "...\033[0m\n"
+        )
+    except KernelError as exc:
+        print(f"\n  \033[31mMission command failed: {exc}\033[0m\n")
 
 
 def handle_slash_command(
@@ -179,6 +464,10 @@ def handle_slash_command(
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
             "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
+            "  \033[1m/missions\033[0m            List durable missions (edge daemon)\n"
+            "  \033[1m/mission show|new|pause|resume|abort|input\033[0m  Manage a mission\n"
+            "  \033[1m/approvals\033[0m           List pending mission approvals\n"
+            "  \033[1m/approve <id>\033[0m, \033[1m/deny <id>\033[0m  Decide a pending mission action\n"
             "  \033[1m/tools\033[0m               List tool groups\n"
             "  \033[1m/enable <group>\033[0m      Enable a tool group\n"
             "  \033[1m/disable <group>\033[0m     Disable a tool group\n"
@@ -459,6 +748,11 @@ def handle_slash_command(
             print(f"\n  \033[1;32m✓ Cancelled task #{task_id}\033[0m\n")
         else:
             print(f"\n  \033[31mNo task with ID #{task_id}\033[0m\n")
+        return None
+
+    if command in ("/missions", "/mission", "/approvals", "/approve",
+                   "/deny"):
+        _handle_mission_command(command, arg, config, sched)
         return None
 
     if command == "/remember" and memory is not None:

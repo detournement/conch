@@ -28,6 +28,7 @@ from .bootstrap import (
     route_scheduled_output as _route_scheduled_output,
     start_remote_loop,
     start_scheduler,
+    start_task_backend,
     warn_unknown_cloud_model,
 )
 from .commands import handle_slash_command
@@ -52,6 +53,8 @@ from . import mcp as mcp_mod
 __bootstrap_reexports__ = (
     resolve_ollama_startup_model,
     _route_scheduled_output,
+    make_scheduled_executor,
+    start_scheduler,
 )
 
 
@@ -408,13 +411,11 @@ def chat_loop():
 
     # Each scheduled run gets its own fresh session (bootstrap wiring); the
     # system prompt is read through a closure so provider/model switches keep
-    # flowing into scheduled turns.
-    sched = start_scheduler(
-        make_scheduled_executor(
-            config,
-            lambda: system_prompt,
-            max_tool_rounds=MAX_TOOL_ROUNDS,
-        )
+    # flowing into scheduled turns. With edge_daemon=true the kernel (and
+    # the conch-edge daemon) owns scheduled tasks instead; without it this
+    # is the classic in-process scheduler and conch.kernel is never imported.
+    sched, sched_kind = start_task_backend(
+        config, lambda: system_prompt, max_tool_rounds=MAX_TOOL_ROUNDS
     )
 
     session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
@@ -523,6 +524,14 @@ def chat_loop():
         active_tasks = [task for task in sched.list_tasks() if task.active]
         if active_tasks:
             print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
+        if sched_kind == "kernel":
+            if sched.daemon_running():
+                print("\033[2mEdge daemon connected (/missions, /approvals)\033[0m")
+            else:
+                print(
+                    "\033[33mEdge mode is on but conch-edge is not running — "
+                    "scheduled tasks and missions won't fire until it starts\033[0m"
+                )
         if agent_mode_from_config:
             print(f"\033[1;33m{AGENT_MODE_CONFIG_NOTICE}\033[0m")
         print("\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m")

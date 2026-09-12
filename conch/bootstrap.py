@@ -449,6 +449,33 @@ def start_scheduler(executor):
     return sched
 
 
+def start_task_backend(config: dict, get_system_prompt, *,
+                       max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS):
+    """Select the scheduled-task backend for one interactive session.
+
+    Returns ``(sched, kind)`` where kind is ``"legacy"`` or ``"kernel"``.
+
+    The no-daemon invariant is enforced here: with ``edge_daemon`` unset or
+    false, this starts the classic in-process scheduler over tasks.json and
+    never imports ``conch.kernel`` at all — interactive behavior is exactly
+    what it has always been. With ``edge_daemon=true``, `/schedule` is
+    backed by the mission kernel through the same Scheduler-shaped surface
+    (over the daemon's socket when it runs, else directly against the
+    kernel database), and execution belongs to the ``conch-edge`` daemon —
+    the shell never runs scheduled work in kernel mode.
+    """
+    if get_bool(config, "edge_daemon"):
+        from .kernel.client import KernelSchedulerAdapter
+
+        return KernelSchedulerAdapter(config), "kernel"
+    sched = start_scheduler(
+        make_scheduled_executor(
+            config, get_system_prompt, max_tool_rounds=max_tool_rounds
+        )
+    )
+    return sched, "legacy"
+
+
 def start_remote_loop(config: dict, conv_mgr=None, session=None) -> tuple:
     """Start the opt-in remote channel loop.
 

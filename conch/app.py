@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import os
 import readline
@@ -27,6 +28,7 @@ from .tooling import (
     ConchConfigClient,
     ConchIntrospectClient,
     DelegateTaskClient,
+    InteractiveTerminalClient,
     PublicApiClient,
     LocalShellClient,
     LocalShellPolicy,
@@ -34,6 +36,7 @@ from .tooling import (
     SaveMemoryClient,
     SearchConversationsClient,
     SkillManageClient,
+    SSHRemoteClient,
     TodoListClient,
     ToolRuntimeState,
     apply_filter,
@@ -172,13 +175,37 @@ def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool =
     local_shell.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=get_agent_mode()))
     # Scale shell-output budget to the active model's context window (plan 1.5)
     from .runtime import tool_result_char_budget
-    local_shell.set_result_budget(
-        tool_result_char_budget((config.get("provider") or "").lower(), config)
+
+    result_budget = tool_result_char_budget(
+        (config.get("provider") or "").lower(), config
     )
+    local_shell.set_result_budget(result_budget)
+    interactive_terminal = InteractiveTerminalClient()
+    interactive_terminal.set_policy(
+        LocalShellPolicy(interactive=interactive, allow_auto_execute=False)
+    )
+    try:
+        ssh_persist = int(config.get("ssh_control_persist", 600) or 600)
+    except (TypeError, ValueError):
+        ssh_persist = 600
+    from .ssh_control import SSHControlManager
+
+    ssh_remote = SSHRemoteClient(
+        manager=SSHControlManager(persist_seconds=ssh_persist)
+    )
+    ssh_remote.set_policy(
+        LocalShellPolicy(
+            interactive=interactive,
+            allow_auto_execute=get_agent_mode(),
+        )
+    )
+    ssh_remote.set_result_budget(result_budget)
     # Seed the always-allow prefix list from config (plan 2.1)
     allow = (config.get("allow_prefixes") or "").strip()
     if allow:
-        local_shell.allow_prefixes(p.strip() for p in allow.split(","))
+        prefixes = [p.strip() for p in allow.split(",") if p.strip()]
+        local_shell.allow_prefixes(prefixes)
+        ssh_remote.allow_prefixes(prefixes)
     manage_tools = ManageToolsClient()
     save_memory = SaveMemoryClient()
     save_memory.bind(memory)
@@ -187,6 +214,8 @@ def _make_builtin_clients(memory: MemoryStore, config: dict, interactive: bool =
     search_convos = SearchConversationsClient()
     clients: Dict[str, Any] = {
         "local_shell": local_shell,
+        "interactive_terminal": interactive_terminal,
+        "ssh_remote": ssh_remote,
         "manage_tools": manage_tools,
         "save_memory": save_memory,
         "conch_config": conch_config,
@@ -389,6 +418,9 @@ class TypeaheadBuffer:
     def start(self):
         if not sys.stdin.isatty():
             return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = None
         self._stop.clear()
         self._buffer = ""
         try:
@@ -405,7 +437,8 @@ class TypeaheadBuffer:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=0.5)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
         if self._old_settings is not None:
             try:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
@@ -414,6 +447,17 @@ class TypeaheadBuffer:
             self._old_settings = None
         partial = self._buffer
         self._buffer = ""
+        return partial
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop_for_handoff(self) -> str:
+        partial = self.stop()
+        if self.is_running():
+            raise RuntimeError(
+                "Conch input reader did not stop; terminal handoff refused"
+            )
         return partial
 
     def get_queued(self) -> list[str]:
@@ -646,6 +690,7 @@ def chat_loop():
             _route_scheduled_output(config, _task, reply, usage)
             return reply, usage
         finally:
+            scheduled_builtins["ssh_remote"].close()
             mcp_mod.close_all(scheduled_clients)
 
     sched.set_executor(_scheduled_executor)
@@ -759,7 +804,11 @@ def chat_loop():
             print(f"\033[2m{len(active_tasks)} scheduled task{'s' if len(active_tasks) != 1 else ''} running\033[0m")
         if agent_mode_from_config:
             print(f"\033[1;33m{AGENT_MODE_CONFIG_NOTICE}\033[0m")
-        print("\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m\n")
+        print("\033[2mType 'exit' or Ctrl+D to quit. /help for commands.\033[0m")
+        print(
+            "\033[2mPassword/passphrase prompts: /terminal <command>; "
+            "remote hosts: /ssh help (input is never captured).\033[0m\n"
+        )
 
     # Wait for background tool loading (with a brief spinner if needed)
     if not _tools_ready.is_set():
@@ -836,15 +885,130 @@ def chat_loop():
     _typeahead_enabled = True
     _typeahead_queued: list[str] = []
     _typeahead_partial = ""
+    _handoff_depth = 0
+
+    def _pause_typeahead(*, preserve: bool = True):
+        nonlocal _typeahead_partial
+        partial = _typeahead.stop_for_handoff()
+        queued = _typeahead.get_queued()
+        if preserve:
+            if partial:
+                _typeahead_partial += partial
+            _typeahead_queued.extend(queued)
+        elif partial or queued:
+            print(
+                "  \033[2m(discarded pre-handoff typeahead for credential "
+                "safety)\033[0m"
+            )
 
     def _safe_input(prompt):
         """Pause typeahead so input() can read stdin normally."""
-        _typeahead.stop()
+        if _handoff_depth:
+            return input(prompt)
+        _pause_typeahead()
         try:
             return input(prompt)
         finally:
             if _typeahead_enabled:
                 _typeahead.start()
+
+    @contextlib.contextmanager
+    def _terminal_handoff_context():
+        """Suspend every Conch stdin reader while a child owns the terminal."""
+
+        nonlocal _handoff_depth
+        _pause_typeahead(preserve=False)
+        _handoff_depth += 1
+        try:
+            yield
+        finally:
+            _handoff_depth -= 1
+            if _typeahead_enabled:
+                _typeahead.start()
+
+    def _set_foreground_policies():
+        standard = LocalShellPolicy(
+            interactive=True,
+            allow_auto_execute=get_agent_mode(),
+            input_fn=_safe_input,
+        )
+        handoff = LocalShellPolicy(
+            interactive=True,
+            allow_auto_execute=get_agent_mode(),
+            input_fn=_safe_input,
+            handoff_context=_terminal_handoff_context,
+        )
+        builtin_clients["local_shell"].set_policy(standard)
+        builtin_clients["interactive_terminal"].set_policy(handoff)
+        builtin_clients["ssh_remote"].set_policy(handoff)
+        builtin_clients["skill_manage"].configure(
+            interactive=True, input_fn=_safe_input
+        )
+
+    def _run_slash_builtin(tool_name: str, arguments: dict):
+        """Run a direct-user builtin through the same lifecycle hooks."""
+
+        import json
+        from .tooling import run_hook
+
+        client = builtin_clients.get(tool_name)
+        if client is None:
+            print(f"\n  \033[31m{tool_name} is unavailable.\033[0m\n")
+            return
+        allowed, hook_out = run_hook(
+            "pre_tool_use",
+            {"tool": tool_name, "arguments": arguments, "slash_command": True},
+            config,
+        )
+        if not allowed:
+            print(
+                f"\n  \033[31mBlocked by pre_tool_use hook:\033[0m "
+                f"{hook_out or 'no reason provided'}\n"
+            )
+            return
+        if hook_out:
+            try:
+                rewritten = json.loads(hook_out)
+            except json.JSONDecodeError:
+                rewritten = None
+            if not isinstance(rewritten, dict):
+                print(
+                    "\n  \033[31mHook returned invalid replacement "
+                    "arguments; nothing ran.\033[0m\n"
+                )
+                return
+            arguments = rewritten
+        try:
+            raw_result = client.call_tool(tool_name, arguments)
+            blocks = raw_result.get("content", [])
+            if isinstance(blocks, list):
+                result_text = "\n".join(
+                    str(
+                        block.get("text", block.get("content", ""))
+                        if isinstance(block, dict)
+                        else block
+                    )
+                    for block in blocks
+                ).strip()
+            else:
+                result_text = str(blocks)
+        except Exception as exc:
+            result_text = f"Error executing {tool_name}: {exc}"
+        result_text = result_text or "(no output)"
+        run_hook(
+            "post_tool_use",
+            {
+                "tool": tool_name,
+                "arguments": arguments,
+                "result": result_text,
+                "slash_command": True,
+            },
+            config,
+        )
+        color = "\033[31m" if result_text.startswith(("Error", "Refused")) else "\033[2m"
+        print(f"\n  {color}{result_text}\033[0m\n")
+
+    _set_foreground_policies()
 
     last_interrupt = 0.0
     _backend_failed = False  # preflight the server after a failed turn (plan 3.3)
@@ -880,10 +1044,7 @@ def chat_loop():
             if stripped.lower() in ("exit", "quit", "/q"):
                 break
 
-            builtin_clients["local_shell"].set_policy(
-                LocalShellPolicy(interactive=True, allow_auto_execute=get_agent_mode(), input_fn=_safe_input)
-            )
-            builtin_clients["skill_manage"].configure(interactive=True, input_fn=_safe_input)
+            _set_foreground_policies()
 
             if stripped.startswith("/"):
                 result = handle_slash_command(
@@ -904,6 +1065,12 @@ def chat_loop():
                 # User-defined slash command: the rendered template becomes
                 # this turn's user message (handled by the normal flow below).
                 _custom_prompt = None
+                if (
+                    isinstance(result, tuple)
+                    and result[0] == "run_builtin_tool"
+                ):
+                    _run_slash_builtin(result[1], result[2])
+                    continue
                 if isinstance(result, tuple) and result[0] == "user_prompt":
                     _custom_prompt = result[1]
                     result = None
@@ -953,9 +1120,7 @@ def chat_loop():
                     _reload_tools()
                     continue
                 if result == "agent_mode_changed":
-                    builtin_clients["local_shell"].set_policy(
-                        LocalShellPolicy(interactive=True, allow_auto_execute=get_agent_mode(), input_fn=_safe_input)
-                    )
+                    _set_foreground_policies()
                 elif result in ("verbose_on", "verbose_off", "verbose_toggle"):
                     from .runtime import get_verbose_tools, set_verbose_tools
                     if result == "verbose_on":
@@ -1160,6 +1325,7 @@ def chat_loop():
 
             _save_current()
     finally:
+        _typeahead.stop()
         _save_current()
         if session_usage["turns"] > 0:
             total_in = session_usage["input_tokens"]
@@ -1181,6 +1347,7 @@ def chat_loop():
             readline.write_history_file(history_file)
         except OSError:
             pass
+        builtin_clients["ssh_remote"].close()
         mcp_mod.close_all(mcp_clients)
         conv_mgr.close()
 
@@ -1254,6 +1421,7 @@ def main():
                 print("[no response]", file=sys.stderr)
                 sys.exit(1)
         finally:
+            builtin_clients["ssh_remote"].close()
             mcp_mod.close_all(mcp_clients)
     else:
         chat_loop()

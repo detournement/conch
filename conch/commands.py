@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -101,6 +102,8 @@ SLASH_COMMANDS = [
     ("/clear", "Wipe conversation history (keep conversation)"),
     ("/agent", "Toggle agent mode (auto-execute shell)"),
     ("/yolo", "Alias for /agent"),
+    ("/terminal <command>", "Run with direct, non-recorded terminal input/output"),
+    ("/ssh <action>", "Connect, execute, open a shell, show status, or disconnect"),
     ("/verbose", "Toggle showing tool args and results"),
     ("/schedule <interval> <prompt>", "Schedule a recurring task"),
     ("/tasks", "List scheduled tasks"),
@@ -166,6 +169,11 @@ def handle_slash_command(
             "  \033[1m/delete <id>\033[0m         Delete conversation\n"
             "  \033[1m/clear\033[0m               Wipe conversation history (keep conversation)\n"
             "  \033[1m/agent\033[0m, \033[1m/yolo\033[0m       Toggle agent mode (auto-execute shell)\n"
+            "  \033[1m/terminal <command>\033[0m  Direct terminal handoff for sudo/getpass (never captured)\n"
+            "  \033[1m/ssh connect <user@host> [port]\033[0m  Authenticate and open a control connection\n"
+            "  \033[1m/ssh exec <command>\033[0m  Run a permission-gated remote command\n"
+            "  \033[1m/ssh shell [command]\033[0m Open a remote TTY (use for remote sudo)\n"
+            "  \033[1m/ssh status|disconnect\033[0m  Inspect or close the active connection\n"
             "  \033[1m/verbose\033[0m             Toggle showing tool args + output\n"
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
@@ -183,6 +191,8 @@ def handle_slash_command(
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
             "  \033[1m/resettools\033[0m          Reset tool-calling if the model drifts to textual calls\n"
             "\n  Shell approval: \033[1my\033[0m/\033[1mEnter\033[0m=run  \033[1mn\033[0m=decline  \033[1me\033[0m=edit  \033[1ma\033[0m=always allow  \033[1mA\033[0m=agent mode on\n"
+            "  Credential safety: type passwords/passphrases only after the "
+            "\033[1m[Conch terminal handoff]\033[0m banner; never put them in a command.\n"
         )
         return None
 
@@ -200,6 +210,92 @@ def handle_slash_command(
             print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
         print()
         return "agent_mode_changed"
+
+    if command in ("/terminal", "/tty"):
+        if not arg:
+            print(
+                "\n  \033[2mUsage: /terminal <command>\n"
+                "  Enter credentials only at the program's prompt after the "
+                "handoff banner.\033[0m\n"
+            )
+            return None
+        return (
+            "run_builtin_tool",
+            "interactive_terminal",
+            {"command": arg, "timeout": 0},
+        )
+
+    if command == "/ssh":
+        usage = (
+            "\n  \033[1;36mSSH commands:\033[0m\n"
+            "    /ssh connect <user@host> [port]\n"
+            "    /ssh status [user@host [port]]\n"
+            "    /ssh exec <command>\n"
+            "    /ssh shell [command]   (interactive TTY; use for sudo)\n"
+            "    /ssh disconnect [user@host [port]]\n"
+            "  \033[2mAuthentication input is accepted only during the direct "
+            "terminal handoff and is never captured.\033[0m\n"
+        )
+        if not arg or arg.lower() in ("help", "-h", "--help"):
+            print(usage)
+            return None
+        action_parts = arg.split(None, 1)
+        action = action_parts[0].lower()
+        rest = action_parts[1] if len(action_parts) > 1 else ""
+        if action == "tty":
+            action = "shell"
+        if action in ("connect", "status", "disconnect"):
+            target_arguments = {}
+            if rest:
+                try:
+                    target_parts = shlex.split(rest)
+                except ValueError as exc:
+                    print(f"\n  \033[31mInvalid SSH target: {exc}\033[0m\n")
+                    return None
+                if len(target_parts) not in (1, 2):
+                    print(usage)
+                    return None
+                from .ssh_control import parse_ssh_target, SSHValidationError
+
+                try:
+                    target = parse_ssh_target(
+                        target_parts[0],
+                        target_parts[1] if len(target_parts) == 2 else None,
+                    )
+                except SSHValidationError as exc:
+                    print(f"\n  \033[31mInvalid SSH target: {exc}\033[0m\n")
+                    return None
+                target_arguments = {
+                    "host": target.host,
+                    "user": target.user,
+                }
+                if target.port is not None:
+                    target_arguments["port"] = target.port
+            if action == "connect" and not target_arguments:
+                print(usage)
+                return None
+            return (
+                "run_builtin_tool",
+                "ssh_remote",
+                {"action": action, **target_arguments},
+            )
+        if action == "exec":
+            if not rest.strip():
+                print(usage)
+                return None
+            return (
+                "run_builtin_tool",
+                "ssh_remote",
+                {"action": "exec", "command": rest, "timeout": 60},
+            )
+        if action == "shell":
+            return (
+                "run_builtin_tool",
+                "ssh_remote",
+                {"action": "shell", "command": rest, "timeout": 0},
+            )
+        print(usage)
+        return None
 
     if command == "/verbose":
         if arg in ("on", "true", "1"):

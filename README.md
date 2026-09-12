@@ -51,7 +51,8 @@ local_only=true
 Switch providers at any time in chat with `/provider openai`, `/provider anthropic`, or `/provider ollama`.
 For containers and automation, the same settings can be supplied as
 `CONCH_PROVIDER`, `CONCH_MODEL`, `CONCH_OLLAMA_BASE_URL`,
-`CONCH_CUSTOM_BASE_URL`, and `CONCH_LOCAL_ONLY`; environment variables take
+`CONCH_CUSTOM_BASE_URL`, `CONCH_LOCAL_ONLY`, and
+`CONCH_SSH_CONTROL_PERSIST`; environment variables take
 precedence over config files. `OLLAMA_HOST` remains supported by Conch and
 other Ollama clients. `local_only` rejects public inference endpoints and
 isolates provider fallback/switches; it is not a network sandbox for tools
@@ -80,6 +81,7 @@ you explicitly configure or approve.
 | `ask_prompt:<provider>/<model-glob>` | — | Same for ask mode |
 | `permission_mode` | `prompt_all` | Shell approval policy: `prompt_all`, `safe_auto`, or `yolo` |
 | `allow_prefixes` | — | Comma-separated command prefixes that never prompt, e.g. `git status, ls` |
+| `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds (clamped to 1–86400) |
 | `hook_pre_tool_use` | — | Shell script gating every tool call (JSON on stdin; non-zero exit blocks) |
 | `hook_post_tool_use` / `hook_on_turn_end` | — | Scripts receiving tool results / the final reply |
 | `custom_base_url` / `custom_model` | — | OpenAI-compatible `/v1` endpoint for `provider=custom` (vLLM, LM Studio, llama.cpp) |
@@ -141,7 +143,35 @@ live display, but it never executes it; the turn returns a protocol error.
 Connect external tools via the [Model Context Protocol](https://modelcontextprotocol.io). Configure servers in `~/.config/conch/mcp.json`. Supports both stdio and HTTP transports.
 
 ### Local shell execution
-The LLM can run shell commands on your machine. In normal mode, each command shows a prompt: **y**/Enter to run, **n** to decline (with optional feedback), **e** to edit the command first, **a** to always-allow commands with the same prefix for the session (`git status`, `docker ps`, …). Toggle `/agent` (or `/yolo`) for auto-execution. Command output streams live to your terminal.
+The LLM can run shell commands on your machine. In normal mode, each command shows a prompt: **y**/Enter to run, **n** to decline (with optional feedback), **e** to edit the command first, **a** to always-allow commands with the same prefix for the session (`git status`, `docker ps`, …). Toggle `/agent` (or `/yolo`) for auto-execution. Command output streams live to your terminal. This captured path has no interactive stdin or controlling TTY, so a password prompt cannot be read accidentally.
+
+### Passwords and direct terminal handoff
+Use `/terminal <command>` (or the model-facing `interactive_terminal` tool) whenever `sudo`, `getpass`, SSH, a key passphrase, or another program may request private input:
+
+```bash
+/terminal sudo -k systemctl status my-service
+```
+
+Conch first shows the exact non-secret command and requires an explicit **y** confirmation even in agent/yolo mode. Queued or pasted input from before approval is discarded. After the `[Conch terminal handoff]` banner, the child inherits the real terminal directly. Type the password or passphrase only at the requesting program's prompt; that program disables echo when appropriate. Conch does not read, pipe, capture, log, or return any input or output from the handoff. Finish the program normally or press Ctrl+C to return to Conch. Never place a credential in the slash command, chat message, command argument, or environment variable; insecure forwarding forms such as `sshpass` and `sudo -S` are rejected.
+
+Interactive handoff is available only in the local foreground TTY. Scheduled tasks, delegated noninteractive sessions, and Slack/SMS/email channel sessions cannot trigger it.
+
+### Remote SSH operation
+`/ssh` manages OpenSSH ControlMaster connections without storing a password:
+
+```bash
+/ssh connect milgauss@192.168.1.152
+/ssh status
+/ssh exec curl -fsS http://127.0.0.1:8080/v1/models
+/ssh shell sudo systemctl status llama-server
+/ssh disconnect
+```
+
+`connect` performs an explicit direct terminal handoff, so OpenSSH can show its normal host-key, password, or key-passphrase prompt. Host-key verification remains at the user's OpenSSH default, and normal `~/.ssh/config` and `known_hosts` handling apply. Conch passes no password option and never sees the response.
+
+After authentication, `exec` reuses the control socket in BatchMode with no TTY. Its output is bounded and returned to the model, and the remote command still passes Conch's permission modes, command-prefix allowlist, lifecycle hooks, timeout, and result budget. Use `shell` for a login shell or a command that genuinely needs a TTY (especially remote `sudo`); it again requires explicit confirmation and returns no transcript. `disconnect` closes the master. Conch also closes masters it created on normal/best-effort process exit. Control sockets use randomized, per-manager paths in a Conch runtime directory forced to mode `0700`; cleanup removes only sockets reserved and tracked by that manager.
+
+SSH user, host/alias, and port fields are strictly validated and passed after OpenSSH's option terminator, so a target cannot inject SSH options. Interactive SSH tools are not exposed to remote channel loops.
 
 ### Graded permissions
 Three approval modes via `permission_mode`: `prompt_all` (default — every command prompts), `safe_auto` (read-only commands like `ls`, `cat`, `git status` auto-approve; anything mutating prompts), and `yolo` (everything auto-executes; same as agent mode). Destructive commands — `rm`, `dd`, `mkfs`, `git push --force`, `git reset --hard`, and friends — always prompt for confirmation, **even in agent/yolo mode**, and are refused outright in non-interactive (scheduled) runs. Pre-seed trusted prefixes with `allow_prefixes=git status, ls`.
@@ -162,7 +192,7 @@ The `delegate_task` tool runs a self-contained subtask in a fresh context with a
 Reusable procedures live in `~/.config/conch/skills/` — one markdown file per skill with frontmatter (`name`, `description`, `tools`, optional `model` and `rounds`) and a body of instructions. Where a custom slash command is a one-shot prompt template, a skill also scopes *tools* and *model*, and the model can invoke it itself: available skills are listed in the system prompt and loaded on demand with the `skill_manage` tool. Use `/skills` to list, `/skill <name> [task]` to run one on a task, or `delegate_task(skill=...)` for an isolated run. The **in-chat skill builder** closes the loop: ask conch to "turn what we just did into a skill" and it drafts the file (steps, commands, pitfalls, verification) and saves it via `skill_manage` — after showing you the file and getting a y/n confirmation, never silently.
 
 ### Remote loop (Slack, SMS, email)
-With `remote_enabled=true`, conch messages you proactively and you can steer it from anywhere: scheduled task output is delivered over your `notify_channel`, and inbound replies are polled (Slack bot channel, Twilio SMS, IMAP inbox) and routed into conversations — a channel thread *is* a conch conversation, so replies resume it. Safety is enforced in code, not prompts: inbound senders must be on a per-channel allowlist (no allowlist = no inbound, fail closed); remote sessions are capped at **safe_auto** permissions regardless of local agent mode; and remote sessions never see self-management or delegation tools. Mutating commands create short-lived approvals bound to the exact channel, sender, thread, command, and timeout. Approval execution reruns lifecycle hooks, and approvals cannot be replayed from another conversation.
+With `remote_enabled=true`, conch messages you proactively and you can steer it from anywhere: scheduled task output is delivered over your `notify_channel`, and inbound replies are polled (Slack bot channel, Twilio SMS, IMAP inbox) and routed into conversations — a channel thread *is* a conch conversation, so replies resume it. Safety is enforced in code, not prompts: inbound senders must be on a per-channel allowlist (no allowlist = no inbound, fail closed); remote sessions are capped at **safe_auto** permissions regardless of local agent mode; and remote sessions never see self-management, delegation, direct-terminal, or SSH-control tools. Mutating local commands create short-lived approvals bound to the exact channel, sender, thread, command, and timeout. Approval execution reruns lifecycle hooks, and approvals cannot be replayed from another conversation. Channel approvals can never produce a local password/passphrase prompt.
 
 ### Budget-aware turns
 Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
@@ -291,6 +321,12 @@ target directly, pass Docker's `--init`.
 | `/provider <name>` | Switch provider |
 | `/agent` | Toggle agent mode (auto-execute shell) |
 | `/yolo` | Alias for `/agent on` |
+| `/terminal <command>` | Hand the real terminal to a credential-aware command without capture |
+| `/ssh connect <user@host> [port]` | Authenticate interactively and create an OpenSSH control connection |
+| `/ssh status` | Check the active SSH control connection |
+| `/ssh exec <command>` | Run a captured, permission-gated command over the control connection |
+| `/ssh shell [command]` | Open an uncaptured remote TTY (including remote sudo) |
+| `/ssh disconnect` | Close the active SSH control connection |
 | `/new` | Start a new conversation |
 | `/clear` | Wipe history (keep conversation) |
 | `/convos` | List conversations |
@@ -359,7 +395,9 @@ conch/
 ├── repomap.py       Repository-map orientation context
 ├── runtime.py       Chat turn logic, compaction, budgets, hooks dispatch
 ├── scheduler.py     Background task scheduler
+├── secure_terminal.py Direct terminal handoff + terminal-state restoration
 ├── skills.py        Skill definitions: loader, builder, rendering
+├── ssh_control.py   Validated OpenSSH ControlMaster lifecycle
 └── tooling.py       Tools, profiles, permissions, hooks, subagents
 ```
 

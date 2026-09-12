@@ -1936,9 +1936,9 @@ def chat_turn(
                 * TOOL_RESULT_BUDGET_FRACTION
             ),
         )
-        shell_client = (builtin_clients or {}).get("local_shell")
-        if hasattr(shell_client, "set_result_budget"):
-            shell_client.set_result_budget(round_result_budget)
+        for client in (builtin_clients or {}).values():
+            if hasattr(client, "set_result_budget"):
+                client.set_result_budget(round_result_budget)
         remaining_result_budget = round_result_budget
         remaining_result_count = len(tool_calls)
         results = []

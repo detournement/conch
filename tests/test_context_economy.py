@@ -78,7 +78,13 @@ class TestSlimLocalPrompt(unittest.TestCase):
 
     def test_ollama_prompt_has_core_tools(self):
         prompt = get_chat_prompt("ollama", "qwen3.6:27b")
-        for tool in ("local_shell", "save_memory", "conch_config"):
+        for tool in (
+            "local_shell",
+            "interactive_terminal",
+            "ssh_remote",
+            "save_memory",
+            "conch_config",
+        ):
             self.assertIn(tool, prompt)
 
     def test_ollama_prompt_drops_slash_command_docs(self):

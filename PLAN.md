@@ -23,7 +23,10 @@ implementations: unknown local capabilities now fail closed, textual calls
 cannot execute, request-specific tool authorization and schema validation are
 enforced, context compaction preserves complete protocol groups, local-only
 sessions cannot fall through to cloud providers, and supported container
-topologies are now non-root and data-preserving.
+topologies are now non-root and data-preserving. Secure interactive execution
+is also implemented: credential-aware commands receive a direct, uncaptured
+local terminal handoff, and validated OpenSSH ControlMaster sessions provide
+connect/exec/shell/status/disconnect semantics without storing credentials.
 
 ---
 
@@ -376,6 +379,16 @@ within the phase matters: 4.1 (skills) before 4.2 (skill-scoped subagents);
 - **Execution isolation:** process-global shell/runtime state is serialized
   across local, scheduled, delegated, and remote turns. Remote approvals are
   single-use, expiring, origin-bound, and hook-gated.
+- **Interactive credential boundary:** captured shell execution has no
+  interactive stdin/controlling TTY. `/terminal` and SSH connect/shell actions
+  require explicit local confirmation, suspend Conch's input reader, inherit
+  the real terminal without capture, and restore terminal flags afterward.
+  Remote channels never receive these tools.
+- **Remote host operation:** OpenSSH ControlMaster sockets live in a private
+  `0700` runtime directory; targets are option-injection validated, host-key
+  policy remains OpenSSH's default, noninteractive remote commands retain
+  permissions/hooks/timeouts/result budgets, and tracked masters are cleaned
+  up on disconnect or best-effort exit.
 - **Containers:** non-root wheel install, bridge networking, narrow workspace
   mount, named config/state volumes, read-only root filesystem, and documented
   host/LAN/Ollama-sidecar/llama.cpp-sidecar topologies. Entrypoint startup

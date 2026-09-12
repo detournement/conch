@@ -200,13 +200,15 @@ REMOTE_SYSTEM_PROMPT = (
     "The user is not at the machine. Keep replies short and plain-text "
     "(no markdown tables; this may be SMS). Shell access is restricted: "
     "read-only commands run immediately; anything else creates an approval "
-    "request the user must confirm — when that happens, say so and move on."
+    "request the user must confirm — when that happens, say so and move on. "
+    "Interactive terminal and SSH-control tools are unavailable remotely."
 )
 
 # Tools a remote session must never see.
 REMOTE_EXCLUDED_TOOLS = {
     "delegate_task", "conch_config", "manage_tools", "skill_manage",
-    "todo_list", "api_layer", "conch_introspect",
+    "todo_list", "api_layer", "conch_introspect", "interactive_terminal",
+    "ssh_remote",
 }
 
 

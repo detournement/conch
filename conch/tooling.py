@@ -20,6 +20,8 @@ PINNED_TOOL_NAMES = {
     # Keep the always-on schema budget deliberately small. Everything else is
     # routed by relevance and can still be pinned explicitly by a profile.
     "local_shell",
+    "interactive_terminal",
+    "ssh_remote",
     "manage_tools",
     "todo_list",
     "delegate_task",
@@ -253,7 +255,13 @@ def save_tool_prefs(prefs: dict):
 
 
 def tool_group(name: str, tool_map: dict) -> str:
-    if name in ("local_shell", "manage_tools", "save_memory"):
+    if name in (
+        "local_shell",
+        "interactive_terminal",
+        "ssh_remote",
+        "manage_tools",
+        "save_memory",
+    ):
         return name
     client = tool_map.get(name)
     client_name = getattr(client, "name", "unknown") if client else "unknown"
@@ -475,6 +483,8 @@ class LocalShellPolicy:
     interactive: bool = True
     allow_auto_execute: bool = False
     input_fn: Any = None
+    handoff_context: Any = None
+    tty_check: Any = None
 
 
 LOCAL_SHELL_TOOL = {
@@ -489,6 +499,91 @@ LOCAL_SHELL_TOOL = {
                 "timeout": {"type": "integer", "description": "Max seconds to wait (default 60)"},
             },
             "required": ["command"],
+        },
+    },
+}
+
+INTERACTIVE_TERMINAL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "interactive_terminal",
+        "description": (
+            "Run a local command by handing the real terminal directly to it. "
+            "Use this instead of local_shell whenever sudo, SSH, getpass, a "
+            "passphrase, or other interactive terminal input may be required. "
+            "The user must explicitly confirm even in agent mode. Conch never "
+            "reads or returns the interaction; only exit status is reported. "
+            "Never put a credential in the command."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "Command to run. Credentials must be entered only at "
+                        "the program's terminal prompt, never in this value."
+                    ),
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": (
+                        "Optional handoff timeout in seconds; 0 means no timeout"
+                    ),
+                },
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+SSH_REMOTE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "ssh_remote",
+        "description": (
+            "Manage a validated OpenSSH ControlMaster connection and execute "
+            "commands through it. Actions: connect (direct terminal handoff "
+            "for password/passphrase/host-key prompts), exec (captured, "
+            "noninteractive, permission-gated), shell (direct terminal "
+            "handoff; use for remote sudo), status, and disconnect. Interactive "
+            "actions always require local confirmation and never return a "
+            "transcript. Never put credentials in arguments."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "connect",
+                        "exec",
+                        "shell",
+                        "status",
+                        "disconnect",
+                    ],
+                },
+                "host": {
+                    "type": "string",
+                    "description": (
+                        "Validated host/IP/SSH-config alias. Required for connect; "
+                        "omit later to use the active connection."
+                    ),
+                },
+                "user": {"type": "string"},
+                "port": {"type": "integer"},
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "Remote command for exec/shell. An empty shell command "
+                        "opens an interactive login shell."
+                    ),
+                },
+                "timeout": {"type": "integer"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
         },
     },
 }
@@ -560,12 +655,13 @@ class LocalShellClient:
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
 
-    def _run_command(self, cmd: str, timeout: int) -> dict:
+    def _run_process(self, command, timeout: int, *, shell: bool) -> dict:
         import os, pty, select, errno, re as _re
         effective_timeout = timeout if timeout > 0 else 60
 
-        # Use a PTY so interactive programs (sudo, passwd, ssh, expect) get a
-        # real terminal — prevents dropped characters and hanging prompts.
+        # A PTY preserves useful terminal-formatted output, but stdin is
+        # deliberately /dev/null and the child has no controlling terminal.
+        # Credential prompts belong exclusively to interactive_terminal.
         master_fd, slave_fd = pty.openpty()
         capture_budget = max(256, int(self._result_budget))
         head_cap = max(1, int(capture_budget * 0.67))
@@ -586,8 +682,8 @@ class LocalShellClient:
 
         try:
             proc = subprocess.Popen(
-                cmd, shell=True,
-                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                command, shell=shell,
+                stdin=subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd,
                 close_fds=True,
                 preexec_fn=os.setsid,
             )
@@ -670,6 +766,12 @@ class LocalShellClient:
             from .runtime import truncate_middle
             output = truncate_middle(output, self._result_budget)
         return self._text(output)
+
+    def _run_command(self, cmd: str, timeout: int) -> dict:
+        return self._run_process(cmd, timeout, shell=True)
+
+    def _run_argv(self, argv: List[str], timeout: int) -> dict:
+        return self._run_process(list(argv), timeout, shell=False)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
         cmd = arguments.get("command", "")
@@ -775,6 +877,358 @@ class LocalShellClient:
         if feedback:
             msg += f" Feedback: {feedback}"
         return self._text(msg)
+
+
+class InteractiveTerminalClient:
+    """Credential-safe terminal handoff.
+
+    The child owns the real terminal. Conch receives no child input/output and
+    returns only a non-secret process-status summary.
+    """
+
+    name = "interactive_terminal"
+
+    def __init__(self, runner=None):
+        from .secure_terminal import DirectTerminalRunner
+
+        self.policy = LocalShellPolicy()
+        self._runner = runner or DirectTerminalRunner()
+
+    def set_policy(self, policy: LocalShellPolicy):
+        self.policy = policy
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    @staticmethod
+    def _display(value: str, limit: int = 240) -> str:
+        clean = "".join(
+            ch
+            if ch.isprintable() and ch != "\x7f"
+            else f"\\x{ord(ch):02x}"
+            for ch in str(value)
+        )
+        return (
+            clean
+            if limit <= 0 or len(clean) <= limit
+            else clean[:limit] + "…"
+        )
+
+    def _configure_runner(self):
+        from .secure_terminal import TerminalHandoffPolicy
+
+        self._runner.set_policy(
+            TerminalHandoffPolicy(
+                local_session=self.policy.interactive,
+                input_fn=self.policy.input_fn,
+                handoff_context=self.policy.handoff_context,
+                tty_check=self.policy.tty_check,
+            )
+        )
+
+    def _format_result(self, result, noun: str = "Interactive command") -> dict:
+        if not result.approved:
+            if result.error:
+                return self._text(f"Refused: {result.error}.")
+            return self._text("User declined the interactive terminal handoff.")
+        if result.error:
+            return self._text(
+                f"Error: {noun.lower()} failed to start ({result.error}). "
+                "No terminal transcript was captured."
+            )
+        if result.timed_out:
+            return self._text(
+                f"{noun} timed out. No terminal input or output was captured."
+            )
+        if result.interrupted:
+            return self._text(
+                f"{noun} was interrupted by the user. No terminal input or "
+                "output was captured."
+            )
+        return self._text(
+            f"{noun} finished with exit code {result.returncode}. "
+            "No terminal input or output was captured."
+        )
+
+    def run_argv(
+        self,
+        argv,
+        *,
+        description: str,
+        timeout: int = 0,
+        noun: str = "Interactive command",
+    ):
+        from .render import clear_active_spinners
+
+        self._configure_runner()
+        clear_active_spinners()
+        result = self._runner.run(
+            argv, description=description, timeout=max(0, int(timeout or 0))
+        )
+        return result, self._format_result(result, noun)
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        from .ssh_control import validate_remote_command, SSHValidationError
+
+        command = arguments.get("command", "")
+        try:
+            command = validate_remote_command(command)
+            timeout = int(arguments.get("timeout", 0) or 0)
+        except (SSHValidationError, TypeError, ValueError) as exc:
+            return self._text(f"Refused: {exc}.")
+        _, formatted = self.run_argv(
+            ["/bin/sh", "-c", command],
+            description=f"Hand terminal to: {self._display(command, limit=0)}?",
+            timeout=timeout,
+        )
+        return formatted
+
+
+class SSHRemoteClient(LocalShellClient):
+    """OpenSSH ControlMaster operations with permission and TTY boundaries."""
+
+    name = "ssh_remote"
+
+    def __init__(self, manager=None, runner=None):
+        from .secure_terminal import DirectTerminalRunner
+        from .ssh_control import SSHControlManager
+
+        super().__init__()
+        self.manager = manager or SSHControlManager()
+        self._terminal = InteractiveTerminalClient(
+            runner=runner or DirectTerminalRunner()
+        )
+
+    def set_policy(self, policy: LocalShellPolicy):
+        super().set_policy(policy)
+        self._terminal.set_policy(policy)
+
+    def close(self):
+        self.manager.close()
+
+    def _target(self, arguments: dict):
+        return self.manager.resolve(
+            host=str(arguments.get("host", "") or ""),
+            user=str(arguments.get("user", "") or ""),
+            port=arguments.get("port"),
+        )
+
+    def _status(self, arguments: dict) -> dict:
+        from .ssh_control import SSHValidationError
+
+        if arguments.get("host"):
+            try:
+                target = self._target(arguments)
+            except SSHValidationError as exc:
+                return self._text(f"Error: {exc}")
+            connected = self.manager.is_connected(target)
+            return self._text(
+                f"SSH {target.identity}: "
+                f"{'connected' if connected else 'not connected'}."
+            )
+        try:
+            target = self.manager.resolve()
+        except SSHValidationError:
+            targets = self.manager.connected_targets()
+            if not targets:
+                return self._text("No active SSH control connection.")
+            return self._text(
+                "Active SSH connections: "
+                + ", ".join(target.identity for target in targets)
+            )
+        connected = self.manager.is_connected(target)
+        return self._text(
+            f"SSH {target.identity}: "
+            f"{'connected' if connected else 'not connected'}."
+        )
+
+    def _connect(self, arguments: dict) -> dict:
+        from .ssh_control import SSHTarget, SSHValidationError
+
+        host = str(arguments.get("host", "") or "")
+        if not host:
+            return self._text("Error: host is required for SSH connect.")
+        try:
+            target = SSHTarget(
+                host=host,
+                user=str(arguments.get("user", "") or ""),
+                port=arguments.get("port"),
+            )
+            timeout = int(arguments.get("timeout", 0) or 0)
+        except (SSHValidationError, TypeError, ValueError) as exc:
+            return self._text(f"Error: {exc}")
+        if self.manager.is_connected(target):
+            self.manager.remember(target)
+            return self._text(
+                f"SSH control connection to {target.identity} is already active."
+            )
+        try:
+            connect_argv = self.manager.connect_argv(target)
+        except OSError as exc:
+            return self._text(f"Error: could not prepare SSH ControlPath ({exc}).")
+        result, formatted = self._terminal.run_argv(
+            connect_argv,
+            description=(
+                f"Open SSH control connection to {target.identity}? "
+                "Authentication will occur directly in the terminal."
+            ),
+            timeout=timeout,
+            noun="SSH connection bootstrap",
+        )
+        if not result.approved or result.error or result.timed_out or result.interrupted:
+            self.manager.disconnect(target)
+            return formatted
+        if result.returncode == 0 and self.manager.is_connected(target):
+            self.manager.remember(target)
+            return self._text(
+                f"SSH control connection to {target.identity} is active. "
+                "Authentication input and terminal output were not captured."
+            )
+        self.manager.disconnect(target)
+        return self._text(
+            f"SSH connection bootstrap for {target.identity} did not establish "
+            "a control socket. Review the terminal-only SSH message and retry; "
+            "no terminal transcript was captured."
+        )
+
+    def _permission_allows(self, command: str) -> tuple:
+        destructive = is_destructive_command(command)
+        mode = get_permission_mode()
+        auto_execute = self.policy.allow_auto_execute or mode == "yolo"
+        if destructive:
+            return False, "destructive"
+        if auto_execute:
+            return True, "agent mode"
+        if self._prefix_allowed(command):
+            return True, f"always-allowed: {command_prefix(command)}"
+        if mode == "safe_auto" and is_safe_command(command):
+            return True, "safe command"
+        return False, ""
+
+    def _confirm_remote_exec(self, target, command: str) -> tuple:
+        allowed, reason = self._permission_allows(command)
+        if allowed:
+            print(f"  \033[2m({reason} — auto-approved)\033[0m")
+            return True, ""
+        if not self.policy.interactive:
+            return False, (
+                "Refused: background or channel sessions cannot approve SSH "
+                "remote commands."
+            )
+        if is_destructive_command(command):
+            print(
+                "  \033[1;31m⚠ Destructive remote command — confirmation "
+                "required (even in agent mode)\033[0m"
+            )
+        input_fn = self.policy.input_fn or input
+        try:
+            answer = input_fn(
+                f"  \033[1;33mExecute on {target.identity}? [y/N]\033[0m "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            return False, "User declined the remote SSH command."
+        return True, ""
+
+    def _exec(self, arguments: dict) -> dict:
+        from .ssh_control import validate_remote_command, SSHValidationError
+
+        try:
+            target = self._target(arguments)
+            command = validate_remote_command(arguments.get("command", ""))
+            timeout = int(arguments.get("timeout", 60) or 60)
+        except (SSHValidationError, TypeError, ValueError) as exc:
+            return self._text(f"Error: {exc}")
+        if not self.manager.is_connected(target):
+            return self._text(
+                f"Error: no active SSH control connection to {target.identity}; "
+                "connect interactively first."
+            )
+        print(
+            f"\n  \033[1;33m⚠ Run over SSH ({target.identity}):\033[0m "
+            f"\033[1m{self._terminal._display(command, limit=0)}\033[0m",
+            flush=True,
+        )
+        approved, reason = self._confirm_remote_exec(target, command)
+        if not approved:
+            return self._text(reason)
+        return self._run_argv(
+            self.manager.exec_argv(target, command, tty=False), timeout
+        )
+
+    def _shell(self, arguments: dict) -> dict:
+        from .ssh_control import validate_remote_command, SSHValidationError
+
+        try:
+            target = self._target(arguments)
+            command = validate_remote_command(
+                arguments.get("command", ""), allow_empty=True
+            )
+            timeout = int(arguments.get("timeout", 0) or 0)
+        except (SSHValidationError, TypeError, ValueError) as exc:
+            return self._text(f"Error: {exc}")
+        if not self.manager.is_connected(target):
+            return self._text(
+                f"Error: no active SSH control connection to {target.identity}; "
+                "connect interactively first."
+            )
+        description = (
+            f"Open interactive SSH shell on {target.identity}?"
+            if not command
+            else (
+                f"Hand terminal to {target.identity} for: "
+                f"{self._terminal._display(command, limit=0)}?"
+            )
+        )
+        _, formatted = self._terminal.run_argv(
+            self.manager.exec_argv(target, command, tty=True),
+            description=description,
+            timeout=timeout,
+            noun="Interactive SSH command",
+        )
+        return formatted
+
+    def _disconnect(self, arguments: dict) -> dict:
+        from .ssh_control import SSHValidationError
+
+        try:
+            target = self._target(arguments)
+        except SSHValidationError as exc:
+            return self._text(f"Error: {exc}")
+        self._terminal._configure_runner()
+        if not self._terminal._runner.available():
+            return self._text(
+                "Refused: SSH disconnect requires the local interactive session."
+            )
+        input_fn = self.policy.input_fn or input
+        try:
+            answer = input_fn(
+                f"  \033[1;33mDisconnect SSH {target.identity}? [y/N]\033[0m "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            return self._text("User declined to disconnect SSH.")
+        success = self.manager.disconnect(target)
+        return self._text(
+            f"SSH control connection to {target.identity} "
+            f"{'closed' if success else 'is no longer active'}."
+        )
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        action = str(arguments.get("action", "") or "").strip().lower()
+        if action == "status":
+            return self._status(arguments)
+        if action == "connect":
+            return self._connect(arguments)
+        if action == "exec":
+            return self._exec(arguments)
+        if action == "shell":
+            return self._shell(arguments)
+        if action == "disconnect":
+            return self._disconnect(arguments)
+        return self._text(f"Error: unknown SSH action '{action}'.")
 
 
 class ManageToolsClient:
@@ -1304,7 +1758,14 @@ class DelegateTaskClient:
 
     # Tools the subagent never gets: itself (no recursive delegation) and
     # self-management tools that belong to the parent session.
-    EXCLUDED_TOOLS = {"delegate_task", "conch_config", "manage_tools", "todo_list"}
+    EXCLUDED_TOOLS = {
+        "delegate_task",
+        "conch_config",
+        "manage_tools",
+        "todo_list",
+        "interactive_terminal",
+        "ssh_remote",
+    }
 
     DEFAULT_ROUNDS = 10
 
@@ -1587,6 +2048,10 @@ def discover_user_tools() -> tuple[List[dict], UserToolClient]:
 
 def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], clients: Dict[str, Any]):
     builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL, PUBLIC_API_TOOL, SEARCH_CONVERSATIONS_TOOL]
+    if "interactive_terminal" in clients:
+        builtin.append(INTERACTIVE_TERMINAL_TOOL)
+    if "ssh_remote" in clients:
+        builtin.append(SSH_REMOTE_TOOL)
     if "conch_config" in clients:
         builtin.append(CONCH_CONFIG_TOOL)
     if "api_layer" in clients:

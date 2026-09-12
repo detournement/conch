@@ -245,6 +245,8 @@ class TestToolCapping(unittest.TestCase):
             PINNED_TOOL_NAMES,
             {
                 "local_shell",
+                "interactive_terminal",
+                "ssh_remote",
                 "manage_tools",
                 "todo_list",
                 "delegate_task",

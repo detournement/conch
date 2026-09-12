@@ -48,6 +48,7 @@ ENV_CONFIG_KEYS = {
     "CONCH_AGENT_MODE": "agent_mode",
     "CONCH_PERMISSION_MODE": "permission_mode",
     "CONCH_TOOL_PROFILE": "tool_profile",
+    "CONCH_SSH_CONTROL_PERSIST": "ssh_control_persist",
 }
 
 

@@ -81,11 +81,12 @@ class ApprovalStore:
         """Register a pending approval bound to its origin.
 
         ``kind`` selects what consuming the approval *does*: ``command``
-        (the original remote-shell flow) runs the approved command;
-        ``ebay_publish`` (Milestone 1b) constructs the exact
-        ``ebay.publish_request.v1`` from the pinned revision. For
-        non-command kinds, ``command`` holds a human-readable description
-        and ``payload`` carries the kind's exact parameters.
+        (the original remote-shell flow) runs the approved command; any
+        other kind is a flow-pack approval class (e.g. ``ebay_publish``)
+        whose consume *constructs* an exact typed request from the pinned
+        immutable contract — never runs a command. For non-command kinds,
+        ``command`` holds a human-readable description and ``payload``
+        carries the kind's pinned parameters.
         """
         with self._lock:
             data = self._load()
@@ -253,7 +254,7 @@ class RemoteLoop:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._turn_lock = threading.RLock()
-        self._listing_flow = None
+        self._pack_flows_cache = None
 
     # --- session mapping (channel thread == conch conversation) -----------
 
@@ -368,32 +369,45 @@ class RemoteLoop:
             self._conv_mgr.save(conv)
         return reply or "(no response)"
 
-    # --- eBay listing flow (Milestone 1b) ------------------------------------
+    # --- flow-pack channel intake ---------------------------------------------
 
-    def _ebay_configured(self) -> bool:
+    def _packs_configured(self) -> bool:
         return bool(str(self.config.get("capitol_base_url") or "").strip())
 
-    def _ebay_flow(self):
-        """Lazy: sessions without Capitol config never import the pilot."""
-        if self._listing_flow is None:
-            from .capitol.channel_flow import ChannelListingFlow
+    def _pack_flows(self):
+        """Channel flows for every loaded flow pack. Lazy: sessions
+        without Capitol config never import the pack engine."""
+        if self._pack_flows_cache is None:
+            from .capitol.packs.registry import channel_flows
 
-            self._listing_flow = ChannelListingFlow(
+            self._pack_flows_cache = channel_flows(
                 self.config,
                 self.approvals,
                 lambda text, channel, thread_id: self.manager.notify(
                     text, channel=channel, thread_id=thread_id
                 ),
             )
-        return self._listing_flow
+        return self._pack_flows_cache
 
-    def _maybe_listing_flow(self, message: InboundMessage) -> Optional[str]:
-        """Photo-bearing messages (and replies in bound listing threads)
-        route into the eBay pilot pipeline instead of the model turn.
-        Inbound text stays item data throughout — it never selects tools."""
-        if not self._ebay_configured():
+    def _pack_flow_for_kind(self, kind: str):
+        """The pack channel flow that declares approval-store *kind*."""
+        for flow in self._pack_flows():
+            if kind in flow.pack.approval_kinds():
+                return flow
+        return None
+
+    def _maybe_pack_intake(self, message: InboundMessage) -> Optional[str]:
+        """Messages matching a pack's channel intake (and replies in bound
+        pack threads) route into that pack's governed pipeline instead of
+        the model turn. Inbound text stays business data throughout — it
+        never selects tools."""
+        if not self._packs_configured():
             return None
-        return self._ebay_flow().handle_message(message)
+        for flow in self._pack_flows():
+            reply = flow.handle_message(message)
+            if reply is not None:
+                return reply
+        return None
 
     # --- inbound dispatch ----------------------------------------------------
 
@@ -407,7 +421,7 @@ class RemoteLoop:
             if match:
                 reply = self._handle_approval(match, message)
             else:
-                reply = self._maybe_listing_flow(message)
+                reply = self._maybe_pack_intake(message)
                 if reply is None:
                     reply = self._run_turn(message)
             reply = self._bound_reply(reply)
@@ -433,7 +447,7 @@ class RemoteLoop:
         except (TypeError, ValueError):
             ttl = REMOTE_APPROVAL_TTL_SECONDS
         # Peek at the kind before the atomic consume discards an expired
-        # entry — an expired *publish* approval gets a fresh one reissued.
+        # entry — an expired *pack* approval gets a fresh one reissued.
         pending_kind = str(
             (self.approvals.pending().get(str(request_id)) or {}).get("kind")
             or "command"
@@ -447,10 +461,12 @@ class RemoteLoop:
         )
         if entry is None:
             if error == "expired":
-                if pending_kind == "ebay_publish" and self._ebay_configured():
-                    reissued = self._ebay_flow().reissue_expired(message)
-                    if reissued:
-                        return reissued
+                if pending_kind != "command" and self._packs_configured():
+                    flow = self._pack_flow_for_kind(pending_kind)
+                    if flow is not None:
+                        reissued = flow.reissue_expired(message)
+                        if reissued:
+                            return reissued
                 return f"Approval #{request_id} expired; request it again."
             if error == "origin_mismatch":
                 return (
@@ -458,13 +474,22 @@ class RemoteLoop:
                     "or conversation."
                 )
             return f"No pending approval #{request_id}."
-        if str(entry.get("kind") or "command") == "ebay_publish":
-            # Consuming a publish approval never runs a command: the flow
-            # constructs the exact ebay.publish_request.v1 from the pinned
-            # immutable revision (second staleness check runs Capitol-side).
-            return self._ebay_flow().handle_approval(
-                request_id, entry, verb, message
+        entry_kind = str(entry.get("kind") or "command")
+        if entry_kind != "command":
+            # Consuming a pack approval never runs a command: the pack's
+            # flow constructs the exact typed request from the pinned
+            # immutable contract (the second staleness check runs
+            # Capitol-side).
+            flow = (
+                self._pack_flow_for_kind(entry_kind)
+                if self._packs_configured() else None
             )
+            if flow is None:
+                return (
+                    f"Approval #{request_id} has kind {entry_kind!r} but "
+                    "no configured flow pack handles it; nothing was done."
+                )
+            return flow.handle_approval(request_id, entry, verb, message)
         if verb == "deny":
             return f"Denied #{request_id}: `{entry['command']}` will not run."
         from .tooling import run_hook

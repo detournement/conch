@@ -1,0 +1,300 @@
+{
+  "schema": "conch.flow_pack.v1",
+  "pack": {
+    "name": "ebay-listing",
+    "version": "1.0.0",
+    "description": "Photo → sandbox eBay listing: draft/revise with clarification relay, caps-clamped publish gate, exact-approval publish, effect confirmation over the originating thread.",
+    "replaces": ["conch/capitol/ebay.py", "conch/capitol/channel_flow.py"]
+  },
+  "capitol": {
+    "org": "${config.capitol_org}",
+    "agent": "${config.capitol_agent}",
+    "workflows": {
+      "draft": {
+        "pin": "${config.ebay_draft_workflow:}",
+        "discover": {"name_contains_any": ["draft"]},
+        "inputs_key": "auto"
+      },
+      "publish": {
+        "pin": "${config.ebay_publish_workflow:}",
+        "discover": {"name_contains_any": ["publish", "approve"]},
+        "inputs_key": "auto"
+      }
+    }
+  },
+  "contracts": {
+    "prefix": "ebay.",
+    "session": {
+      "name": "revision",
+      "schema": "ebay.listing_revision.v1",
+      "status_field": "status",
+      "identity": ["listing_session_id", "revision", "draft_hash"]
+    },
+    "effect": {
+      "schema": "ebay.inventory_effect.v1",
+      "facts": ["state", "listing.listing_id", "listing.offer_id", "listing.sku", "listing.listing_url"],
+      "link_fact": "listing_url",
+      "success": {"fact": "state", "equals_ci": "PUBLISHED"}
+    },
+    "rejection": {"schema": "ebay.approval_rejection.v1"},
+    "guidance": {"schema": "ebay.draft_request_guidance.v1"}
+  },
+  "intakes": [
+    {
+      "kind": "channel_message",
+      "channel": "slack",
+      "enabled_key": "ebay_channel_intake",
+      "match": {"attachments_mime": ["image/*"], "min_attachments": 1},
+      "attachments": {
+        "max_count": 12,
+        "max_bytes": 52428800,
+        "suffixes": [".jpg", ".jpeg", ".png", ".gif", ".webp"],
+        "noun": "photo"
+      },
+      "session": {"scope": "thread", "id_scheme": "channel-sha16", "dedupe": "session_per_message_ts"},
+      "start": "draft_initial",
+      "context_default": "Image-only listing request; no user-supplied listing metadata."
+    },
+    {
+      "kind": "shell_command",
+      "command": "/ebay",
+      "usage": "/ebay <photo…> [-- notes about the item] | /ebay sessions",
+      "start": "draft_initial"
+    }
+  ],
+  "bindings": {
+    "draft_initial": {
+      "workflow": "draft",
+      "mode_key": "ebay_intake",
+      "default_mode": "chat",
+      "modes": {
+        "chat": {
+          "kind": "chat_intake",
+          "message": "Please draft a sandbox eBay listing from the attached photo(s). Item context: {item_context}",
+          "attachments": "fileparts",
+          "reconcile": {"by": "context_id", "attempts": 6, "delay_seconds": 5}
+        },
+        "typed": {"kind": "typed_request", "upload": "private_artifact", "request": "draft"}
+      }
+    },
+    "draft_revise": {"workflow": "draft", "kind": "typed_request", "request": "revise"},
+    "publish": {
+      "workflow": "publish",
+      "kind": "typed_request",
+      "request": "publish",
+      "gateway_key": {"base": "request.idempotency_key", "retry_suffix": ":retry{attempt}"}
+    }
+  },
+  "requests": {
+    "draft": {
+      "schema": "ebay.draft_request.v1",
+      "fields": {
+        "mode": "initial",
+        "app_id": "${config.ebay_app_id:conch-ebay}",
+        "account_ref": "${config.ebay_account_ref:org-ebay-sandbox}",
+        "listing_session_id": "${session.id}",
+        "expected_revision": 1,
+        "actor_principal_id": "${config.ebay_actor_id!required}",
+        "channel": "a2a",
+        "thread_id": "${session.thread_key}",
+        "media": "${session.media[].{artifact_id} +order}",
+        "seller_policies": {
+          "fulfillment_policy_id": "${config.ebay_fulfillment_policy_id!required}",
+          "payment_policy_id": "${config.ebay_payment_policy_id!required}",
+          "return_policy_id": "${config.ebay_return_policy_id!required}",
+          "merchant_location_key": "${config.ebay_merchant_location_key!required}"
+        },
+        "item_context": "${intake.text:Image-only listing request; no user-supplied listing metadata.}"
+      },
+      "idempotency_key": "{app_id}:{listing_session_id}:r{expected_revision}:draft"
+    },
+    "revise": {
+      "schema": "ebay.draft_request.v1",
+      "from_contract": "revision",
+      "require": ["app_id", "account_ref", "listing_session_id", "actor_principal_id", "channel", "thread_id", "revision"],
+      "fields": {
+        "mode": "revise",
+        "app_id": "${contract.app_id}",
+        "account_ref": "${contract.account_ref}",
+        "listing_session_id": "${contract.listing_session_id}",
+        "expected_revision": "${contract.revision + 1}",
+        "actor_principal_id": "${contract.actor_principal_id}",
+        "channel": "${contract.channel}",
+        "thread_id": "${contract.thread_id}",
+        "media": "${contract.media[].{artifact_id, digest} +order !nonempty}",
+        "seller_policies": "${contract.listing.policies | fill_missing(config: fulfillment_policy_id=ebay_fulfillment_policy_id, payment_policy_id=ebay_payment_policy_id, return_policy_id=ebay_return_policy_id, merchant_location_key=ebay_merchant_location_key) !complete}",
+        "item_context": "${session.item_context:Image-only listing request; no user-supplied listing metadata.}",
+        "current_revision": "${contract}",
+        "revision_feedback": "${intake.text:No further information available; proceed with conservative assumptions.}"
+      },
+      "idempotency_key": "{app_id}:{listing_session_id}:r{expected_revision}:draft"
+    },
+    "publish": {
+      "schema": "ebay.publish_request.v1",
+      "from_contract": "revision",
+      "require": ["app_id", "listing_session_id", "revision", "draft_hash", "channel", "thread_id"],
+      "fields": {
+        "app_id": "${contract.app_id}",
+        "listing_session_id": "${contract.listing_session_id}",
+        "revision": "${contract.revision}",
+        "draft_hash": "${contract.draft_hash}",
+        "actor_principal_id": "${contract.actor_principal_id:${config.ebay_actor_id:}}",
+        "channel": "${contract.channel}",
+        "thread_id": "${contract.thread_id}",
+        "presentation_id": "${engine.unique_id('conch-presentation')}",
+        "confirmation": "proceed to post",
+        "challenge": "POST r{revision} {draft_hash[-12:]}",
+        "idempotency_key": "{app_id}:{listing_session_id}:r{revision}:publish",
+        "current_revision": "${contract}"
+      }
+    }
+  },
+  "flow": {
+    "session_contract": "revision",
+    "phases": ["drafting", "clarify", "hitl", "awaiting_approval", "publishing", "done", "failed"],
+    "on_status": {
+      "needs_info": {
+        "phase": "clarify",
+        "questions_field": "open_questions",
+        "max_rounds": 5,
+        "reply_action": "draft_revise"
+      },
+      "draft_review": {"phase": "gate", "approval": "ebay_publish"}
+    },
+    "hitl": {
+      "park_on": "node.input_required",
+      "clarification": {"relay": "originating_thread", "reply_feeds": "response"},
+      "intervention": {"relay": "originating_thread", "tokens": ["continue", "stop"]}
+    },
+    "recovery_order": ["hitl", "contract_status", "failed"],
+    "revision_invalidates_approval": true
+  },
+  "approvals": [
+    {
+      "kind": "ebay_publish",
+      "constructs": "publish",
+      "pin": ["session.id", "contract.revision", "contract.draft_hash"],
+      "policy_event": "capitol.ebay.publish",
+      "policy_fields": ["app_id", "listing_session_id", "revision", "draft_hash"],
+      "caps": {
+        "toggle_key": "ebay_auto_publish",
+        "checks": [
+          {"field": "listing.category_id", "op": "in_csv", "config_key": "ebay_allowed_category_ids", "skip_when_unset": true, "label": "category"},
+          {"field": "listing.price.value", "op": "lte_float", "config_key": "ebay_max_price_usd", "skip_when_unset": true, "label": "price", "unit": "USD"}
+        ],
+        "unreadable_outcome": "exact_approval"
+      },
+      "auto_within_caps": {
+        "shell": {"confirm": true},
+        "channel": {"opt_in_key": "ebay_channel_auto_publish", "default": false}
+      },
+      "exact": {"phrase": "proceed to post", "challenge": "POST r{revision} {draft_hash[-12:]}"},
+      "on_effect_failure": {"reissue": true, "reason": "the previous publish attempt failed upstream"},
+      "ttl_key": "remote_approval_ttl",
+      "describe": "publish eBay listing r{revision} ({listing.title:120=untitled})"
+    }
+  ],
+  "state": {
+    "store": "pack_state",
+    "file": "ebay_pilot.json",
+    "effect_field": "listing",
+    "session_fields": ["phase", "channel", "thread_id", "sender", "origin_ts", "item_context", "photos", "media", "workflows", "context_id", "intake", "revision", "clarify_rounds", "approval_id", "publish_attempts", "hitl", "listing"],
+    "collections": {
+      "runs": ["kind", "run_id", "idempotency_key", "started_at", "last_sequence", "status"],
+      "revisions": ["revision", "draft_hash", "status"]
+    },
+    "threads": {"key": "{channel}:{thread_id}", "value": "session_id", "doubles_as": "intake_dedupe"}
+  },
+  "notifications": {
+    "progress": {"target": "originating_thread", "events": ["session_started", "revising", "auto_publishing"]},
+    "results": {"target": "originating_thread"}
+  },
+  "messages": {
+    "channel": {
+      "restart_hint": "Post the photos as a new message to start over.",
+      "auth_fix_hint": "fix the bearer, then reply here (or repost the photos).",
+      "step_failed": "eBay listing step failed: {error}{hint_part}{tail}",
+      "retry_hint": "The previous draft still stands; reply again to continue.",
+      "started_notify": "Starting an eBay sandbox listing from your {count} photo(s) (session {session_id}) — drafting…",
+      "duplicate_intake": "This message already started listing session {session_id}; reply in this thread to continue it.",
+      "extra_attachments_note": "This listing session already has its photos; the new ones are ignored for now.\n",
+      "done": "This listing session is complete{url_part} Post new photos as a new message to sell another item.",
+      "failed": "This listing session failed earlier. {restart_hint}",
+      "interrupted": "This listing session was interrupted mid-step and cannot be resumed. {restart_hint}",
+      "no_contract": "This session has no revision to revise. {restart_hint}",
+      "clarify_exhausted": "The draft still needs information after {rounds} clarification rounds; stopping. {restart_hint}",
+      "revising_notify": "Revising the draft…",
+      "hitl_lost": "The parked checkpoint was lost. {restart_hint}",
+      "clarify_header": "The draft needs more information:",
+      "unexpected_status": "Unexpected revision status {status}; stopping. {restart_hint}",
+      "auto_effect_notify": "{summary}\nWithin caps — publishing to the eBay sandbox (challenge {challenge})…",
+      "channel_auto_off_reason": "channel auto-publish is off (set {opt_in_key}=true to publish within caps automatically)",
+      "approval_header": "Publish approval needed [#{id}]:",
+      "approval_reply_hint": "Reply 'approve {id}' to publish to the eBay sandbox, 'deny {id}' to stop, or reply with feedback to revise the draft (which voids this approval).",
+      "deny": "Denied #{id} — nothing will be published. Reply with feedback to revise the draft, or ignore this thread.",
+      "approval_missing_session": "Approval #{id} refers to a listing session that no longer exists; nothing was published.",
+      "approval_stale": "Approval #{id} is stale — the draft it approved is no longer current. Nothing was published.",
+      "stale_rearm_reason": "the draft changed after that approval was issued",
+      "expired_rearm_reason": "the previous approval expired",
+      "expired_reissue_intro": "That approval expired; here is a fresh one.",
+      "approve_auth_failed": "Capitol credential needed: {error} — nothing was published.",
+      "prepublish_failed": "Publish step failed before submission: {error} — nothing was published.",
+      "policy_denied": "Publish denied by required policy: {reason} — nothing was published.",
+      "effect_failed": "Publish failed: {error}{hint_part}\nNothing was published. Fix the upstream issue, then re-approve to retry.\n{rearm}",
+      "gate_rejected": "Publish was rejected by Capitol's approval gate: {detail} — zero writes were made. {restart_hint}",
+      "no_effect_contract": "Publish run produced no {schema} contract; treating this session as failed. {restart_hint}"
+    },
+    "shell": {
+      "session_started": "  listing session {session_id} (intake: {intake})",
+      "uploading": "  uploading {name} …",
+      "attaching": "  attaching photo(s) to the intake message …",
+      "agent_reply": "  agent: {reply}",
+      "clarify_header": "\n  The draft needs more information:",
+      "clarify_exhausted": "draft still needs info after {rounds} clarification rounds; stopping",
+      "caps_auto": "\n  Policy: within caps — auto-publish permitted (sandbox). Challenge: {challenge}",
+      "confirm_effect": "  publish this listing to the eBay sandbox?",
+      "declined": "  stopped before publish (nothing was sent).",
+      "phrase_mismatch": "  approval phrase mismatch — not publishing.",
+      "attachment_missing": "at least one photo path is required",
+      "attachment_too_many": "at most {max} photos per listing",
+      "attachment_not_found": "photo not found: {path}",
+      "attachment_bad_type": "{name}: unsupported type (expected one of {suffixes})",
+      "attachment_too_big": "{name}: over the {cap} photo cap"
+    }
+  },
+  "presentation": {
+    "channel": [
+      "Draft r{revision} — {listing.title:120}",
+      "  Price {listing.price.value:20} {listing.price.currency:8} · Category {listing.category_id:40} · Condition {listing.condition:60} · Qty {listing.quantity:12}",
+      "  Photos {#media} · Hash …{draft_hash[-12:]}",
+      {"if": "listing.description", "line": "  About: {listing.description:300}"},
+      {"each": "warnings", "line": "  ⚠ {item:200}"}
+    ],
+    "shell": [
+      "",
+      "  Draft revision r{revision} ({draft_hash:80})",
+      "    Title:     {listing.title:120}",
+      "    Category:  {listing.category_id:40}",
+      "    Condition: {listing.condition:60}",
+      "    Price:     {listing.price.value:20} {listing.price.currency:8}",
+      "    Quantity:  {listing.quantity:12}",
+      "    Media:     {#media} photo(s)",
+      {"if": "listing.policies", "line": "    Shipping:  fulfillment {listing.policies.fulfillment_policy_id:40}, returns {listing.policies.return_policy_id:40}"},
+      {"if": "listing.description", "line": "    About:     {listing.description:300}"},
+      {"each": "warnings", "line": "    ⚠ {item:200}"}
+    ],
+    "effect": {
+      "channel": [
+        "Publish effect: {state:40=?}",
+        {"if": "listing_id", "append": " — listing {listing_id:40}"},
+        {"if": "listing_url", "append": "\n{listing_url:200}"}
+      ],
+      "shell": [
+        "\n  Publish effect: {state:40=?}",
+        {"if": "listing_id", "append": " — listing {listing_id}"},
+        {"if": "listing_url", "append": "\n  {listing_url}"}
+      ]
+    }
+  },
+  "scope": {"org_config_key": "capitol_org", "agent_config_key": "capitol_agent"}
+}

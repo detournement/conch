@@ -49,3 +49,12 @@ version = {attr = "conch.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["conch*"]
+
+[tool.setuptools.package-data]
+# Flow packs shipped with conch (declarative Capitol use cases; the
+# manifests are data the pack engine validates and executes).
+"conch.capitol.packs" = [
+    "data/*/pack.json",
+    "data/*/README.md",
+    "data/*/assets/*",
+]

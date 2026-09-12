@@ -38,7 +38,7 @@ class PackError(CapitolError):
 _TOP_LEVEL_KEYS = {
     "schema", "pack", "capitol", "contracts", "intakes", "bindings",
     "requests", "flow", "approvals", "state", "notifications",
-    "messages", "presentation", "scope",
+    "messages", "presentation", "acceptance", "scope",
 }
 _REQUIRED_TOP = ("schema", "pack", "capitol")
 
@@ -520,6 +520,12 @@ def _validate(data: Dict[str, Any]):
                 f"presentation.{section} is not supported "
                 "(channel, shell, effect)"
             )
+
+    acceptance = data.get("acceptance")
+    if acceptance is not None:
+        _check_keys("acceptance", acceptance,
+                    {"kind", "module", "fixtures", "checks", "note"},
+                    ("kind",))
 
     scope = data.get("scope")
     if scope is not None:

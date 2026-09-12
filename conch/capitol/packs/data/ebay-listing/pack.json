@@ -296,5 +296,10 @@
       ]
     }
   },
+  "acceptance": {
+    "kind": "golden_scenarios",
+    "module": "tests.capitol_golden_scenarios",
+    "note": "The R0 equivalence suite: every scenario (shell intake, clarify/revise, caps auto vs gate, exact-approval publish, effect-failure re-arm, chat FilePart intake, thread-session mapping, HITL park/resume) replays against the fake A2A gateway and must match its recorded fixture byte-identically modulo the normalized volatile fields."
+  },
   "scope": {"org_config_key": "capitol_org", "agent_config_key": "capitol_agent"}
 }

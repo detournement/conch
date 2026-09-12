@@ -72,6 +72,21 @@ CMD []
 FROM runtime AS minimal
 
 
+# Optional strict-isolation fleet worker profile (Swarm Phase 2): the same
+# verified wheel, but the container runs the constrained worker supervisor,
+# never an interactive shell. Deploy digest-pinned (image@sha256:...);
+# hostctl runs it non-root/read-only with all capabilities dropped and no
+# Docker socket. Delivery/verification/rollback semantics are identical to
+# the signed .pyz profile.
+FROM runtime AS worker
+
+ENV CONCH_FLEET_WORKER_HOME=/worker
+VOLUME ["/worker"]
+
+ENTRYPOINT ["conch-worker"]
+CMD []
+
+
 FROM dev-base AS dev
 
 COPY --from=runtime /opt/venv /opt/venv

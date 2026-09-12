@@ -115,6 +115,7 @@ SLASH_COMMANDS = [
     ("/profiles", "List tool profiles"),
     ("/connect <app>", "Connect a service via OAuth (Composio)"),
     ("/apps", "List connectable services"),
+    ("/ebay <photo...> [-- notes]", "eBay pilot: draft + publish a sandbox listing from photos (Capitol A2A)"),
     ("/reload", "Reload MCP tools"),
     ("/resettools", "Reset tool-calling if the model drifts to textual calls"),
     ("/rounds <n>", "Set max tool call rounds"),
@@ -184,6 +185,7 @@ def handle_slash_command(
             "  \033[1m/profile [name]\033[0m      Switch tool profile (minimal, dev, comms, full)\n"
             "  \033[1m/connect <app>\033[0m       Connect a service\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
+            "  \033[1m/ebay <photo...> [-- notes]\033[0m  Draft + publish a sandbox eBay listing (Capitol A2A)\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
             "  \033[1m/status\033[0m              Show provider, model, context window, and config\n"
@@ -900,6 +902,15 @@ def handle_slash_command(
         color = "\033[1;32m" if success else "\033[31m"
         prefix = "✓" if success else "✗"
         print(f"\n  {color}{prefix} {message}\033[0m\n")
+        return None
+
+    if command == "/ebay":
+        # eBay pilot (Capitol A2A): deterministic driver, no model in the
+        # loop — imported lazily so sessions without Capitol config pay
+        # nothing at startup.
+        from .capitol.ebay import run_ebay_command
+
+        run_ebay_command(arg, config)
         return None
 
     # User-defined slash commands (builtins above always take precedence)

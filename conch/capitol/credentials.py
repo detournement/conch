@@ -30,6 +30,7 @@ from ..config import local_only_enabled
 from .errors import CapitolAuthError, CapitolError
 
 DEFAULT_BEARER_ENV = "CAPITOL_A2A_BEARER"
+DEFAULT_ADMIN_TOKEN_ENV = "CAPITOL_ADMIN_TOKEN"
 REGISTRY_PATH = Path(os.path.expanduser("~/.capitol-a2a/agents.yaml"))
 
 REDACTED = "[redacted]"
@@ -187,4 +188,153 @@ def resolve_bearer(
         f"no Capitol bearer found: set ${env_name} or add an entry for "
         f"org {org_id} / agent {agent_id} to {REGISTRY_PATH} "
         "(tokens are never stored in conch config or state)"
+    )
+
+
+def bearer_fingerprint(token: str) -> str:
+    """Loggable, irreversible reference to a bearer (never the bytes)."""
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(
+        str(token).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def sink_bearer_to_registry(
+    alias: str,
+    *,
+    org_id: str,
+    agent_id: str,
+    base_url: str,
+    bearer: str,
+    description: str = "",
+) -> str:
+    """Write a minted/rotated bearer straight into the A2Actrl registry —
+    the established OS-side credential store — and return its fingerprint.
+
+    The token bytes go only to ``~/.capitol-a2a/agents.yaml`` (0600,
+    atomic replace). An existing entry for the same (org, agent, host) has
+    its ``bearer`` line replaced in place; otherwise a new entry is
+    appended. Nothing here logs, returns, or stores the token itself.
+    """
+    if not bearer:
+        raise CapitolAuthError("refusing to sink an empty bearer")
+    path = REGISTRY_PATH
+    try:
+        text = path.read_text()
+    except OSError:
+        text = "agents:\n"
+    if "agents:" not in text.splitlines():
+        text = (text.rstrip("\n") + "\nagents:\n") if text.strip() else (
+            "agents:\n"
+        )
+    host = (urlsplit(base_url).hostname or "").lower()
+    lines = text.splitlines()
+    # Locate an existing entry block for (org, agent, host).
+    blocks: List[Tuple[int, int]] = []
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip().startswith("- "):
+            if start is not None:
+                blocks.append((start, index))
+            start = index
+    if start is not None:
+        blocks.append((start, len(lines)))
+    replaced = False
+    for begin, end in blocks:
+        block = lines[begin:end]
+
+        def _value(key: str) -> str:
+            for entry_line in block:
+                stripped = entry_line.strip().lstrip("- ")
+                if stripped.startswith(f"{key}:"):
+                    return stripped.split(":", 1)[1].strip().strip("'\"")
+            return ""
+        if _value("org_id") != org_id or _value("agent_id") != agent_id:
+            continue
+        entry_host = (
+            urlsplit(_value("base_url")).hostname or ""
+        ).lower()
+        if host and entry_host and entry_host != host:
+            continue
+        for offset in range(begin, end):
+            if lines[offset].strip().startswith("bearer:"):
+                indent = lines[offset][:len(lines[offset])
+                                       - len(lines[offset].lstrip())]
+                lines[offset] = f"{indent}bearer: {bearer}"
+                replaced = True
+                break
+        if not replaced:
+            lines.insert(begin + 1, f"  bearer: {bearer}")
+            replaced = True
+        break
+    if not replaced:
+        entry = [
+            f"- name: {alias}",
+            f"  base_url: {base_url}",
+            f"  org_id: {org_id}",
+            f"  agent_id: {agent_id}",
+            f"  bearer: {bearer}",
+        ]
+        if description:
+            entry.append(f"  description: {description[:120]}")
+        lines.extend(entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return bearer_fingerprint(bearer)
+
+
+def resolve_admin_token(
+    config: dict,
+    org_id: str,
+    base_url: str = "",
+) -> Tuple[str, str]:
+    """Resolve the CapitolAdmin platform token (user JWT), never storing it.
+
+    Order: the env var named by ``capitol_admin_token_env`` (default
+    ``CAPITOL_ADMIN_TOKEN``), then any A2Actrl registry entry for the org
+    carrying an ``x_user_token`` (host-matched first). Returns
+    ``(token, source)``; the error on failure names the sources only.
+    """
+    env_name = str(
+        (config or {}).get("capitol_admin_token_env")
+        or DEFAULT_ADMIN_TOKEN_ENV
+    ).strip() or DEFAULT_ADMIN_TOKEN_ENV
+    token = os.environ.get(env_name, "").strip()
+    if token:
+        return token, f"env:{env_name}"
+
+    host = (urlsplit(base_url).hostname or "").lower()
+    fallback: Optional[Tuple[str, str]] = None
+    for entry in _load_registry_entries():
+        if entry.get("org_id") != org_id:
+            continue
+        candidate = (entry.get("x_user_token") or "").strip()
+        if not candidate:
+            continue
+        alias = entry.get("name") or "unnamed"
+        entry_host = (
+            urlsplit(entry.get("base_url") or "").hostname or ""
+        ).lower()
+        if not host or not entry_host or entry_host == host:
+            return candidate, f"registry:{alias}"
+        if fallback is None:
+            fallback = (candidate, f"registry:{alias}")
+    if fallback is not None:
+        return fallback
+    raise CapitolAuthError(
+        f"no Capitol admin token found: set ${env_name} or add an "
+        f"x_user_token to a registry entry for org {org_id} in "
+        f"{REGISTRY_PATH} (tokens are never stored in conch config or "
+        "state)"
     )

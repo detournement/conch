@@ -574,6 +574,123 @@ class DaemonWiringTests(unittest.TestCase):
             finally:
                 daemon.shutdown()
 
+    def test_mission_binds_supervises_approves_and_completes(self):
+        """The end-to-end Phase 3 mission gate in one scenario: a mission
+        binds a Capitol run, the daemon supervises it, a HITL checkpoint
+        round-trips through a kernel approval, the run then completes, and
+        replaying the binding journal reproduces the live projections."""
+        import os
+        from unittest.mock import patch
+
+        FakeGateway.reset(self.port)
+        now = [2_000_000.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = {
+                "capitol_base_url": f"http://127.0.0.1:{self.port}",
+                "capitol_org": ORG,
+                "capitol_agent": AGENT,
+                "capitol_poll_seconds": 1,
+            }
+            daemon = EdgeDaemon(
+                config, kernel_dir=root / "kernel", state_dir=root,
+                socket_path=root / "run" / "edge.sock",
+                clock=lambda: now[0],
+                session_factory=lambda *a: ("ok", {}),
+            )
+            daemon.start()
+
+            def tick():
+                # force a Capitol pass every tick regardless of cadence
+                daemon._capitol_last_poll = 0.0
+                with patch.dict(os.environ, {"CAPITOL_A2A_BEARER": BEARER}):
+                    return daemon.tick()
+
+            try:
+                mission_id = daemon.engine.create_mission({
+                    "goal": "bind, supervise, approve, complete",
+                    "budgets": {}, "dry_run": False,
+                    "cadence_seconds": 3600,
+                    "capitol": {"workflows": ["draft-wf"],
+                                "allow_start": True},
+                }, activate=True)
+                daemon.store.transition_mission(
+                    mission_id, "waiting_timer", reason="parked"
+                )
+                mission = daemon.store.get_mission(mission_id)
+                tool = CapitolControlClient(
+                    daemon.store, mission, "ses-int", config,
+                    runtime_factory=lambda: CapitolRuntime(
+                        f"http://127.0.0.1:{self.port}", ORG, AGENT, BEARER,
+                    ),
+                )
+                # 1) the mission binds a run
+                tool.call_tool("capitol_control", {
+                    "op": "start_capitol_run", "workflow_id": "draft-wf",
+                    "inputs": {"value": {"n": 1}},
+                })
+                binding = daemon.store.find_bindings(
+                    kind="capitol_run", mission_id=mission_id
+                )[0]
+                run_id = binding["resource"]["run_id"]
+
+                # 2) the daemon supervises to a HITL checkpoint
+                FakeGateway.run_events[run_id] = [
+                    _event(1), _hitl_event(2, "req-int"),
+                ]
+                FakeGateway.runs[run_id]["status"] = "running"
+                now[0] += 2
+                stats = tick()
+                self.assertEqual(stats.get("capitol_hitl"), 1)
+                binding = daemon.store.get_binding(binding["binding_id"])
+                self.assertEqual(binding["status"],
+                                 BindingStatus.WAITING_HITL)
+
+                # 3) the checkpoint is a kernel approval that round-trips
+                approvals = daemon.store.pending_approvals()
+                self.assertEqual(len(approvals), 1)
+                approval = approvals[0]
+                self.assertEqual(approval["mission_id"], mission_id)
+                self.assertEqual(approval["action_kind"],
+                                 "capitol.hitl.intervention")
+                daemon.store.decide_approval(
+                    approval["approval_id"], "approve",
+                    nonce=approval["nonce"], origin_channel="local",
+                    decided_by="test",
+                )
+                now[0] += 2
+                tick()  # relays the approved reply to Capitol, once
+                sent = [
+                    data for skill, data, _e in FakeGateway.calls
+                    if skill == "submit_intervention_response"
+                ]
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0]["response"], "continue")
+                binding = daemon.store.get_binding(binding["binding_id"])
+                self.assertEqual(binding["status"], BindingStatus.ACTIVE)
+
+                # 4) the run completes; the daemon drives it to terminal
+                FakeGateway.run_events[run_id].append(
+                    _event(3, event_type="workflow.run_completed")
+                )
+                FakeGateway.runs[run_id]["status"] = "success"
+                now[0] += 2
+                stats = tick()
+                self.assertEqual(stats.get("capitol_terminal"), 1)
+                binding = daemon.store.get_binding(binding["binding_id"])
+                self.assertEqual(binding["status"], BindingStatus.COMPLETED)
+                self.assertEqual(binding["detail"]["final_state"], "success")
+                self.assertEqual(
+                    daemon.store.get_mission(mission_id)["status"],
+                    MissionState.READY,
+                )
+
+                # 5) binding-event replay equals live state
+                ok, detail = daemon.store.replay_matches_live()
+                self.assertTrue(ok, detail)
+            finally:
+                daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

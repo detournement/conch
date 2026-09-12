@@ -1,35 +1,43 @@
-"""Dormant swarm entrypoints (Swarm Phase 0).
+"""Swarm console entrypoints.
 
-Each console script must exist, parse arguments, and refuse to run with a
-clear pointer to the plan — exiting nonzero so scripts and supervisors can't
-mistake a dormant mode for a working one.
+``conch-edge`` is live (Swarm Phase 1) but gated on ``edge_daemon=true`` —
+without it the command refuses with a clear pointer, so shell-only users
+cannot start a daemon by accident. The still-dormant entrypoints
+(controller, worker, hostctl) must exist, parse arguments, and refuse to
+run with a pointer to the plan — exiting nonzero so scripts and supervisors
+can't mistake a dormant mode for a working one.
 """
 
 import contextlib
 import io
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from conch import __version__
 from conch.entrypoints import (
     DORMANT_EXIT_CODE,
+    EDGE_DISABLED_EXIT_CODE,
     controller_main,
     edge_main,
     hostctl_main,
     worker_main,
 )
 
-ALL_MAINS = {
+DORMANT_MAINS = {
     "conch-controller": controller_main,
-    "conch-edge": edge_main,
     "conch-worker": worker_main,
     "conch-hostctl": hostctl_main,
 }
 
+ALL_MAINS = dict(DORMANT_MAINS)
+ALL_MAINS["conch-edge"] = edge_main
+
 
 class TestDormantEntrypoints(unittest.TestCase):
-    def test_all_exit_nonzero_with_plan_pointer(self):
-        for prog, main in ALL_MAINS.items():
+    def test_dormant_mains_exit_nonzero_with_plan_pointer(self):
+        for prog, main in DORMANT_MAINS.items():
             with self.subTest(prog=prog):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
@@ -61,14 +69,6 @@ class TestDormantEntrypoints(unittest.TestCase):
                 self.assertIn(__version__, stdout.getvalue())
                 self.assertIn(prog, stdout.getvalue())
 
-    def test_help_flag_works_now(self):
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
-            with self.assertRaises(SystemExit) as ctx:
-                edge_main(["--help"])
-        self.assertEqual(ctx.exception.code, 0)
-        self.assertIn("dormant", stdout.getvalue())
-
     def test_unknown_arguments_are_a_usage_error(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -81,6 +81,38 @@ class TestDormantEntrypoints(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             code = hostctl_main(["--config", "/tmp/some.conf"])
         self.assertEqual(code, DORMANT_EXIT_CODE)
+
+
+class TestEdgeEntrypoint(unittest.TestCase):
+    """conch-edge is live but hard-gated on edge_daemon=true."""
+
+    def test_refuses_without_edge_daemon_enabled(self):
+        stderr = io.StringIO()
+        clean_env = {
+            key: value for key, value in os.environ.items()
+            if key != "CONCH_EDGE_DAEMON"
+        }
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            clean_env["XDG_CONFIG_HOME"] = str(Path(tmp) / "config")
+            with patch.dict(os.environ, clean_env, clear=True):
+                with contextlib.redirect_stderr(stderr):
+                    code = edge_main([])
+        self.assertEqual(code, EDGE_DISABLED_EXIT_CODE)
+        message = stderr.getvalue()
+        self.assertIn("edge_daemon", message)
+        self.assertIn("fully", message)
+
+    def test_help_describes_the_live_daemon(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                edge_main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("mission kernel", text)
+        self.assertNotIn("dormant", text)
 
 
 class TestPyprojectScripts(unittest.TestCase):

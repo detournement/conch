@@ -56,6 +56,10 @@ ENV_CONFIG_KEYS = {
     "CONCH_CAPITOL_ORG": "capitol_org",
     "CONCH_CAPITOL_AGENT": "capitol_agent",
     "CONCH_CAPITOL_BEARER_ENV": "capitol_bearer_env",
+    # Edge daemon / mission kernel (Swarm Phase 1). Off by default: the
+    # interactive shell keeps its in-process scheduler and never imports
+    # the kernel unless this is enabled.
+    "CONCH_EDGE_DAEMON": "edge_daemon",
 }
 
 

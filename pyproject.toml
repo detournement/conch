@@ -30,8 +30,10 @@ dependencies = [
 conch = "conch.app:main"
 conch-chat = "conch.app:main"
 conch-ask = "conch.cli:main"
-# Swarm entrypoints (Phase 0 scaffolding): installed but dormant — each
-# prints a "not yet enabled" notice and exits nonzero until its phase lands.
+# Swarm entrypoints. conch-edge is live (Phase 1): the personal edge daemon
+# owning the mission kernel, gated on edge_daemon=true. The others remain
+# dormant — each prints a "not yet enabled" notice and exits nonzero until
+# its phase lands.
 conch-controller = "conch.entrypoints:controller_main"
 conch-edge = "conch.entrypoints:edge_main"
 conch-worker = "conch.entrypoints:worker_main"

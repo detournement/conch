@@ -1,14 +1,14 @@
-"""Dormant swarm console entrypoints (Swarm Phase 0).
+"""Swarm console entrypoints.
 
-``conch-controller``, ``conch-edge``, ``conch-worker``, and ``conch-hostctl``
-are installed from day one so packaging, docs, and deployment scripts can
-reference stable command names, but every one of them currently prints a
-clear "not yet enabled" message and exits nonzero. Later phases replace the
-``_dormant`` call with the real daemon/utility main while keeping the
-argparse surface built here.
+``conch-edge`` is live as of Swarm Phase 1: the personal edge daemon that
+owns the mission kernel and keeps missions running when the terminal
+closes. It refuses to start unless ``edge_daemon=true`` is configured (or
+``CONCH_EDGE_DAEMON=true``), so nothing changes for shell-only users.
 
-The interactive ``conch`` entrypoint is untouched and never depends on any
-of these.
+``conch-controller``, ``conch-worker``, and ``conch-hostctl`` remain
+dormant: each prints a clear "not yet enabled" message and exits nonzero
+until its phase lands. The interactive ``conch`` entrypoint is untouched
+and never depends on any of these.
 """
 
 from __future__ import annotations
@@ -68,14 +68,55 @@ def controller_main(argv: Optional[List[str]] = None) -> int:
     return _dormant("conch-controller", "the mission controller daemon")
 
 
+#: Exit status when the edge daemon is not enabled in config (EX_CONFIG).
+EDGE_DISABLED_EXIT_CODE = 78
+
+
 def edge_main(argv: Optional[List[str]] = None) -> int:
-    parser = _build_parser(
-        "conch-edge",
-        "Personal Conch edge daemon: keeps missions running when the "
-        "terminal closes, sharing the shell's config and state (dormant).",
+    parser = argparse.ArgumentParser(
+        prog="conch-edge",
+        description=(
+            "Personal Conch edge daemon: owns the durable mission kernel, "
+            "fires scheduled work sessions, delivers notifications, and "
+            "serves the shell's /missions attach surface over a local "
+            "control socket. It keeps missions running when the terminal "
+            "closes, sharing the shell's config and state."
+        ),
     )
-    parser.parse_args(argv)
-    return _dormant("conch-edge", "the personal edge daemon")
+    parser.add_argument(
+        "--version", action="version", version=f"conch-edge {__version__}"
+    )
+    parser.add_argument(
+        "--config", metavar="PATH", default="",
+        help="Extra config file layered over the standard conch config.",
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Run a single supervision tick and exit (smoke testing).",
+    )
+    args = parser.parse_args(argv)
+    from .config import get_bool, load_config
+
+    config = load_config()
+    if args.config:
+        from pathlib import Path
+
+        from .config import _parse_config_file
+
+        config.update(_parse_config_file(Path(args.config)))
+    if not get_bool(config, "edge_daemon"):
+        print(
+            "conch-edge: the edge daemon is not enabled. Set "
+            "`edge_daemon = true` in your conch config (or "
+            "CONCH_EDGE_DAEMON=true) to let the daemon own scheduled "
+            "tasks and missions; the interactive shell is fully "
+            "functional without it. See README \"Edge daemon\".",
+            file=sys.stderr,
+        )
+        return EDGE_DISABLED_EXIT_CODE
+    from .kernel.daemon import run_edge_daemon
+
+    return run_edge_daemon(config, once=args.once)
 
 
 def worker_main(argv: Optional[List[str]] = None) -> int:

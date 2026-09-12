@@ -30,6 +30,12 @@ dependencies = [
 conch = "conch.app:main"
 conch-chat = "conch.app:main"
 conch-ask = "conch.cli:main"
+# Swarm entrypoints (Phase 0 scaffolding): installed but dormant — each
+# prints a "not yet enabled" notice and exits nonzero until its phase lands.
+conch-controller = "conch.entrypoints:controller_main"
+conch-edge = "conch.entrypoints:edge_main"
+conch-worker = "conch.entrypoints:worker_main"
+conch-hostctl = "conch.entrypoints:hostctl_main"
 
 [project.urls]
 Homepage = "https://github.com/detournement/conch"

@@ -237,6 +237,54 @@ publishes nothing. Slack app requirements: the `files:read` bot scope (plus
 `chat:write` and your channel type's history scope), then reinstall the app;
 see `config.example` for `ebay_channel_intake` / `ebay_channel_auto_publish`.
 
+### Capitol as a governed execution fabric
+The eBay pilot is one consumer of a general integration: Conch drives
+[Capitol](https://capitol.ai) — A2A orchestrator agents and durable Temporal
+workflows — as a subordinate, governed process-execution fabric while mission
+truth, policy, budgets, approvals, and the external-action ledger stay on the
+Conch controller. The adapter (`conch/capitol/`) is stdlib-only (HTTP + a
+hand-rolled SSE reader, no CLI on the control path) and mirrors the
+[A2Actrl](https://github.com/Faction-V/A2Actrl) reference client's wire
+behavior; the adapter is verified differentially against the `a2actrl` CLI
+during development.
+
+**Durable mission supervision.** A mission may carry a `capitol` authority
+envelope — an allowlist of workflow ids plus `allow_start` / `allow_respond` /
+`max_runs` — and its bounded `capitol_control` tool derives every grant from
+that envelope *and* a fail-closed required-policy check, never from the model's
+prompt. The edge daemon supervises bound runs on its own cadence: it advances
+a persisted event cursor, wakes parked missions on terminal/failure, maps each
+Human-in-the-Loop checkpoint into an origin-bound, TTL'd kernel approval whose
+decision flows back as the exact HITL reply exactly once, and maps a mission
+abort onto the run's cancel. If Capitol is unreachable the binding degrades
+with exponential backoff and the mission parks — it is never failed and no
+alternate provider is substituted — and supervision resumes from the persisted
+cursor when the platform returns. Configure `capitol_base_url` / `capitol_org`
+/ `capitol_agent` / `capitol_bearer_env` (the bearer is read from that env var
+or `~/.capitol-a2a/agents.yaml`, never stored in Conch config) plus
+`capitol_poll_seconds` and `capitol_hitl_ttl_seconds`.
+
+**Bounded provisioning (builder profile).** For pre-authorized production
+creation, `CapitolAdmin` is a separately-authorized surface over Capitol's
+management APIs — create orchestrator agents, publish/pin workflow versions,
+manage an agent's workflow allowlist, bind collections, and create/update
+schedules. It is **off by default** (`capitol_admin=true` to enable, plus
+`capitol_platform_url`) and every mutation additionally passes a fail-closed
+required-policy check. Each mutation records a caller idempotency key as a
+kernel external-action ledger entry *before* the wire call (a committed
+duplicate replays the recorded outcome instead of acting again), captures a
+version pin and rollback reference, and reconciles transport-uncertain
+outcomes by query rather than blind retry. A minted or rotated agent bearer is
+written straight into the A2Actrl registry (0600) under a name-only reference;
+callers, the ledger, and logs only ever see a fingerprint. The admin token
+(a platform user JWT) is resolved per call from `CAPITOL_ADMIN_TOKEN` or a
+registry `x_user_token` and is scrubbed from every error.
+
+Dev-time live and differential tests exercise all of this against a local
+Capitol stack behind `CONCH_CAPITOL_LIVE=1` (they skip cleanly when the stack,
+CLI, or token is absent); see `tests/test_capitol_live.py` and
+`tests/test_capitol_crossclient.py`.
+
 ### Budget-aware turns
 Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
 

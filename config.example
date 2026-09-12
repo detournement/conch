@@ -174,7 +174,7 @@ api_key_env=ANTHROPIC_API_KEY
 # Repository map injected when cwd is a git repo (~1k tokens). On by default.
 #repo_map=true
 
-# --- Capitol A2A (eBay pilot) --------------------------------------------------
+# --- Capitol A2A ---------------------------------------------------------------
 # Conch drives governed Capitol workflows over the A2A gateway. The bearer
 # token is NEVER stored here: capitol_bearer_env names the environment
 # variable it is read from; if that is unset, the A2Actrl registry
@@ -184,6 +184,29 @@ api_key_env=ANTHROPIC_API_KEY
 #capitol_org=00000000-0000-0000-0000-000000000000
 #capitol_agent=00000000-0000-0000-0000-000000000000
 #capitol_bearer_env=CAPITOL_A2A_BEARER
+
+# Mission supervision (daemon): how often the edge daemon polls Capitol to
+# advance bound-run cursors, and the TTL for the origin-bound kernel
+# approval a Human-in-the-Loop checkpoint parks as. An unreachable Capitol
+# degrades the binding with exponential backoff (mission parks, never fails).
+#capitol_poll_seconds=10
+#capitol_hitl_ttl_seconds=86400
+
+# Bounded builder/provisioning profile (CapitolAdmin) — OFF BY DEFAULT.
+# Enables creating/managing platform assets (orchestrator agents, workflow
+# version publish/pin/rollback, agent allowlists, schedules, collections) on
+# the configured org. Every mutation is additionally gated by a fail-closed
+# required-policy check, records an idempotency key + external-action ledger
+# entry + version pin + rollback reference, and never blind-retries. Minted
+# bearers are written to the A2Actrl registry (0600) by reference; only a
+# fingerprint is ever returned or logged. Set capitol_admin=true AND
+# capitol_platform_url to enable. The admin token (a platform user JWT) is
+# resolved per call from the env var named by capitol_admin_token_env
+# (default CAPITOL_ADMIN_TOKEN) or an x_user_token in the registry entry for
+# the org — never stored in conch config.
+#capitol_admin=false
+#capitol_platform_url=http://localhost:8811
+#capitol_admin_token_env=CAPITOL_ADMIN_TOKEN
 
 # eBay pilot (/ebay <photo...> [-- notes]): sandbox photo→listing driver.
 # Identity + seller prerequisites for ebay.draft_request.v1 (ask the org

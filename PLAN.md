@@ -232,6 +232,130 @@ remote SSH/Docker host reachable and macOS has no systemd during this run):
 - GPU residency scheduling against an actual `nvidia-smi` host and a shared
   Ollama endpoint under real concurrent load.
 
+**Swarm Phase 3 — full Capitol integration (September 2026): landed.**
+Conch drives Capitol as a governed, subordinate process-execution fabric —
+discovering, invoking, supervising, and (under a separately authorized,
+default-off profile) provisioning Capitol assets — while mission truth,
+policy, budgets, approvals, and the external-action ledger stay on the
+controller. All in `conch/capitol/`, dependency-light (stdlib HTTP + a
+hand-rolled SSE reader; no CLI subprocess on the production control path);
+the eBay pilot paths (`channel_flow.py`, the `/ebay` driver) ride the same
+adapter unchanged. [`A2Actrl`](/Users/thom/composer/A2Actrl) remains the
+normative reference client — the adapter is verified differentially against
+the `a2actrl` CLI, and any accepted divergences are documented.
+
+- **`CapitolRuntime` (`conch/capitol/client.py`):** the full adapter surface
+  — AgentCard discovery with fail-closed capability gating (`ensure_skill`
+  refuses an unknown/absent skill or an unsupported wire schema *before* any
+  call), org agent directory, workflow list/describe/suggest/versions/stats,
+  `call_workflow` with caller idempotency keys, HITL replies, artifact
+  upload (presigned PUT) / download, eval roll-ups, and `watch_run` — SSE
+  streaming that resumes with `since_sequence=last+1` across drops and
+  degrades to a resumable `get_workflow_events` poll when streaming is not
+  advertised. Bearer bytes are scrubbed from every error; no automatic
+  re-auth (a 401 parks as "credential needed").
+- **Resource-binding lifecycle + mission envelope (`conch/kernel/`):**
+  `resource_bindings` gained `task_id/status/cursor/detail/updated_at` (an
+  additive migration; replay reproduces migrated tables byte-for-byte),
+  `binding_updated` joined the event taxonomy with monotonic-cursor and
+  terminal-immutability enforcement, and mission specs accept a validated
+  `capitol` authority envelope (workflow allowlist, `allow_start`/
+  `allow_respond`, `max_runs`) that fails closed on unknown fields.
+- **Daemon supervision + bounded mission tool (`conch/capitol/supervisor.py`,
+  `conch/kernel/daemon.py`):** `CapitolSupervisor` advances persisted event
+  cursors for bound runs, wakes parked missions on terminal/failure, maps
+  HITL checkpoints into origin-bound expiring kernel approvals whose decision
+  flows back as the exact HITL reply exactly once (shared ledger key), maps
+  mission abort onto `stop_workflow`/`CancelTask`, and degrades with
+  exponential backoff when Capitol is unreachable — cursors survive outages
+  and supervision resumes cleanly. The mission-facing `capitol_control` tool
+  (`start_capitol_run`/`check_run`/`respond_hitl`) derives every grant from
+  the spec envelope plus required policy, never the prompt; starts, replies,
+  and cancels are ledgered external actions whose idempotency keys ride the
+  wire.
+- **`CapitolAdmin` (`conch/capitol/admin.py`) — the bounded builder
+  profile:** config-gated (default off; `capitol_admin=true`) *and*
+  required-policy-checked (`capitol.admin.{op}`, fail-closed) provisioning
+  over the platform/workflow management APIs: create orchestrator agents,
+  publish/pin workflow versions, manage the agent's workflow allowlist, bind
+  collections, and create/update/delete schedules. Every mutation shares one
+  discipline — a caller idempotency key ledgered as a kernel external action
+  *before* the wire call (committed duplicates replay the recorded outcome
+  without a second effect), a version pin and rollback reference in the
+  ledger detail, and transport-uncertain outcomes resolving `unknown` to
+  reconcile by query (create ops adopt an existing same-name asset) rather
+  than blind-retry. Minted/rotated bearers stream straight into the A2Actrl
+  registry (`~/.capitol-a2a/agents.yaml`, 0600) under an OS-side reference;
+  callers, the ledger, and logs only ever see a fingerprint.
+- **Gates (all in tests; 1,359 in the routine suite on Python 3.9 and 3.14,
+  ruff clean, plus 12 opt-in live tests):**
+  - *Recorded fake-gateway contract tests* (`test_capitol_client.py`,
+    `test_capitol_admin.py`, `test_capitol_bindings.py`): the fake mirrors
+    the live 1.0.27 skill catalog and wire envelopes — invoke, HITL,
+    artifacts, eval reads, duplicate-request idempotency, version-pin undo,
+    and unknown-capability rejection with clear errors, plus every admin
+    gate (default-off, policy veto, mandatory idempotency+ledger, bearer
+    hygiene, the full create→verify→revert→clean-up drill).
+  - *Mission gates* (`test_capitol_mission.py`): the bounded tool's
+    spec-not-prompt authority, supervise-to-terminal, HITL↔approval with
+    exactly-once reply, abort→cancel, replay==live, and one integrated
+    end-to-end scenario (a mission binds a run → the daemon supervises it →
+    a HITL checkpoint round-trips through a kernel approval → the run
+    completes → binding-event replay equals live state).
+  - *Unreachable-platform behavior*: pointing the runtime at a closed port
+    degrades the binding with exponential backoff and parks the mission
+    (never fails it, never uses an alternate provider); the cursor survives
+    and supervision resumes cleanly when the platform returns.
+  - *Live gates against the local dev stack* (`test_capitol_live.py`,
+    opt-in `CONCH_CAPITOL_LIVE=1`, fail-closed skip otherwise): the
+    disposable-asset drill through `CapitolAdmin` (create an orchestrator
+    agent, publish + pin a `conch-phase3-*` workflow, manage its allowlist,
+    create/update/delete a schedule, revert the publish to the prior
+    version, clean everything up — each step ledgered and replay-verified),
+    and invoke/supervise-to-terminal, cursor resume without replay, eval
+    read, artifact round-trip, and a HITL round-trip through
+    `CapitolRuntime`.
+  - *Cross-client differential tests* (`test_capitol_crossclient.py`,
+    opt-in): card / handshake / workflow list / describe / run start /
+    status / events-since / cancel run through both the `a2actrl` CLI and
+    the adapter against the local stack and compared on the semantic facts
+    (volatile fields ignored). Accepted divergences are documented in the
+    module's `DIVERGENCES` note.
+
+**Capitol platform requests** (poll/resubscribe until these land; filed as
+Capitol-side epics):
+
+- **Signed push / webhook run notifications** so supervision does not have
+  to poll — today the supervisor advances cursors on a timer and the adapter
+  reconciles dropped streams by re-reading; a push callback (with an HMAC or
+  signature Conch can verify) would make terminal/HITL wake-ups immediate.
+- **A single idempotent unified management API.** Provisioning currently
+  spans two services (platform-api for agents/bearers/collections,
+  workflow-api for workflows/versions/schedules) with inconsistent
+  idempotency and two different version stores (see the rollback divergence
+  below). One management contract with first-class idempotency keys and a
+  single authoritative version history would remove the reconcile-by-query
+  and re-persist-to-undo workarounds.
+- **Process-graph diff / migration.** Publishing today re-persists a full
+  payload and mints a new version with no server-side diff or safe
+  migration between versions; a diff/migration API would let the builder
+  profile reason about and gate structural changes.
+- **First-class Gmail push ingestion** (Phase 4 dependency) so per-user mail
+  intake is event-driven rather than polled.
+
+**Verified live tonight against the local dev stack** (workflow-api
+`:8300`, platform-api `:8811`, dev org): the full disposable-asset drill,
+invoke → supervise-to-`success`, SSE streaming and cursor resume, eval
+roll-up reads (a passing suite), artifact upload/download round-trips, a
+HITL pause + intervention reply, and the a2actrl-vs-adapter comparisons —
+all creating only `conch-phase3-*` assets and cleaning up. **Accepted
+divergence:** the platform-api `/agentic-workflows/.../rollback` endpoint
+reads a separate version store that workflow-api publishes never populate
+(it 404s for workflows published through the workflow-api), so Conch
+reverts a publish by re-persisting the payload with `publish_to_api`
+cleared through the same workflow-api endpoint — publish and undo stay in
+one version lineage. Documented in `admin.py` and `test_capitol_crossclient.py`.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

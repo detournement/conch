@@ -333,7 +333,7 @@ def normalize_spec(spec: Dict[str, Any],
         "cadence_seconds", "channel", "dry_run", "kind", "prompt",
         "run_once", "misfire_policy", "catch_up_limit",
         "session_wall_seconds", "session_max_tool_rounds",
-        "session_token_budget", "principal",
+        "session_token_budget", "principal", "notify",
     }
     unknown = set(spec) - known
     if unknown:
@@ -382,6 +382,11 @@ def normalize_spec(spec: Dict[str, Any],
     misfire = str(spec.get("misfire_policy") or MisfirePolicy.COALESCE)
     if misfire not in MisfirePolicy.ALL:
         raise KernelError(f"unknown misfire_policy {misfire!r}")
+    notify = str(spec.get("notify") or "milestones")
+    if notify not in ("sessions", "milestones"):
+        raise KernelError(
+            f"notify must be 'sessions' or 'milestones', got {notify!r}"
+        )
     try:
         catch_up_limit = int(spec.get("catch_up_limit", 5))
     except (TypeError, ValueError):
@@ -403,6 +408,7 @@ def normalize_spec(spec: Dict[str, Any],
         "misfire_policy": misfire,
         "catch_up_limit": min(catch_up_limit, CATCH_UP_HARD_CAP),
         "principal": str(spec.get("principal") or "user"),
+        "notify": notify,
     }
     for key, default in SESSION_DEFAULTS.items():
         raw = spec.get(key, default)

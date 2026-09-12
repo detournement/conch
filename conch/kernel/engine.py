@@ -767,6 +767,15 @@ class MissionEngine:
                 f"{_clip(summary, 2000)}"
             )
             return {"text": text, "channel": channel}
+        if outcome == MissionState.WAITING_TIMER and not error and (
+            spec.get("notify") == "sessions"
+        ):
+            # digest-style missions: every checkpoint is the deliverable
+            text = (
+                f"[conch mission {mission_id}] {goal} — session digest\n\n"
+                f"{_clip(summary, 2500)}"
+            )
+            return {"text": text, "channel": channel}
         if error:
             return {
                 "text": (

@@ -236,6 +236,23 @@ class TestSessionFlow(EngineCase):
         result = engine.run_session(mission_id)
         self.assertIn("backend unreachable", result["error"])
 
+    def test_notify_sessions_sends_the_digest_each_checkpoint(self):
+        factory = ScriptedFactory(reply="today: 3 commits, tree clean")
+        engine = self.engine(factory)
+        mission_id = self.make_ready(engine, notify="sessions")
+        engine.run_session(mission_id)
+        outbox = self.store.list_outbox(mission_id=mission_id)
+        self.assertEqual(len(outbox), 1)
+        self.assertIn("session digest", outbox[0]["payload"])
+        self.assertIn("3 commits", outbox[0]["payload"])
+
+    def test_milestones_notify_stays_quiet_on_routine_checkpoints(self):
+        factory = ScriptedFactory(reply="routine work")
+        engine = self.engine(factory)
+        mission_id = self.make_ready(engine)  # default notify=milestones
+        engine.run_session(mission_id)
+        self.assertEqual(self.store.list_outbox(mission_id=mission_id), [])
+
     def test_scheduled_prompt_notifies_each_run(self):
         factory = ScriptedFactory(reply="disk is 42% full")
         engine = self.engine(factory)

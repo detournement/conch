@@ -72,6 +72,50 @@ stale-approval zero-write proofs captured. Publishing itself is parked on an
 expired eBay sandbox user token (no refresh token in the org credential
 bundle) — an operator re-auth, not a code gap.
 
+**Swarm Phase 1 — durable mission/controller kernel (September 2026):
+landed.** Mission coordination moved from JSON files into one transactional
+SQLite kernel (`conch/kernel/`, WAL, single-writer thread) under
+`~/.local/state/conch/kernel/`; JSON/JSONL remain export/audit formats.
+Every mutation commits an optimistic version check, an immutable
+hash-chained event, the projection update, budget operations, and outbox
+inserts in ONE transaction; projections rebuild exactly from the journal
+(replay == live is a tested invariant) and unknown event versions fail
+closed. Entities: missions, mission_events, plans, tasks, task_attempts,
+leases, checkpoints, integer-unit budgets (reserve/commit/release; child
+scopes strict subsets), an external-action ledger with idempotency keys and
+query-before-retry unknown outcomes, origin-bound approvals (canonical-args
+hash + expiry + one-use nonce, extending remote.py's patterns), timers
+(logical key, generation fencing, claim leases, skip/coalesce/bounded
+catch_up misfires), a transactional inbox/outbox (dedupe keys,
+at-least-once delivery, exactly-once ledger effects), artifacts, and
+resource bindings for later Capitol/fleet linkage.
+
+Missions run as bounded checkpointed work sessions over `AgentSession` —
+fresh rehydrated context every time (spec + latest plan/checkpoint + open
+tasks + event tail + remaining budgets, size-capped regardless of journal
+length), hard wall/token/round caps, and a `mission_control` tool for
+plans/notes/tasks, next-wake scheduling, input requests, and completion.
+STOP (global kill file + per-mission flag) is honored at session start and
+re-checked before every tool round through the fail-closed required-policy
+layer. The `conch-edge` daemon (gated on `edge_daemon=true`) owns the
+kernel exclusively — OS flock plus controller-epoch fencing so a superseded
+zombie can never write — fires timers/sessions/outbox deliveries, migrates
+legacy tasks.json idempotently (original kept as `.bak`), stops gracefully
+on SIGTERM, and serves shell attach (`/missions`, `/mission`, `/approvals`,
+`/approve`, `/deny`, plus the unchanged `/schedule` UX) over a
+0700/0600-protected local socket speaking a tiny versioned JSON protocol;
+without the daemon the same commands hit the kernel directly. The
+no-daemon invariant is a tested gate: with `edge_daemon` unset, the classic
+in-process scheduler runs and `conch.kernel` is never imported. Gates in
+tests (137 new): fake-clock weeks of timers and misfire policies,
+kill/restart at every claim/fire/session boundary with no duplicate
+effects, hard budget enforcement, replayable projections, a scripted
+backup/restore drill, bounded rehydration, wrong-origin/expired/replayed
+approval rejection, outbox exactly-once-effect semantics under redelivery,
+kernel secret-canary sweeps, and real-process SIGTERM/kill -9 lifecycle
+drills. Milestone A ran live on this machine — see the evidence note at
+the end of this file.
+
 **Milestone 1b — Slack-first channel intake (September 2026): landed.** The
 primary UX from contract Rev 2: a Slack photo message is the intake, and its
 thread carries the whole session. `SlackChannel` now captures `files[]`
@@ -635,3 +679,52 @@ rather than inventing parallel stores.
 Coordination note: 0.2 and 0.7 overlap with the qwen tool-calling and live
 model-list fixes in progress on the `curses` branch — check that diff before
 implementing.
+
+---
+
+## Swarm Milestone A — live evidence (September 12, 2026, this machine)
+
+The daemon was enabled locally (`edge_daemon = true` in
+`~/.config/conch/config`; previous config kept at
+`config.pre-edge-backup`) and run against the real Anthropic backend
+(`CONCH_PROVIDER=anthropic` env override; the configured llama.cpp
+endpoint was unreachable that night). No `tasks.json` existed on this
+machine, so migration was a no-op here (it is covered by tests).
+
+- **Mission:** `msn-001a094c37857-e8154420a371de5e` — "daily activity
+  summary of /Users/thom/conch" (standard kind, `notify=sessions`,
+  dry-run, budgets 90 sessions / 9M tokens, daily cadence).
+- **Scheduled sessions ran:** activation → first session executed real
+  `git` commands via `local_shell` (agent mode), recorded a
+  `mission_control` note, checkpointed, committed budgets, rescheduled
+  the wake timer (+24h), and enqueued its digest — all in one kernel
+  transaction. A separate `/schedule`-style run-once task
+  (`msn-001a094c3a940`, 2-minute interval) had its timer fire live,
+  ran, succeeded, and delivered its one-line answer.
+- **Notifications:** no channel is configured, so all three session
+  digests were delivered over the log transport and recorded as
+  `delivered` outbox rows with session-scoped dedupe keys (`outbox #1-3`
+  in `~/.local/state/conch/kernel/daemon.log`). Configuring
+  `notify_channel` (Slack/SMS/email) upgrades the same path to a live
+  channel with no mission changes.
+- **kill -9 / resume proof:** mission resumed → second session active →
+  daemon killed with SIGKILL mid-session (epoch 2, pid 34096). Restarted
+  daemon adopted epoch 3 and *honored the dead session's live lease*
+  (no theft); at lease expiry reconciliation released the budget
+  reservation, appended `session_abandoned`
+  (`ses-001a094c7f756-a420363bf5049065`), returned the mission to
+  ready, and the retried session checkpointed normally. Final state:
+  `waiting_timer`, runs=2, budgets `sessions committed=2, reserved=0` —
+  the killed session left no partial effects, no duplicate outbox rows,
+  and no duplicate timer fires (exactly one `timer_fired` per scheduled
+  occurrence).
+- **Shell attach:** `/missions`, `/mission show 17`, and `/tasks` ran
+  through the real command path over the daemon socket, showing live
+  status, budgets, checkpoint, and the event tail.
+- **Integrity:** `verify_integrity()` on the live kernel:
+  62 events hash-chain-verified, replay == live across every replayed
+  projection. Daemon epochs advanced 1 → 2 → 3 across the restarts.
+
+Gates all live in tests (`tests/test_kernel_*.py`, plus the kernel
+secret-canary sweep and the no-daemon compat gate): 1,183 tests green on
+Python 3.14 and 3.9 with ruff clean at every commit.

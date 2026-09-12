@@ -193,6 +193,10 @@ class FakeAdminGateway(BaseHTTPRequestHandler):
             if not tail and self.command == "GET":
                 self._json({"workflow": {"payload": record["payload"]}})
                 return
+            if not tail and self.command == "DELETE":
+                cls.workflows.pop(workflow_id, None)
+                self._json({"success": True})
+                return
             if tail == "versions" and self.command == "GET":
                 self._json({"workflow_id": workflow_id,
                             "versions": record["versions"]})
@@ -504,6 +508,84 @@ class AdminCase(unittest.TestCase):
             "wf-1", idempotency_key="k-roll2",
         )
         self.assertTrue(again_roll["already_unpublished"])
+
+    # -- persist / delete workflows ------------------------------------------------
+
+    def test_persist_workflow_create_pins_version(self):
+        payload = {"id": "wf-new", "name": "Fresh Flow",
+                   "nodes": [], "edges": [], "publish_to_api": True}
+        result = self.admin.persist_workflow(
+            payload, idempotency_key="k-pw1",
+        )
+        self.assertTrue(result["created"])
+        self.assertTrue(result["version_pin"])
+        # undoing a first persist removes the asset
+        self.assertEqual(
+            result["rollback_ref"],
+            {"kind": "delete_workflow", "workflow_id": "wf-new"},
+        )
+        self.assertEqual(
+            FakeAdminGateway.workflows["wf-new"]["payload"]["name"],
+            "Fresh Flow",
+        )
+        action = self.store.find_action(
+            "capitol-admin:persist_workflow:k-pw1"
+        )
+        self.assertEqual(action["status"], "committed")
+
+    def test_persist_workflow_update_keeps_rollback_version(self):
+        result = self.admin.persist_workflow(
+            {"id": "wf-1", "name": "Fake Flow v2", "nodes": [],
+             "edges": [], "publish_to_api": False},
+            idempotency_key="k-pw2",
+        )
+        self.assertFalse(result["created"])
+        self.assertEqual(
+            result["rollback_ref"]["kind"], "persist_prior_version"
+        )
+        self.assertEqual(
+            result["rollback_ref"]["prior_version_id"], "ver-1"
+        )
+        self.assertNotEqual(result["version_pin"], "ver-1")
+
+    def test_persist_workflow_replays_without_new_version(self):
+        payload = {"id": "wf-rep", "name": "Replayed", "nodes": [],
+                   "edges": [], "publish_to_api": True}
+        first = self.admin.persist_workflow(
+            payload, idempotency_key="k-pw3",
+        )
+        versions_before = len(
+            FakeAdminGateway.workflows["wf-rep"]["versions"]
+        )
+        replay = self.admin.persist_workflow(
+            payload, idempotency_key="k-pw3",
+        )
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["version_pin"], first["version_pin"])
+        self.assertEqual(
+            len(FakeAdminGateway.workflows["wf-rep"]["versions"]),
+            versions_before,
+        )
+
+    def test_persist_workflow_requires_stable_id(self):
+        with self.assertRaises(CapitolError):
+            self.admin.persist_workflow(
+                {"name": "No Id"}, idempotency_key="k-pw4",
+            )
+
+    def test_delete_workflow_ledgers(self):
+        self.admin.persist_workflow(
+            {"id": "wf-del", "name": "Doomed", "nodes": [], "edges": []},
+            idempotency_key="k-pw5",
+        )
+        result = self.admin.delete_workflow(
+            "wf-del", idempotency_key="k-pw6",
+        )
+        self.assertTrue(result["deleted"])
+        action = self.store.find_action(
+            "capitol-admin:delete_workflow:k-pw6"
+        )
+        self.assertEqual(action["status"], "committed")
 
     # -- schedules ----------------------------------------------------------------
 

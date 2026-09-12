@@ -77,6 +77,8 @@ _ACTION_CLASSES = {
     "revoke_bearer": ActionClass.ACCOUNT_CHANGE,
     "set_workflow_allowlist": ActionClass.ACCOUNT_CHANGE,
     "bind_agent_collections": ActionClass.ACCOUNT_CHANGE,
+    "persist_workflow": ActionClass.PROVISION,
+    "delete_workflow": ActionClass.DELETE,
     "publish_workflow": ActionClass.PUBLISH,
     "rollback_workflow": ActionClass.PROVISION,
     "create_schedule": ActionClass.PROVISION,
@@ -564,7 +566,83 @@ class CapitolAdmin:
             ),
         )
 
-    # -- workflows: publish / versions / rollback -----------------------------------
+    # -- workflows: persist / publish / versions / rollback ---------------------------
+
+    def persist_workflow(self, payload: Dict[str, Any], *,
+                         idempotency_key: str) -> Dict[str, Any]:
+        """Create or update a workflow definition (one new version).
+
+        ``payload`` is a full ``AdvancedWorkflowPayload`` dict carrying its
+        own ``id`` (the caller supplies a stable UUID so create is
+        idempotent across reconciles). The version persisted becomes the
+        pin; the rollback reference is the prior top version when the
+        workflow already existed, else ``delete_workflow`` — undoing a
+        first persist removes the asset.
+        """
+        workflow_id = str((payload or {}).get("id") or "").strip()
+        if not workflow_id:
+            raise CapitolError(
+                "persist_workflow payload requires a stable id"
+            )
+        name = str((payload or {}).get("name") or "")
+
+        def effect() -> Dict[str, Any]:
+            prior_version: Dict[str, Any] = {}
+            existed = False
+            try:
+                prior_version = self._current_version(workflow_id)
+                existed = bool(
+                    prior_version
+                    or (self.get_workflow(workflow_id) or {}).get("workflow")
+                )
+            except CapitolError as exc:
+                # 404 = no such workflow; the access layer answers 403 for
+                # unknown ids too (existence is not revealed). Either way
+                # the POST below is the authoritative act — a genuine
+                # permission problem fails there.
+                if exc.http_status not in (403, 404):
+                    raise
+            persisted = self._request(
+                self.workflow_url,
+                f"/api/v1/orgs/{self.org_id}/workflows",
+                method="POST", body=dict(payload),
+            )
+            new_version = self._current_version(workflow_id)
+            rollback_ref: Dict[str, Any] = (
+                {"kind": "persist_prior_version",
+                 "workflow_id": workflow_id,
+                 "prior_version_id": str(prior_version.get("id") or "")}
+                if existed else
+                {"kind": "delete_workflow", "workflow_id": workflow_id}
+            )
+            return {
+                "workflow_id": str(
+                    (persisted or {}).get("workflow_id") or workflow_id
+                ),
+                "name": name,
+                "created": not existed,
+                "version_pin": str(new_version.get("id") or ""),
+                "version_number": new_version.get("version_number"),
+                "rollback_ref": rollback_ref,
+            }
+        return self._mutation(
+            "persist_workflow", idempotency_key,
+            {"workflow_id": workflow_id, "name": name}, effect,
+        )
+
+    def delete_workflow(self, workflow_id: str, *,
+                        idempotency_key: str) -> Dict[str, Any]:
+        def effect() -> Dict[str, Any]:
+            self._request(
+                self.workflow_url,
+                f"/api/v1/orgs/{self.org_id}/workflows/{workflow_id}",
+                method="DELETE",
+            )
+            return {"workflow_id": workflow_id, "deleted": True}
+        return self._mutation(
+            "delete_workflow", idempotency_key,
+            {"workflow_id": workflow_id}, effect,
+        )
 
     def workflow_versions(self, workflow_id: str) -> List[Dict[str, Any]]:
         payload = self._request(

@@ -97,6 +97,24 @@ class TestSpecNormalization(unittest.TestCase):
         with self.assertRaises(KernelError):
             normalize_spec({"goal": "x", "misfire_policy": "improvise"})
 
+    def test_capitol_bind_scheduled_normalizes_and_gates(self):
+        spec = normalize_spec({
+            "goal": "x",
+            "capitol": {"workflows": ["wf-1"], "bind_scheduled": True},
+        })
+        self.assertTrue(spec["capitol"]["bind_scheduled"])
+        self.assertFalse(spec["capitol"]["allow_start"])
+        # defaults off
+        spec = normalize_spec(
+            {"goal": "x", "capitol": {"workflows": ["wf-1"]}}
+        )
+        self.assertFalse(spec["capitol"]["bind_scheduled"])
+        # discovery without an allowlist is meaningless — fail closed
+        with self.assertRaises(KernelError):
+            normalize_spec(
+                {"goal": "x", "capitol": {"bind_scheduled": True}}
+            )
+
 
 class TestStoreBasics(KernelCase):
     def test_wal_mode_and_single_file_under_state_dir(self):

@@ -562,7 +562,7 @@ def normalize_spec(spec: Dict[str, Any],
     if not isinstance(capitol_raw, dict):
         raise KernelError("mission spec capitol must be a dict")
     capitol_known = {"workflows", "allow_start", "allow_respond",
-                     "max_runs"}
+                     "max_runs", "bind_scheduled"}
     capitol_unknown = set(capitol_raw) - capitol_known
     if capitol_unknown:
         raise KernelError(
@@ -590,10 +590,16 @@ def normalize_spec(spec: Dict[str, Any],
             "allow_start": bool(capitol_raw.get("allow_start", False)),
             "allow_respond": bool(capitol_raw.get("allow_respond", False)),
             "max_runs": max_runs,
+            "bind_scheduled": bool(capitol_raw.get("bind_scheduled", False)),
         }
         if capitol["allow_start"] and not capitol["workflows"]:
             raise KernelError(
                 "capitol.allow_start requires a non-empty "
+                "capitol.workflows allowlist"
+            )
+        if capitol["bind_scheduled"] and not capitol["workflows"]:
+            raise KernelError(
+                "capitol.bind_scheduled requires a non-empty "
                 "capitol.workflows allowlist"
             )
 

@@ -54,6 +54,10 @@ DEFAULT_HITL_TTL_SECONDS = 1800.0
 BACKOFF_BASE_SECONDS = 15.0
 BACKOFF_CAP_SECONDS = 900.0
 
+#: How often one mission's ``bind_scheduled`` discovery lists recent runs
+#: (per-binding supervision still runs every tick).
+DISCOVERY_INTERVAL_SECONDS = 60.0
+
 #: Fallback clarification reply when an operator approves the checkpoint
 #: without supplying text (the workflow regains autonomy instead of
 #: waiting out its server-side timeout).
@@ -120,6 +124,9 @@ class CapitolSupervisor:
         self._runtime: Optional[CapitolRuntime] = None
         self._log = log or (lambda line: None)
         self.clock = clock
+        #: mission_id -> monotonic-ish next discovery time (in-memory: a
+        #: daemon restart simply rediscovers, which binding dedupe absorbs).
+        self._next_discovery: Dict[str, float] = {}
 
     # -- runtime -----------------------------------------------------------
 
@@ -147,8 +154,10 @@ class CapitolSupervisor:
         from ..kernel.model import BindingStatus
 
         stats = {"polled": 0, "events": 0, "hitl": 0, "woken": 0,
-                 "terminal": 0, "degraded": 0, "cancelled": 0}
+                 "terminal": 0, "degraded": 0, "cancelled": 0,
+                 "discovered": 0}
         now = float(self.clock())
+        self._discover_scheduled(stats, now)
         bindings = self.store.find_bindings(
             kind=RUN_BINDING_KIND, statuses=BindingStatus.SUPERVISED
         )
@@ -180,6 +189,116 @@ class CapitolSupervisor:
                 )
                 self._reschedule(binding, BACKOFF_BASE_SECONDS)
         return stats
+
+    # -- scheduled-run discovery ------------------------------------------------
+
+    def _discover_scheduled(self, stats: Dict[str, int],
+                            now: float) -> None:
+        """Bind platform-scheduled runs for missions that opted in.
+
+        A mission whose spec's ``capitol.bind_scheduled`` is true gets its
+        allowlisted workflows' recent runs discovered each interval and
+        bound as ``capitol_run`` bindings — the same bindings mission-
+        started runs get, so the daemon supervises platform-scheduled work
+        with identical cursor/HITL/terminal semantics. Deterministic and
+        bounded: dedupe on run_id against every existing binding, newest
+        runs first, and never more than ``max_runs`` supervised bindings
+        per mission. Discovery failures log and back off; they never
+        abort the tick or touch existing bindings.
+        """
+        from ..kernel.model import BindingStatus, MissionState
+
+        for mission in self.store.list_missions():
+            if mission.get("status") in MissionState.TERMINAL:
+                continue
+            spec = mission.get("spec") or {}
+            envelope = spec.get("capitol") or {}
+            if not envelope.get("bind_scheduled"):
+                continue
+            workflows = [str(w) for w in envelope.get("workflows") or []]
+            if not workflows:
+                continue
+            mission_id = mission["mission_id"]
+            if float(self._next_discovery.get(mission_id, 0)) > now:
+                continue
+            self._next_discovery[mission_id] = (
+                now + DISCOVERY_INTERVAL_SECONDS
+            )
+            policy = evaluate_required_policy("capitol.run.bind", {
+                "mission_id": mission_id,
+                "workflows": workflows,
+            })
+            if not policy.allowed:
+                self._log(
+                    f"capitol discovery denied for {mission_id}: "
+                    f"{policy.reason}"
+                )
+                continue
+            existing = self.store.find_bindings(
+                kind=RUN_BINDING_KIND, mission_id=mission_id
+            )
+            bound_run_ids = {
+                str((binding.get("resource") or {}).get("run_id") or "")
+                for binding in existing
+            }
+            supervised = sum(
+                1 for binding in existing
+                if binding.get("status") in BindingStatus.SUPERVISED
+            )
+            budget = max(
+                0, int(envelope.get("max_runs", 3)) - supervised
+            )
+            if not budget:
+                continue
+            try:
+                runtime = self.runtime()
+                for workflow_id in workflows:
+                    if not budget:
+                        break
+                    listing = runtime.list_runs(workflow_id, limit=10)
+                    for run in (listing or {}).get("runs") or []:
+                        if not budget:
+                            break
+                        run_id = str(
+                            (run or {}).get("run_id")
+                            or (run or {}).get("id") or ""
+                        )
+                        if not run_id or run_id in bound_run_ids:
+                            continue
+                        self.store.record_binding(
+                            mission_id, RUN_BINDING_KIND,
+                            {
+                                "org_id": runtime.org_id,
+                                "agent_id": runtime.agent_id,
+                                "workflow_id": workflow_id,
+                                "run_id": run_id,
+                                "session_id": str(
+                                    run.get("session_id") or ""
+                                ),
+                                "source": "scheduled",
+                                "idempotency_key": "",
+                            },
+                            status=BindingStatus.ACTIVE,
+                        )
+                        bound_run_ids.add(run_id)
+                        budget -= 1
+                        stats["discovered"] += 1
+            except CapitolAuthError as exc:
+                self._invalidate_runtime()
+                self._log(
+                    f"capitol discovery auth failure for {mission_id}: "
+                    f"{_clip(exc, 200)}"
+                )
+            except CapitolError as exc:
+                self._log(
+                    f"capitol discovery failed for {mission_id}: "
+                    f"{_clip(exc, 200)}"
+                )
+            except Exception as exc:  # never break the daemon tick
+                self._log(
+                    f"capitol discovery error for {mission_id}: "
+                    f"{type(exc).__name__}: {_clip(exc, 200)}"
+                )
 
     # -- per-binding supervision ---------------------------------------------
 

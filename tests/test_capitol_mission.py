@@ -24,6 +24,7 @@ from pathlib import Path
 
 from conch.capitol.client import CapitolRuntime
 from conch.capitol.supervisor import (
+    DISCOVERY_INTERVAL_SECONDS,
     CapitolControlClient,
     CapitolSupervisor,
     cancel_idempotency_key,
@@ -99,7 +100,7 @@ class SupervisionCase(unittest.TestCase):
 
     def _mission(self, *, dry_run=False, allow_start=True,
                  allow_respond=False, workflows=("draft-wf",),
-                 max_runs=2, park=True):
+                 max_runs=2, park=True, bind_scheduled=False):
         spec = {
             "goal": "supervise a capitol run",
             "budgets": {"sessions": 5},
@@ -110,6 +111,7 @@ class SupervisionCase(unittest.TestCase):
                 "allow_start": allow_start,
                 "allow_respond": allow_respond,
                 "max_runs": max_runs,
+                "bind_scheduled": bind_scheduled,
             },
         }
         mission_id = self.engine.create_mission(spec, activate=True)
@@ -497,6 +499,91 @@ class SupervisionCase(unittest.TestCase):
         degraded = self.store.get_binding(binding["binding_id"])
         self.assertEqual(degraded["status"], BindingStatus.DEGRADED)
         self.assertTrue(degraded["detail"]["auth_needed"])
+
+    # -- scheduled-run discovery (capitol.bind_scheduled) --------------------
+
+    def _seed_run(self, run_id, status="running"):
+        FakeGateway.runs[run_id] = {"status": status, "output": {}}
+        FakeGateway.run_events[run_id] = []
+
+    def test_bind_scheduled_discovers_dedupes_and_caps(self):
+        mission_id = self._mission(
+            allow_start=False, bind_scheduled=True, max_runs=2,
+        )
+        self._seed_run("sched-a")
+        self._seed_run("sched-b")
+        self._seed_run("sched-c")
+        stats = self.supervisor.tick()
+        self.assertEqual(stats["discovered"], 2, "max_runs caps discovery")
+        bindings = self.store.find_bindings(
+            kind="capitol_run", mission_id=mission_id
+        )
+        self.assertEqual(len(bindings), 2)
+        for binding in bindings:
+            self.assertEqual(binding["resource"]["source"], "scheduled")
+            self.assertEqual(
+                binding["resource"]["workflow_id"], "draft-wf"
+            )
+        # within the discovery interval nothing re-lists
+        stats = self.supervisor.tick()
+        self.assertEqual(stats["discovered"], 0)
+        # past the interval: still capped, and never a duplicate binding
+        self.now[0] += DISCOVERY_INTERVAL_SECONDS + 1
+        stats = self.supervisor.tick()
+        self.assertEqual(stats["discovered"], 0)
+        bound_ids = sorted(
+            binding["resource"]["run_id"]
+            for binding in self.store.find_bindings(
+                kind="capitol_run", mission_id=mission_id
+            )
+        )
+        self.assertEqual(len(bound_ids), 2)
+        self.assertEqual(len(set(bound_ids)), 2)
+        # a supervised run reaching terminal frees discovery budget
+        finished = bound_ids[0]
+        FakeGateway.runs[finished]["status"] = "success"
+        self.now[0] += DISCOVERY_INTERVAL_SECONDS + 1
+        self.supervisor.tick()   # completes the finished binding
+        self.now[0] += DISCOVERY_INTERVAL_SECONDS + 1
+        stats = self.supervisor.tick()
+        self.assertEqual(stats["discovered"], 1)
+        all_ids = {
+            binding["resource"]["run_id"]
+            for binding in self.store.find_bindings(
+                kind="capitol_run", mission_id=mission_id
+            )
+        }
+        self.assertEqual(all_ids, {"sched-a", "sched-b", "sched-c"})
+        ok, detail = self.store.replay_matches_live()
+        self.assertTrue(ok, detail)
+
+    def test_discovery_requires_opt_in(self):
+        self._mission(allow_start=False, bind_scheduled=False)
+        self._seed_run("sched-x")
+        stats = self.supervisor.tick()
+        self.assertEqual(stats["discovered"], 0)
+        self.assertEqual(
+            self.store.find_bindings(kind="capitol_run"), []
+        )
+
+    def test_discovery_respects_required_policy(self):
+        register_required_policy(
+            "test-bind-deny",
+            lambda event, payload: event != "capitol.run.bind",
+        )
+        self.addCleanup(unregister_required_policy, "test-bind-deny")
+        mission_id = self._mission(
+            allow_start=False, bind_scheduled=True,
+        )
+        self._seed_run("sched-veto")
+        stats = self.supervisor.tick()
+        self.assertEqual(stats["discovered"], 0)
+        self.assertEqual(
+            self.store.find_bindings(
+                kind="capitol_run", mission_id=mission_id
+            ),
+            [],
+        )
 
 
 class DaemonWiringTests(unittest.TestCase):

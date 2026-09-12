@@ -4,12 +4,20 @@ Wire contract (mirrors the A2Actrl reference client and the a2a-client
 skill, targeting gateway wire schema 1.0.x):
 
 - ``GET  {base}/a2a/{org}/{agent}/.well-known/agent-card.json`` — discovery
+- ``GET  {base}/a2a/{org}/agents`` — the org's A2A agent directory
 - ``POST {base}/a2a/{org}/{agent}`` — JSON-RPC 2.0, methods ``SendMessage``
   and ``SendStreamingMessage`` (SSE); every skill is multiplexed through
   ``params.message.parts[0].data.skill_id``
 - ``GET  {base}/a2a/{org}/{agent}/files/{id}/download-url`` — click-time
   presigned download resolution (the oversight-app pattern; used for
   future label PDFs)
+
+Capability gating (Phase 3): the AgentCard's ``skills`` catalog and
+``capabilities`` flags gate every Phase 3 surface through
+:meth:`CapitolRuntime.ensure_skill` — an unknown or missing capability
+raises :class:`CapitolCapabilityError` before any wire call. ``watch_run``
+degrades from SSE to the resumable polling loop when streaming is not
+advertised.
 
 Fail-closed posture:
 
@@ -43,7 +51,13 @@ import urllib.error
 import urllib.request
 
 from .credentials import redact_text
-from .errors import CapitolAuthError, CapitolError, CapitolProtocolError, parse_error_info
+from .errors import (
+    CapitolAuthError,
+    CapitolCapabilityError,
+    CapitolError,
+    CapitolProtocolError,
+    parse_error_info,
+)
 
 A2A_VERSION = "1.0"
 SUPPORTED_WIRE_PREFIX = "1.0"
@@ -457,6 +471,75 @@ class CapitolRuntime:
         self._card = card
         return card
 
+    # -- capability gating ----------------------------------------------------
+    #
+    # Phase 3 surfaces are gated on what the AgentCard advertises. The card
+    # self-describes its skill catalog (``skills[].id``) and capability
+    # flags (``capabilities.streaming`` / ``pushNotifications``); a feature
+    # whose skill is absent fails closed with a clear error *before* any
+    # wire call. The Milestone-1 pilot paths (``call_skill`` and the
+    # methods it backs) keep their permissive behavior — the gateway
+    # already answers unknown skills with typed task failures — so the
+    # live-proven /ebay and channel flows cannot regress; every surface
+    # added in Phase 3 gates explicitly through :meth:`ensure_skill`.
+
+    def skill_ids(self) -> frozenset:
+        """Skill ids advertised by the (cached) AgentCard."""
+        card = self.discover()
+        skills = card.get("skills")
+        if not isinstance(skills, list):
+            return frozenset()
+        found = set()
+        for skill in skills:
+            if isinstance(skill, dict) and skill.get("id"):
+                found.add(str(skill["id"]))
+        return frozenset(found)
+
+    def capability_flags(self) -> Dict[str, Any]:
+        """Normalized card capability flags (camelCase and snake_case)."""
+        card = self.discover()
+        raw = card.get("capabilities")
+        raw = raw if isinstance(raw, dict) else {}
+        flags: Dict[str, Any] = {}
+        for key, aliases in (
+            ("streaming", ("streaming",)),
+            ("push_notifications", ("pushNotifications",
+                                    "push_notifications")),
+        ):
+            for alias in aliases:
+                if alias in raw:
+                    flags[key] = raw[alias]
+                    break
+        return flags
+
+    def streaming_advertised(self) -> Optional[bool]:
+        value = self.capability_flags().get("streaming")
+        return value if isinstance(value, bool) else None
+
+    def ensure_skill(self, skill_id: str, feature: str = "") -> None:
+        """Fail closed unless the card advertises *skill_id*.
+
+        A card without any skill catalog cannot vouch for the feature, so
+        that is refused too (unknown capability == missing capability).
+        """
+        advertised = self.skill_ids()
+        if not advertised:
+            raise self._fail(
+                f"agent card for {self.agent_id} advertises no skill "
+                f"catalog — cannot verify {skill_id!r}"
+                f"{' (needed by ' + feature + ')' if feature else ''}; "
+                "failing closed",
+                CapitolCapabilityError,
+            )
+        if skill_id not in advertised:
+            raise self._fail(
+                f"agent card for {self.agent_id} does not advertise the "
+                f"{skill_id!r} skill"
+                f"{' (needed by ' + feature + ')' if feature else ''} — "
+                f"{len(advertised)} skills advertised; failing closed",
+                CapitolCapabilityError,
+            )
+
     def handshake(self) -> str:
         """Open a session; thread the returned ``context_id`` everywhere."""
         payload = self.call(
@@ -478,6 +561,27 @@ class CapitolRuntime:
         self.context_id = context_id
         return context_id
 
+    # -- org directory ---------------------------------------------------------
+
+    def list_org_agents(self) -> List[Dict[str, Any]]:
+        """``GET /a2a/{org}/agents`` — the org's A2A agent directory.
+
+        The bearer only needs to resolve to *some* agent in the org.
+        Returns the ``agents`` rows (``agent_id``, ``name``,
+        ``description``, ``card_url``, ``rpc_url``, ``workflow_ids``,
+        ``exposed_via_a2a``); use it instead of a hand-curated registry.
+        """
+        raw = self._request(f"{self.base_url}/a2a/{self.org_id}/agents")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise self._fail(
+                f"org agent directory returned a non-JSON body: {exc}",
+                CapitolProtocolError,
+            ) from None
+        agents = (payload or {}).get("agents")
+        return agents if isinstance(agents, list) else []
+
     # -- workflows ------------------------------------------------------------
 
     def list_workflows(self) -> List[Dict[str, Any]]:
@@ -487,6 +591,42 @@ class CapitolRuntime:
 
     def describe_workflow(self, workflow_id: str) -> Dict[str, Any]:
         return self.call("get_workflow_details", {"workflow_id": workflow_id})
+
+    def suggest_workflows(
+        self, goal: str, *, max_suggestions: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Rank the agent's workflows against a free-form goal
+        (``suggest_workflow``). Returns suggestion rows
+        (``workflow_id``, ``name``, ``confidence``, ``reason``);
+        accepts the legacy ``candidates`` key as well.
+        """
+        self.ensure_skill("suggest_workflow", "suggest_workflows")
+        payload = self.call("suggest_workflow", {
+            "description": str(goal),
+            "max_suggestions": int(max_suggestions),
+        })
+        for key in ("suggestions", "candidates"):
+            rows = (payload or {}).get(key)
+            if isinstance(rows, list):
+                return rows
+        return []
+
+    def workflow_versions(self, workflow_id: str) -> Dict[str, Any]:
+        """Version history for a workflow (``get_workflow_versions``)."""
+        self.ensure_skill("get_workflow_versions", "workflow_versions")
+        return self.call("get_workflow_versions",
+                         {"workflow_id": workflow_id})
+
+    def workflow_stats(
+        self, workflow_id: str, *, days: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Aggregate run statistics (``get_workflow_stats``): run_count,
+        success_rate, duration percentiles, per-status breakdown."""
+        self.ensure_skill("get_workflow_stats", "workflow_stats")
+        data: Dict[str, Any] = {"workflow_id": workflow_id}
+        if days is not None:
+            data["days"] = int(days)
+        return self.call("get_workflow_stats", data)
 
     def call_workflow(
         self,
@@ -546,9 +686,12 @@ class CapitolRuntime:
         workflow_id: str,
         *,
         limit: int = 20,
+        offset: int = 0,
         status_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         data: Dict[str, Any] = {"workflow_id": workflow_id, "limit": limit}
+        if offset:
+            data["offset"] = int(offset)
         if status_filter:
             data["status_filter"] = status_filter
         return self.call("list_workflow_runs", data)
@@ -572,6 +715,28 @@ class CapitolRuntime:
 
     def workflow_output(self, run_id: str) -> Dict[str, Any]:
         return self.call("get_workflow_output", {"run_id": run_id})
+
+    def eval_report(self, run_id: str) -> Dict[str, Any]:
+        """Suite-level eval roll-up for a run — the ``eval_rollup``
+        section of ``get_workflow_output`` (mirrors the reference
+        client's ``get_eval_report``). A run without Evaluations nodes
+        returns ``has_evals=False`` with zeroed counts, so callers can
+        gate promotion decisions on one uniform shape.
+        """
+        self.ensure_skill("get_workflow_output", "eval_report")
+        output = self.workflow_output(run_id)
+        rollup = (output or {}).get("eval_rollup")
+        if isinstance(rollup, dict) and rollup:
+            return rollup
+        return {
+            "has_evals": False,
+            "summary": {
+                "total": 0, "passed": 0, "failed": 0, "na": 0,
+                "errors": 0, "success_rate": 0.0, "suite_passed": False,
+            },
+            "evals": [],
+            "eval_nodes": [],
+        }
 
     # -- HITL -----------------------------------------------------------------
 
@@ -614,6 +779,24 @@ class CapitolRuntime:
         if reason:
             data["reason"] = reason
         return self.call("pause_workflow", data)
+
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        payload: Optional[Any] = None,
+        edited_node_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Resume a paused run (``resume_workflow``). ``payload`` rides the
+        Temporal resume signal; ``edited_node_ids`` invalidates cached
+        node results on resume."""
+        self.ensure_skill("resume_workflow", "resume_run")
+        data: Dict[str, Any] = {"run_id": run_id}
+        if payload is not None:
+            data["payload"] = payload
+        if edited_node_ids:
+            data["edited_node_ids"] = list(edited_node_ids)
+        return self.call("resume_workflow", data)
 
     def stop_run(self, run_id: str, reason: str = "") -> Dict[str, Any]:
         data: Dict[str, Any] = {"run_id": run_id}
@@ -720,7 +903,28 @@ class CapitolRuntime:
         reconciled against ``get_workflow_status`` and never surfaced as
         a run verdict. The reconnect budget applies to *consecutive*
         failures; any delivered event resets it.
+
+        Capability-gated: streams only when the card advertises
+        ``subscribe_workflow_events`` (and ``capabilities.streaming`` is
+        not explicitly false); otherwise it degrades to the resumable
+        ``get_workflow_events`` polling loop — same yielded shapes, same
+        cursor semantics.
         """
+        stream_capable = True
+        try:
+            self.ensure_skill("subscribe_workflow_events", "watch_run")
+            if self.streaming_advertised() is False:
+                stream_capable = False
+        except CapitolCapabilityError:
+            stream_capable = False
+        if not stream_capable:
+            self.ensure_skill("get_workflow_events", "watch_run (polling)")
+            for event in self.poll_run(
+                run_id, since_sequence=since_sequence, types=types,
+                _sleep=_sleep,
+            ):
+                yield event
+            return
         last_seen = max(0, int(since_sequence) - 1)
         failures = 0
         while True:
@@ -803,6 +1007,60 @@ class CapitolRuntime:
                     category="transport",
                 )
             _sleep(reconnect_delay * failures)
+
+    def poll_run(
+        self,
+        run_id: str,
+        *,
+        since_sequence: int = 0,
+        types: Optional[List[str]] = None,
+        poll_seconds: float = 2.0,
+        max_polls: int = 0,
+        _sleep=time.sleep,
+    ) -> Iterator[Dict[str, Any]]:
+        """Resumable ``get_workflow_events`` polling loop — the
+        non-streaming twin of :meth:`watch_run`, yielding identical
+        shapes: WorkflowEvent dicts then one ``_final_status`` frame.
+
+        ``max_polls`` bounds the loop for tests/supervisors (0 = until
+        terminal). The cursor is ``since_sequence``-driven, so a caller
+        can stop, persist ``sequence``, and resume without loss.
+        """
+        last_seen = max(0, int(since_sequence) - 1)
+        polls = 0
+        while True:
+            payload = self.run_events(
+                run_id, since_sequence=last_seen + 1, types=types
+            )
+            events = (payload or {}).get("events")
+            terminal_event = False
+            for event in events if isinstance(events, list) else []:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event_type") == KEEPALIVE_EVENT:
+                    continue
+                sequence = event.get("sequence")
+                if isinstance(sequence, (int, float)):
+                    if int(sequence) <= last_seen:
+                        continue  # server re-sent below the cursor
+                    last_seen = int(sequence)
+                if event.get("event_type") in TERMINAL_EVENT_TYPES:
+                    terminal_event = True
+                yield event
+            status_payload = self.run_status(run_id)
+            run_state = str((status_payload or {}).get("status") or "").lower()
+            if run_state in TERMINAL_RUN_STATUSES or terminal_event:
+                yield {
+                    "event_type": FINAL_STATUS_EVENT,
+                    "scope": "workflow",
+                    "data": {"state": run_state or "unknown",
+                             "reconciled": True, "polled": True},
+                }
+                return
+            polls += 1
+            if max_polls and polls >= max_polls:
+                return
+            _sleep(poll_seconds)
 
     # -- files / artifacts ----------------------------------------------------
 

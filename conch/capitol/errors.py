@@ -55,6 +55,16 @@ class CapitolProtocolError(CapitolError):
     """Unknown wire version or malformed envelope — always fail closed."""
 
 
+class CapitolCapabilityError(CapitolError):
+    """The AgentCard does not advertise the capability a feature needs.
+
+    Raised *before* any wire call is attempted: Phase 3 surfaces are gated
+    on the card's self-described skill catalog and capability flags, and an
+    unknown or missing capability fails closed with the skill named — a
+    refused feature must never be mistaken for a gateway error.
+    """
+
+
 def parse_error_info(error: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a JSON-RPC ``error`` object's ErrorInfo metadata.
 

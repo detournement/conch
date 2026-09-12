@@ -38,6 +38,7 @@ from conch.capitol.credentials import (
 )
 from conch.capitol.errors import (
     CapitolAuthError,
+    CapitolCapabilityError,
     CapitolError,
     CapitolProtocolError,
     parse_error_info,
@@ -46,6 +47,18 @@ from conch.capitol.errors import (
 ORG = "org-0000"
 AGENT = "agent-0000"
 BEARER = "cap_a2a_TESTTOKENxx0123456789abcdef"
+
+#: The default fake card mirrors the live eBay Sales Operator catalog
+#: (gateway 1.0.27): every skill the Phase 3 surfaces gate on.
+CARD_SKILLS = [
+    "handshake", "chat", "call_workflow", "list_workflows",
+    "get_workflow_details", "get_workflow_status", "get_workflow_events",
+    "get_workflow_output", "get_workflow_stats", "get_workflow_versions",
+    "list_workflow_runs", "suggest_workflow", "subscribe_workflow_events",
+    "pause_workflow", "resume_workflow", "stop_workflow",
+    "submit_intervention_response", "submit_clarification_response",
+    "request_upload_url", "upload_file", "download_file",
+]
 
 
 def _task(payload):
@@ -78,7 +91,8 @@ class FakeGateway(BaseHTTPRequestHandler):
         cls.card = {
             "name": "Fake eBay Sales Operator",
             "wireSchemaVersion": "1.0.11",
-            "skills": [{"id": "handshake"}, {"id": "call_workflow"}],
+            "capabilities": {"streaming": True, "pushNotifications": False},
+            "skills": [{"id": skill} for skill in CARD_SKILLS],
         }
         cls.calls = []
         cls.runs = {}
@@ -91,6 +105,12 @@ class FakeGateway(BaseHTTPRequestHandler):
         cls.error_script = None
         cls.chat_script = None
         cls.run_counter = 0
+        cls.run_events = {}   # run_id -> [event, ...] for get_workflow_events
+        cls.org_agents = [{
+            "agent_id": AGENT, "name": "Fake eBay Sales Operator",
+            "description": "fake", "exposed_via_a2a": True,
+            "workflow_ids": ["draft-wf", "publish-wf"],
+        }]
         cls.port = port
 
     def log_message(self, *_args):
@@ -118,6 +138,15 @@ class FakeGateway(BaseHTTPRequestHandler):
                 self._json({"detail": "Bearer token not recognized"}, 401)
                 return
             self._json(cls.card)
+            return
+        if self.path.rstrip("/").endswith(f"/a2a/{ORG}/agents"):
+            if not self._authorized():
+                self._json({"detail": "Bearer token not recognized"}, 401)
+                return
+            self._json({
+                "org_id": ORG, "count": len(cls.org_agents),
+                "agents": cls.org_agents,
+            })
             return
         if "/files/" in self.path and self.path.endswith("/download-url"):
             if not self._authorized():
@@ -252,7 +281,38 @@ class FakeGateway(BaseHTTPRequestHandler):
             run = cls.runs.get(data.get("run_id")) or {}
             return run.get("output", {})
         if skill == "get_workflow_events":
-            return {"events": []}
+            since = int(data.get("since_sequence") or 0)
+            events = [
+                event
+                for event in cls.run_events.get(data.get("run_id"), [])
+                if int(event.get("sequence") or 0) >= since
+            ]
+            return {"events": events}
+        if skill == "suggest_workflow":
+            return {"suggestions": [{
+                "workflow_id": "draft-wf",
+                "name": "Draft or Revise Listing",
+                "confidence": 0.9,
+                "reason": f"matches: {data.get('description', '')[:40]}",
+            }][:int(data.get("max_suggestions") or 3)]}
+        if skill == "get_workflow_versions":
+            return {"workflow_id": data.get("workflow_id"), "versions": [
+                {"version_id": "v2", "version": 2, "current": True},
+                {"version_id": "v1", "version": 1, "current": False},
+            ]}
+        if skill == "get_workflow_stats":
+            return {"workflow_id": data.get("workflow_id"),
+                    "run_count": 4, "success_rate": 0.75,
+                    "days": data.get("days"),
+                    "by_status": {"success": 3, "failed": 1}}
+        if skill == "resume_workflow":
+            run = cls.runs.setdefault(
+                data.get("run_id"), {"status": "running", "output": {}}
+            )
+            run["status"] = "running"
+            run["resume_payload"] = data.get("payload")
+            return {"ok": True, "run_id": data.get("run_id"),
+                    "status": "running"}
         if skill in ("submit_intervention_response",
                      "submit_clarification_response"):
             return {"delivered": True, "request_id": data.get("request_id")}
@@ -629,6 +689,145 @@ class CapitolClientTests(unittest.TestCase):
             "artifacts": [{"parts": [{"data": {"x": 2}}]}],
         }
         self.assertEqual(extract_payload(task), {"x": 1})
+
+    # -- Phase 3: capability gating ----------------------------------------
+
+    def test_capability_report_parses_card(self):
+        self.assertIn("suggest_workflow", self.runtime.skill_ids())
+        self.assertIs(self.runtime.streaming_advertised(), True)
+        flags = self.runtime.capability_flags()
+        self.assertIs(flags["push_notifications"], False)
+
+    def test_unknown_capability_fails_closed_before_wire(self):
+        FakeGateway.card = dict(
+            FakeGateway.card,
+            skills=[{"id": "handshake"}, {"id": "call_workflow"}],
+        )
+        calls_before = len(FakeGateway.calls)
+        with self.assertRaises(CapitolCapabilityError) as raised:
+            self.runtime.suggest_workflows("sell a lamp")
+        self.assertIn("suggest_workflow", str(raised.exception))
+        self.assertIn("failing closed", str(raised.exception))
+        # the gate refused before any JSON-RPC call went out
+        self.assertEqual(len(FakeGateway.calls), calls_before)
+
+    def test_missing_skill_catalog_fails_closed(self):
+        FakeGateway.card = {
+            "name": "No Catalog", "wireSchemaVersion": "1.0.11",
+        }
+        with self.assertRaises(CapitolCapabilityError):
+            self.runtime.workflow_versions("draft-wf")
+
+    def test_capability_error_is_a_capitol_error(self):
+        self.assertTrue(issubclass(CapitolCapabilityError, CapitolError))
+
+    # -- Phase 3: org directory / catalog / stats / versions ----------------
+
+    def test_list_org_agents_directory(self):
+        agents = self.runtime.list_org_agents()
+        self.assertEqual(agents[0]["agent_id"], AGENT)
+        self.assertEqual(agents[0]["workflow_ids"],
+                         ["draft-wf", "publish-wf"])
+
+    def test_suggest_workflows_wire_shape(self):
+        rows = self.runtime.suggest_workflows(
+            "draft a listing", max_suggestions=2
+        )
+        self.assertEqual(rows[0]["workflow_id"], "draft-wf")
+        skill, data, _env = FakeGateway.calls[-1]
+        self.assertEqual(skill, "suggest_workflow")
+        self.assertEqual(data, {
+            "description": "draft a listing", "max_suggestions": 2,
+        })
+
+    def test_workflow_versions_and_stats(self):
+        versions = self.runtime.workflow_versions("draft-wf")
+        self.assertEqual(versions["versions"][0]["version_id"], "v2")
+        stats = self.runtime.workflow_stats("draft-wf", days=7)
+        self.assertEqual(stats["run_count"], 4)
+        skill, data, _env = FakeGateway.calls[-1]
+        self.assertEqual(skill, "get_workflow_stats")
+        self.assertEqual(data, {"workflow_id": "draft-wf", "days": 7})
+
+    def test_resume_run_wire_shape(self):
+        FakeGateway.runs["run-p"] = {"status": "paused", "output": {}}
+        result = self.runtime.resume_run(
+            "run-p", payload={"go": True}, edited_node_ids=["n1"]
+        )
+        self.assertTrue(result["ok"])
+        skill, data, _env = FakeGateway.calls[-1]
+        self.assertEqual(skill, "resume_workflow")
+        self.assertEqual(data, {
+            "run_id": "run-p", "payload": {"go": True},
+            "edited_node_ids": ["n1"],
+        })
+
+    # -- Phase 3: eval roll-ups ---------------------------------------------
+
+    def test_eval_report_extracts_rollup(self):
+        FakeGateway.runs["run-e"] = {"status": "success", "output": {
+            "eval_rollup": {
+                "has_evals": True,
+                "summary": {"total": 2, "passed": 2, "failed": 0,
+                            "na": 0, "errors": 0, "success_rate": 1.0,
+                            "suite_passed": True},
+                "evals": [{"eval_id": "e1", "passed": True}],
+                "eval_nodes": [],
+            },
+        }}
+        report = self.runtime.eval_report("run-e")
+        self.assertTrue(report["has_evals"])
+        self.assertTrue(report["summary"]["suite_passed"])
+
+    def test_eval_report_zeroed_when_absent(self):
+        FakeGateway.runs["run-n"] = {"status": "success", "output": {}}
+        report = self.runtime.eval_report("run-n")
+        self.assertFalse(report["has_evals"])
+        self.assertEqual(report["summary"]["total"], 0)
+        self.assertFalse(report["summary"]["suite_passed"])
+
+    # -- Phase 3: polling fallback -------------------------------------------
+
+    def test_watch_run_falls_back_to_polling_without_streaming(self):
+        FakeGateway.card = dict(
+            FakeGateway.card,
+            capabilities={"streaming": False},
+        )
+        run_id = "run-poll"
+        FakeGateway.runs[run_id] = {"status": "success", "output": {}}
+        FakeGateway.run_events[run_id] = [_event(1), _event(2)]
+        events = list(self.runtime.watch_run(
+            run_id, _sleep=lambda _s: None
+        ))
+        sequences = [
+            event["sequence"] for event in events
+            if event.get("event_type") == "node.node_started"
+        ]
+        self.assertEqual(sequences, [1, 2])
+        self.assertEqual(events[-1]["event_type"], "_final_status")
+        self.assertTrue(events[-1]["data"].get("polled"))
+        # no SSE request was made
+        self.assertEqual(FakeGateway.stream_requests, [])
+
+    def test_poll_run_resumes_from_cursor(self):
+        run_id = "run-poll2"
+        FakeGateway.runs[run_id] = {"status": "running", "output": {}}
+        FakeGateway.run_events[run_id] = [_event(1), _event(2), _event(3)]
+        first = list(self.runtime.poll_run(
+            run_id, max_polls=1, _sleep=lambda _s: None
+        ))
+        self.assertEqual([e["sequence"] for e in first], [1, 2, 3])
+        FakeGateway.run_events[run_id].append(_event(4))
+        FakeGateway.runs[run_id]["status"] = "success"
+        resumed = list(self.runtime.poll_run(
+            run_id, since_sequence=4, _sleep=lambda _s: None
+        ))
+        sequences = [
+            event["sequence"] for event in resumed
+            if event.get("event_type") == "node.node_started"
+        ]
+        self.assertEqual(sequences, [4])  # no replay below the cursor
+        self.assertEqual(resumed[-1]["event_type"], "_final_status")
 
 
 class CredentialTests(unittest.TestCase):

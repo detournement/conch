@@ -49,13 +49,21 @@ ENV_CONFIG_KEYS = {
     "CONCH_PERMISSION_MODE": "permission_mode",
     "CONCH_TOOL_PROFILE": "tool_profile",
     "CONCH_SSH_CONTROL_PERSIST": "ssh_control_persist",
-    # Capitol A2A adapter (Swarm Phase 3 seed). The bearer itself is never
-    # a config value: capitol_bearer_env names the environment variable it
+    # Capitol A2A adapter (Swarm Phase 3). The bearer itself is never a
+    # config value: capitol_bearer_env names the environment variable it
     # is read from (or the ~/.capitol-a2a registry supplies it).
     "CONCH_CAPITOL_BASE_URL": "capitol_base_url",
     "CONCH_CAPITOL_ORG": "capitol_org",
     "CONCH_CAPITOL_AGENT": "capitol_agent",
     "CONCH_CAPITOL_BEARER_ENV": "capitol_bearer_env",
+    # Daemon-tick Capitol supervision cadence (seconds between poll passes).
+    "CONCH_CAPITOL_POLL_SECONDS": "capitol_poll_seconds",
+    # CapitolAdmin (builder profile, bounded production). Default off; the
+    # admin token is resolved from the env var named here (or the
+    # ~/.capitol-a2a registry's x_user_token), never stored.
+    "CONCH_CAPITOL_ADMIN": "capitol_admin",
+    "CONCH_CAPITOL_PLATFORM_URL": "capitol_platform_url",
+    "CONCH_CAPITOL_ADMIN_TOKEN_ENV": "capitol_admin_token_env",
     # Edge daemon / mission kernel (Swarm Phase 1). Off by default: the
     # interactive shell keeps its in-process scheduler and never imports
     # the kernel unless this is enabled.

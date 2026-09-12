@@ -767,6 +767,101 @@ class TestHostctlIsStandalone(unittest.TestCase):
             self.assertTrue(result["ok"])
 
 
+def _docker_image_id(tag):
+    proc = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    return proc.stdout.decode().strip() if proc.returncode == 0 else ""
+
+
+@unittest.skipUnless(
+    os.environ.get("CONCH_FLEET_DOCKER_DRILL") == "1"
+    and shutil.which("docker")
+    and _docker_image_id("conch-worker:rollback-v1")
+    and _docker_image_id("conch-worker:rollback-v2"),
+    "docker drill opt-in (set CONCH_FLEET_DOCKER_DRILL=1 and build "
+    "conch-worker:rollback-v1/v2)",
+)
+class TestDockerProfileRollbackDrill(HostctlCase):
+    """Live rollback drill under the docker runtime profile (Docker
+    Desktop). CI-skipped: opt in with CONCH_FLEET_DOCKER_DRILL=1 after
+    building the two worker images. The process-profile drill in
+    TestProcessProfileLifecycle always runs."""
+
+    def _put_signed(self, key, main_py, worker="drillw"):
+        from conch.fleet.artifacts import (
+            build_worker_artifact,
+            sign_manifest,
+            write_manifest,
+        )
+
+        art = self.root / f"{main_py[:4]}.pyz"
+        manifest = build_worker_artifact(art, packages=("conch",),
+                                         main_py=main_py)
+        manifest_path = write_manifest(art, manifest)
+        sig = sign_manifest(manifest_path, key)
+        digests = {}
+        for label, path in (("artifact", art), ("manifest", manifest_path),
+                            ("signature", sig)):
+            digest = sha256_file(path)
+            digests[label] = digest
+            hostctl_json(["artifact-put", "--digest", digest], self.home,
+                         path.read_bytes())
+        return digests
+
+    def test_docker_rollback_restores_previous_image(self):
+        from conch.fleet.artifacts import (
+            allowed_signers_line,
+            generate_signing_key,
+        )
+
+        key, pub = generate_signing_key(self.root / "keys")
+        hostctl_json(["trust-install", "--op-id", "t1"], self.home,
+                     allowed_signers_line("drill@fleet", pub).encode())
+        id1 = _docker_image_id("conch-worker:rollback-v1")
+        id2 = _docker_image_id("conch-worker:rollback-v2")
+        d1 = self._put_signed(key, "print('v1')\n")
+        hostctl_json(["deploy", "--worker", "drillw", "--op-id", "d1",
+                      "--artifact-digest", d1["artifact"],
+                      "--manifest-digest", d1["manifest"],
+                      "--signature-digest", d1["signature"],
+                      "--profile", "docker", "--image-id", id1], self.home)
+        hostctl_json(["activate", "--worker", "drillw", "--op-id", "a1",
+                      "--digest", d1["artifact"]], self.home)
+        started = hostctl_json(
+            ["worker-start", "--worker", "drillw", "--profile", "docker"],
+            self.home,
+        )
+        self.addCleanup(lambda: subprocess.run(
+            ["docker", "rm", "-f", "conch-worker-drillw"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        self.assertEqual(started["image_id"], id1)
+        time.sleep(3)
+        status = hostctl_json(["worker-status", "--worker", "drillw"],
+                              self.home)
+        self.assertTrue(status["running"])
+        d2 = self._put_signed(key, "print('v2')\n")
+        hostctl_json(["deploy", "--worker", "drillw", "--op-id", "d2",
+                      "--artifact-digest", d2["artifact"],
+                      "--manifest-digest", d2["manifest"],
+                      "--signature-digest", d2["signature"],
+                      "--profile", "docker", "--image-id", id2], self.home)
+        hostctl_json(["activate", "--worker", "drillw", "--op-id", "a2",
+                      "--digest", d2["artifact"]], self.home)
+        rb = hostctl_json(["rollback", "--worker", "drillw", "--op-id",
+                           "rb1"], self.home)
+        self.assertTrue(rb["restarted"])
+        time.sleep(2)
+        running = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Image}}",
+             "conch-worker-drillw"],
+            stdout=subprocess.PIPE,
+        ).stdout.decode().strip()
+        self.assertEqual(running, id1, "rollback did not restore v1 image")
+
+
 class TestHostctlInProcess(HostctlCase):
     """The console-script surface stays wired to the same module."""
 

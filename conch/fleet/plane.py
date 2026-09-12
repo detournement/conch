@@ -582,6 +582,7 @@ class TaskPlane:
                 result=receipt.get("payload") or {},
                 reason="worker success",
             )
+            self._record_side_effect(dispatch)
             stats["completed"] += 1
         elif outcome == "cancelled":
             self.store.transition_dispatch(
@@ -589,6 +590,42 @@ class TaskPlane:
             )
         else:
             self._handle_failure(dispatch, receipt, stats)
+
+    #: Action classes that constitute an external side effect the ledger
+    #: must record effectively-once (task-local writes are excluded).
+    _SIDE_EFFECTING = frozenset({
+        ActionClass.COMMUNICATE, ActionClass.PUBLISH, ActionClass.PURCHASE,
+        ActionClass.ACCOUNT_CHANGE, ActionClass.DELETE,
+        ActionClass.PROVISION,
+    })
+
+    def _record_side_effect(self, dispatch: Dict[str, Any]) -> None:
+        """Record a completed side-effecting dispatch in the kernel's
+        external-action ledger, keyed by the envelope idempotency key.
+
+        Idempotent by construction: redelivery (a re-polled completion)
+        finds the existing ledger row and does not double-effect — the
+        non-negotiable effectively-once property, on the controller where
+        mission truth lives, not on the replaceable worker.
+        """
+        envelope = dispatch["envelope"]
+        classes = [
+            c for c in envelope.get("action_classes", [])
+            if c in self._SIDE_EFFECTING
+        ]
+        if not classes:
+            return
+        try:
+            self.store.record_action(
+                envelope["mission_id"],
+                classes[0],
+                idempotency_key=envelope["idempotency_key"],
+                task_id=dispatch["task_id"],
+                detail={"dispatch": dispatch["task_id"],
+                        "action_classes": classes},
+            )
+        except KernelError as exc:
+            self._log(f"ledger record for {dispatch['task_id']} failed: {exc}")
 
     def _handle_failure(self, dispatch: Dict[str, Any],
                         receipt: Dict[str, Any],

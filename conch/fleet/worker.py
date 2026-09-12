@@ -808,7 +808,13 @@ class WorkerSupervisor:
             pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(path))
-        os.chmod(path, 0o600)
+        # The 0700 run directory is the authorization boundary; some
+        # filesystems (e.g. Docker Desktop bind mounts) reject chmod on a
+        # socket, so tightening the socket itself is best-effort.
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         server.listen(8)
         server.settimeout(0.5)
         self._server = server

@@ -648,10 +648,12 @@ class MissionEngine:
             value = usage.get(key)
             if isinstance(value, int) and value >= 0:
                 return value
-        prompt = usage.get("prompt_tokens")
-        completion = usage.get("completion_tokens")
+        # chat_turn reports input_tokens/output_tokens; some providers use
+        # prompt/completion naming.
         total = 0
-        for value in (prompt, completion):
+        for key in ("input_tokens", "output_tokens", "prompt_tokens",
+                    "completion_tokens"):
+            value = usage.get(key)
             if isinstance(value, int) and value > 0:
                 total += value
         return total

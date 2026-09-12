@@ -402,6 +402,19 @@ class TestBudgetEnforcement(EngineCase):
         status = self.store.budget_status(mission["root_scope_id"])
         self.assertLessEqual(status["tokens"]["committed"], 5000)
 
+    def test_chat_turn_usage_shape_is_counted(self):
+        """chat_turn reports input_tokens/output_tokens — the engine must
+        commit real usage from that shape, not zero."""
+        factory = ScriptedFactory(
+            usage={"input_tokens": 800, "output_tokens": 150, "model": "m"}
+        )
+        engine = self.engine(factory)
+        mission_id = self.make_ready(engine)
+        engine.run_session(mission_id)
+        mission = self.store.get_mission(mission_id)
+        status = self.store.budget_status(mission["root_scope_id"])
+        self.assertEqual(status["tokens"]["committed"], 950)
+
 
 class TestBoundedRehydration(EngineCase):
     def test_context_bounded_regardless_of_journal_size(self):

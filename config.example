@@ -149,13 +149,20 @@ api_key_env=ANTHROPIC_API_KEY
 # Optional workflow pins; discovered from the agent's allowlist when unset.
 #ebay_draft_workflow=
 #ebay_publish_workflow=
-# Deterministic caps policy: auto-publish is allowed only when every
-# configured cap passes (sandbox default: allowed, no caps configured).
-# Outside the caps the driver demands the exact approval phrase instead.
+# Intake path for the photo-bearing draft turn. "chat" (default) attaches
+# photos as A2A FileParts on a chat message — the one upload path the
+# gateway promotes into durable org artifacts the image node can resolve.
+# "typed" uploads via request_upload_url and calls the workflow directly
+# (blocked on gateways that do not promote typed uploads). Revise and
+# publish always use the typed workflow surface.
+#ebay_intake=chat
+# Caps: a thin clamp on publish outcomes (never on listing content — the
+# workflow's judgment stands). Within the clamp the sandbox auto-publishes
+# after a y/n confirm; outside it the exact approval phrase is required.
+# Sandbox default: auto allowed, no caps configured.
 #ebay_auto_publish=true
-#ebay_allowed_category_ids=
 #ebay_max_price_usd=
-#ebay_min_price_usd=
+#ebay_allowed_category_ids=
 
 # --- Lifecycle hooks -----------------------------------------------------------
 # Shell scripts run around the agent loop; payload arrives as JSON on stdin.

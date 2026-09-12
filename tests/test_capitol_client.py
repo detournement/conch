@@ -70,6 +70,7 @@ class FakeGateway(BaseHTTPRequestHandler):
     blobs = {}
     echo_bearer_500 = False
     error_script = None
+    chat_script = None
     run_counter = 0
 
     @classmethod
@@ -88,6 +89,7 @@ class FakeGateway(BaseHTTPRequestHandler):
         cls.blobs = {}
         cls.echo_bearer_500 = False
         cls.error_script = None
+        cls.chat_script = None
         cls.run_counter = 0
         cls.port = port
 
@@ -270,6 +272,18 @@ class FakeGateway(BaseHTTPRequestHandler):
                     "download_url": "http://example.invalid/x"}
         if skill in ("pause_workflow", "stop_workflow"):
             return {"ok": True, "run_id": data.get("run_id")}
+        if skill == "chat":
+            script = getattr(cls, "chat_script", None)
+            if script:
+                return script(data, message)
+            return {"assistant_reply": "hello", "conversation_id": "ctx-fake-1"}
+        if skill == "list_workflow_runs":
+            rows = [
+                {"run_id": run_id,
+                 "started_by_context": info.get("started_by_context", "")}
+                for run_id, info in cls.runs.items()
+            ]
+            return {"runs": rows}
         return {"__task_failed__": f"Skill not supported: {skill}"}
 
     def _call_workflow(self, data):

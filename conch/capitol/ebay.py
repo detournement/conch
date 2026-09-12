@@ -14,20 +14,22 @@ re-verifies all of it deterministically, so what the user approved is
 byte-identical to what the effect validates — two independent staleness
 checks in series.
 
-Boundaries (roadmap invariants):
+Where determinism lives (and where it doesn't): the workflow's models own
+everything judgment-shaped — what the item is, the title, description,
+category, price, and whether clarification is worth asking (the driver
+relays ``open_questions``/HITL prompts verbatim and imposes no field
+checklists). Deterministic machinery exists only at the
+money/irreversibility boundaries:
 
-- Models never appear in this driver. Workflow text (open questions,
-  titles, errors) is untrusted business data: it is displayed with
-  control characters stripped and echoed into the *next request's data
-  fields* — it never selects or executes a tool.
-- Deterministic policy authorizes. The caps gate is config-driven and
-  prompt-independent; the required-policy registry
-  (:mod:`conch.policy`) is consulted before every publish so later
-  phases can veto centrally (denials fail closed).
-- Run linkage (run ids, revision hashes, listing ids, event cursors) is
-  persisted to a tiny JSON state file under the XDG state dir; the
-  Phase 1 mission kernel replaces this store later, so the schema stays
-  minimal and versioned.
+- the exact publish action (confirmation/challenge/idempotency-key
+  construction, plus the caps clamp deciding auto vs exact approval),
+- the required-policy registry consult before submitting it, and
+- durable run linkage (run ids, revision hashes, listing ids, cursors)
+  in a tiny versioned JSON state file the Phase 1 kernel replaces later.
+
+Workflow/model text is untrusted business data throughout: it is
+displayed (control characters stripped) and echoed into the next
+request's data fields — it never selects or executes a tool.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..config import get_bool
 from ..policy import evaluate_required_policy
 from .client import FINAL_STATUS_EVENT, CapitolRuntime
-from .errors import CapitolError
+from .errors import CapitolAuthError, CapitolError, CapitolProtocolError
 
 DRAFT_REQUEST_SCHEMA = "ebay.draft_request.v1"
 PUBLISH_REQUEST_SCHEMA = "ebay.publish_request.v1"
@@ -114,11 +116,14 @@ def find_contract(value: Any, schema: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic caps policy (models propose; this authorizes)
+# Caps: a thin clamp on outcomes at the publish boundary. Listing content
+# (title, description, category choice, pricing judgment) is the
+# workflow's call and is never linted or corrected here — the clamp only
+# decides whether the outcome may auto-publish or needs exact approval.
 # ---------------------------------------------------------------------------
 
 class CapsDecision:
-    """Outcome of the config-driven caps evaluation for one revision."""
+    """Outcome of the clamp for one drafted revision."""
 
     def __init__(self, auto: bool, reasons: List[str]):
         self.auto = bool(auto)
@@ -129,8 +134,12 @@ class CapsDecision:
 
 
 def evaluate_caps(config: dict, revision: Dict[str, Any]) -> CapsDecision:
-    """Auto-publish only when every configured cap passes; anything
-    missing or malformed on the revision fails closed to exact approval."""
+    """Price ceiling + optional category allowlist + an on/off toggle.
+
+    When a configured cap cannot read its outcome (no price on the
+    revision while a ceiling is set), the clamp routes to exact approval
+    — clamps clamp; they never guess.
+    """
     reasons: List[str] = []
     listing = revision.get("listing") or {}
     if not get_bool(config, "ebay_auto_publish", True):
@@ -140,37 +149,35 @@ def evaluate_caps(config: dict, revision: Dict[str, Any]) -> CapsDecision:
     if allowed_raw:
         allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
         category = str(listing.get("category_id") or "").strip()
-        if not category:
-            reasons.append("revision has no category_id (fail closed)")
-        elif category not in allowed:
+        if category not in allowed:
             reasons.append(
-                f"category {category} is outside the allowlist "
+                f"category {category or '(none)'} is outside the allowlist "
                 f"({', '.join(sorted(allowed))})"
             )
 
-    price_value: Optional[float] = None
-    try:
-        price_value = float((listing.get("price") or {}).get("value"))
-    except (TypeError, ValueError):
-        price_value = None
-    for key, label, breach in (
-        ("ebay_max_price_usd", "max", lambda p, cap: p > cap),
-        ("ebay_min_price_usd", "min", lambda p, cap: p < cap),
-    ):
-        raw = str(config.get(key) or "").strip()
-        if not raw:
-            continue
+    ceiling_raw = str(config.get("ebay_max_price_usd") or "").strip()
+    if ceiling_raw:
         try:
-            cap = float(raw)
+            ceiling = float(ceiling_raw)
         except ValueError:
-            reasons.append(f"{key}={raw!r} is not a number (fail closed)")
-            continue
-        if price_value is None:
-            reasons.append("revision has no readable price (fail closed)")
-        elif breach(price_value, cap):
+            ceiling = None
             reasons.append(
-                f"price {price_value:.2f} USD breaches {label} cap {cap:.2f}"
+                f"ebay_max_price_usd={ceiling_raw!r} is not a number"
             )
+        if ceiling is not None:
+            try:
+                price = float((listing.get("price") or {}).get("value"))
+            except (TypeError, ValueError):
+                price = None
+            if price is None:
+                reasons.append(
+                    "the revision has no readable price to clamp"
+                )
+            elif price > ceiling:
+                reasons.append(
+                    f"price {price:.2f} USD is above the "
+                    f"{ceiling:.2f} ceiling"
+                )
     return CapsDecision(not reasons, reasons)
 
 
@@ -331,6 +338,82 @@ def build_draft_request(
     return request
 
 
+def build_revise_request(
+    config: dict,
+    revision: Dict[str, Any],
+    *,
+    revision_feedback: str,
+    item_context: str = "",
+) -> Dict[str, Any]:
+    """A parent+1 revise request derived entirely from the immutable
+    revision: identity fields, media (artifact ids + verified digests),
+    and seller policies are echoed verbatim so lineage cannot drift;
+    config only backfills policies when a partial (``needs_info``)
+    revision omits them.
+    """
+    for field in ("app_id", "account_ref", "listing_session_id",
+                  "actor_principal_id", "channel", "thread_id", "revision"):
+        if not revision.get(field):
+            raise CapitolError(
+                f"current revision is missing {field!r}; refusing to revise"
+            )
+    media = [
+        {
+            "artifact_id": item.get("artifact_id"),
+            "digest": item.get("digest"),
+            "order": index,
+        }
+        for index, item in enumerate(revision.get("media") or [])
+        if item.get("artifact_id")
+    ]
+    if not media:
+        raise CapitolError("current revision carries no media to revise from")
+    policies = dict(
+        (revision.get("listing") or {}).get("policies") or {}
+    )
+    for key, config_key in (
+        ("fulfillment_policy_id", "ebay_fulfillment_policy_id"),
+        ("payment_policy_id", "ebay_payment_policy_id"),
+        ("return_policy_id", "ebay_return_policy_id"),
+        ("merchant_location_key", "ebay_merchant_location_key"),
+    ):
+        if not policies.get(key):
+            fallback = str(config.get(config_key) or "").strip()
+            if fallback:
+                policies[key] = fallback
+    missing = [
+        key for key in ("fulfillment_policy_id", "payment_policy_id",
+                        "return_policy_id", "merchant_location_key")
+        if not policies.get(key)
+    ]
+    if missing:
+        raise CapitolError(
+            "revise needs seller policies (absent from the revision and "
+            "config): " + ", ".join(missing)
+        )
+    return {
+        "schema": DRAFT_REQUEST_SCHEMA,
+        "mode": "revise",
+        "app_id": revision["app_id"],
+        "account_ref": revision["account_ref"],
+        "listing_session_id": revision["listing_session_id"],
+        "expected_revision": int(revision["revision"]) + 1,
+        "actor_principal_id": revision["actor_principal_id"],
+        "channel": revision["channel"],
+        "thread_id": revision["thread_id"],
+        "media": media,
+        "seller_policies": {
+            key: policies[key]
+            for key in ("fulfillment_policy_id", "payment_policy_id",
+                        "return_policy_id", "merchant_location_key")
+        },
+        "item_context": item_context
+        or "Image-only listing request; no user-supplied listing metadata.",
+        "current_revision": revision,
+        "revision_feedback": revision_feedback,
+    }
+
+
 def build_publish_request(
     revision: Dict[str, Any],
     *,
@@ -395,7 +478,6 @@ class EbayPilot:
         self.ask = ask or (lambda prompt: input(prompt))
         self.confirm = confirm or self._default_confirm
         self._input_keys: Dict[str, str] = {}
-        self._pending_feedback = ""
 
     def _default_confirm(self, prompt: str) -> bool:
         return self.ask(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
@@ -470,6 +552,19 @@ class EbayPilot:
 
     # -- photos --------------------------------------------------------------
 
+    def _validate_photo(self, raw: str) -> Path:
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            raise CapitolError(f"photo not found: {path}")
+        if path.suffix.lower() not in PHOTO_SUFFIXES:
+            raise CapitolError(
+                f"{path.name}: unsupported type (expected one of "
+                f"{', '.join(PHOTO_SUFFIXES)})"
+            )
+        if path.stat().st_size > MAX_PHOTO_BYTES:
+            raise CapitolError(f"{path.name}: over the 50 MB photo cap")
+        return path
+
     def upload_photos(self, paths: List[str]) -> List[Dict[str, Any]]:
         if not paths:
             raise CapitolError("at least one photo path is required")
@@ -477,16 +572,7 @@ class EbayPilot:
             raise CapitolError(f"at most {MAX_PHOTOS} photos per listing")
         media: List[Dict[str, Any]] = []
         for index, raw in enumerate(paths):
-            path = Path(raw).expanduser()
-            if not path.is_file():
-                raise CapitolError(f"photo not found: {path}")
-            if path.suffix.lower() not in PHOTO_SUFFIXES:
-                raise CapitolError(
-                    f"{path.name}: unsupported type (expected one of "
-                    f"{', '.join(PHOTO_SUFFIXES)})"
-                )
-            if path.stat().st_size > MAX_PHOTO_BYTES:
-                raise CapitolError(f"{path.name}: over the 50 MB photo cap")
+            path = self._validate_photo(raw)
             self.say(f"  uploading {path.name} …")
             uploaded = self.runtime.upload_artifact(str(path))
             uploaded["order"] = index
@@ -503,18 +589,29 @@ class EbayPilot:
         request_value: Dict[str, Any],
         idempotency_key: str,
     ) -> Dict[str, Any]:
-        """Start a run, supervise it to terminal, return its output.
+        """Start a typed run, supervise it to terminal, return its output."""
+        inputs = {self._inputs_key(workflow_id): request_value}
+        submission = self.runtime.call_workflow(
+            workflow_id, inputs, idempotency_key=idempotency_key
+        )
+        return self.supervise_run(
+            session_id, kind, str(submission["run_id"]), idempotency_key
+        )
+
+    def supervise_run(
+        self,
+        session_id: str,
+        kind: str,
+        run_id: str,
+        idempotency_key: str = "",
+    ) -> Dict[str, Any]:
+        """Watch a run to terminal and return its output.
 
         Mid-run ``node.input_required`` events are relayed to the user and
         answered through the HITL skills; every event advances the
         persisted ``last_sequence`` cursor so a resumed watch never
         replays or drops events.
         """
-        inputs = {self._inputs_key(workflow_id): request_value}
-        submission = self.runtime.call_workflow(
-            workflow_id, inputs, idempotency_key=idempotency_key
-        )
-        run_id = str(submission["run_id"])
         self.state.record_run(session_id, kind, run_id, idempotency_key)
         self.say(f"  {kind} run {run_id} started")
         final_state = ""
@@ -610,77 +707,172 @@ class EbayPilot:
             lines.append(f"    ⚠ {clean_text(warning, 200)}")
         self.say("\n".join(lines))
 
+    # -- intake paths -------------------------------------------------------------
+
+    def _extract_revision(
+        self, session_id: str, output: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        revision = find_contract(output, REVISION_SCHEMA)
+        if revision is None:
+            guidance = find_contract(output, "ebay.draft_request_guidance.v1")
+            detail = ""
+            if guidance:
+                detail = clean_text(
+                    (guidance.get("error_detail") or {}).get("message")
+                    or guidance.get("message"), 300,
+                )
+            raise CapitolError(
+                "draft run produced no ebay.listing_revision.v1 contract"
+                + (f" (workflow guidance: {detail})" if detail else "")
+            )
+        self.state.append(session_id, "revisions", {
+            "revision": revision.get("revision"),
+            "draft_hash": revision.get("draft_hash"),
+            "status": revision.get("status"),
+        })
+        return revision
+
+    def _initial_draft_typed(
+        self,
+        session_id: str,
+        workflows: Dict[str, str],
+        photo_paths: List[str],
+        item_context: str,
+    ) -> Dict[str, Any]:
+        """Typed intake: upload photos, then call the draft workflow with a
+        constructed ebay.draft_request.v1.
+
+        Known gateway gap (2026-09-11, local stack): request_upload_url /
+        upload_file register artifacts only in the gateway's 24 h registry,
+        which the eBay image node cannot resolve (it authorizes durable org
+        Artifact rows) — the run then degrades to the typed no-image branch.
+        Chat intake below is the promoted path; this stays for gateways
+        that promote typed uploads.
+        """
+        app_id = str(self.config.get("ebay_app_id") or "conch-ebay")
+        media = self.upload_photos(photo_paths)
+        self.state.update_session(session_id, media=[
+            {k: item[k] for k in ("artifact_id", "digest", "order", "filename")}
+            for item in media
+        ])
+        request = build_draft_request(
+            self.config,
+            listing_session_id=session_id,
+            thread_id=f"{session_id}:shell",
+            media=media,
+            item_context=item_context,
+        )
+        output = self.run_workflow(
+            session_id, "draft", workflows["draft"], request,
+            draft_idempotency_key(app_id, session_id, 1),
+        )
+        return self._extract_revision(session_id, output)
+
+    def _initial_draft_chat(
+        self,
+        session_id: str,
+        workflows: Dict[str, str],
+        photo_paths: List[str],
+        item_context: str,
+    ) -> Dict[str, Any]:
+        """Chat intake (the agent's designed path): photos ride the chat
+        message as FileParts — the one A2A upload path the gateway promotes
+        into durable org artifacts the image node can resolve — and the
+        orchestrator's allowlisted draft_or_revise tool launches the run.
+        The reply prose is untrusted and only displayed; the revision
+        contract is read from the run's typed outputs.
+        """
+        if not photo_paths:
+            raise CapitolError("at least one photo path is required")
+        if len(photo_paths) > MAX_PHOTOS:
+            raise CapitolError(f"at most {MAX_PHOTOS} photos per listing")
+        for path in photo_paths:
+            self._validate_photo(path)
+        self.say("  attaching photo(s) to the intake message …")
+        message = (
+            "Please draft a sandbox eBay listing from the attached "
+            f"photo(s). Item context: {item_context}"
+        )
+        reply = ""
+        payload: Dict[str, Any] = {}
+        try:
+            payload = self.runtime.chat(message, files=photo_paths) or {}
+            reply = clean_text(payload.get("assistant_reply"), 600)
+        except (CapitolAuthError, CapitolProtocolError):
+            raise
+        except CapitolError:
+            # The blocking chat turn outlived its transport, but the run it
+            # launched may be live server-side. Never resend the intake
+            # blindly (that would start a second draft run) — reconcile
+            # from the conversation's run history instead.
+            self.say("  chat transport dropped; reconciling run state …")
+        run_id = str(payload.get("run_id") or "")
+        for _attempt in range(6):
+            if run_id:
+                break
+            listing = self.runtime.list_runs(workflows["draft"], limit=10)
+            for run in listing.get("runs") or []:
+                context = str(
+                    run.get("started_by_context") or run.get("context_id")
+                    or ""
+                )
+                if context and context == self.runtime.context_id:
+                    run_id = str(run.get("run_id") or "")
+                    break
+            if not run_id:
+                time.sleep(5)
+        if not run_id:
+            raise CapitolError(
+                "the agent did not start a draft run"
+                + (f" — it said: {reply}" if reply else "")
+            )
+        if reply:
+            self.say(f"  agent: {reply}")
+        output = self.supervise_run(session_id, "draft", run_id)
+        return self._extract_revision(session_id, output)
+
     # -- the flow -----------------------------------------------------------------
 
     def sell(self, photo_paths: List[str], notes: str = "") -> Dict[str, Any]:
         """Full Milestone-1 loop: photos → draft (+clarify) → policy gate →
         exact approval → sandbox publish → listing id."""
         workflows = self.resolve_workflows()
-        app_id = str(self.config.get("ebay_app_id") or "conch-ebay")
         session_id = (
             f"conch-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
         )
-        thread_id = f"{session_id}:shell"
-        if not self.runtime.context_id:
+        intake = str(self.config.get("ebay_intake") or "chat").strip().lower()
+        # Chat intake binds the server-side listing session to the A2A
+        # context, so every listing session gets a fresh handshake.
+        if intake == "chat" or not self.runtime.context_id:
             self.runtime.handshake()
         self.state.update_session(
             session_id,
-            app_id=app_id,
-            thread_id=thread_id,
+            intake=intake,
             context_id=self.runtime.context_id,
             workflows=workflows,
         )
-        self.say(f"  listing session {session_id}")
-
-        media = self.upload_photos(photo_paths)
-        self.state.update_session(session_id, media=[
-            {k: item[k] for k in ("artifact_id", "digest", "order", "filename")}
-            for item in media
-        ])
+        self.say(f"  listing session {session_id} (intake: {intake})")
 
         item_context = notes.strip() or (
             "Image-only listing request; no user-supplied listing metadata."
         )
-        revision: Optional[Dict[str, Any]] = None
-        current: Optional[Dict[str, Any]] = None
-        expected_revision = 1
-        for _round in range(MAX_CLARIFY_ROUNDS + 1):
-            if current is None:
-                request = build_draft_request(
-                    self.config,
-                    listing_session_id=session_id,
-                    thread_id=thread_id,
-                    media=media,
-                    item_context=item_context,
-                )
-            else:
-                request = build_draft_request(
-                    self.config,
-                    listing_session_id=session_id,
-                    thread_id=thread_id,
-                    media=media,
-                    item_context=item_context,
-                    mode="revise",
-                    expected_revision=expected_revision,
-                    current_revision=current,
-                    revision_feedback=self._pending_feedback,
-                )
-            output = self.run_workflow(
-                session_id, "draft", workflows["draft"], request,
-                draft_idempotency_key(app_id, session_id, expected_revision),
+        if intake == "typed":
+            revision = self._initial_draft_typed(
+                session_id, workflows, photo_paths, item_context
             )
-            revision = find_contract(output, REVISION_SCHEMA)
-            if revision is None:
+        else:
+            revision = self._initial_draft_chat(
+                session_id, workflows, photo_paths, item_context
+            )
+
+        clarify_rounds = 0
+        while revision.get("status") == "needs_info":
+            if clarify_rounds >= MAX_CLARIFY_ROUNDS:
                 raise CapitolError(
-                    "draft run produced no ebay.listing_revision.v1 contract"
+                    "draft still needs info after "
+                    f"{MAX_CLARIFY_ROUNDS} clarification rounds; stopping"
                 )
-            self.state.append(session_id, "revisions", {
-                "revision": revision.get("revision"),
-                "draft_hash": revision.get("draft_hash"),
-                "status": revision.get("status"),
-            })
-            if revision.get("status") != "needs_info":
-                break
+            clarify_rounds += 1
             questions = [
                 clean_text(question, 500)
                 for question in revision.get("open_questions") or []
@@ -691,17 +883,24 @@ class EbayPilot:
                 answer = self.ask(f"    {question}\n    → ").strip()
                 if answer:
                     answers.append(f"Q: {question} A: {answer}")
-            self._pending_feedback = (
+            feedback = (
                 " ".join(answers) or "No further information available; "
                 "proceed with conservative assumptions."
             )
-            current = revision
-            expected_revision = int(revision.get("revision") or 1) + 1
-        else:
-            raise CapitolError(
-                "draft still needs info after "
-                f"{MAX_CLARIFY_ROUNDS} clarification rounds; stopping"
+            request = build_revise_request(
+                self.config, revision,
+                revision_feedback=feedback,
+                item_context=item_context,
             )
+            output = self.run_workflow(
+                session_id, "draft", workflows["draft"], request,
+                draft_idempotency_key(
+                    str(request["app_id"]),
+                    str(request["listing_session_id"]),
+                    int(request["expected_revision"]),
+                ),
+            )
+            revision = self._extract_revision(session_id, output)
 
         if revision.get("status") != "draft_review":
             raise CapitolError(
@@ -736,13 +935,17 @@ class EbayPilot:
         presentation_id = f"conch-presentation-{uuid.uuid4().hex[:10]}"
         publish_request = build_publish_request(
             revision,
-            actor_principal_id=str(self.config.get("ebay_actor_id") or ""),
+            actor_principal_id=str(
+                revision.get("actor_principal_id")
+                or self.config.get("ebay_actor_id")
+                or ""
+            ),
             presentation_id=presentation_id,
         )
         policy = evaluate_required_policy("capitol.ebay.publish", {
             "workflow_id": workflows["publish"],
-            "app_id": app_id,
-            "listing_session_id": session_id,
+            "app_id": publish_request["app_id"],
+            "listing_session_id": publish_request["listing_session_id"],
             "revision": publish_request["revision"],
             "draft_hash": publish_request["draft_hash"],
             "idempotency_key": publish_request["idempotency_key"],

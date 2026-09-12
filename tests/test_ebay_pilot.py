@@ -37,6 +37,7 @@ ORG = "org-ebay"
 AGENT = "agent-ebay"
 
 BASE_CONFIG = {
+    "ebay_intake": "typed",
     "ebay_app_id": "conch-ebay",
     "ebay_account_ref": "org-ebay-sandbox",
     "ebay_actor_id": "9e000000-0000-0000-0000-000000000001",
@@ -45,6 +46,52 @@ BASE_CONFIG = {
     "ebay_return_policy_id": "6244378000",
     "ebay_merchant_location_key": "sandbox-location",
 }
+
+SANDBOX_POLICIES = {
+    "fulfillment_policy_id": "6244379000",
+    "payment_policy_id": "6244377000",
+    "return_policy_id": "6244378000",
+    "merchant_location_key": "sandbox-location",
+}
+
+
+def chat_orchestrator(data, message):
+    """Scripted stand-in for the agent's delegable draft_or_revise binding:
+    promotes the message's FileParts and launches the draft workflow with
+    the server-side defaults (session/thread bound to the context)."""
+    file_parts = [
+        part for part in (message.get("parts") or [])[1:]
+        if isinstance(part, dict) and (part.get("file") or {}).get("bytes")
+    ]
+    request = {
+        "schema": "ebay.draft_request.v1",
+        "mode": "initial",
+        "app_id": "ebay-oversight",
+        "account_ref": "org-ebay-sandbox",
+        "listing_session_id": "ctx-fake-1",
+        "expected_revision": 1,
+        "actor_principal_id": "server-actor-0001",
+        "channel": "a2a",
+        "thread_id": "ctx-fake-1",
+        "media": [
+            {"artifact_id": f"promoted-{index}", "order": index}
+            for index, _part in enumerate(file_parts)
+        ],
+        "seller_policies": dict(SANDBOX_POLICIES),
+        "item_context": str(data.get("message") or ""),
+    }
+    FakeGateway.run_counter += 1
+    run_id = f"run-{FakeGateway.run_counter}"
+    output = EbayEngine._draft(run_id, request)
+    FakeGateway.runs[run_id] = {
+        "status": "running", "output": output,
+        "started_by_context": "ctx-fake-1",
+    }
+    return {
+        "assistant_reply": "I drafted a listing from your photo.",
+        "conversation_id": "ctx-fake-1",
+        "run_id": run_id,
+    }
 
 
 def _revision(request, number, status, open_questions=(), parent=None):
@@ -425,6 +472,47 @@ class EbayFlowTests(unittest.TestCase):
             pilot.sell(self.photos[:1])
         self.assertIn("ebay_actor_id", str(raised.exception))
 
+    def test_chat_intake_clarify_then_publish(self):
+        """Default intake: photos as chat FileParts; the orchestrator's
+        launch is supervised, the revise + publish turns stay typed and
+        echo the server-bound identity (session = context) verbatim."""
+        FakeGateway.chat_script = chat_orchestrator
+        ui = ScriptedUI(answers=["Acme Press"], confirms=[True])
+        pilot, _config = self._pilot(ui, {"ebay_intake": "chat"})
+        result = pilot.sell(self.photos, notes="paperback, light wear")
+        self.assertTrue(result["published"])
+
+        chat_calls = [
+            (data, env) for skill, data, env in FakeGateway.calls
+            if skill == "chat"
+        ]
+        self.assertEqual(len(chat_calls), 1)
+        data, envelope = chat_calls[0]
+        self.assertIn("paperback, light wear", data["message"])
+        parts = envelope["params"]["message"]["parts"]
+        self.assertEqual(len(parts), 3)  # data part + two FileParts
+        self.assertTrue(all(p.get("file", {}).get("bytes")
+                            for p in parts[1:]))
+
+        # Revise + publish echo the server-side session/actor, not config.
+        revise = EbayEngine.draft_requests[-1]
+        self.assertEqual(revise["mode"], "revise")
+        self.assertEqual(revise["listing_session_id"], "ctx-fake-1")
+        self.assertEqual(revise["actor_principal_id"], "server-actor-0001")
+        self.assertEqual(
+            [m["artifact_id"] for m in revise["media"]],
+            ["promoted-0", "promoted-1"],
+        )
+        publish = EbayEngine.publish_requests[0]
+        self.assertEqual(publish["listing_session_id"], "ctx-fake-1")
+        self.assertEqual(publish["actor_principal_id"], "server-actor-0001")
+        self.assertEqual(
+            publish["idempotency_key"],
+            "ebay-oversight:ctx-fake-1:r2:publish",
+        )
+        # No typed upload happened on the chat path.
+        self.assertEqual(FakeGateway.uploads, {})
+
 
 class CapsPolicyTests(unittest.TestCase):
     def _revision(self, price="19.95", category="377"):
@@ -447,13 +535,15 @@ class CapsPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.auto)
 
-    def test_price_cap_boundaries(self):
+    def test_price_ceiling_boundary(self):
         config = {"ebay_max_price_usd": "19.95"}
         self.assertTrue(evaluate_caps(config, self._revision("19.95")).auto)
         self.assertFalse(evaluate_caps(config, self._revision("19.96")).auto)
-        config = {"ebay_min_price_usd": "5"}
-        self.assertTrue(evaluate_caps(config, self._revision("5.00")).auto)
-        self.assertFalse(evaluate_caps(config, self._revision("4.99")).auto)
+
+    def test_no_min_price_rule(self):
+        # The clamp is a ceiling only; low prices are the workflow's call.
+        config = {"ebay_max_price_usd": "50"}
+        self.assertTrue(evaluate_caps(config, self._revision("0.99")).auto)
 
     def test_category_allowlist(self):
         config = {"ebay_allowed_category_ids": "377, 261186"}

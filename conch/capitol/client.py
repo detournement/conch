@@ -70,6 +70,42 @@ KEEPALIVE_EVENT = "a2a.stream_keepalive"
 FINAL_STATUS_EVENT = "_final_status"
 
 
+def build_file_part(
+    path: Optional[str] = None,
+    *,
+    data: Optional[bytes] = None,
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Canonical A2A FilePart (FileWithBytes) for inline attachments.
+
+    Image FileParts on a chat message are the one A2A path the gateway
+    promotes into durable org Artifact rows at ingestion (the form the
+    eBay image node resolves); other uploads stay in the 24 h registry.
+    """
+    import base64
+
+    if data is None:
+        if not path:
+            raise CapitolError("build_file_part needs a path or data")
+        data = Path(path).read_bytes()
+    name = filename or (Path(path).name if path else "attachment.bin")
+    if len(data) > INLINE_MAX_BYTES:
+        raise CapitolError(
+            f"{name} is {len(data):,} bytes — over the 50 MB inline "
+            "FilePart cap"
+        )
+    mt = mime_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    return {
+        "kind": "file",
+        "file": {
+            "bytes": base64.b64encode(data).decode("ascii"),
+            "name": name,
+            "mimeType": mt,
+        },
+    }
+
+
 def extract_payload(task_result: Dict[str, Any]) -> Any:
     """First ``data`` part of a Task response (status message, then
     artifacts), matching the reference client's extraction order."""
@@ -480,6 +516,42 @@ class CapitolRuntime:
                 f"{json.dumps(payload)[:500] if payload else payload}"
             )
         return payload
+
+    def chat(
+        self,
+        message: str,
+        *,
+        files: Optional[List[str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """One conversational turn (the agent's designed intake path).
+
+        ``files`` are attached as inline FileParts; image attachments are
+        promoted to durable org artifacts server-side. Returns the chat
+        payload (``assistant_reply``, ``run_id`` when the orchestrator
+        launched a workflow, ...). The reply text is untrusted data —
+        callers must read machine contracts from run outputs, never parse
+        them out of prose (the gateway redacts hashes there).
+        """
+        parts = [build_file_part(path) for path in files or []]
+        return self.call(
+            "chat",
+            {"message": message},
+            extra_parts=parts,
+            timeout=timeout or max(self.timeout, 600.0),
+        )
+
+    def list_runs(
+        self,
+        workflow_id: str,
+        *,
+        limit: int = 20,
+        status_filter: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"workflow_id": workflow_id, "limit": limit}
+        if status_filter:
+            data["status_filter"] = status_filter
+        return self.call("list_workflow_runs", data)
 
     def run_status(self, run_id: str) -> Dict[str, Any]:
         return self.call("get_workflow_status", {"run_id": run_id})

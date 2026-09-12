@@ -247,6 +247,31 @@ class InboxStatus:
     ALL = frozenset({PENDING, PROCESSED, FAILED})
 
 
+class BindingStatus:
+    """Resource-binding lifecycle (Swarm Phase 3).
+
+    A binding ties a mission (and optionally one of its tasks) to an
+    external resource — a Capitol run, session, artifact, schedule, or
+    provisioned asset — and carries the supervision cursor. ``DEGRADED``
+    means the external system is unreachable and the supervisor is backing
+    off; it is never terminal, and a recovered system resumes from the
+    persisted cursor.
+    """
+
+    ACTIVE = "active"
+    WAITING_HITL = "waiting_hitl"
+    DEGRADED = "degraded"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    ALL = frozenset({
+        ACTIVE, WAITING_HITL, DEGRADED, COMPLETED, FAILED, CANCELLED,
+    })
+    TERMINAL = frozenset({COMPLETED, FAILED, CANCELLED})
+    SUPERVISED = frozenset({ACTIVE, WAITING_HITL, DEGRADED})
+
+
 # ---------------------------------------------------------------------------
 # Fleet: worker registry and dispatch state machines (Swarm Phase 2)
 # ---------------------------------------------------------------------------
@@ -412,6 +437,7 @@ EVENT_KINDS = frozenset({
     "action_resolved",
     "artifact_recorded",
     "binding_recorded",
+    "binding_updated",
     "outbox_enqueued",
     "inbox_received",
     "inbox_processed",
@@ -471,7 +497,7 @@ def normalize_spec(spec: Dict[str, Any],
         "cadence_seconds", "channel", "dry_run", "kind", "prompt",
         "run_once", "misfire_policy", "catch_up_limit",
         "session_wall_seconds", "session_max_tool_rounds",
-        "session_token_budget", "principal", "notify",
+        "session_token_budget", "principal", "notify", "capitol",
     }
     unknown = set(spec) - known
     if unknown:
@@ -532,8 +558,48 @@ def normalize_spec(spec: Dict[str, Any],
     if catch_up_limit < 1:
         raise KernelError("catch_up_limit must be at least 1")
 
+    capitol_raw = spec.get("capitol") or {}
+    if not isinstance(capitol_raw, dict):
+        raise KernelError("mission spec capitol must be a dict")
+    capitol_known = {"workflows", "allow_start", "allow_respond",
+                     "max_runs"}
+    capitol_unknown = set(capitol_raw) - capitol_known
+    if capitol_unknown:
+        raise KernelError(
+            f"mission spec capitol has unknown field(s) "
+            f"{sorted(capitol_unknown)} — failing closed"
+        )
+    capitol: Dict[str, Any] = {}
+    if capitol_raw:
+        workflows = capitol_raw.get("workflows") or []
+        if not isinstance(workflows, (list, tuple)) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in workflows
+        ):
+            raise KernelError(
+                "capitol.workflows must be a list of workflow id strings"
+            )
+        try:
+            max_runs = int(capitol_raw.get("max_runs", 3))
+        except (TypeError, ValueError):
+            raise KernelError("capitol.max_runs must be an integer")
+        if max_runs < 0:
+            raise KernelError("capitol.max_runs must not be negative")
+        capitol = {
+            "workflows": list(workflows),
+            "allow_start": bool(capitol_raw.get("allow_start", False)),
+            "allow_respond": bool(capitol_raw.get("allow_respond", False)),
+            "max_runs": max_runs,
+        }
+        if capitol["allow_start"] and not capitol["workflows"]:
+            raise KernelError(
+                "capitol.allow_start requires a non-empty "
+                "capitol.workflows allowlist"
+            )
+
     normalized: Dict[str, Any] = {
         "goal": goal,
+        "capitol": capitol,
         "success_criteria": _str_list("success_criteria"),
         "constraints": _str_list("constraints"),
         "budgets": budgets,

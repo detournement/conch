@@ -47,6 +47,7 @@ from .model import (
     ActionStatus,
     ApprovalError,
     ApprovalStatus,
+    BindingStatus,
     BudgetExceededError,
     CATCH_UP_HARD_CAP,
     ConflictError,
@@ -303,8 +304,15 @@ CREATE TABLE IF NOT EXISTS resource_bindings (
     mission_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     resource TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    task_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    cursor INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_bindings_kind_status
+    ON resource_bindings(kind, status);
 CREATE TABLE IF NOT EXISTS workers (
     worker_id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -427,6 +435,7 @@ REPLAYED_TABLES: Dict[str, Tuple[str, ...]] = {
     ),
     "resource_bindings": (
         "binding_id", "mission_id", "kind", "resource", "created_at",
+        "task_id", "status", "cursor", "detail", "updated_at",
     ),
     # Fleet registry / dispatch truth is replayed; heartbeat columns and
     # dispatch_events (worker observations) are operational by design.
@@ -741,11 +750,41 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
              data.get("content"), created_at),
         )
     elif kind == "binding_recorded":
+        # Events that predate the Phase 3 lifecycle carry no "status";
+        # they project the schema defaults (updated_at 0) so replaying an
+        # old journal reproduces a migrated live table byte-for-byte.
+        lifecycle = "status" in data
         conn.execute(
             "INSERT INTO resource_bindings(binding_id, mission_id, kind,"
-            " resource, created_at) VALUES (?,?,?,?,?)",
+            " resource, created_at, task_id, status, cursor, detail,"
+            " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (data["binding_id"], mission_id, data["binding_kind"],
-             _canonical(data["resource"]), created_at),
+             _canonical(data["resource"]), created_at,
+             data.get("task_id", ""),
+             data.get("status", BindingStatus.ACTIVE),
+             int(data.get("cursor", 0)),
+             _canonical(data.get("detail", {})),
+             created_at if lifecycle else 0),
+        )
+    elif kind == "binding_updated":
+        fields = data["fields"]
+        assignments = []
+        params: List[Any] = []
+        for column in sorted(fields):
+            value = fields[column]
+            if column == "detail":
+                value = _canonical(value)
+            elif column == "cursor":
+                value = int(value)
+            assignments.append(f'"{column}"=?')
+            params.append(value)
+        assignments.append("updated_at=?")
+        params.append(created_at)
+        params.append(data["binding_id"])
+        conn.execute(
+            "UPDATE resource_bindings SET "
+            + ", ".join(assignments) + " WHERE binding_id=?",
+            params,
         )
     elif kind == "outbox_enqueued":
         conn.execute(
@@ -923,6 +962,10 @@ class MissionStore:
         try:
             conn = sqlite3.connect(str(self.path), isolation_level=None)
             self._configure(conn, writer=True)
+            # Column migrations run before the schema script: _SCHEMA's
+            # index statements may reference columns added after a
+            # pre-existing table was created.
+            self._add_missing_columns(conn)
             conn.executescript(_SCHEMA)
             row = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
@@ -968,6 +1011,41 @@ class MissionStore:
             finally:
                 job.done.set()
         conn.close()
+
+    @staticmethod
+    def _add_missing_columns(conn: sqlite3.Connection) -> None:
+        """Additive column micro-migrations for pre-existing databases.
+
+        ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so
+        columns added to ``_SCHEMA`` after a database was created are
+        backfilled here with the exact defaults the schema declares —
+        replaying old journals into the new schema then reproduces the
+        same bytes (the defaults are what ``_apply_event`` writes for
+        events that predate the column).
+        """
+        additions = {
+            "resource_bindings": (
+                ("task_id", "TEXT NOT NULL DEFAULT ''"),
+                ("status", "TEXT NOT NULL DEFAULT 'active'"),
+                ("cursor", "INTEGER NOT NULL DEFAULT 0"),
+                ("detail", "TEXT NOT NULL DEFAULT '{}'"),
+                ("updated_at", "REAL NOT NULL DEFAULT 0"),
+            ),
+        }
+        for table, columns in additions.items():
+            existing = {
+                row[1] for row in conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            if not existing:
+                continue  # table doesn't exist yet; _SCHEMA creates it
+            for name, declaration in columns:
+                if name not in existing:
+                    conn.execute(
+                        f'ALTER TABLE {table} ADD COLUMN "{name}"'
+                        f" {declaration}"
+                    )
 
     def _check_epoch(self, conn: sqlite3.Connection) -> None:
         if self._epoch is None:
@@ -2267,7 +2345,24 @@ class MissionStore:
         return self._mutate(fn)
 
     def record_binding(self, mission_id: str, kind: str,
-                       resource: Dict[str, Any]) -> str:
+                       resource: Dict[str, Any], *,
+                       task_id: str = "",
+                       status: str = BindingStatus.ACTIVE,
+                       cursor: int = 0,
+                       detail: Optional[Dict[str, Any]] = None) -> str:
+        """Bind an external resource to a mission (event-sourced).
+
+        ``resource`` carries the external identifiers — for a Capitol run
+        binding: org/agent/workflow/version ids, context_id, run_id,
+        session_id, idempotency key. ``cursor`` is the resumable
+        event-sequence high-water mark the supervisor advances through
+        :meth:`update_binding`; ``detail`` holds mutable supervision
+        state (backoff, last error, HITL linkage).
+        """
+        if status not in BindingStatus.ALL:
+            raise KernelError(f"unknown binding status {status!r}")
+        if int(cursor) < 0:
+            raise KernelError("binding cursor must not be negative")
         binding_id = kernel_id("bnd")
 
         def fn(conn):
@@ -2275,9 +2370,105 @@ class MissionStore:
             self._append(conn, mission_id, "binding_recorded", {
                 "binding_id": binding_id, "binding_kind": str(kind),
                 "resource": resource,
+                "task_id": str(task_id),
+                "status": status,
+                "cursor": int(cursor),
+                "detail": detail or {},
             })
             return binding_id
         return self._mutate(fn)
+
+    def update_binding(self, binding_id: str, *,
+                       status: Optional[str] = None,
+                       cursor: Optional[int] = None,
+                       detail: Optional[Dict[str, Any]] = None) -> None:
+        """Advance a binding's lifecycle (event-sourced, single event).
+
+        The cursor is monotonic — moving it backwards is refused, so a
+        crashed/replayed supervisor pass can never lose progress. A
+        terminal binding accepts no further updates.
+        """
+        if status is not None and status not in BindingStatus.ALL:
+            raise KernelError(f"unknown binding status {status!r}")
+
+        def fn(conn):
+            row = conn.execute(
+                'SELECT mission_id, status, "cursor", detail FROM'
+                " resource_bindings WHERE binding_id=?",
+                (binding_id,),
+            ).fetchone()
+            if row is None:
+                raise KernelError(f"unknown binding {binding_id!r}")
+            mission_id, current_status, current_cursor, current_detail = row
+            if current_status in BindingStatus.TERMINAL:
+                raise KernelError(
+                    f"binding {binding_id} is terminal ({current_status})"
+                    " — no further updates"
+                )
+            fields: Dict[str, Any] = {}
+            if status is not None and status != current_status:
+                fields["status"] = status
+            if cursor is not None:
+                if int(cursor) < int(current_cursor):
+                    raise KernelError(
+                        f"binding {binding_id} cursor is monotonic:"
+                        f" {cursor} < {current_cursor}"
+                    )
+                if int(cursor) != int(current_cursor):
+                    fields["cursor"] = int(cursor)
+            if detail is not None and _canonical(detail) != current_detail:
+                fields["detail"] = detail
+            if not fields:
+                return  # no-op: nothing changed, no event appended
+            self._append(conn, mission_id, "binding_updated", {
+                "binding_id": binding_id, "fields": fields,
+            })
+        self._mutate(fn)
+
+    @staticmethod
+    def _binding_dict(row) -> Dict[str, Any]:
+        binding = dict(row)
+        for key in ("resource", "detail"):
+            try:
+                binding[key] = _json.loads(binding.get(key) or "{}")
+            except ValueError:
+                binding[key] = {}
+        return binding
+
+    def get_binding(self, binding_id: str) -> Optional[Dict[str, Any]]:
+        row = self._read_conn().execute(
+            "SELECT * FROM resource_bindings WHERE binding_id=?",
+            (binding_id,),
+        ).fetchone()
+        return self._binding_dict(row) if row else None
+
+    def find_bindings(self, *, kind: str = "", mission_id: str = "",
+                      status: str = "",
+                      statuses: Optional[Any] = None
+                      ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM resource_bindings"
+        clauses: List[str] = []
+        params: List[Any] = []
+        if kind:
+            clauses.append("kind=?")
+            params.append(kind)
+        if mission_id:
+            clauses.append("mission_id=?")
+            params.append(mission_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if statuses:
+            wanted = sorted(str(item) for item in statuses)
+            clauses.append(
+                "status IN (%s)" % ",".join("?" for _ in wanted)
+            )
+            params.extend(wanted)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, binding_id"
+        rows = self._read_conn().execute(query, params).fetchall()
+        return [self._binding_dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Fleet: worker registry (Swarm Phase 2)

@@ -761,15 +761,21 @@ class DaemonWiringTests(unittest.TestCase):
                     _event(3, event_type="workflow.run_completed")
                 )
                 FakeGateway.runs[run_id]["status"] = "success"
+                runs_before = daemon.store.get_mission(mission_id)["runs"]
                 now[0] += 2
                 stats = tick()
                 self.assertEqual(stats.get("capitol_terminal"), 1)
                 binding = daemon.store.get_binding(binding["binding_id"])
                 self.assertEqual(binding["status"], BindingStatus.COMPLETED)
                 self.assertEqual(binding["detail"]["final_state"], "success")
+                # The terminal event woke the mission and its session fired
+                # inside the same tick (supervision runs ahead of the
+                # session slot) — no timer wait, then back to its cadence.
+                self.assertEqual(stats["sessions"], 1)
+                mission_after = daemon.store.get_mission(mission_id)
+                self.assertEqual(mission_after["runs"], runs_before + 1)
                 self.assertEqual(
-                    daemon.store.get_mission(mission_id)["status"],
-                    MissionState.READY,
+                    mission_after["status"], MissionState.WAITING_TIMER
                 )
 
                 # 5) binding-event replay equals live state

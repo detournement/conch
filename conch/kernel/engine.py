@@ -391,19 +391,64 @@ class MissionEngine:
         return result
 
     def provide_input(self, mission_id: str, text: str,
-                      source: str = "local") -> None:
-        """Answer a waiting_input mission and wake it."""
-        mission = self.store.get_mission(mission_id)
-        if mission is None:
-            raise KernelError(f"unknown mission {mission_id!r}")
-        self.store.receive_inbox(
+                      source: str = "local") -> Dict[str, Any]:
+        """Answer a mission with user input and wake it immediately."""
+        return self.deliver_event(
             source, f"input:{mission_id}:{kernel_id('obx')}",
             {"text": str(text)}, mission_id,
         )
-        if mission["status"] == MissionState.WAITING_INPUT:
-            self.store.transition_mission(
-                mission_id, MissionState.READY, reason="input provided"
+
+    def deliver_event(self, source: str, idempotency_key: str,
+                      payload: Dict[str, Any], mission_id: str = "",
+                      wake: bool = True) -> Dict[str, Any]:
+        """General kernel-inbox event API (always-on daemon work item).
+
+        Records one external event — an inbound channel message, a webhook,
+        a filesystem watch — durably and idempotently on *idempotency_key*.
+        When the event is addressed to a mission and ``wake`` is true, a
+        mission parked on its timer or waiting for input transitions to
+        ready in the same call, so the next scheduler slot runs its session
+        instead of waiting out the timer. Paused missions, missions parked
+        on an approval, and terminal missions are never woken: operator
+        pauses stick, and an unsolicited event cannot bypass an approval
+        gate.
+        """
+        if not str(idempotency_key).strip():
+            raise KernelError("deliver_event needs an idempotency key")
+        if mission_id and self.store.get_mission(mission_id) is None:
+            raise KernelError(f"unknown mission {mission_id!r}")
+        result = self.store.receive_inbox(
+            str(source or "external"), str(idempotency_key),
+            dict(payload or {}), mission_id,
+        )
+        woken = False
+        if wake and mission_id and not result["duplicate"]:
+            woken = self.wake_mission(
+                mission_id, reason=f"inbox event from {source}"
             )
+        return {
+            "inbox_id": result["inbox_id"],
+            "duplicate": result["duplicate"],
+            "woken": woken,
+        }
+
+    def wake_mission(self, mission_id: str, reason: str = "event") -> bool:
+        """Wake a parked mission so its next session runs at the next
+        scheduler slot. Only timer- and input-parked missions are eligible;
+        returns False (never raises) when the mission is elsewhere in its
+        lifecycle or a concurrent transition wins the race."""
+        mission = self.store.get_mission(mission_id)
+        if mission is None or mission["status"] not in (
+            MissionState.WAITING_INPUT, MissionState.WAITING_TIMER,
+        ):
+            return False
+        try:
+            self.store.transition_mission(
+                mission_id, MissionState.READY, reason=reason
+            )
+        except KernelError:
+            return False  # racing transition; the event journal explains
+        return True
 
     # -- bounded rehydration ---------------------------------------------------
 
@@ -488,7 +533,8 @@ class MissionEngine:
         ]
         if inputs:
             parts.append(_clip(
-                "New user input:\n" + "\n".join(f"  - {t}" for t in inputs),
+                "New input and events:\n"
+                + "\n".join(f"  - {t}" for t in inputs),
                 _SECTION_CAPS["events"],
             ))
         context = "\n\n".join(part for part in parts if part)
@@ -504,9 +550,18 @@ class MissionEngine:
         for row in rows:
             import json
             try:
-                texts.append(str(json.loads(row[1]).get("text", "")))
-            except (ValueError, AttributeError):
+                payload = json.loads(row[1])
+            except ValueError:
                 continue
+            if not isinstance(payload, dict):
+                continue
+            # Events without a text field (webhooks, watches) still reach
+            # the session as their compact payload — an event the mission
+            # can never see is an event that never happened.
+            text = str(payload.get("text") or "")
+            if not text:
+                text = json.dumps(payload, sort_keys=True)[:200]
+            texts.append(text)
         return texts
 
     def _consume_inputs(self, mission_id: str) -> None:

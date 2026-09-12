@@ -251,7 +251,13 @@ class EdgeDaemon:
     def tick(self) -> Dict[str, int]:
         """One supervision pass. Every step is crash-safe: timers are
         exactly-once ledger effects, sessions are lease-guarded, and outbox
-        delivery is at-least-once with dedupe keys."""
+        delivery is at-least-once with dedupe keys.
+
+        Event sources (due timers, Capitol supervision, channel intake) run
+        *before* the session slot so a mission woken by an event observed
+        this tick runs its session in this same tick — immediate wakes,
+        never a wait for the next cadence timer.
+        """
         if self.store is None or self.engine is None:
             raise KernelError("daemon is not started")
         stats = {"fired": 0, "sessions": 0, "delivered": 0}
@@ -273,6 +279,7 @@ class EdgeDaemon:
                     )
             except StaleGenerationError:
                 continue  # another pass already advanced it
+        self._capitol_tick(stats)
         if not self._stop.is_set():
             for result in self.engine.run_ready_sessions(limit=1):
                 stats["sessions"] += 1
@@ -282,7 +289,6 @@ class EdgeDaemon:
                     + (f" ({result['error']})" if result.get("error") else "")
                 )
         stats["delivered"] = self.deliver_outbox()
-        self._capitol_tick(stats)
         self._tick_count += 1
         if self._tick_count % 60 == 0:
             self.store.reconcile(self.holder)
@@ -578,11 +584,23 @@ class EdgeDaemon:
             self.engine.abort_mission(str(args.get("mission_id") or ""))
             return {"ok": True}
         if op == "mission.input":
-            self.engine.provide_input(
+            result = self.engine.provide_input(
                 str(args.get("mission_id") or ""),
                 str(args.get("text") or ""),
+                source=str(args.get("source") or "local"),
             )
-            return {"ok": True}
+            return {"ok": True, "woken": result["woken"]}
+        if op == "event.post":
+            payload = args.get("payload")
+            if not isinstance(payload, dict):
+                raise KernelError("event.post needs a payload object")
+            return self.engine.deliver_event(
+                str(args.get("source") or "control"),
+                str(args.get("key") or ""),
+                payload,
+                str(args.get("mission_id") or ""),
+                wake=bool(args.get("wake", True)),
+            )
         if op == "approvals.list":
             return approval_entries(self.store)
         if op == "approval.decide":

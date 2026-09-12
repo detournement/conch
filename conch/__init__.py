@@ -1,8 +1,7 @@
 """Conch package.
 
-Versioning: the minor version tracks the repo's merged-PR count plus the
-in-flight release PR (PR #3 ≙ 0.4.0, so the Phase 0-4 branch — the next PR —
-carries 0.5.0). Single-sourced here; pyproject.toml reads it dynamically.
+The version is single-sourced here: pyproject.toml reads it dynamically,
+releases are tagged ``v{version}``, and CHANGELOG.md carries the notes.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

@@ -350,6 +350,12 @@ and cleaning up. Accepted divergences between the adapter and the
 reference client (including the publish-revert path) are documented in
 `admin.py` and `test_capitol_crossclient.py`.
 
+**Release 0.6.0 (September 12, 2026):** first tagged release from `edge` —
+secure execution (terminal handoff, SSH control), `AgentSession`, the swarm
+protocol and required-policy substrate, the mission kernel and `conch-edge`
+daemon, the trusted SSH fleet, and the generic Capitol integration; notes
+in `CHANGELOG.md`.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

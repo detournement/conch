@@ -72,6 +72,23 @@ stale-approval zero-write proofs captured. Publishing itself is parked on an
 expired eBay sandbox user token (no refresh token in the org credential
 bundle) — an operator re-auth, not a code gap.
 
+**Milestone 1b — Slack-first channel intake (September 2026): landed.** The
+primary UX from contract Rev 2: a Slack photo message is the intake, and its
+thread carries the whole session. `SlackChannel` now captures `files[]`
+(bot-bearer download, magic-byte validation, XDG quarantine, `files:read`
+scope) and polls `conversations.replies` for threads the bot posted into;
+`conch/capitol/channel_flow.py` runs the listing session as a durable state
+machine over the thread (clarify / mid-run HITL park+resume / awaiting
+approval — all restart-safe, deduped on the message ts); publishing rides the
+existing origin-bound `ApprovalStore` via the new `ebay_publish` approval
+kind whose consume constructs the exact `ebay.publish_request.v1` from the
+pinned revision (conch staleness check + Capitol's approval node = two gates
+in series). Channel auto-publish within caps is a separate explicit opt-in
+(`ebay_channel_auto_publish`, default off). Verified with fixtures only (no
+Slack workspace configured); the publish effect stays parked on the expired
+sandbox token. Email threading (Message-ID correlation) and watched-folder
+intake remain later items.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

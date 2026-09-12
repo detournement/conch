@@ -215,6 +215,28 @@ stored in config) plus the `ebay_*` keys in `config.example`. Run linkage
 (run ids, revision hashes, listing ids) persists as a tiny JSON file under the
 XDG state dir.
 
+**Message-first Slack intake (Milestone 1b).** With the remote loop running,
+a Slack message containing item photo(s) plus whatever you know about the item
+*is* the intake: conch quarantines and validates the photos, starts a listing
+session in the same governed pipeline, and the message's thread carries
+everything that follows — clarifying questions (reply in-thread to answer,
+including mid-run HITL checkpoints, which park durably and survive restarts),
+the drafted-revision review, and the publish decision. The caps clamp decides
+auto vs. approval: within caps *and* with the explicit
+`ebay_channel_auto_publish=true` opt-in it publishes and confirms in-thread;
+otherwise it posts an origin-bound approval — the immutable revision summary
+plus the exact challenge (`POST r{rev} {hash[-12:]}`) — that only `approve N`
+from the same channel, thread, and sender can consume (TTL'd; expired ones are
+reissued). Consuming the approval *constructs* the publish request from the
+pinned revision, and Capitol's approval node re-verifies the same identity —
+two staleness checks in series; any new revision voids the pending approval.
+Inbound text is item data, never control: only the anchored `approve N` /
+`deny N` replies carry control semantics, so approval-like text buried in a
+message body, sent from the wrong thread, or from a non-allowlisted sender
+publishes nothing. Slack app requirements: the `files:read` bot scope (plus
+`chat:write` and your channel type's history scope), then reinstall the app;
+see `config.example` for `ebay_channel_intake` / `ebay_channel_auto_publish`.
+
 ### Budget-aware turns
 Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
 

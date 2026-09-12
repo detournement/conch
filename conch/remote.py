@@ -74,12 +74,24 @@ class ApprovalStore:
         thread_id: str,
         sender: str = "",
         timeout: int = 60,
+        *,
+        kind: str = "command",
+        payload: Optional[Dict[str, Any]] = None,
     ) -> int:
+        """Register a pending approval bound to its origin.
+
+        ``kind`` selects what consuming the approval *does*: ``command``
+        (the original remote-shell flow) runs the approved command;
+        ``ebay_publish`` (Milestone 1b) constructs the exact
+        ``ebay.publish_request.v1`` from the pinned revision. For
+        non-command kinds, ``command`` holds a human-readable description
+        and ``payload`` carries the kind's exact parameters.
+        """
         with self._lock:
             data = self._load()
             request_id = int(data.get("next_id", 1))
             data["next_id"] = request_id + 1
-            data.setdefault("pending", {})[str(request_id)] = {
+            entry: Dict[str, Any] = {
                 "command": command,
                 "channel": channel,
                 "thread_id": thread_id,
@@ -87,6 +99,11 @@ class ApprovalStore:
                 "timeout": timeout,
                 "created_at": time.time(),
             }
+            if kind != "command":
+                entry["kind"] = kind
+            if payload:
+                entry["payload"] = payload
+            data.setdefault("pending", {})[str(request_id)] = entry
             self._save(data)
             return request_id
 
@@ -236,6 +253,7 @@ class RemoteLoop:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._turn_lock = threading.RLock()
+        self._listing_flow = None
 
     # --- session mapping (channel thread == conch conversation) -----------
 
@@ -350,6 +368,33 @@ class RemoteLoop:
             self._conv_mgr.save(conv)
         return reply or "(no response)"
 
+    # --- eBay listing flow (Milestone 1b) ------------------------------------
+
+    def _ebay_configured(self) -> bool:
+        return bool(str(self.config.get("capitol_base_url") or "").strip())
+
+    def _ebay_flow(self):
+        """Lazy: sessions without Capitol config never import the pilot."""
+        if self._listing_flow is None:
+            from .capitol.channel_flow import ChannelListingFlow
+
+            self._listing_flow = ChannelListingFlow(
+                self.config,
+                self.approvals,
+                lambda text, channel, thread_id: self.manager.notify(
+                    text, channel=channel, thread_id=thread_id
+                ),
+            )
+        return self._listing_flow
+
+    def _maybe_listing_flow(self, message: InboundMessage) -> Optional[str]:
+        """Photo-bearing messages (and replies in bound listing threads)
+        route into the eBay pilot pipeline instead of the model turn.
+        Inbound text stays item data throughout — it never selects tools."""
+        if not self._ebay_configured():
+            return None
+        return self._ebay_flow().handle_message(message)
+
     # --- inbound dispatch ----------------------------------------------------
 
     def handle_inbound(self, message: InboundMessage) -> str:
@@ -362,7 +407,9 @@ class RemoteLoop:
             if match:
                 reply = self._handle_approval(match, message)
             else:
-                reply = self._run_turn(message)
+                reply = self._maybe_listing_flow(message)
+                if reply is None:
+                    reply = self._run_turn(message)
             reply = self._bound_reply(reply)
             self.manager.notify(
                 reply, channel=message.channel, thread_id=message.thread_id
@@ -385,6 +432,12 @@ class RemoteLoop:
             )
         except (TypeError, ValueError):
             ttl = REMOTE_APPROVAL_TTL_SECONDS
+        # Peek at the kind before the atomic consume discards an expired
+        # entry — an expired *publish* approval gets a fresh one reissued.
+        pending_kind = str(
+            (self.approvals.pending().get(str(request_id)) or {}).get("kind")
+            or "command"
+        )
         entry, error = self.approvals.consume(
             request_id,
             channel=message.channel,
@@ -394,6 +447,10 @@ class RemoteLoop:
         )
         if entry is None:
             if error == "expired":
+                if pending_kind == "ebay_publish" and self._ebay_configured():
+                    reissued = self._ebay_flow().reissue_expired(message)
+                    if reissued:
+                        return reissued
                 return f"Approval #{request_id} expired; request it again."
             if error == "origin_mismatch":
                 return (
@@ -401,6 +458,13 @@ class RemoteLoop:
                     "or conversation."
                 )
             return f"No pending approval #{request_id}."
+        if str(entry.get("kind") or "command") == "ebay_publish":
+            # Consuming a publish approval never runs a command: the flow
+            # constructs the exact ebay.publish_request.v1 from the pinned
+            # immutable revision (second staleness check runs Capitol-side).
+            return self._ebay_flow().handle_approval(
+                request_id, entry, verb, message
+            )
         if verb == "deny":
             return f"Denied #{request_id}: `{entry['command']}` will not run."
         from .tooling import run_hook

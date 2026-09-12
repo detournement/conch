@@ -153,6 +153,7 @@ class EbayEngine:
 
     first_draft_needs_info = True
     reject_publish = False
+    fail_publish_run = False
     hitl_on_first_draft = False
     last_revision = {}
     publish_requests = []
@@ -162,6 +163,7 @@ class EbayEngine:
     def reset(cls):
         cls.first_draft_needs_info = True
         cls.reject_publish = False
+        cls.fail_publish_run = False
         cls.hitl_on_first_draft = False
         cls.last_revision = {}
         cls.publish_requests = []
@@ -177,6 +179,15 @@ class EbayEngine:
             output = cls._draft(run_id, request)
         elif workflow_id == "publish-wf":
             cls.publish_requests.append(request)
+            if cls.fail_publish_run:
+                # The effect failed upstream (e.g. expired sandbox token):
+                # the run ends failed; the stream drops with no terminal
+                # frame so the client reconciles via get_workflow_status.
+                FakeGateway.runs[run_id] = {"status": "failed", "output": {}}
+                FakeGateway.stream_plans[run_id] = [
+                    {"events": [], "end": "drop"}
+                ]
+                return
             output = cls._publish(request)
         else:
             output = {}

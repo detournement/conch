@@ -171,6 +171,20 @@ api_key_env=ANTHROPIC_API_KEY
 #ebay_max_price_usd=
 #ebay_allowed_category_ids=
 
+# Slack message-first intake (Milestone 1b): a photo-bearing message from
+# an allowlisted sender in slack_channel starts a listing session; the
+# thread then carries clarifying questions, the draft review, the publish
+# approval ('approve N' / 'deny N', origin-bound + TTL'd), and
+# confirmations. Needs the remote loop plus the files:read Slack scope
+# (see the Slack section above). On by default whenever Capitol is
+# configured; set false to keep photos out of the eBay flow.
+#ebay_channel_intake=true
+# Publish over the channel without an approve reply when the caps clamp
+# passes. Default false: every channel publish takes the origin-bound
+# approval path, even within caps — opt in deliberately after setting
+# real caps (ebay_max_price_usd / ebay_allowed_category_ids).
+#ebay_channel_auto_publish=false
+
 # --- Lifecycle hooks -----------------------------------------------------------
 # Shell scripts run around the agent loop; payload arrives as JSON on stdin.
 # pre_tool_use: non-zero exit blocks the tool call; JSON stdout rewrites args.

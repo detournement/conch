@@ -266,6 +266,23 @@ class PilotState:
     def sessions(self) -> Dict[str, Any]:
         return dict(self.load().get("sessions", {}))
 
+    def session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        return (self.load().get("sessions") or {}).get(session_id)
+
+    # -- channel-thread bindings (Milestone 1b: thread ↔ listing session) --
+
+    def bind_thread(self, key: str, session_id: str):
+        """Bind ``{channel}:{thread_id}`` to a listing session, durably —
+        the binding doubles as the intake dedupe (one session per thread,
+        recorded before any run starts)."""
+        with _STATE_LOCK:
+            data = self.load()
+            data.setdefault("threads", {})[key] = session_id
+            self._save(data)
+
+    def thread_session(self, key: str) -> Optional[str]:
+        return (self.load().get("threads") or {}).get(key)
+
 
 # ---------------------------------------------------------------------------
 # Request constructors (deterministic; exact-match fields come from the
@@ -414,6 +431,18 @@ def build_revise_request(
     }
 
 
+def effect_listing(effect: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize an ``ebay.inventory_effect.v1`` contract's listing facts."""
+    listing = effect.get("listing") or {}
+    return {
+        "state": effect.get("state"),
+        "listing_id": listing.get("listing_id") or effect.get("listing_id"),
+        "offer_id": listing.get("offer_id") or effect.get("offer_id"),
+        "sku": listing.get("sku") or effect.get("sku"),
+        "listing_url": listing.get("listing_url") or effect.get("listing_url"),
+    }
+
+
 def build_publish_request(
     revision: Dict[str, Any],
     *,
@@ -454,6 +483,130 @@ def build_publish_request(
 
 
 # ---------------------------------------------------------------------------
+# Shared pipeline helpers (the shell pilot and the Milestone 1b channel
+# flow drive the exact same workflows through these)
+# ---------------------------------------------------------------------------
+
+def resolve_workflows(runtime: CapitolRuntime, config: dict) -> Dict[str, str]:
+    """Locate the draft + publish workflows on the agent's allowlist.
+
+    Config pins (``ebay_draft_workflow`` / ``ebay_publish_workflow``) win;
+    otherwise match by name. ``list_workflows`` returns the id
+    ``call_workflow`` expects, so the discovered value is passed back
+    verbatim.
+    """
+    pinned_draft = str(config.get("ebay_draft_workflow") or "").strip()
+    pinned_publish = str(config.get("ebay_publish_workflow") or "").strip()
+    if pinned_draft and pinned_publish:
+        return {"draft": pinned_draft, "publish": pinned_publish}
+    workflows = runtime.list_workflows()
+    draft = pinned_draft
+    publish = pinned_publish
+    for workflow in workflows:
+        name = str(workflow.get("name") or "").lower()
+        identifier = str(
+            workflow.get("workflow_id") or workflow.get("id") or ""
+        )
+        if not identifier:
+            continue
+        if not draft and "draft" in name:
+            draft = identifier
+        elif not publish and ("publish" in name or "approve" in name):
+            publish = identifier
+    if not draft or not publish:
+        names = ", ".join(
+            clean_text(w.get("name"), 80) or "?" for w in workflows
+        ) or "(none)"
+        raise CapitolError(
+            "could not locate the draft/publish workflows on this "
+            f"agent's allowlist (saw: {names}); pin them with "
+            "ebay_draft_workflow / ebay_publish_workflow"
+        )
+    return {"draft": draft, "publish": publish}
+
+
+def workflow_inputs_key(
+    runtime: CapitolRuntime,
+    workflow_id: str,
+    cache: Optional[Dict[str, str]] = None,
+) -> str:
+    """Canonical inputs key for the workflow's JSON request input node."""
+    if cache is not None and workflow_id in cache:
+        return cache[workflow_id]
+    key = "value"
+    try:
+        details = runtime.describe_workflow(workflow_id) or {}
+        fields = [
+            field for field in details.get("fields") or []
+            if isinstance(field, dict)
+        ]
+        value_fields = [
+            field for field in fields
+            if str(field.get("field_id")) == "value"
+        ]
+        target = value_fields[0] if value_fields else (
+            fields[0] if len(fields) == 1 else None
+        )
+        if target:
+            node = str(target.get("node_instance_id") or "").strip()
+            field_id = str(target.get("field_id") or "value")
+            key = f"{node}.{field_id}" if node else field_id
+    except CapitolError:
+        pass  # fall back to the bare field id
+    if cache is not None:
+        cache[workflow_id] = key
+    return key
+
+
+def start_chat_draft(
+    runtime: CapitolRuntime,
+    draft_workflow_id: str,
+    message: str,
+    photo_paths: List[str],
+    say: Callable[[str], None],
+) -> tuple:
+    """Launch the initial draft over chat FileParts; return (run_id, reply).
+
+    This is the agent's designed intake path — image FileParts are the one
+    A2A upload the gateway promotes into durable org artifacts the image
+    node can resolve. If the blocking chat turn outlives its transport,
+    the launched run is reconciled from the conversation's run history
+    instead of resending the intake (a resend would start a second run).
+    The assistant reply is untrusted prose; contracts are read from run
+    outputs, never parsed out of chat text.
+    """
+    reply = ""
+    payload: Dict[str, Any] = {}
+    try:
+        payload = runtime.chat(message, files=photo_paths) or {}
+        reply = clean_text(payload.get("assistant_reply"), 600)
+    except (CapitolAuthError, CapitolProtocolError):
+        raise
+    except CapitolError:
+        say("  chat transport dropped; reconciling run state …")
+    run_id = str(payload.get("run_id") or "")
+    for _attempt in range(6):
+        if run_id:
+            break
+        listing = runtime.list_runs(draft_workflow_id, limit=10)
+        for run in listing.get("runs") or []:
+            context = str(
+                run.get("started_by_context") or run.get("context_id") or ""
+            )
+            if context and context == runtime.context_id:
+                run_id = str(run.get("run_id") or "")
+                break
+        if not run_id:
+            time.sleep(5)
+    if not run_id:
+        raise CapitolError(
+            "the agent did not start a draft run"
+            + (f" — it said: {reply}" if reply else "")
+        )
+    return run_id, reply
+
+
+# ---------------------------------------------------------------------------
 # The pilot flow
 # ---------------------------------------------------------------------------
 
@@ -485,70 +638,10 @@ class EbayPilot:
     # -- discovery ---------------------------------------------------------
 
     def resolve_workflows(self) -> Dict[str, str]:
-        """Locate the draft + publish workflows on the agent's allowlist.
-
-        Config pins (``ebay_draft_workflow`` / ``ebay_publish_workflow``)
-        win; otherwise match by name. ``list_workflows`` returns the id
-        ``call_workflow`` expects, so the discovered value is passed back
-        verbatim.
-        """
-        pinned_draft = str(self.config.get("ebay_draft_workflow") or "").strip()
-        pinned_publish = str(
-            self.config.get("ebay_publish_workflow") or ""
-        ).strip()
-        if pinned_draft and pinned_publish:
-            return {"draft": pinned_draft, "publish": pinned_publish}
-        workflows = self.runtime.list_workflows()
-        draft = pinned_draft
-        publish = pinned_publish
-        for workflow in workflows:
-            name = str(workflow.get("name") or "").lower()
-            identifier = str(
-                workflow.get("workflow_id") or workflow.get("id") or ""
-            )
-            if not identifier:
-                continue
-            if not draft and "draft" in name:
-                draft = identifier
-            elif not publish and ("publish" in name or "approve" in name):
-                publish = identifier
-        if not draft or not publish:
-            names = ", ".join(
-                clean_text(w.get("name"), 80) or "?" for w in workflows
-            ) or "(none)"
-            raise CapitolError(
-                "could not locate the draft/publish workflows on this "
-                f"agent's allowlist (saw: {names}); pin them with "
-                "ebay_draft_workflow / ebay_publish_workflow"
-            )
-        return {"draft": draft, "publish": publish}
+        return resolve_workflows(self.runtime, self.config)
 
     def _inputs_key(self, workflow_id: str) -> str:
-        """Canonical inputs key for the workflow's JSON request input node."""
-        if workflow_id in self._input_keys:
-            return self._input_keys[workflow_id]
-        key = "value"
-        try:
-            details = self.runtime.describe_workflow(workflow_id) or {}
-            fields = [
-                field for field in details.get("fields") or []
-                if isinstance(field, dict)
-            ]
-            value_fields = [
-                field for field in fields
-                if str(field.get("field_id")) == "value"
-            ]
-            target = value_fields[0] if value_fields else (
-                fields[0] if len(fields) == 1 else None
-            )
-            if target:
-                node = str(target.get("node_instance_id") or "").strip()
-                field_id = str(target.get("field_id") or "value")
-                key = f"{node}.{field_id}" if node else field_id
-        except CapitolError:
-            pass  # fall back to the bare field id
-        self._input_keys[workflow_id] = key
-        return key
+        return workflow_inputs_key(self.runtime, workflow_id, self._input_keys)
 
     # -- photos --------------------------------------------------------------
 
@@ -793,39 +886,9 @@ class EbayPilot:
             "Please draft a sandbox eBay listing from the attached "
             f"photo(s). Item context: {item_context}"
         )
-        reply = ""
-        payload: Dict[str, Any] = {}
-        try:
-            payload = self.runtime.chat(message, files=photo_paths) or {}
-            reply = clean_text(payload.get("assistant_reply"), 600)
-        except (CapitolAuthError, CapitolProtocolError):
-            raise
-        except CapitolError:
-            # The blocking chat turn outlived its transport, but the run it
-            # launched may be live server-side. Never resend the intake
-            # blindly (that would start a second draft run) — reconcile
-            # from the conversation's run history instead.
-            self.say("  chat transport dropped; reconciling run state …")
-        run_id = str(payload.get("run_id") or "")
-        for _attempt in range(6):
-            if run_id:
-                break
-            listing = self.runtime.list_runs(workflows["draft"], limit=10)
-            for run in listing.get("runs") or []:
-                context = str(
-                    run.get("started_by_context") or run.get("context_id")
-                    or ""
-                )
-                if context and context == self.runtime.context_id:
-                    run_id = str(run.get("run_id") or "")
-                    break
-            if not run_id:
-                time.sleep(5)
-        if not run_id:
-            raise CapitolError(
-                "the agent did not start a draft run"
-                + (f" — it said: {reply}" if reply else "")
-            )
+        run_id, reply = start_chat_draft(
+            self.runtime, workflows["draft"], message, photo_paths, self.say
+        )
         if reply:
             self.say(f"  agent: {reply}")
         output = self.supervise_run(session_id, "draft", run_id)
@@ -973,17 +1036,7 @@ class EbayPilot:
             raise CapitolError(
                 "publish run produced no ebay.inventory_effect.v1 contract"
             )
-        listing = {
-            "state": effect.get("state"),
-            "listing_id": (effect.get("listing") or {}).get("listing_id")
-            or effect.get("listing_id"),
-            "offer_id": (effect.get("listing") or {}).get("offer_id")
-            or effect.get("offer_id"),
-            "sku": (effect.get("listing") or {}).get("sku")
-            or effect.get("sku"),
-            "listing_url": (effect.get("listing") or {}).get("listing_url")
-            or effect.get("listing_url"),
-        }
+        listing = effect_listing(effect)
         self.state.update_session(session_id, listing=listing)
         state_text = clean_text(listing.get("state"), 40) or "?"
         self.say(

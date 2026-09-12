@@ -36,7 +36,7 @@ api_key_env=ANTHROPIC_API_KEY
 # --- Custom OpenAI-compatible endpoint (vLLM, LM Studio, llama.cpp) ----------
 # Assumed tool-capable; verified by a startup probe.
 #provider=custom
-#custom_base_url=http://192.168.1.50:8000/v1
+#custom_base_url=http://192.0.2.50:8000/v1
 #custom_model=qwen2.5-32b
 #custom_context_window=32768
 #api_key_env=MY_ENDPOINT_KEY

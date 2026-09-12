@@ -240,9 +240,9 @@ policy, budgets, approvals, and the external-action ledger stay on the
 controller. All in `conch/capitol/`, dependency-light (stdlib HTTP + a
 hand-rolled SSE reader; no CLI subprocess on the production control path);
 the eBay pilot paths (`channel_flow.py`, the `/ebay` driver) ride the same
-adapter unchanged. [`A2Actrl`](/Users/thom/composer/A2Actrl) remains the
-normative reference client — the adapter is verified differentially against
-the `a2actrl` CLI, and any accepted divergences are documented.
+adapter unchanged. The `A2Actrl` reference client remains normative — the
+adapter is verified differentially against the `a2actrl` CLI, and any
+accepted divergences are documented.
 
 - **`CapitolRuntime` (`conch/capitol/client.py`):** the full adapter surface
   — AgentCard discovery with fail-closed capability gating (`ensure_skill`
@@ -330,12 +330,10 @@ Capitol-side epics):
   reconciles dropped streams by re-reading; a push callback (with an HMAC or
   signature Conch can verify) would make terminal/HITL wake-ups immediate.
 - **A single idempotent unified management API.** Provisioning currently
-  spans two services (platform-api for agents/bearers/collections,
-  workflow-api for workflows/versions/schedules) with inconsistent
-  idempotency and two different version stores (see the rollback divergence
-  below). One management contract with first-class idempotency keys and a
-  single authoritative version history would remove the reconcile-by-query
-  and re-persist-to-undo workarounds.
+  spans multiple services with inconsistent idempotency semantics. One
+  management contract with first-class idempotency keys and a single
+  authoritative version history would remove the reconcile-by-query and
+  re-persist-to-undo workarounds documented in `admin.py`.
 - **Process-graph diff / migration.** Publishing today re-persists a full
   payload and mints a new version with no server-side diff or safe
   migration between versions; a diff/migration API would let the builder
@@ -343,18 +341,14 @@ Capitol-side epics):
 - **First-class Gmail push ingestion** (Phase 4 dependency) so per-user mail
   intake is event-driven rather than polled.
 
-**Verified live tonight against the local dev stack** (workflow-api
-`:8300`, platform-api `:8811`, dev org): the full disposable-asset drill,
-invoke → supervise-to-`success`, SSE streaming and cursor resume, eval
-roll-up reads (a passing suite), artifact upload/download round-trips, a
-HITL pause + intervention reply, and the a2actrl-vs-adapter comparisons —
-all creating only `conch-phase3-*` assets and cleaning up. **Accepted
-divergence:** the platform-api `/agentic-workflows/.../rollback` endpoint
-reads a separate version store that workflow-api publishes never populate
-(it 404s for workflows published through the workflow-api), so Conch
-reverts a publish by re-persisting the payload with `publish_to_api`
-cleared through the same workflow-api endpoint — publish and undo stay in
-one version lineage. Documented in `admin.py` and `test_capitol_crossclient.py`.
+**Verified live against a development Capitol stack:** the full
+disposable-asset drill, invoke → supervise-to-`success`, SSE streaming and
+cursor resume, eval roll-up reads (a passing suite), artifact
+upload/download round-trips, a HITL pause + intervention reply, and the
+a2actrl-vs-adapter comparisons — all creating only `conch-phase3-*` assets
+and cleaning up. Accepted divergences between the adapter and the
+reference client (including the publish-revert path) are documented in
+`admin.py` and `test_capitol_crossclient.py`.
 
 ---
 
@@ -905,48 +899,39 @@ implementing.
 
 ---
 
-## Swarm Milestone A — live evidence (September 12, 2026, this machine)
+## Swarm Milestone A — live evidence (September 2026)
 
-The daemon was enabled locally (`edge_daemon = true` in
-`~/.config/conch/config`; previous config kept at
-`config.pre-edge-backup`) and run against the real Anthropic backend
-(`CONCH_PROVIDER=anthropic` env override; the configured llama.cpp
-endpoint was unreachable that night). No `tasks.json` existed on this
-machine, so migration was a no-op here (it is covered by tests).
+The daemon was enabled locally (`edge_daemon = true`) and run against a
+real cloud backend. Legacy `tasks.json` migration did not apply on the
+verification machine (it is covered by tests). Verified live:
 
-- **Mission:** `msn-001a094c37857-e8154420a371de5e` — "daily activity
-  summary of /Users/thom/conch" (standard kind, `notify=sessions`,
-  dry-run, budgets 90 sessions / 9M tokens, daily cadence).
-- **Scheduled sessions ran:** activation → first session executed real
-  `git` commands via `local_shell` (agent mode), recorded a
+- **Mission lifecycle:** a standard daily mission (dry-run, session and
+  token budgets, daily cadence) activated; its first session executed
+  real `git` commands via `local_shell` (agent mode), recorded a
   `mission_control` note, checkpointed, committed budgets, rescheduled
   the wake timer (+24h), and enqueued its digest — all in one kernel
-  transaction. A separate `/schedule`-style run-once task
-  (`msn-001a094c3a940`, 2-minute interval) had its timer fire live,
-  ran, succeeded, and delivered its one-line answer.
-- **Notifications:** no channel is configured, so all three session
-  digests were delivered over the log transport and recorded as
-  `delivered` outbox rows with session-scoped dedupe keys (`outbox #1-3`
-  in `~/.local/state/conch/kernel/daemon.log`). Configuring
+  transaction. A separate `/schedule`-style run-once task had its timer
+  fire live, ran, succeeded, and delivered its one-line answer.
+- **Notifications:** with no channel configured, every session digest
+  was delivered over the log transport and recorded as a `delivered`
+  outbox row with a session-scoped dedupe key. Configuring
   `notify_channel` (Slack/SMS/email) upgrades the same path to a live
   channel with no mission changes.
-- **kill -9 / resume proof:** mission resumed → second session active →
-  daemon killed with SIGKILL mid-session (epoch 2, pid 34096). Restarted
-  daemon adopted epoch 3 and *honored the dead session's live lease*
-  (no theft); at lease expiry reconciliation released the budget
-  reservation, appended `session_abandoned`
-  (`ses-001a094c7f756-a420363bf5049065`), returned the mission to
-  ready, and the retried session checkpointed normally. Final state:
-  `waiting_timer`, runs=2, budgets `sessions committed=2, reserved=0` —
-  the killed session left no partial effects, no duplicate outbox rows,
-  and no duplicate timer fires (exactly one `timer_fired` per scheduled
-  occurrence).
-- **Shell attach:** `/missions`, `/mission show 17`, and `/tasks` ran
+- **kill -9 / resume proof:** the daemon was killed with SIGKILL
+  mid-session. The restarted daemon adopted a new epoch and *honored
+  the dead session's live lease* (no theft); at lease expiry,
+  reconciliation released the budget reservation, appended
+  `session_abandoned`, returned the mission to ready, and the retried
+  session checkpointed normally. The killed session left no partial
+  effects, no duplicate outbox rows, and no duplicate timer fires
+  (exactly one `timer_fired` per scheduled occurrence).
+- **Shell attach:** `/missions`, `/mission show`, and `/tasks` ran
   through the real command path over the daemon socket, showing live
   status, budgets, checkpoint, and the event tail.
-- **Integrity:** `verify_integrity()` on the live kernel:
-  62 events hash-chain-verified, replay == live across every replayed
-  projection. Daemon epochs advanced 1 → 2 → 3 across the restarts.
+- **Integrity:** `verify_integrity()` on the live kernel hash-chain
+  verified the full journal, with replay == live across every replayed
+  projection and daemon epochs advancing monotonically across the
+  restarts.
 
 Gates all live in tests (`tests/test_kernel_*.py`, plus the kernel
 secret-canary sweep and the no-daemon compat gate): 1,183 tests green on

@@ -227,12 +227,12 @@ class TestBuildSelfDescription(CtxCacheTestCase):
 
     def test_ollama_description_includes_base_url(self):
         side_effect = _fake_show_server({"llama.context_length": 131072})
-        config = {"provider": "ollama", "ollama_base_url": "http://192.168.1.247:11434"}
+        config = {"provider": "ollama", "ollama_base_url": "http://192.0.2.247:11434"}
         with patch("urllib.request.urlopen", side_effect=side_effect):
             text = build_self_description("ollama", "llama3.3", config)
         self.assertIn("ollama/llama3.3", text)
         self.assertIn("4,096 tokens", text)
-        self.assertIn("http://192.168.1.247:11434", text)
+        self.assertIn("http://192.0.2.247:11434", text)
 
     def test_description_stays_compact(self):
         text = build_self_description("openai", "gpt-4o-mini", {})
@@ -292,10 +292,10 @@ class TestStatusCommand(CtxCacheTestCase):
 
     def test_ollama_shows_base_url(self):
         side_effect = _fake_show_server({"llama.context_length": 131072})
-        config = {"provider": "ollama", "ollama_base_url": "http://192.168.1.247:11434"}
+        config = {"provider": "ollama", "ollama_base_url": "http://192.0.2.247:11434"}
         with patch("urllib.request.urlopen", side_effect=side_effect):
             result, output = self._run(config, "ollama", "llama3.3")
-        self.assertIn("http://192.168.1.247:11434", output)
+        self.assertIn("http://192.0.2.247:11434", output)
         self.assertIn("4,096 tokens", output)
 
     def test_secretlike_settings_hidden(self):

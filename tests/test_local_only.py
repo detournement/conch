@@ -62,7 +62,7 @@ class TestLocalOnlyPolicy(unittest.TestCase):
     def test_local_endpoint_classification(self):
         for url in (
             "http://127.0.0.1:11434",
-            "http://192.168.1.247:11434",
+            "http://192.0.2.247:11434",
             "http://host.docker.internal:11434",
             "http://ollama:11434",
             "http://inference.local:8080",

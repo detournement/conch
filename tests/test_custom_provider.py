@@ -44,7 +44,7 @@ class _FakeHTTPResponse:
 
 CONFIG = {
     "provider": "custom",
-    "custom_base_url": "http://192.168.1.50:8000/v1",
+    "custom_base_url": "http://192.0.2.50:8000/v1",
     "custom_model": "qwen2.5-32b-vllm",
     "chat_model": "qwen2.5-32b-vllm",
     "model": "qwen2.5-32b-vllm",
@@ -121,7 +121,7 @@ class CustomCacheTestCase(unittest.TestCase):
 
 class TestCustomBaseUrl(unittest.TestCase):
     def test_custom_base_url_key(self):
-        self.assertEqual(get_custom_base_url(CONFIG), "http://192.168.1.50:8000/v1")
+        self.assertEqual(get_custom_base_url(CONFIG), "http://192.0.2.50:8000/v1")
 
     def test_shared_base_url_when_provider_custom(self):
         cfg = {"provider": "custom", "base_url": "http://host:8000/v1/"}
@@ -155,7 +155,7 @@ class TestRawCustom(CustomCacheTestCase):
             ),
         ):
             result = raw_custom(CONFIG, [{"role": "user", "content": "hi"}])
-        self.assertEqual(recorded["url"], "http://192.168.1.50:8000/v1/chat/completions")
+        self.assertEqual(recorded["url"], "http://192.0.2.50:8000/v1/chat/completions")
         self.assertEqual(recorded["body"]["model"], "qwen2.5-32b-vllm")
         self.assertEqual(result["content"], "hi there")
         self.assertEqual(result["_usage"], {"input_tokens": 5, "output_tokens": 2})
@@ -373,14 +373,14 @@ class TestCustomConfigLoading(unittest.TestCase):
             conch_dir.mkdir()
             (conch_dir / "config").write_text(
                 "provider = custom\n"
-                "base_url = http://192.168.1.50:8000/v1\n"
+                "base_url = http://192.0.2.50:8000/v1\n"
                 "model = local-model\n"
             )
             with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}), \
                  mock.patch.object(Path, "home", return_value=Path(tmp)):
                 config = load_config()
         self.assertEqual(config["provider"], "custom")
-        self.assertEqual(config["custom_base_url"], "http://192.168.1.50:8000/v1")
+        self.assertEqual(config["custom_base_url"], "http://192.0.2.50:8000/v1")
         self.assertEqual(config["custom_model"], "local-model")
         self.assertEqual(config["chat_model"], "local-model")
 

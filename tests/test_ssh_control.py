@@ -34,9 +34,9 @@ from conch.tooling import (
 
 class TestSSHValidation(unittest.TestCase):
     def test_valid_target(self):
-        target = parse_ssh_target("milgauss@192.168.1.152", "22")
-        self.assertEqual(target.user, "milgauss")
-        self.assertEqual(target.host, "192.168.1.152")
+        target = parse_ssh_target("user@192.0.2.152", "22")
+        self.assertEqual(target.user, "user")
+        self.assertEqual(target.host, "192.0.2.152")
         self.assertEqual(target.port, 22)
 
     def test_ipv6_and_config_alias_are_supported(self):
@@ -85,7 +85,7 @@ class TestSSHCommandConstruction(unittest.TestCase):
         )
         self.addCleanup(self.manager.close)
         self.target = SSHTarget(
-            host="192.168.1.152", user="milgauss", port=2222
+            host="192.0.2.152", user="user", port=2222
         )
 
     def test_runtime_directory_is_private(self):
@@ -112,7 +112,7 @@ class TestSSHCommandConstruction(unittest.TestCase):
         self.assertIn("-M", argv)
         self.assertIn("-N", argv)
         self.assertIn("-f", argv)
-        self.assertEqual(argv[-2:], ["--", "192.168.1.152"])
+        self.assertEqual(argv[-2:], ["--", "192.0.2.152"])
         rendered = " ".join(argv)
         self.assertNotIn("StrictHostKeyChecking=no", rendered)
         self.assertNotIn("UserKnownHostsFile", rendered)
@@ -211,7 +211,7 @@ class TestSSHControlLifecycle(unittest.TestCase):
 
 class _FakeManager:
     def __init__(self):
-        self.target = SSHTarget("192.168.1.152", "milgauss", 22)
+        self.target = SSHTarget("192.0.2.152", "user", 22)
         self.connected = False
         self.remembered = []
         self.disconnected = []
@@ -298,8 +298,8 @@ class TestSSHRemoteClient(unittest.TestCase):
             "ssh_remote",
             {
                 "action": "connect",
-                "host": "192.168.1.152",
-                "user": "milgauss",
+                "host": "192.0.2.152",
+                "user": "user",
                 "port": 22,
             },
         )
@@ -321,8 +321,8 @@ class TestSSHRemoteClient(unittest.TestCase):
             "ssh_remote",
             {
                 "action": "connect",
-                "host": "192.168.1.152",
-                "user": "milgauss",
+                "host": "192.0.2.152",
+                "user": "user",
             },
         )
         self.assertIn("Refused", result["content"][0]["text"])
@@ -424,15 +424,15 @@ class TestSSHSlashCommands(unittest.TestCase):
 
     def test_connect_target_is_split_into_validated_fields(self):
         result = self._parse(
-            "/ssh connect milgauss@192.168.1.152 22"
+            "/ssh connect user@192.0.2.152 22"
         )
         self.assertEqual(result[0:2], ("run_builtin_tool", "ssh_remote"))
         self.assertEqual(
             result[2],
             {
                 "action": "connect",
-                "host": "192.168.1.152",
-                "user": "milgauss",
+                "host": "192.0.2.152",
+                "user": "user",
                 "port": 22,
             },
         )

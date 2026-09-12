@@ -9,7 +9,7 @@ funding relevance is judged agentically inside the ingest workflow.
 Three durable assets, all prefixed ``together-funding-``:
 
 - **together-funding-ingest** — scheduled per-connection Gmail fetch
-  (EY-pattern query windowing with overlap; the run user's Composio
+  (query windowing with overlap; the run user's Composio
   connection resolves via the platform's ``USER_COMPOSIO_URL`` sentinel),
   agentic funding-relevance classification with threshold routing,
   a minimal ledger row for every processed message (non-matches too, for
@@ -252,7 +252,7 @@ Nothing else."""
 
 
 # ---------------------------------------------------------------------------
-# Graph assembly primitives (EY build_local_payload pattern, catalog-driven)
+# Graph assembly primitives (catalog-driven build_local_payload pattern)
 # ---------------------------------------------------------------------------
 
 def _find_param(struct: Dict[str, Any], field_id: str) -> Dict[str, Any]:
@@ -318,7 +318,7 @@ def _edge(src: str, sport: str, dst: str, dport: str,
         "sourceHandle": sport,
         "targetHandle": dport,
         # port_to_param + target_param_id is mandatory for bound params:
-        # the temporal input resolver does not infer them (EY gotcha #5).
+        # the temporal input resolver does not infer them.
         "edge_type": "port_to_param" if target_param_id else "port_to_port",
         "sourceNodeId": src,
         "targetNodeId": dst,

@@ -42,7 +42,7 @@ Or for a local Ollama server:
 
 ```ini
 provider=ollama
-ollama_base_url=http://192.168.1.247:11434
+ollama_base_url=http://192.0.2.247:11434
 model=qwen3.6:27b
 chat_model=qwen3.6:27b
 local_only=true
@@ -160,7 +160,7 @@ Interactive handoff is available only in the local foreground TTY. Scheduled tas
 `/ssh` manages OpenSSH ControlMaster connections without storing a password:
 
 ```bash
-/ssh connect milgauss@192.168.1.152
+/ssh connect user@192.0.2.152
 /ssh status
 /ssh exec curl -fsS http://127.0.0.1:8080/v1/models
 /ssh shell sudo systemctl status llama-server
@@ -480,7 +480,7 @@ OLLAMA_HOST=http://host.docker.internal:11434 \
   docker compose run --rm conch
 ```
 
-For a LAN server, set `OLLAMA_HOST=http://192.168.1.247:11434`. On Linux,
+For a LAN server, set `OLLAMA_HOST=http://192.0.2.247:11434`. On Linux,
 Compose maps `host.docker.internal` through `host-gateway`. To run an Ollama
 sidecar:
 

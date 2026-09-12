@@ -4,7 +4,7 @@ The builders and driver behind the live ``together-funding-*`` assets:
 
 - graph payloads are structurally sound (every edge endpoint resolves;
   every bound param rides a ``port_to_param`` edge with its
-  ``target_param_id`` — the EY local-stack gotcha), deterministic across
+  ``target_param_id`` — a known local-stack gotcha), deterministic across
   rebuilds, and published;
 - the ingest agent's authority is configuration, not prose: the packet
   workflow is the single delegable entry, version-pinned, launch budget
@@ -538,8 +538,8 @@ class OnboardingCase(unittest.TestCase):
         )
 
     def test_connected_member_reports_live_pipe(self):
-        FakeOnboardGateway.connected_members.add("tom@capitol.ai")
-        row = tf.provision_member(self.base, TOKEN, ORG, "tom@capitol.ai")
+        FakeOnboardGateway.connected_members.add("member@example.com")
+        row = tf.provision_member(self.base, TOKEN, ORG, "member@example.com")
         self.assertEqual(row["connected"], ["gmail"])
         self.assertEqual(row["auth_url"], "")
 

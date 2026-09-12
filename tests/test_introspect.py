@@ -79,12 +79,12 @@ class TestCapabilities(IsolatedConfigTestCase):
 class TestConfigReport(IsolatedConfigTestCase):
     def test_shows_provider_window_and_paths(self):
         config = {"provider": "ollama",
-                  "ollama_base_url": "http://192.168.1.152:11434",
+                  "ollama_base_url": "http://192.0.2.152:11434",
                   "ollama_num_ctx": "16384"}
         report = _call(_client(config=config), {"action": "config"})
         self.assertIn("ollama", report)
         self.assertIn("16,384 tokens", report)
-        self.assertIn("192.168.1.152", report)
+        self.assertIn("192.0.2.152", report)
         self.assertIn("permission mode", report)
         self.assertIn("config file:", report)
 

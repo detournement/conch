@@ -15,7 +15,7 @@ kernel missions and supervises them from the daemon tick.
 
 Stdlib only; models never talk to these surfaces directly (drivers and
 mission tools construct exact requests, deterministic policy authorizes).
-[`A2Actrl`](/Users/thom/composer/A2Actrl) is the normative wire reference.
+The ``A2Actrl`` reference client is the normative wire reference.
 """
 
 from .errors import (  # noqa: F401

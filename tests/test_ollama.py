@@ -823,8 +823,8 @@ class TestNormalizeMessagesForOllama(unittest.TestCase):
 
 class TestGetOllamaBaseUrl(unittest.TestCase):
     def test_config_base_url_when_provider_ollama(self):
-        cfg = {"provider": "ollama", "base_url": "http://192.168.1.247:11434/"}
-        self.assertEqual(get_ollama_base_url(cfg), "http://192.168.1.247:11434")
+        cfg = {"provider": "ollama", "base_url": "http://192.0.2.247:11434/"}
+        self.assertEqual(get_ollama_base_url(cfg), "http://192.0.2.247:11434")
 
     def test_foreign_base_url_ignored(self):
         cfg = {"provider": "cerebras", "base_url": "https://api.cerebras.ai/v1"}
@@ -832,12 +832,12 @@ class TestGetOllamaBaseUrl(unittest.TestCase):
             self.assertEqual(get_ollama_base_url(cfg), "http://localhost:11434")
 
     def test_ollama_base_url_key_wins_after_provider_switch(self):
-        cfg = {"provider": "anthropic", "ollama_base_url": "http://192.168.1.247:11434"}
-        self.assertEqual(get_ollama_base_url(cfg), "http://192.168.1.247:11434")
+        cfg = {"provider": "anthropic", "ollama_base_url": "http://192.0.2.247:11434"}
+        self.assertEqual(get_ollama_base_url(cfg), "http://192.0.2.247:11434")
 
     def test_env_fallback_and_scheme_added(self):
-        with patch.dict("os.environ", {"OLLAMA_HOST": "192.168.1.247:11434"}):
-            self.assertEqual(get_ollama_base_url({}), "http://192.168.1.247:11434")
+        with patch.dict("os.environ", {"OLLAMA_HOST": "192.0.2.247:11434"}):
+            self.assertEqual(get_ollama_base_url({}), "http://192.0.2.247:11434")
 
 
 # ---------------------------------------------------------------------------
@@ -1206,7 +1206,7 @@ class TestOllamaFallbacks(OllamaCacheTestCase):
     def test_chain_passes_config_to_live_list(self):
         # The fallback chain must query the *configured* server, not just
         # OLLAMA_HOST/localhost.
-        config = {"provider": "ollama", "ollama_base_url": "http://192.168.1.247:11434"}
+        config = {"provider": "ollama", "ollama_base_url": "http://192.0.2.247:11434"}
         with patch("conch.providers.list_ollama_models", return_value=["qwen3:latest"]) as mock_list:
             get_fallback_chain("ollama", "qwen3:latest", config)
         mock_list.assert_called_with(config)

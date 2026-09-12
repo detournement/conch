@@ -237,7 +237,7 @@ class TestSearchToolContent(unittest.TestCase):
                                 "type": "tool_use",
                                 "id": "toolu_2",
                                 "name": "JIRA_GET_ISSUE",
-                                "input": {"issue_key": "ENG-707"},
+                                "input": {"issue_key": "PROJ-1234"},
                             },
                         ],
                     },
@@ -247,13 +247,13 @@ class TestSearchToolContent(unittest.TestCase):
                             {
                                 "type": "tool_result",
                                 "tool_use_id": "toolu_2",
-                                "content": "ENG-707: regional admin session isolation bug",
+                                "content": "PROJ-1234: example widget rendering bug",
                             },
                         ],
                     },
                 ]
                 mgr.save(conv)
-                results = mgr.search("ENG-707")
+                results = mgr.search("PROJ-1234")
                 self.assertEqual(len(results), 1)
                 self.assertGreaterEqual(len(results[0]["matches"]), 2)
 

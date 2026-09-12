@@ -16,11 +16,12 @@ referenced by name only. Every asset these tests create carries the
 temporary A2Actrl registry entry added so the ``a2actrl`` CLI can talk to
 a disposable agent.
 
-The knobs (all optional, with local-dev defaults):
+The knobs:
 
 - ``CONCH_CAPITOL_WORKFLOW_URL`` (default ``http://localhost:8300``)
 - ``CONCH_CAPITOL_PLATFORM_URL`` (default ``http://localhost:8811``)
-- ``CONCH_CAPITOL_ORG``          (default the dev org UUID)
+- ``CONCH_CAPITOL_ORG``          (required: the target org UUID — there is
+  no default, so the live suite additionally skips until it is set)
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from conch.capitol.credentials import resolve_admin_token
 
 LIVE_ENV = "CONCH_CAPITOL_LIVE"
-DEFAULT_ORG = "7d577196-ffad-46ba-8d28-ac7f4c85294d"
+ORG_ENV = "CONCH_CAPITOL_ORG"
 ASSET_PREFIX = "conch-phase3-"
 
 WORKFLOW_URL = os.environ.get(
@@ -46,7 +47,10 @@ WORKFLOW_URL = os.environ.get(
 PLATFORM_URL = os.environ.get(
     "CONCH_CAPITOL_PLATFORM_URL", "http://localhost:8811"
 ).rstrip("/")
-ORG = os.environ.get("CONCH_CAPITOL_ORG", DEFAULT_ORG)
+#: The org every live asset is created in. Deliberately has no default:
+#: the UUID identifies a private deployment, so it must come from the
+#: operator's environment.
+ORG = os.environ.get(ORG_ENV, "")
 
 #: A tiny, deterministic, LLM-free workflow that emits a passing eval
 #: suite — used to drive live invoke/supervise/eval reads. Discovered by
@@ -76,6 +80,10 @@ def live_config() -> Dict[str, str]:
     if not os.environ.get(LIVE_ENV):
         raise unittest.SkipTest(
             f"set {LIVE_ENV}=1 to run the live Capitol stack tests"
+        )
+    if not ORG:
+        raise unittest.SkipTest(
+            f"set {ORG_ENV} to the target org UUID for the live tests"
         )
     if not _probe(f"{PLATFORM_URL}/health"):
         raise unittest.SkipTest(f"platform-api unreachable at {PLATFORM_URL}")

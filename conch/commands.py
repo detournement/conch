@@ -121,6 +121,7 @@ SLASH_COMMANDS = [
     ("/connect <app>", "Connect a service via OAuth (Composio)"),
     ("/apps", "List connectable services"),
     ("/ebay <photo...> [-- notes]", "eBay pilot: draft + publish a sandbox listing from photos (Capitol A2A)"),
+    ("/capitol <subcommand> [...]", "Control Capitol workflows, runs, artifacts, and flow packs (A2Actrl parity; /capitol help)"),
     ("/reload", "Reload MCP tools"),
     ("/resettools", "Reset tool-calling if the model drifts to textual calls"),
     ("/rounds <n>", "Set max tool call rounds"),
@@ -475,6 +476,7 @@ def handle_slash_command(
             "  \033[1m/connect <app>\033[0m       Connect a service\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/ebay <photo...> [-- notes]\033[0m  Draft + publish a sandbox eBay listing (Capitol A2A)\n"
+            "  \033[1m/capitol <subcommand>\033[0m  Control Capitol workflows/runs/artifacts/packs (/capitol help)\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
             "  \033[1m/status\033[0m              Show provider, model, context window, and config\n"
@@ -1201,10 +1203,20 @@ def handle_slash_command(
     if command == "/ebay":
         # eBay pilot (Capitol A2A): deterministic driver, no model in the
         # loop — imported lazily so sessions without Capitol config pay
-        # nothing at startup.
+        # nothing at startup. The flow itself is the ebay-listing flow
+        # pack run by the generic engine (conch.capitol.packs).
         from .capitol.ebay import run_ebay_command
 
         run_ebay_command(arg, config)
+        return None
+
+    if command == "/capitol":
+        # Generic Capitol control surface (A2Actrl parity): runtime reads
+        # and steering over CapitolRuntime, gated admin over CapitolAdmin,
+        # and the flow-pack surface — imported lazily like /ebay.
+        from .capitol.commands import run_capitol_command
+
+        run_capitol_command(arg, config)
         return None
 
     # User-defined slash commands (builtins above always take precedence)

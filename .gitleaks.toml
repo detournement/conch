@@ -1,0 +1,36 @@
+# Gitleaks configuration for conch.
+#
+# Extends the default gitleaks ruleset with a rule for Capitol A2A bearer
+# tokens, and allowlists the synthetic fixtures used by the test suite and
+# the placeholders used in the docs. To allowlist a new synthetic fixture,
+# add it to the relevant allowlist below in the same commit that introduces
+# it — never allowlist a value that has ever been a real credential.
+
+[extend]
+useDefault = true
+
+# Capitol A2A bearers (cap_a2a_*) are not covered by the default rules.
+[[rules]]
+id = "capitol-a2a-bearer"
+description = "Capitol A2A bearer token (cap_a2a_*)"
+regex = '''cap_a2a_[A-Za-z0-9_\-]{4,}'''
+keywords = ["cap_a2a_"]
+
+[rules.allowlist]
+description = "Synthetic cap_a2a_ fixtures used by the test suite"
+regexes = [
+    '''cap_a2a_(TESTTOKENxx0123456789abcdef|WRONG|LOCAL|CUSTOM|MINTEDBEARER0001|ROTATEDBEARER002)''',
+]
+
+[allowlist]
+description = "Documentation placeholders and known false positives"
+regexes = [
+    # README / mcp.example.json / config.example placeholders
+    '''YOUR_COMPOSIO_API_KEY''',
+    '''ghp_your_token_here''',
+    '''your_jira_api_token''',
+    '''your_confluence_api_token''',
+    '''YOUR_SERVER_ID''',
+    # Model identifier that trips the generic-api-key rule
+    '''moonshotai\.kimi''',
+]

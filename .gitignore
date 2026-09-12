@@ -1,7 +1,31 @@
 # Secrets - never commit
 .env
+.env.*
 .env.local
 *.pem
+*.key
+.anthropic_key
+id_rsa*
+id_ed25519*
+known_hosts
+authorized_keys
+
+# Runtime state / logs / databases - never commit
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+tasks.json
+memory.json
+ebay_pilot.json
+
+# Backups
+*.bak
+*.orig
+config.pre-*
 
 # Python
 .venv/

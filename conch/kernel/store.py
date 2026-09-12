@@ -36,7 +36,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import time as _time
 
-from ..swarm.protocol import ActionClass, canonical_json
+from ..swarm.protocol import (
+    ActionClass,
+    DataClassification,
+    ProtocolError,
+    TaskEnvelope,
+    canonical_json,
+)
 from .model import (
     ActionStatus,
     ApprovalError,
@@ -44,6 +50,7 @@ from .model import (
     BudgetExceededError,
     CATCH_UP_HARD_CAP,
     ConflictError,
+    DispatchState,
     EVENT_KINDS,
     EVENT_SCHEMA_VERSION,
     InboxStatus,
@@ -53,8 +60,11 @@ from .model import (
     MissionState,
     StaleGenerationError,
     TaskState,
+    WorkerState,
+    check_dispatch_transition,
     check_task_transition,
     check_transition,
+    check_worker_transition,
     kernel_id,
     normalize_spec,
 )
@@ -295,6 +305,63 @@ CREATE TABLE IF NOT EXISTS resource_bindings (
     resource TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workers (
+    worker_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    host TEXT NOT NULL,
+    ssh_user TEXT NOT NULL DEFAULT '',
+    ssh_port INTEGER,
+    state TEXT NOT NULL,
+    trust_level INTEGER NOT NULL DEFAULT 0,
+    data_ceiling TEXT NOT NULL DEFAULT 'internal',
+    labels TEXT NOT NULL DEFAULT '{}',
+    capabilities TEXT NOT NULL DEFAULT '{}',
+    runtime_profile TEXT NOT NULL DEFAULT '',
+    profiles TEXT NOT NULL DEFAULT '[]',
+    resource_group TEXT NOT NULL DEFAULT '',
+    max_concurrency INTEGER NOT NULL DEFAULT 1,
+    artifact_digest TEXT NOT NULL DEFAULT '',
+    config_digest TEXT NOT NULL DEFAULT '',
+    protocol_min INTEGER NOT NULL DEFAULT 1,
+    protocol_max INTEGER NOT NULL DEFAULT 1,
+    incarnation INTEGER NOT NULL DEFAULT 0,
+    autonomy_capable INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    heartbeat_seq INTEGER NOT NULL DEFAULT 0,
+    last_heartbeat_at REAL
+);
+CREATE TABLE IF NOT EXISTS dispatches (
+    task_id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    parent_task_id TEXT NOT NULL DEFAULT '',
+    envelope TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    worker_id TEXT NOT NULL DEFAULT '',
+    fence INTEGER NOT NULL DEFAULT 0,
+    not_before REAL NOT NULL DEFAULT 0,
+    failure_class TEXT NOT NULL DEFAULT '',
+    result TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispatches_state
+    ON dispatches(state, not_before);
+CREATE TABLE IF NOT EXISTS dispatch_events (
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    failure_class TEXT NOT NULL DEFAULT '',
+    received_at REAL NOT NULL,
+    PRIMARY KEY(task_id, attempt, seq)
+);
 """
 
 #: Tables rebuilt from the event journal, with the columns that must match
@@ -361,7 +428,35 @@ REPLAYED_TABLES: Dict[str, Tuple[str, ...]] = {
     "resource_bindings": (
         "binding_id", "mission_id", "kind", "resource", "created_at",
     ),
+    # Fleet registry / dispatch truth is replayed; heartbeat columns and
+    # dispatch_events (worker observations) are operational by design.
+    "workers": (
+        "worker_id", "name", "host", "ssh_user", "ssh_port", "state",
+        "trust_level", "data_ceiling", "labels", "capabilities",
+        "runtime_profile", "profiles", "resource_group", "max_concurrency",
+        "artifact_digest", "config_digest", "protocol_min", "protocol_max",
+        "incarnation", "autonomy_capable", "version", "created_at",
+        "updated_at",
+    ),
+    "dispatches": (
+        "task_id", "mission_id", "parent_task_id", "envelope", "state",
+        "attempt", "max_attempts", "worker_id", "fence", "not_before",
+        "failure_class", "result", "error", "version", "created_at",
+        "updated_at",
+    ),
 }
+
+#: Worker fields an admin/probe update may change through worker_updated.
+#: Trust/data labels are admin-assigned; capabilities are observed — the
+#: registry keeps them in separate columns so one can never masquerade as
+#: the other.
+WORKER_UPDATABLE_FIELDS = frozenset({
+    "host", "ssh_user", "ssh_port", "trust_level", "data_ceiling",
+    "labels", "capabilities", "runtime_profile", "profiles",
+    "resource_group", "max_concurrency", "artifact_digest",
+    "config_digest", "protocol_min", "protocol_max", "incarnation",
+    "autonomy_capable",
+})
 
 
 def _canonical(data: Dict[str, Any]) -> str:
@@ -675,6 +770,84 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
             " WHERE idempotency_key=?",
             (data["status"], data.get("detail", ""), created_at,
              data["idempotency_key"]),
+        )
+    elif kind == "worker_enrolled":
+        conn.execute(
+            "INSERT INTO workers(worker_id, name, host, ssh_user, ssh_port,"
+            " state, trust_level, data_ceiling, labels, capabilities,"
+            " runtime_profile, profiles, resource_group, max_concurrency,"
+            " artifact_digest, config_digest, protocol_min, protocol_max,"
+            " incarnation, autonomy_capable, version, created_at,"
+            " updated_at, heartbeat_seq, last_heartbeat_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL)",
+            (data["worker_id"], data["name"], data["host"],
+             data.get("ssh_user", ""), data.get("ssh_port"),
+             data["state"], data.get("trust_level", 0),
+             data.get("data_ceiling", "internal"),
+             _canonical(data.get("labels", {})),
+             _canonical(data.get("capabilities", {})),
+             data.get("runtime_profile", ""),
+             _canonical({"list": data.get("profiles", [])}),
+             data.get("resource_group", ""),
+             data.get("max_concurrency", 1),
+             data.get("artifact_digest", ""),
+             data.get("config_digest", ""),
+             data.get("protocol_min", 1), data.get("protocol_max", 1),
+             data.get("incarnation", 0),
+             1 if data.get("autonomy_capable") else 0,
+             data["version"], created_at, created_at),
+        )
+    elif kind == "worker_updated":
+        fields = data["fields"]
+        assignments = []
+        params: List[Any] = []
+        for column in sorted(fields):
+            value = fields[column]
+            if column in ("labels", "capabilities"):
+                value = _canonical(value)
+            elif column == "profiles":
+                value = _canonical({"list": value})
+            elif column == "autonomy_capable":
+                value = 1 if value else 0
+            assignments.append(f"{column}=?")
+            params.append(value)
+        assignments.append("version=?")
+        params.append(data["version"])
+        assignments.append("updated_at=?")
+        params.append(created_at)
+        params.append(data["worker_id"])
+        conn.execute(
+            f"UPDATE workers SET {', '.join(assignments)} WHERE worker_id=?",
+            params,
+        )
+    elif kind == "worker_transitioned":
+        conn.execute(
+            "UPDATE workers SET state=?, version=?, updated_at=?"
+            " WHERE worker_id=?",
+            (data["to"], data["version"], created_at, data["worker_id"]),
+        )
+    elif kind == "dispatch_created":
+        envelope = data["envelope"]
+        conn.execute(
+            "INSERT INTO dispatches(task_id, mission_id, parent_task_id,"
+            " envelope, state, attempt, max_attempts, worker_id, fence,"
+            " not_before, failure_class, result, error, version,"
+            " created_at, updated_at)"
+            " VALUES (?,?,?,?,?,0,?, '', 0, 0, '', '{}', '', ?, ?, ?)",
+            (envelope["task_id"], mission_id,
+             envelope.get("parent_task_id", ""), _canonical(envelope),
+             data["state"], data["max_attempts"], data["version"],
+             created_at, created_at),
+        )
+    elif kind == "dispatch_transitioned":
+        conn.execute(
+            "UPDATE dispatches SET state=?, attempt=?, worker_id=?,"
+            " fence=?, not_before=?, failure_class=?, result=?, error=?,"
+            " version=?, updated_at=? WHERE task_id=?",
+            (data["to"], data["attempt"], data["worker_id"], data["fence"],
+             data["not_before"], data.get("failure_class", ""),
+             _canonical(data.get("result", {})), data.get("error", ""),
+             data["version"], created_at, data["task_id"]),
         )
     elif kind == "session_started":
         conn.execute(
@@ -2105,6 +2278,359 @@ class MissionStore:
             })
             return binding_id
         return self._mutate(fn)
+
+    # ------------------------------------------------------------------
+    # Fleet: worker registry (Swarm Phase 2)
+    #
+    # Worker truth (identity, admin trust/data labels, observed
+    # capabilities, states, digests, protocol range) is event-sourced
+    # under the "" mission chain and fully replayed. Heartbeats are
+    # operational coordination, never events.
+    # ------------------------------------------------------------------
+
+    def enroll_worker(self, name: str, host: str, *, ssh_user: str = "",
+                      ssh_port: Optional[int] = None,
+                      trust_level: int = 0,
+                      data_ceiling: str = DataClassification.INTERNAL,
+                      labels: Optional[Dict[str, Any]] = None,
+                      capabilities: Optional[Dict[str, Any]] = None,
+                      runtime_profile: str = "",
+                      profiles: Optional[List[str]] = None,
+                      resource_group: str = "",
+                      max_concurrency: int = 1,
+                      protocol_min: int = 1, protocol_max: int = 1,
+                      autonomy_capable: bool = False,
+                      worker_id: Optional[str] = None) -> str:
+        name = str(name or "").strip()
+        if not name:
+            raise KernelError("worker name is required")
+        if data_ceiling not in DataClassification.ALL:
+            raise KernelError(f"unknown data ceiling {data_ceiling!r}")
+        if int(max_concurrency) < 1:
+            raise KernelError("max_concurrency must be at least 1")
+        wid = worker_id or kernel_id("wrk")
+
+        def fn(conn):
+            existing = conn.execute(
+                "SELECT worker_id FROM workers WHERE name=?", (name,)
+            ).fetchone()
+            if existing is not None:
+                raise KernelError(
+                    f"worker name {name!r} is already enrolled"
+                    f" ({existing[0]})"
+                )
+            self._append(conn, "", "worker_enrolled", {
+                "worker_id": wid, "name": name, "host": str(host),
+                "ssh_user": str(ssh_user or ""),
+                "ssh_port": int(ssh_port) if ssh_port else None,
+                "state": WorkerState.PENDING,
+                "trust_level": int(trust_level),
+                "data_ceiling": data_ceiling,
+                "labels": labels or {},
+                "capabilities": capabilities or {},
+                "runtime_profile": str(runtime_profile),
+                "profiles": list(profiles or []),
+                "resource_group": str(resource_group),
+                "max_concurrency": int(max_concurrency),
+                "artifact_digest": "", "config_digest": "",
+                "protocol_min": int(protocol_min),
+                "protocol_max": int(protocol_max),
+                "incarnation": 0,
+                "autonomy_capable": bool(autonomy_capable),
+                "version": 1,
+            })
+            return wid
+        return self._mutate(fn)
+
+    def _worker_row(self, conn: sqlite3.Connection, worker_id: str):
+        row = conn.execute(
+            "SELECT worker_id, state, version FROM workers WHERE"
+            " worker_id=?",
+            (worker_id,),
+        ).fetchone()
+        if row is None:
+            raise KernelError(f"unknown worker {worker_id!r}")
+        return row
+
+    def update_worker(self, worker_id: str, fields: Dict[str, Any],
+                      expected_version: Optional[int] = None) -> int:
+        unknown = set(fields) - WORKER_UPDATABLE_FIELDS
+        if unknown:
+            raise KernelError(
+                f"worker fields {sorted(unknown)} are not updatable —"
+                " failing closed"
+            )
+        if "data_ceiling" in fields and (
+            fields["data_ceiling"] not in DataClassification.ALL
+        ):
+            raise KernelError(
+                f"unknown data ceiling {fields['data_ceiling']!r}"
+            )
+        if not fields:
+            raise KernelError("update_worker needs at least one field")
+
+        def fn(conn):
+            row = self._worker_row(conn, worker_id)
+            version = int(row[2])
+            if expected_version is not None and version != expected_version:
+                raise ConflictError(
+                    f"worker {worker_id} version {version} !="
+                    f" expected {expected_version}"
+                )
+            new_version = version + 1
+            self._append(conn, "", "worker_updated", {
+                "worker_id": worker_id, "fields": fields,
+                "version": new_version,
+            })
+            return new_version
+        return self._mutate(fn)
+
+    def transition_worker(self, worker_id: str, target: str,
+                          reason: str = "",
+                          expected_version: Optional[int] = None) -> int:
+        def fn(conn):
+            row = self._worker_row(conn, worker_id)
+            current, version = row[1], int(row[2])
+            if expected_version is not None and version != expected_version:
+                raise ConflictError(
+                    f"worker {worker_id} version {version} !="
+                    f" expected {expected_version}"
+                )
+            check_worker_transition(current, target)
+            new_version = version + 1
+            self._append(conn, "", "worker_transitioned", {
+                "worker_id": worker_id, "from": current, "to": target,
+                "reason": str(reason), "version": new_version,
+            })
+            return new_version
+        return self._mutate(fn)
+
+    def record_worker_heartbeat(self, worker_id: str, seq: int,
+                                now: Optional[float] = None) -> bool:
+        """Operational heartbeat record (no event). Returns True when the
+        sequence advanced; a lower sequence still stamps the time (it
+        signals a restarted worker — the plane handles incarnations)."""
+        def fn(conn):
+            self._worker_row(conn, worker_id)
+            current = float(now if now is not None else self.clock())
+            row = conn.execute(
+                "SELECT heartbeat_seq FROM workers WHERE worker_id=?",
+                (worker_id,),
+            ).fetchone()
+            advanced = int(seq) > int(row[0])
+            conn.execute(
+                "UPDATE workers SET heartbeat_seq=?, last_heartbeat_at=?"
+                " WHERE worker_id=?",
+                (max(int(seq), int(row[0])), current, worker_id),
+            )
+            return advanced
+        return self._mutate(fn)
+
+    @staticmethod
+    def _worker_dict(row) -> Dict[str, Any]:
+        data = dict(row)
+        data["labels"] = _json.loads(data["labels"])
+        data["capabilities"] = _json.loads(data["capabilities"])
+        data["profiles"] = _json.loads(data["profiles"]).get("list", [])
+        data["autonomy_capable"] = bool(data["autonomy_capable"])
+        return data
+
+    def get_worker(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        row = self._read_conn().execute(
+            "SELECT * FROM workers WHERE worker_id=?", (worker_id,)
+        ).fetchone()
+        return self._worker_dict(row) if row else None
+
+    def find_worker(self, name: str) -> Optional[Dict[str, Any]]:
+        row = self._read_conn().execute(
+            "SELECT * FROM workers WHERE name=?", (name,)
+        ).fetchone()
+        return self._worker_dict(row) if row else None
+
+    def list_workers(self, state: str = "") -> List[Dict[str, Any]]:
+        if state:
+            rows = self._read_conn().execute(
+                "SELECT * FROM workers WHERE state=? ORDER BY name",
+                (state,),
+            ).fetchall()
+        else:
+            rows = self._read_conn().execute(
+                "SELECT * FROM workers ORDER BY name"
+            ).fetchall()
+        return [self._worker_dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Fleet: dispatches (distributed task plane truth)
+    # ------------------------------------------------------------------
+
+    def create_dispatch(self, envelope: Dict[str, Any],
+                        max_attempts: int = 3) -> str:
+        """Persist a new dispatch from a validated TaskEnvelope dict."""
+        try:
+            validated = TaskEnvelope.from_dict(dict(envelope))
+        except ProtocolError as exc:
+            raise KernelError(f"invalid task envelope: {exc}")
+        if int(max_attempts) < 1:
+            raise KernelError("max_attempts must be at least 1")
+        payload = validated.to_dict()
+
+        def fn(conn):
+            self._mission_row(conn, validated.mission_id)
+            existing = conn.execute(
+                "SELECT task_id FROM dispatches WHERE task_id=?",
+                (validated.task_id,),
+            ).fetchone()
+            if existing is not None:
+                raise KernelError(
+                    f"dispatch {validated.task_id} already exists"
+                )
+            self._append(conn, validated.mission_id, "dispatch_created", {
+                "envelope": payload, "state": DispatchState.QUEUED,
+                "max_attempts": int(max_attempts), "version": 1,
+            })
+            return validated.task_id
+        return self._mutate(fn)
+
+    def transition_dispatch(self, task_id: str, target: str, *,
+                            expected_version: Optional[int] = None,
+                            attempt: Optional[int] = None,
+                            worker_id: Optional[str] = None,
+                            fence: Optional[int] = None,
+                            not_before: Optional[float] = None,
+                            failure_class: str = "",
+                            result: Optional[Dict[str, Any]] = None,
+                            error: str = "", reason: str = "") -> int:
+        """One journaled dispatch state change. Unspecified attempt/worker/
+        fence fields carry forward; a terminal state is final forever."""
+        def fn(conn):
+            row = conn.execute(
+                "SELECT mission_id, state, version, attempt, worker_id,"
+                " fence, not_before, result FROM dispatches WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KernelError(f"unknown dispatch {task_id!r}")
+            (mission_id, current, version, cur_attempt, cur_worker,
+             cur_fence, cur_not_before, cur_result) = row
+            if expected_version is not None and (
+                int(version) != expected_version
+            ):
+                raise ConflictError(
+                    f"dispatch {task_id} version {version} !="
+                    f" expected {expected_version}"
+                )
+            check_dispatch_transition(current, target)
+            new_version = int(version) + 1
+            self._append(conn, mission_id, "dispatch_transitioned", {
+                "task_id": task_id, "from": current, "to": target,
+                "version": new_version,
+                "attempt": int(
+                    attempt if attempt is not None else cur_attempt
+                ),
+                "worker_id": (
+                    worker_id if worker_id is not None else cur_worker
+                ),
+                "fence": int(fence if fence is not None else cur_fence),
+                "not_before": float(
+                    not_before if not_before is not None else cur_not_before
+                ),
+                "failure_class": failure_class,
+                "result": (
+                    result if result is not None
+                    else _json.loads(cur_result or "{}")
+                ),
+                "error": str(error), "reason": str(reason),
+            })
+            return new_version
+        return self._mutate(fn)
+
+    def get_dispatch(self, task_id: str) -> Optional[Dict[str, Any]]:
+        row = self._read_conn().execute(
+            "SELECT * FROM dispatches WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["envelope"] = _json.loads(data["envelope"])
+        data["result"] = _json.loads(data["result"] or "{}")
+        return data
+
+    def list_dispatches(self, state: str = "", mission_id: str = "",
+                        worker_id: str = "",
+                        parent_task_id: str = "") -> List[Dict[str, Any]]:
+        query = "SELECT * FROM dispatches"
+        clauses, params = [], []
+        if state:
+            clauses.append("state=?")
+            params.append(state)
+        if mission_id:
+            clauses.append("mission_id=?")
+            params.append(mission_id)
+        if worker_id:
+            clauses.append("worker_id=?")
+            params.append(worker_id)
+        if parent_task_id:
+            clauses.append("parent_task_id=?")
+            params.append(parent_task_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at"
+        rows = self._read_conn().execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["envelope"] = _json.loads(data["envelope"])
+            data["result"] = _json.loads(data["result"] or "{}")
+            result.append(data)
+        return result
+
+    def count_worker_dispatches(self, worker_id: str) -> int:
+        """In-flight dispatches assigned to one worker (capacity checks)."""
+        row = self._read_conn().execute(
+            "SELECT COUNT(*) FROM dispatches WHERE worker_id=? AND state"
+            " IN (?,?,?)",
+            (worker_id, DispatchState.OFFERING, DispatchState.RUNNING,
+             DispatchState.WAITING_CHILD),
+        ).fetchone()
+        return int(row[0])
+
+    def record_dispatch_events(self, events: List[Dict[str, Any]]) -> int:
+        """Persist worker-observed task events. Idempotent on
+        (task_id, attempt, seq): redelivered batches insert nothing new —
+        this is what makes at-least-once event delivery safe."""
+        def fn(conn):
+            inserted = 0
+            now = float(self.clock())
+            for event in events:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO dispatch_events(task_id,"
+                    " attempt, seq, kind, payload, failure_class,"
+                    " received_at) VALUES (?,?,?,?,?,?,?)",
+                    (str(event["task_id"]), int(event["attempt"]),
+                     int(event["sequence"]), str(event["kind"]),
+                     _canonical(event.get("payload", {})),
+                     str(event.get("failure_class", "")), now),
+                )
+                inserted += cursor.rowcount
+            return inserted
+        return self._mutate(fn)
+
+    def list_dispatch_events(self, task_id: str,
+                             attempt: Optional[int] = None,
+                             since_seq: int = -1) -> List[Dict[str, Any]]:
+        query = ("SELECT * FROM dispatch_events WHERE task_id=? AND seq>?")
+        params: List[Any] = [task_id, int(since_seq)]
+        if attempt is not None:
+            query += " AND attempt=?"
+            params.append(int(attempt))
+        query += " ORDER BY attempt, seq"
+        rows = self._read_conn().execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["payload"] = _json.loads(data["payload"] or "{}")
+            result.append(data)
+        return result
 
     # ------------------------------------------------------------------
     # Composite session flows (single-transaction guarantees)

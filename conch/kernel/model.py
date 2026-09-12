@@ -44,11 +44,11 @@ class ApprovalError(KernelError):
 # Canonical kernel IDs (same shape as conch.swarm.protocol IDs)
 # ---------------------------------------------------------------------------
 
-#: Kernel-local ID kinds. ``msn``/``task`` intentionally match the swarm
-#: protocol so mission/task IDs are valid on the wire in later phases.
+#: Kernel-local ID kinds. ``msn``/``task``/``wrk`` intentionally match the
+#: swarm protocol so mission/task/worker IDs are valid on the wire.
 KERNEL_ID_KINDS = frozenset({
     "msn", "task", "pln", "ses", "ckpt", "apr", "tmr", "act", "att",
-    "art", "bnd", "scp", "lse", "obx",
+    "art", "bnd", "scp", "lse", "obx", "wrk",
 })
 
 _ID_RE = re.compile(r"^([a-z]{2,8})-([0-9a-f]{13})-([0-9a-f]{16})$")
@@ -248,6 +248,137 @@ class InboxStatus:
 
 
 # ---------------------------------------------------------------------------
+# Fleet: worker registry and dispatch state machines (Swarm Phase 2)
+# ---------------------------------------------------------------------------
+
+class WorkerState:
+    """FleetRegistry worker lifecycle. REVOKED is terminal; QUARANTINED
+    and REVOKED are operator decisions, never automatic."""
+
+    PENDING = "pending"          # enrolled, not yet admitted for work
+    ACTIVE = "active"            # schedulable
+    DRAINING = "draining"        # finishing in-flight work, no new tasks
+    OFFLINE = "offline"          # deliberately stopped (still trusted)
+    UNREACHABLE = "unreachable"  # missed heartbeats; observed, not chosen
+    UPDATING = "updating"        # deploy/activate in progress
+    QUARANTINED = "quarantined"  # operator hold: no work, trust suspended
+    REVOKED = "revoked"          # terminal: never schedulable again
+
+    ALL = frozenset({
+        PENDING, ACTIVE, DRAINING, OFFLINE, UNREACHABLE, UPDATING,
+        QUARANTINED, REVOKED,
+    })
+    SCHEDULABLE = frozenset({ACTIVE})
+    TERMINAL = frozenset({REVOKED})
+
+
+WORKER_TRANSITIONS = {
+    WorkerState.PENDING: frozenset({
+        WorkerState.ACTIVE, WorkerState.UPDATING, WorkerState.QUARANTINED,
+        WorkerState.REVOKED,
+    }),
+    WorkerState.ACTIVE: frozenset({
+        WorkerState.DRAINING, WorkerState.OFFLINE, WorkerState.UNREACHABLE,
+        WorkerState.UPDATING, WorkerState.QUARANTINED, WorkerState.REVOKED,
+    }),
+    WorkerState.DRAINING: frozenset({
+        WorkerState.ACTIVE, WorkerState.OFFLINE, WorkerState.UNREACHABLE,
+        WorkerState.QUARANTINED, WorkerState.REVOKED,
+    }),
+    WorkerState.OFFLINE: frozenset({
+        WorkerState.ACTIVE, WorkerState.UPDATING, WorkerState.QUARANTINED,
+        WorkerState.REVOKED,
+    }),
+    WorkerState.UNREACHABLE: frozenset({
+        WorkerState.ACTIVE, WorkerState.OFFLINE, WorkerState.QUARANTINED,
+        WorkerState.REVOKED,
+    }),
+    WorkerState.UPDATING: frozenset({
+        WorkerState.ACTIVE, WorkerState.OFFLINE, WorkerState.UNREACHABLE,
+        WorkerState.QUARANTINED, WorkerState.REVOKED,
+    }),
+    WorkerState.QUARANTINED: frozenset({
+        WorkerState.ACTIVE, WorkerState.OFFLINE, WorkerState.REVOKED,
+    }),
+    WorkerState.REVOKED: frozenset(),
+}
+
+
+def check_worker_transition(current: str, target: str) -> None:
+    if current not in WorkerState.ALL or target not in WorkerState.ALL:
+        raise KernelError(
+            f"unknown worker state in transition {current!r} -> {target!r}"
+        )
+    if target not in WORKER_TRANSITIONS[current]:
+        raise KernelError(
+            f"illegal worker transition {current!r} -> {target!r}"
+        )
+
+
+class DispatchState:
+    """Distributed task dispatch lifecycle (controller truth).
+
+    ``NEEDS_RECONCILE`` exists for unknown external outcomes: the dispatch
+    parks until something queries the real outcome — never blind-retried.
+    """
+
+    QUEUED = "queued"                  # awaiting scheduling
+    OFFERING = "offering"              # offered to a worker, awaiting start
+    RUNNING = "running"                # started under a live lease
+    WAITING_CHILD = "waiting_child"    # parked on a brokered delegation
+    NEEDS_RECONCILE = "needs_reconcile"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    ALL = frozenset({
+        QUEUED, OFFERING, RUNNING, WAITING_CHILD, NEEDS_RECONCILE,
+        SUCCEEDED, FAILED, CANCELLED,
+    })
+    TERMINAL = frozenset({SUCCEEDED, FAILED, CANCELLED})
+    IN_FLIGHT = frozenset({OFFERING, RUNNING, WAITING_CHILD})
+
+
+DISPATCH_TRANSITIONS = {
+    DispatchState.QUEUED: frozenset({
+        DispatchState.OFFERING, DispatchState.FAILED,
+        DispatchState.CANCELLED,
+    }),
+    DispatchState.OFFERING: frozenset({
+        DispatchState.RUNNING, DispatchState.QUEUED, DispatchState.FAILED,
+        DispatchState.CANCELLED, DispatchState.NEEDS_RECONCILE,
+    }),
+    DispatchState.RUNNING: frozenset({
+        DispatchState.WAITING_CHILD, DispatchState.SUCCEEDED,
+        DispatchState.FAILED, DispatchState.CANCELLED,
+        DispatchState.QUEUED, DispatchState.NEEDS_RECONCILE,
+    }),
+    DispatchState.WAITING_CHILD: frozenset({
+        DispatchState.RUNNING, DispatchState.QUEUED, DispatchState.FAILED,
+        DispatchState.CANCELLED,
+    }),
+    DispatchState.NEEDS_RECONCILE: frozenset({
+        DispatchState.QUEUED, DispatchState.SUCCEEDED,
+        DispatchState.FAILED, DispatchState.CANCELLED,
+    }),
+    DispatchState.SUCCEEDED: frozenset(),
+    DispatchState.FAILED: frozenset(),
+    DispatchState.CANCELLED: frozenset(),
+}
+
+
+def check_dispatch_transition(current: str, target: str) -> None:
+    if current not in DispatchState.ALL or target not in DispatchState.ALL:
+        raise KernelError(
+            f"unknown dispatch state in transition {current!r} -> {target!r}"
+        )
+    if target not in DISPATCH_TRANSITIONS[current]:
+        raise KernelError(
+            f"illegal dispatch transition {current!r} -> {target!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Kernel event taxonomy
 # ---------------------------------------------------------------------------
 
@@ -287,6 +418,13 @@ EVENT_KINDS = frozenset({
     "session_started",
     "session_checkpointed",
     "session_abandoned",
+    # Fleet (Swarm Phase 2). Worker events chain under mission_id "";
+    # dispatch events chain under the envelope's real mission.
+    "worker_enrolled",
+    "worker_updated",
+    "worker_transitioned",
+    "dispatch_created",
+    "dispatch_transitioned",
 })
 
 

@@ -37,6 +37,13 @@ def _state_dir() -> Path:
 REMOTE_REPLY_MAX_CHARS = 3000
 REMOTE_APPROVAL_TTL_SECONDS = 600
 _APPROVE_RE = re.compile(r"^\s*(approve|deny)\s+#?(\d+)\s*$", re.IGNORECASE)
+#: `input msn-<id> <text>` — a channel message addressed to a mission. The
+#: text routes straight into the kernel inbox (an addressed wake), never
+#: through a model turn; it is only honored when a kernel bridge is wired.
+MISSION_INPUT_RE = re.compile(
+    r"^\s*input\s+(msn-[0-9a-f]+-[0-9a-f]+)[\s:]+(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,11 +238,26 @@ REMOTE_EXCLUDED_TOOLS = {
 
 
 class RemoteLoop:
-    """Polls channels, maps threads to conversations, runs turns, replies."""
+    """Polls channels, maps threads to conversations, runs turns, replies.
+
+    Hosting: the interactive shell shares its live session state
+    (``session=``/``chat_state=``/``builtin_clients=``); the edge daemon
+    instead passes ``turn_session_factory`` so every inbound turn gets a
+    fresh, fully wired host session — the same bootstrap wiring (provider
+    config, env overrides, tool state) its mission sessions use. Either
+    way the per-turn safety posture is identical: safe_auto cap, excluded
+    tools, origin-bound approvals, bounded replies.
+
+    Coordination: when ``intake_gate`` is set (kernel mode), every polling
+    pass must first acquire the kernel channel-intake lease through it —
+    exactly one consumer polls the channels no matter how many processes
+    are running; ``stop()`` releases the lease for immediate handoff.
+    """
 
     def __init__(self, config: dict, conv_mgr=None, chat_state=None,
                  builtin_clients: Optional[Dict[str, Any]] = None,
-                 session=None):
+                 session=None, turn_session_factory=None,
+                 mission_input=None, intake_gate=None):
         # An AgentSession may be passed instead of loose config/state; the
         # explicit keyword arguments still win so tests and older callers
         # keep working unchanged.
@@ -250,6 +272,9 @@ class RemoteLoop:
         self._conv_mgr = conv_mgr
         self._chat_state = chat_state
         self._builtin_clients = builtin_clients or {}
+        self._turn_session_factory = turn_session_factory
+        self._mission_input = mission_input
+        self._intake_gate = intake_gate
         self._sessions_path = _state_dir() / "remote_sessions.json"
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -296,10 +321,10 @@ class RemoteLoop:
     # --- turn execution ----------------------------------------------------
 
     def _remote_clients(
-        self, channel: str, thread_id: str, sender: str
+        self, pool: Dict[str, Any], channel: str, thread_id: str, sender: str
     ) -> Dict[str, Any]:
         clients = {
-            k: v for k, v in self._builtin_clients.items()
+            k: v for k, v in (pool or {}).items()
             if k not in REMOTE_EXCLUDED_TOOLS and k != "local_shell"
         }
         clients["local_shell"] = RemoteShellClient(
@@ -311,8 +336,8 @@ class RemoteLoop:
         )
         return clients
 
-    def _remote_tools(self) -> Optional[List[dict]]:
-        pool = getattr(self._chat_state, "tools", None) or []
+    def _remote_tools(self, chat_state) -> Optional[List[dict]]:
+        pool = getattr(chat_state, "tools", None) or []
         tools = [
             t for t in pool
             if t.get("function", {}).get("name") not in REMOTE_EXCLUDED_TOOLS
@@ -337,28 +362,43 @@ class RemoteLoop:
             messages[0]["content"] = system_prompt
         messages.append({"role": "user", "content": message.text})
 
-        # Each inbound turn is its own child session with a fresh, never-
-        # agent-mode permission state: the local /agent toggle can never lift
-        # the remote safe_auto cap, and remote turns cannot mutate the
-        # interactive session's policy. Shared clients keep their own
-        # bindings (bind=False); the shell is a per-turn RemoteShellClient.
-        session = AgentSession(
-            dict(self.config),
-            interactive=False,
-            permissions=PermissionState(),
-        )
-        session.attach_clients(
-            self._remote_clients(
-                message.channel, message.thread_id, message.sender
-            ),
-            bind=False,
-        )
-        reply, usage = session.run_turn(
-            messages,
-            tools=self._remote_tools(),
-            tool_map=getattr(self._chat_state, "tool_map", {}) or {},
-            max_tool_rounds=int(self.config.get("remote_rounds", 8) or 8),
-        )
+        host = None
+        chat_state = self._chat_state
+        clients_pool = self._builtin_clients
+        try:
+            if self._turn_session_factory is not None:
+                # Headless host (edge daemon): a fresh fully-wired session
+                # per inbound turn, closed when the turn ends.
+                host = self._turn_session_factory()
+                chat_state = host.chat_state
+                clients_pool = host.builtin_clients
+            # Each inbound turn is its own child session with a fresh,
+            # never-agent-mode permission state: the local /agent toggle can
+            # never lift the remote safe_auto cap, and remote turns cannot
+            # mutate the hosting session's policy. Shared clients keep their
+            # own bindings (bind=False); the shell is a per-turn
+            # RemoteShellClient.
+            session = AgentSession(
+                dict(self.config),
+                interactive=False,
+                permissions=PermissionState(),
+            )
+            session.attach_clients(
+                self._remote_clients(
+                    clients_pool, message.channel, message.thread_id,
+                    message.sender,
+                ),
+                bind=False,
+            )
+            reply, usage = session.run_turn(
+                messages,
+                tools=self._remote_tools(chat_state),
+                tool_map=getattr(chat_state, "tool_map", {}) or {},
+                max_tool_rounds=int(self.config.get("remote_rounds", 8) or 8),
+            )
+        finally:
+            if host is not None:
+                host.close()
         if usage.get("error"):
             reply = ("conch: the model backend is unreachable right now — "
                      "try again later.")
@@ -409,6 +449,23 @@ class RemoteLoop:
                 return reply
         return None
 
+    # --- mission-addressed input ------------------------------------------------
+
+    def _maybe_mission_input(self, message: InboundMessage) -> Optional[str]:
+        """`input msn-… <text>` delivers the text to that mission through
+        the kernel inbox and wakes it — an addressed event, never a model
+        turn. Only active when a kernel bridge is wired (daemon-hosted
+        intake, or a kernel-mode shell); otherwise the text falls through
+        to the normal turn."""
+        if self._mission_input is None:
+            return None
+        match = MISSION_INPUT_RE.match(message.text)
+        if match is None:
+            return None
+        return self._mission_input(
+            match.group(1), match.group(2).strip(), message
+        )
+
     # --- inbound dispatch ----------------------------------------------------
 
     def handle_inbound(self, message: InboundMessage) -> str:
@@ -421,7 +478,9 @@ class RemoteLoop:
             if match:
                 reply = self._handle_approval(match, message)
             else:
-                reply = self._maybe_pack_intake(message)
+                reply = self._maybe_mission_input(message)
+                if reply is None:
+                    reply = self._maybe_pack_intake(message)
                 if reply is None:
                     reply = self._run_turn(message)
             reply = self._bound_reply(reply)
@@ -565,7 +624,14 @@ class RemoteLoop:
     # --- polling -------------------------------------------------------------
 
     def poll_once(self) -> int:
-        """One polling pass; returns the number of messages handled."""
+        """One polling pass; returns the number of messages handled.
+
+        With an intake gate wired, the pass runs only while this process
+        holds the kernel channel-intake lease — channel cursors advance
+        exactly once, under exactly one consumer.
+        """
+        if self._intake_gate is not None and not self._intake_gate.acquire():
+            return 0
         handled = 0
         for message in self.manager.poll_all():
             try:
@@ -596,3 +662,11 @@ class RemoteLoop:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._intake_gate is not None:
+            # Immediate handoff: the next consumer (usually the daemon)
+            # acquires the lease on its next pass instead of waiting out
+            # the lease TTL.
+            try:
+                self._intake_gate.release()
+            except Exception:
+                pass

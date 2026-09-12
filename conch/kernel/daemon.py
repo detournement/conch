@@ -7,11 +7,18 @@ Responsibilities:
   adopted at start, so a superseded (zombie) daemon can never write again
   even if it still holds file handles.
 - **Scheduler-driven session firing**: each tick claims due timers, fires
-  them (exactly-once ledger effects), runs at most one ready mission
-  session, delivers the outbox, and periodically reconciles leases and
-  expires approvals.
+  them (exactly-once ledger effects), runs event sources (Capitol
+  supervision, channel intake) ahead of the session slot so event wakes
+  execute the same tick, runs at most one ready mission session, delivers
+  the outbox, and periodically reconciles leases and expires approvals.
+- **Channel intake hosting** (:mod:`conch.kernel.intake`): with
+  ``remote_enabled`` set (and ``remote_host`` not ``shell``), the daemon
+  polls Slack/SMS/email under the kernel ``channel_intake`` lease and
+  answers inbound messages 24/7 with full agent turns — no interactive
+  shell required, every remote-safety invariant unchanged.
 - **Graceful SIGTERM/SIGINT**: stop accepting work, finish the in-flight
-  kernel transaction, close the store, remove the socket, release the lock.
+  kernel transaction, release the intake lease, close the store, remove
+  the socket, release the lock.
 - **A permission-protected control socket** (0700 dir, 0600 socket)
   speaking the tiny versioned JSON protocol in :mod:`conch.kernel.control`;
   the shell attaches through it while the daemon runs.
@@ -110,7 +117,8 @@ class EdgeDaemon:
                  clock: Callable[[], float] = time.time,
                  tick_seconds: float = 1.0,
                  session_factory: Optional[Callable] = None,
-                 notifier: Optional[Callable] = None):
+                 notifier: Optional[Callable] = None,
+                 intake_loop_factory: Optional[Callable] = None):
         self.config = config or {}
         self.state_dir = Path(state_dir) if state_dir else (
             default_state_dir()
@@ -124,9 +132,11 @@ class EdgeDaemon:
         self.holder = f"edge-{socket.gethostname()}-{os.getpid()}"
         self._session_factory = session_factory
         self._notifier = notifier
+        self._intake_loop_factory = intake_loop_factory
         self._lock = _KernelLock(self.kernel_dir)
         self.store: Optional[MissionStore] = None
         self.engine: Optional[MissionEngine] = None
+        self.intake = None
         self._capitol = None
         self._capitol_last_poll = 0.0
         self._capitol_error = ""
@@ -191,6 +201,18 @@ class EdgeDaemon:
                     f"recovered {reconciled['sessions_abandoned']}"
                     " abandoned session(s) from a previous run"
                 )
+            from .intake import ChannelIntake
+
+            self.intake = ChannelIntake(
+                self.store, self.engine, self.config, self.holder,
+                log=self.log, clock=self.clock,
+                loop_factory=self._intake_loop_factory,
+            )
+            if self.intake.enabled():
+                self.log(
+                    "channel intake: hosted by this daemon"
+                    " (remote_host=daemon)"
+                )
             self._start_socket_server()
             self._started_at = float(self.clock())
             self.log(
@@ -218,6 +240,9 @@ class EdgeDaemon:
                 socket_path.unlink()
         except OSError:
             pass
+        if self.intake is not None and self.store is not None:
+            self.intake.release()
+            self.intake = None
         if self.store is not None:
             self.store.close()
             self.store = None
@@ -280,6 +305,16 @@ class EdgeDaemon:
             except StaleGenerationError:
                 continue  # another pass already advanced it
         self._capitol_tick(stats)
+        if not self._stop.is_set() and self.intake is not None:
+            try:
+                handled = self.intake.tick()
+            except Exception as exc:
+                handled = 0
+                self.log(
+                    f"channel intake error: {type(exc).__name__}: {exc}"
+                )
+            if handled:
+                stats["intake"] = handled
         if not self._stop.is_set():
             for result in self.engine.run_ready_sessions(limit=1):
                 stats["sessions"] += 1
@@ -536,12 +571,17 @@ class EdgeDaemon:
             schedule_entries,
         )
         if op == "status":
+            from .intake import INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE
+
             missions = self.store.list_missions()
             by_status: Dict[str, int] = {}
             for mission in missions:
                 by_status[mission["status"]] = (
                     by_status.get(mission["status"], 0) + 1
                 )
+            intake_lease = self.store.get_lease(
+                INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE
+            )
             return {
                 "protocol": CONTROL_PROTOCOL_VERSION,
                 "holder": self.holder,
@@ -554,6 +594,13 @@ class EdgeDaemon:
                 "pending_outbox": len(self.store.list_outbox(status="pending")),
                 "kernel": str(self.kernel_dir / "kernel.db"),
                 "events": self.store.event_count(),
+                "channel_intake": (
+                    {
+                        "holder": intake_lease["holder"],
+                        "expires_at": float(intake_lease["expires_at"]),
+                    }
+                    if intake_lease else None
+                ),
             }
         if op == "missions.list":
             return [
@@ -601,6 +648,35 @@ class EdgeDaemon:
                 str(args.get("mission_id") or ""),
                 wake=bool(args.get("wake", True)),
             )
+        if op == "intake.acquire":
+            # A shell-hosted remote loop (remote_host=shell) takes the same
+            # channel-intake lease this daemon's own intake uses, so exactly
+            # one consumer polls even when process configs disagree.
+            from .intake import INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE
+
+            holder = str(args.get("holder") or "").strip()
+            if not holder:
+                raise KernelError("intake.acquire needs a holder")
+            try:
+                seconds = float(args.get("seconds") or 0)
+            except (TypeError, ValueError):
+                seconds = 0.0
+            seconds = min(max(seconds, 5.0), 3600.0)
+            lease = self.store.acquire_lease(
+                INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE, holder, seconds
+            )
+            return {"granted": lease is not None}
+        if op == "intake.release":
+            from .intake import INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE
+
+            holder = str(args.get("holder") or "").strip()
+            if not holder:
+                raise KernelError("intake.release needs a holder")
+            return {
+                "released": self.store.release_lease(
+                    INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE, holder
+                )
+            }
         if op == "approvals.list":
             return approval_entries(self.store)
         if op == "approval.decide":

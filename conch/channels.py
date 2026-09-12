@@ -614,6 +614,85 @@ def _email_body(parsed) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fake loopback channel (tests, demos, live acceptance drills)
+# ---------------------------------------------------------------------------
+
+class FakeChannel(Channel):
+    """File-backed loopback transport: inbound messages are JSON lines in
+    ``<fake_channel_dir>/inbound.jsonl`` (``{"sender", "text", "thread_id"}``),
+    outbound replies append to ``<fake_channel_dir>/outbound.jsonl``.
+
+    It exists so the remote loop — including the daemon-hosted intake — can
+    be exercised end to end without a real workspace: same allowlist
+    enforcement (``fake_allowed_senders``, fail closed), same cursor
+    semantics (``fake_offset`` advances exactly once per consumed line),
+    same reply path. Never configure it alongside production traffic; it is
+    a test harness, not a transport.
+    """
+
+    name = "fake"
+
+    def _dir(self) -> Path:
+        return Path(str(self.config.get("fake_channel_dir") or "").strip())
+
+    def is_configured(self) -> bool:
+        return bool(str(self.config.get("fake_channel_dir") or "").strip())
+
+    def send(self, text: str, thread_id: str = "") -> tuple:
+        if not self.is_configured():
+            return False, "fake channel not configured (fake_channel_dir)"
+        import time
+
+        directory = self._dir()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "ts": time.time(), "thread_id": thread_id, "text": text,
+            }
+            with open(directory / "outbound.jsonl", "a") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        except OSError as exc:
+            return False, f"fake channel send failed: {exc}"
+        return True, str(entry["ts"])
+
+    def poll(self, state: Dict[str, Any]) -> List[InboundMessage]:
+        if not self.is_configured():
+            return []
+        try:
+            lines = (self._dir() / "inbound.jsonl").read_text().splitlines()
+        except OSError:
+            return []
+        try:
+            offset = int(state.get("fake_offset", 0) or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        messages: List[InboundMessage] = []
+        for line in lines[offset:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            sender = str(entry.get("sender") or "").strip()
+            text = str(entry.get("text") or "").strip()
+            if not sender or not text:
+                continue
+            messages.append(InboundMessage(
+                channel="fake",
+                sender=sender,
+                text=text,
+                thread_id=str(entry.get("thread_id") or sender),
+                ts=str(entry.get("ts") or ""),
+            ))
+        state["fake_offset"] = len(lines)
+        return messages
+
+
+# ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
 
@@ -621,6 +700,7 @@ CHANNEL_TYPES = {
     "slack": SlackChannel,
     "sms": TwilioSMSChannel,
     "email": EmailChannel,
+    "fake": FakeChannel,
 }
 
 

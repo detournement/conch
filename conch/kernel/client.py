@@ -79,8 +79,28 @@ class SocketKernelClient:
     def abort(self, mission_id: str) -> None:
         self._call("mission.abort", {"mission_id": mission_id})
 
-    def provide_input(self, mission_id: str, text: str) -> None:
-        self._call("mission.input", {"mission_id": mission_id, "text": text})
+    def provide_input(self, mission_id: str, text: str,
+                      source: str = "local") -> Dict[str, Any]:
+        return self._call("mission.input", {
+            "mission_id": mission_id, "text": text, "source": source,
+        })
+
+    def post_event(self, source: str, key: str, payload: Dict[str, Any],
+                   mission_id: str = "", wake: bool = True) -> Dict[str, Any]:
+        return self._call("event.post", {
+            "source": source, "key": key, "payload": payload,
+            "mission_id": mission_id, "wake": wake,
+        })
+
+    def intake_acquire(self, holder: str, seconds: float) -> bool:
+        result = self._call("intake.acquire", {
+            "holder": holder, "seconds": float(seconds),
+        })
+        return bool(result.get("granted"))
+
+    def intake_release(self, holder: str) -> bool:
+        result = self._call("intake.release", {"holder": holder})
+        return bool(result.get("released"))
 
     def list_approvals(self) -> List[Dict[str, Any]]:
         return self._call("approvals.list")
@@ -178,8 +198,30 @@ class DirectKernelClient:
     def abort(self, mission_id: str) -> None:
         self.engine.abort_mission(mission_id)
 
-    def provide_input(self, mission_id: str, text: str) -> None:
-        self.engine.provide_input(mission_id, text)
+    def provide_input(self, mission_id: str, text: str,
+                      source: str = "local") -> Dict[str, Any]:
+        return self.engine.provide_input(mission_id, text, source=source)
+
+    def post_event(self, source: str, key: str, payload: Dict[str, Any],
+                   mission_id: str = "", wake: bool = True) -> Dict[str, Any]:
+        return self.engine.deliver_event(
+            source, key, payload, mission_id, wake=wake
+        )
+
+    def intake_acquire(self, holder: str, seconds: float) -> bool:
+        from .intake import INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE
+
+        lease = self.store.acquire_lease(
+            INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE, holder, float(seconds)
+        )
+        return lease is not None
+
+    def intake_release(self, holder: str) -> bool:
+        from .intake import INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE
+
+        return self.store.release_lease(
+            INTAKE_LEASE_KIND, INTAKE_LEASE_RESOURCE, holder
+        )
 
     def list_approvals(self) -> List[Dict[str, Any]]:
         return approval_entries(self.store)

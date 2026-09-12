@@ -476,18 +476,112 @@ def start_task_backend(config: dict, get_system_prompt, *,
     return sched, "legacy"
 
 
+class _ShellIntakeGate:
+    """Channel-intake lease for a shell-hosted remote loop in kernel mode.
+
+    The same ``channel_intake`` lease the daemon's intake takes: whoever
+    holds it is the single channel consumer, no matter what each process's
+    config says. Kernel imports stay inside the methods so nothing kernel-
+    related loads before the loop actually polls. Fails closed: no
+    reachable kernel means no polling.
+    """
+
+    def __init__(self, config: dict):
+        import os
+        import socket as socket_mod
+
+        self._config = config
+        self.holder = f"shell-{socket_mod.gethostname()}-{os.getpid()}"
+
+    def _lease_seconds(self) -> float:
+        from .kernel.intake import intake_lease_seconds
+
+        return intake_lease_seconds(
+            self._config.get("remote_poll_interval", 60) or 60
+        )
+
+    def _with_client(self, fn):
+        from .kernel.client import attach_kernel
+        from .kernel.model import KernelError
+
+        try:
+            client = attach_kernel(self._config)
+        except KernelError:
+            return None
+        try:
+            return fn(client)
+        except KernelError:
+            return None
+        finally:
+            client.close()
+
+    def acquire(self) -> bool:
+        granted = self._with_client(
+            lambda client: client.intake_acquire(
+                self.holder, self._lease_seconds()
+            )
+        )
+        return bool(granted)
+
+    def release(self) -> None:
+        self._with_client(
+            lambda client: client.intake_release(self.holder)
+        )
+
+    def mission_input(self, mission_id: str, text: str, message) -> str:
+        source = f"{message.channel}:{message.sender}"
+        result = self._with_client(
+            lambda client: client.provide_input(
+                mission_id, text, source=source
+            )
+        )
+        if result is None:
+            return f"Mission input failed: no kernel answered for {mission_id}."
+        if result.get("woken"):
+            return (
+                f"Input delivered to {mission_id} — it wakes now and will"
+                " run at the next session slot."
+            )
+        return (
+            f"Input recorded for {mission_id}; its state is unchanged and"
+            " the input will be visible at its next session."
+        )
+
+
 def start_remote_loop(config: dict, conv_mgr=None, session=None) -> tuple:
     """Start the opt-in remote channel loop.
 
     Returns (loop, "") when running, (None, "disabled") when remote_enabled
-    is off, and (None, "no channel configured") when it is on but no channel
-    is usable — the caller decides how (or whether) to surface each case.
+    is off, (None, "daemon-hosted") when the edge daemon owns channel
+    intake (the default whenever ``edge_daemon`` is enabled — set
+    ``remote_host=shell`` to keep the loop in the shell), and (None, "no
+    channel configured") when it is on but no channel is usable — the
+    caller decides how (or whether) to surface each case.
     """
     if not get_bool(config, "remote_enabled"):
         return None, "disabled"
+    kernel_mode = get_bool(config, "edge_daemon")
+    remote_host = str(config.get("remote_host") or "daemon").strip().lower()
+    if kernel_mode and remote_host != "shell":
+        # Daemon-when-enabled default: the daemon answers channels 24/7;
+        # a second consumer here would double-answer every message.
+        return None, "daemon-hosted"
     from .remote import RemoteLoop
 
-    loop = RemoteLoop(config, conv_mgr=conv_mgr, session=session)
+    intake_gate = None
+    mission_input = None
+    if kernel_mode:
+        # remote_host=shell: the shell hosts the loop but holds the same
+        # kernel channel-intake lease the daemon would, so exactly one
+        # consumer polls either way; mission-addressed input routes into
+        # the kernel and wakes the mission immediately.
+        gate = _ShellIntakeGate(config)
+        intake_gate = gate
+        mission_input = gate.mission_input
+    loop = RemoteLoop(
+        config, conv_mgr=conv_mgr, session=session,
+        intake_gate=intake_gate, mission_input=mission_input,
+    )
     if loop.start():
         return loop, ""
     return None, "no channel configured"

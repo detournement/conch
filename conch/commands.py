@@ -395,9 +395,15 @@ def _handle_mission_command(command: str, arg: str, config: dict, sched):
                     print("\n  \033[2mUsage: /mission input <id> "
                           "<answer>\033[0m\n")
                     return
-                client.provide_input(mission_id, ref_parts[1].strip())
+                result = client.provide_input(
+                    mission_id, ref_parts[1].strip()
+                )
+                woken = isinstance(result, dict) and result.get("woken")
+                outcome = (
+                    "wakes now" if woken else "will pick it up next session"
+                )
                 print(f"\n  \033[1;32m✓ Input recorded\033[0m \033[2m— "
-                      f"{mission_id} will pick it up next session\033[0m\n")
+                      f"{mission_id} {outcome}\033[0m\n")
                 return
             action = {
                 "pause": client.pause, "resume": client.resume,

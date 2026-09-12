@@ -588,6 +588,11 @@ def chat_loop():
             f"\033[2mRemote loop active on: {', '.join(_remote_loop.manager.configured())} "
             f"(safe_auto cap, allowlisted senders only)\033[0m"
         )
+    elif _remote_reason == "daemon-hosted":
+        print(
+            "\033[2mChannel intake is hosted by the conch-edge daemon "
+            "(remote_host=daemon); the shell will not poll channels\033[0m"
+        )
     elif _remote_reason == "no channel configured":
         print(
             "\033[33m  ⚠ remote_enabled is set but no channel is configured "

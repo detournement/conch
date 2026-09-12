@@ -209,7 +209,7 @@ class TaskExecutor:
         live model) drives the real chat_turn with canned responses."""
         script_path = os.environ.get("CONCH_FLEET_TASK_SCRIPT", "").strip()
         if script_path:
-            return "openai", _scripted_raw_fn(script_path)
+            return "openai", _scripted_raw_fn(script_path, self.envelope.task)
         from ..providers import RAW_FNS
 
         provider = (config.get("provider") or "").lower()
@@ -318,19 +318,32 @@ class TaskExecutor:
         return {}
 
 
-def _scripted_raw_fn(script_path: str):
-    """A raw_fn that replays a JSON list of response dicts (test / offline
-    execution). Each element is a normal provider response:
-    ``{"content": "...", "tool_calls": [...], "_usage": {...}}``.
+def _scripted_raw_fn(script_path: str, task_text: str = ""):
+    """A raw_fn that replays canned provider responses (test / offline
+    execution). Each response is ``{"content", "tool_calls", "_usage"}``.
 
-    The position is derived from the number of assistant messages already
-    in the conversation, not a per-process counter — so a resumed task
-    subprocess (after a brokered delegation) continues past the delegation
+    The script file is either a JSON list of responses, or a dict
+    ``{"match": [["substr", [responses]], ...], "default": [responses]}``
+    selecting a response list by a substring of the task — so one worker
+    can serve distinct parent/child behaviours.
+
+    Within a chosen list, the position is derived from the number of
+    assistant messages already in the conversation (not a per-process
+    counter) — so a resumed task subprocess continues past a delegation
     instead of replaying it.
     """
-    responses = json.loads(Path(script_path).read_text(encoding="utf-8"))
-    if not isinstance(responses, list):
-        raise RuntimeError("fleet task script must be a JSON list")
+    loaded = json.loads(Path(script_path).read_text(encoding="utf-8"))
+    if isinstance(loaded, list):
+        responses = loaded
+    elif isinstance(loaded, dict):
+        responses = list(loaded.get("default") or [])
+        for entry in loaded.get("match") or []:
+            substr, candidate = entry[0], entry[1]
+            if substr in (task_text or ""):
+                responses = candidate
+                break
+    else:
+        raise RuntimeError("fleet task script must be a JSON list or dict")
 
     def raw_fn(config, messages, tools):  # noqa: ARG001
         index = sum(

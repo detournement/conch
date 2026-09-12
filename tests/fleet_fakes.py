@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from conch.swarm.protocol import MAX_WIRE_BYTES
+from conch.swarm.protocol import MAX_WIRE_BYTES, new_id
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -152,3 +152,11 @@ class FakeSSHWorkerTransport:
         if not raw:
             raise ConnectionError("worker unreachable over fake transport")
         return RpcResponse.from_json(raw)
+
+    def call(self, op, args=None):
+        """WorkerTransport-compatible surface used by the task plane."""
+        from conch.swarm.protocol import RpcRequest
+
+        return self.send(RpcRequest(
+            rpc_id=new_id("rpc"), op=op, args=args or {},
+        ))

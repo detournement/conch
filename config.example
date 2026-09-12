@@ -109,6 +109,32 @@ api_key_env=ANTHROPIC_API_KEY
 # every tool round) or /mission abort <id>.
 #edge_daemon=false
 
+# --- Trusted SSH fleet (Swarm Phase 2) ----------------------------------------
+# Off by default and entirely opt-in: the interactive shell never depends on
+# the fleet. When you enroll trusted SSH hosts, the controller deploys bounded
+# workers (signed single-file .pyz by default, or the digest-pinned docker
+# `worker` image for strict isolation) and dispatches versioned task envelopes
+# over `conch-hostctl rpc <worker>` on SSH stdio. Workers are replaceable
+# compute: mission truth, credentials, budgets, and the external-action ledger
+# stay on the controller.
+#
+# Artifact signing: build+sign with tools/build_worker_artifact.py using an
+# OpenSSH key; hosts verify the sshsig + digest against an allowed-signers
+# trust anchor before activation (fail-closed). Point hosts at the anchor:
+#fleet_allowed_signers=~/.config/conch/fleet/allowed_signers
+# The fleet home on each worker host (content-addressed artifact store,
+# receipts, per-worker releases). Defaults to ~/.local/state/conch-fleet.
+#fleet_home=~/.local/state/conch-fleet
+# Scheduling / reliability knobs (controller side):
+#fleet_max_attempts=3                 # retry cap per dispatch (by failure class)
+#fleet_backoff_base_seconds=2.0       # exponential backoff base (full jitter)
+#fleet_heartbeat_deadline_seconds=90  # miss this long -> UNREACHABLE + requeue
+#fleet_max_delegation_depth=3         # brokered delegate_task depth cap
+#fleet_max_fan_out=8                  # brokered children per parent cap
+# Shared-endpoint resource groups so one Ollama box is never oversubscribed:
+# give co-located workers the same group and cap the group's concurrency.
+#fleet_resource_group_caps=ollama-box-1:1,ollama-box-2:2
+
 # --- Remote loop (Slack / SMS / email) ----------------------------------------
 # Opt-in remote operation: scheduled output is delivered over notify_channel,
 # and inbound replies are polled and routed into conversations. SAFETY:

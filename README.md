@@ -341,6 +341,70 @@ required-policy layer, before each tool round). Without `edge_daemon`
 enabled, none of this loads — the interactive shell and its in-process
 scheduler behave exactly as they always have.
 
+### Trusted SSH fleet (workers)
+Opt-in distributed execution: the controller deploys bounded, replaceable
+workers to trusted SSH hosts and dispatches versioned task envelopes to
+them. Workers are compute, never state authorities — mission truth,
+credentials, budgets, and the external-action ledger stay on the
+controller; a worker receives only a task envelope (its exact
+tool/model/data/budget authority) and returns events and artifacts.
+
+Every deployment is a **signed single-file artifact**: a reproducible
+`.pyz` (stdlib `zipapp`, bundling `conch` + `pygments`, entry point =
+`conch-worker`) with a canonical-JSON sha256 manifest, signed with OpenSSH
+`sshsig` (`ssh-keygen -Y sign`). Verification on the host is mandatory and
+fail-closed — a missing or wrong signature, an unknown manifest version,
+or a digest/size mismatch refuses activation. Containers are the optional
+strict-isolation profile (the `worker` target in the Dockerfile,
+digest-pinned); delivery, verification, and rollback are identical across
+profiles.
+
+```bash
+# Build + sign a worker artifact (operator machine)
+ssh-keygen -t ed25519 -f ~/.config/conch/fleet/signing-key   # once
+python tools/build_worker_artifact.py --out dist/conch-worker.pyz \
+    --sign-key ~/.config/conch/fleet/signing-key \
+    --principal fleet@you --emit-allowed-signers > allowed_signers
+```
+
+Lifecycle (enroll → probe → deploy → dispatch):
+
+1. **Enroll** a host interactively with strict host-key verification, then
+   confirm restart-safe key-based `BatchMode` auth. `conch-hostctl` is
+   streamed to the host and installed by verified sha256 (stdlib-only, so a
+   bare host needs only `python3`). A host is `autonomy_capable` only when
+   unattended key auth works; password-only hosts enroll but never run
+   unattended.
+2. **Probe** records the host's arch/OS, Python, systemd version and
+   sandboxing, Docker, disk, cgroups, GPU (`nvidia-smi`), and reachable
+   local model endpoints as *observed capabilities* — kept separate from
+   the administrator-assigned trust level, data ceiling, and labels.
+3. **Deploy / activate / rollback** are idempotent with operation
+   receipts under a remote deployment lock: repeating a deploy is a no-op,
+   the previous revision is retained, and rollback swaps back (symlink/unit
+   swap for the process/systemd profiles, image rollback for docker).
+   Workers run under a hardened user-level **systemd** unit on Linux
+   (`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `ProtectHome`,
+   `MemoryMax`/`CPUQuota`/`TasksMax`, `IPAddressDeny` + localhost allow),
+   a plain **supervised process** where systemd is absent (macOS dev), or
+   the **docker** profile for strict isolation.
+4. **Dispatch** goes over `WorkerTransport` — a fixed JSON request/response
+   line each way carried by `conch-hostctl rpc <worker>` over SSH stdio (no
+   secrets or prompts in argv, no worker network port). The controller
+   schedules by filter→score (protocol/state/trust/data ceiling/model
+   residency/capacity, with shared-endpoint resource groups so one Ollama
+   box is never oversubscribed), offers with a fencing token + controller
+   epoch, leases, retries by failure class with backoff/jitter, and
+   heartbeats with monotonic deadlines. A worker's `delegate_task` becomes
+   a controller-brokered child dispatch (validated for depth, fan-out,
+   budget, authority-subset, and trust placement); the parent parks and its
+   child's result returns as a complete tool-result group.
+
+None of this loads for shell-only users; the fleet is entirely opt-in and
+the interactive CLI never depends on it. See `PLAN.md` (Swarm Phase 2) for
+the current status and the items that still need a live Linux/SSH host for
+final verification.
+
 ### Cost tracking
 See token usage and estimated cost per turn and per session. `/cost` for session totals.
 

@@ -133,6 +133,105 @@ Slack workspace configured); the publish effect stays parked on the expired
 sandbox token. Email threading (Message-ID correlation) and watched-folder
 intake remain later items.
 
+**Swarm Phase 2 — trusted SSH fleet and distributed subagents
+(September 2026): landed.** The controller can deploy bounded, replaceable
+workers to trusted SSH hosts and dispatch versioned task envelopes to them;
+mission truth, credentials, budgets, and the external-action ledger stay on
+the controller. New package `conch/fleet/`, all opt-in — the interactive
+shell never imports it.
+
+- **Signed artifacts (`conch/fleet/artifacts.py` + `tools/`):** reproducible
+  single-file worker builds via stdlib `zipapp` (byte-identical across
+  builds; bundles `conch` + `pygments`, entry = `conch-worker`), a
+  canonical-JSON sha256 manifest, and OpenSSH `sshsig` signatures
+  (`ssh-keygen -Y sign/verify`, namespace-bound, allowed-signers file — no
+  new Python deps). Verification is mandatory and fail-closed: missing/invalid
+  signature, unknown manifest version, or digest/size mismatch refuses
+  activation. The Dockerfile gained a non-root `worker` target for the
+  optional strict-isolation profile with identical delivery semantics.
+- **`conch-hostctl` (`conch/fleet/hostctl.py`, stdlib-only single file):**
+  streamed onto bare hosts and installed by verified sha256; provides
+  `probe` (arch/OS, python3, systemd version + sandboxing, docker, disk,
+  cgroups, GPU via nvidia-smi, reachable local model endpoints), a
+  content-addressed artifact store (atomic, idempotent), fail-closed signed
+  `deploy`, `activate`/`rollback` with previous-revision retention and
+  idempotent operation receipts under a remote deployment lock (repeat op =
+  recorded receipt; re-deploy of staged content = no-op), worker supervision
+  under a hardened user-level systemd unit (Linux default), a plain
+  supervised process (macOS dev), or docker, and the bounded `rpc` relay to
+  the worker supervisor socket.
+- **FleetRegistry (`conch/fleet/registry.py` + kernel tables):**
+  event-sourced worker + dispatch truth (replayed, hash-chained,
+  replay==live), separating admin-assigned trust/data labels from observed
+  probe capabilities and runtime profiles; identity, incarnation,
+  artifact/config digests, protocol range, heartbeat sequence, and the
+  PENDING/ACTIVE/DRAINING/OFFLINE/UNREACHABLE/UPDATING/QUARANTINED/REVOKED
+  state machine. Enrollment (`conch/fleet/enroll.py`) is built on
+  `ssh_control.py`: strict host-key first-enroll, then a fresh BatchMode
+  connection check that marks a host autonomy-capable only when restart-safe
+  key auth works.
+- **Worker supervisor (`conch/fleet/worker.py`) + task executor
+  (`conch/fleet/taskexec.py`):** durable offer/start receipt handshake
+  (persist `(task, attempt, fence, epoch)` before ack; duplicates return the
+  recorded receipt), fencing (stale fences rejected, newer fence supersedes
+  with a process-group kill), bounded queue with retry-after rejection,
+  per-attempt event spool with an ack watermark, cancellation as a state
+  transition + process-group kill, and wall-clock enforcement. Tasks run the
+  real `chat_turn` via an `AgentSession` restricted to the envelope's exact
+  tool intersection (request-scoped authorization preserved); events spool
+  locally until controller ack.
+- **Task plane (`conch/fleet/plane.py`):** filter→score scheduling
+  (protocol/state/trust/data ceiling/model residency/capacity + shared
+  resource-group caps so one Ollama box is never oversubscribed), offer/start
+  with controller epoch + per-dispatch fencing (a receipt commits only when
+  `(attempt, fence)` matches; the kernel epoch guard already fences a
+  superseded controller out of all writes), retries by protocol failure class
+  with backoff/jitter and an attempt cap (`unknown_external_outcome` →
+  NEEDS_RECONCILE, never blind-retried), heartbeats with monotonic deadlines
+  (silent worker → UNREACHABLE + requeue), content-addressed artifact
+  transfer with digest verification both directions, and effectively-once
+  external side effects recorded through the kernel ledger keyed by the
+  envelope idempotency key.
+- **Brokered delegation:** a worker's `delegate_task` raises to park the task
+  (a `delegation_requested` event); the controller validates depth, fan-out,
+  authority-subset (tools/action-classes/data class), and trust placement
+  into a child dispatch; the parent parks WAITING_CHILD (releasing its worker
+  slot) and drives its own resume from the child's terminal outcome, folding
+  the child result back as a complete tool-result group. Interactive local
+  `delegate_task` is unchanged.
+- **Gates (all in tests; +125 new, 1,308 total on Python 3.9 and 3.14, ruff
+  clean at every commit):** the worker + hostctl run as real local
+  subprocesses over a byte-identical fake SSH transport (a local socket in
+  place of the SSH hop). Covered: signed/unsigned/tampered artifacts fail
+  closed (bytes flipped, re-verified); duplicate offers/starts never
+  duplicate receipts; obsolete fences rejected end to end; repeated deploy =
+  no-op receipts; process-profile rollback drill with a live supervised
+  worker (and a process-group-kill escape check); docker-profile rollback
+  drill verified live on Docker Desktop (CI-skipped behind
+  `CONCH_FLEET_DOCKER_DRILL=1`); systemd units validated textually
+  (`systemd-analyze` unavailable on macOS — see follow-ups); resource-group
+  oversubscription guard; effectively-once side effects through the kernel
+  ledger under redelivery; fault injection killing the worker mid-run and
+  after a result is written (exactly one terminal outcome per attempt); and a
+  fleet-path secret-canary sweep (keys/bearers never in envelopes, events,
+  receipts, argv, or logs).
+
+**Needs a real Linux/SSH host for final live verification** (deferred — no
+remote SSH/Docker host reachable and macOS has no systemd during this run):
+
+- Real OpenSSH enrollment and dispatch against a remote host: the interactive
+  strict-host-key first-enroll through the secure terminal, the BatchMode
+  autonomy check, hostctl streamed/installed over a real SSH session, and
+  `WorkerTransport` driving `conch-hostctl rpc` over SSH stdio. Tonight these
+  ran through injected runners and the local-socket fake transport (wire and
+  supervisor logic byte-identical; only the SSH hop is substituted).
+- Live hardened systemd unit on Linux: `systemd-analyze security` on the
+  generated unit and a real `systemctl --user enable --now` / stop / restart
+  cycle for `worker start/stop/status` and the systemd rollback swap. The
+  unit text is validated directive-by-directive in tests today.
+- GPU residency scheduling against an actual `nvidia-smi` host and a shared
+  Ollama endpoint under real concurrent load.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

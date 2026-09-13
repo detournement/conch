@@ -270,6 +270,18 @@ Point `weak_model` (and optionally `weak_provider`) at a small fast model and Co
 ### Memory
 Conch remembers facts across sessions. Use `/remember` to save manually, or the LLM saves important context automatically via the `save_memory` tool. Recall is ranked with SQLite FTS5 (bm25) when available. A separate always-loaded tier lives in `~/.config/conch/facts.md` — append with `/fact <text>`, view with `/facts`; its (bounded) contents ride in the system prompt of every session. Conversation search (`/search`, `search_conversations`) runs on a SQLite FTS5 index instead of scanning every file, synced incrementally as conversations are saved.
 
+Memory never stores credentials. Every write path (`save_memory`,
+`/remember`, auto session summaries, mission-lesson consolidation) runs a
+deterministic credential detector — JWTs, Atlassian/AWS/OpenAI/Slack/
+GitHub/GitLab/Google token shapes, private-key blocks, `password:`/`token:`
+style assignments, and high-entropy strings next to auth words — and a
+matching entry is rejected whole with the type named (never sanitized and
+saved). Retrieval re-scans on the way out, so a legacy entry written
+before the gate (or matching patterns added later) is dropped from model
+context and logged by type instead of surfacing. Mentioning credentials is
+fine ("the Jira token lives in mcp.json"); pasting one is not. The store
+file itself is owner-only (0600).
+
 ### Repository map
 When you start Conch inside a git repo, a ~1k-token structural overview (ranked files + top-level symbols) is injected into the system prompt so the model starts oriented. Disable with `repo_map=false`.
 
@@ -331,6 +343,14 @@ projections replay from exactly. Missions run as bounded, checkpointed work
 sessions (fresh rehydrated context each time, never a growing transcript)
 with hard wall/token/round caps; the model schedules its own next wake via
 the `mission_control` tool or falls back to the mission cadence.
+
+Cadence missions — a recurring schedule and no success criteria — run
+forever by design, so their specs default to
+`allow_model_completion = false`: a `complete_mission` call from the model
+is refused with a steering message and journaled as a `completion_denied`
+event, and only an operator finishes the mission (`fail_mission` stays
+available). Missions with success criteria or `run_once` default to
+`true`; set the field explicitly in the spec to override either way.
 
 Quickstart:
 

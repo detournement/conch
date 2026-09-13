@@ -113,7 +113,12 @@ api_key_env=ANTHROPIC_API_KEY
 # the control socket) wake parked missions immediately — no waiting out
 # the cadence timer. Emergency stop: create
 # ~/.local/state/conch/kernel/STOP (checked at session start and before
-# every tool round) or /mission abort <id>.
+# every tool round) or /mission abort <id>. Cadence missions (recurring
+# schedule, no success criteria) default to allow_model_completion=false
+# in their spec: the model cannot self-complete them — complete_mission is
+# refused and journaled (completion_denied); an operator finishes them.
+# Missions with success criteria or run_once default to true; set the
+# spec field explicitly to override.
 #edge_daemon=false
 
 # --- Mission judgment and shared memory ----------------------------------------
@@ -151,6 +156,11 @@ api_key_env=ANTHROPIC_API_KEY
 # keywords, hard char cap; the overall rehydration bound is unchanged).
 # Consolidation runs as a post-checkpoint side task with a timeout —
 # failure or timeout is a logged skip and never blocks the session path.
+# The memory store itself refuses credential material on EVERY write path
+# (save_memory tool, /remember, session summaries): entries matching the
+# credential detector are rejected whole, and retrieval re-scans entries
+# on the way out so legacy credential-bearing entries never reach model
+# context (dropped and logged by type — always on, not configurable).
 #mission_consolidation=true
 #mission_consolidation_max_lessons=3
 #mission_consolidation_max_chars=240

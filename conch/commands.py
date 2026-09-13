@@ -567,7 +567,6 @@ def _escalate_item(store, item, rest: str, config: dict, sched):
     """Run the existing mission-intake flow seeded from the item, then
     bind the link. Missions execute in the daemon, so this goes through
     the same attach path /mission new uses."""
-    from .kernel import items as items_mod
     from .kernel.model import ItemStatus, KernelError
 
     if item["status"] != ItemStatus.OPEN:

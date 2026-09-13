@@ -52,7 +52,6 @@ from typing import Any, Dict, List, Optional
 
 from ..policy import evaluate_required_policy
 from .client import (
-    FINAL_STATUS_EVENT,
     KEEPALIVE_EVENT,
     TERMINAL_EVENT_TYPES,
     TERMINAL_RUN_STATUSES,

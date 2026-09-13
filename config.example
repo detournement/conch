@@ -66,6 +66,12 @@ api_key_env=ANTHROPIC_API_KEY
 # Command prefixes that never prompt (comma-separated).
 #allow_prefixes=git status, ls, cat
 
+# Editor for editor-backed commands (/notes new, /notes open). Resolution:
+# this key → $VISUAL → $EDITOR → nano if installed → vi. The value may carry
+# arguments (e.g. `code --wait`). The editor runs through the direct terminal
+# handoff, so these commands work in interactive local sessions only.
+#editor=nano
+
 # Interactive credentials are never configured here. Use `/terminal <command>`
 # or `/ssh connect user@host [port]` and type them only after Conch hands the
 # real terminal to the requesting program. OpenSSH config and known_hosts apply.

@@ -497,6 +497,31 @@ secret-bearing items whole exactly like memory does, and item content is
 stored text — reading an item whose body says `/agent on` or `approve 1`
 executes nothing.
 
+### Notes (/notes) — replacing the Apple Notes habit
+Editor-backed notes on the same personal-items store (space `notes`): no
+new database, the same event-sourcing discipline, the same privacy rules.
+`/notes new [title]` opens your editor on a scratch buffer through the
+direct terminal handoff (the `/terminal` gate — interactive local sessions
+with a real TTY only); the buffer's first line `# Title` names the note
+(falling back to the argument, then `Untitled <date>`), save+quit stores
+it, and abandoning an empty buffer stores nothing. `/notes open
+<#|id|title>` reopens a note — titles resolve by unambiguous substring,
+ambiguity lists the candidates — and every save is an `item_updated`
+event, so `/notes show` gets the full edit history ("edited 3 times, last
+…") for free. `/notes add "title" [#tag] -- body` quick-captures without
+the editor (the `/todo add` grammar); `search` scans titles and bodies;
+`archive`/`reopen` complete the lifecycle; `/note` aliases. The editor
+chain is the `editor` config key → `$VISUAL` → `$EDITOR` → nano if
+installed → vi (set `editor = nano` or `= vi` to pin; the value may carry
+arguments, e.g. `editor = code --wait`). In remote and channel sessions
+the editor verbs refuse and point at quick-add and the `personal_items`
+tool, which work everywhere. The point is weaning off Apple Notes: capture
+keeps the frictionless open-an-editor-and-type shape, but notes land in a
+queryable, history-bearing, agent-reachable store — the model pulls them
+through `personal_items` search when relevant, never wholesale. Context
+pinning and `note:` references for missions/packs land in N2; Apple Notes
+import in N3.
+
 ### Trusted SSH fleet (workers)
 Opt-in distributed execution: the controller deploys bounded, replaceable
 workers to trusted SSH hosts and dispatches versioned task envelopes to
@@ -641,6 +666,8 @@ target directly, pass Docker's `--init`.
 | `/todo` | Today's personal todos: due, overdue, top urgent |
 | `/todo add\|done\|due\|list\|show\|work\|escalate …` | Manage the personal todo list |
 | `/list <space> [verb …]` | Other personal item spaces (recipes, papers, …) |
+| `/notes` | Recent notes; `new [title]` / `open <#\|id\|title>` write in your editor (`/note` aliases) |
+| `/notes add\|show\|search\|archive\|reopen …` | Quick-capture and manage notes without the editor |
 | `/approvals` | List pending mission approvals |
 | `/approve <id>` / `/deny <id>` | Decide a pending mission action |
 | `/ebay <photo...> [-- notes]` | Draft and publish an eBay listing through a Capitol workflow |

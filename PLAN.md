@@ -472,6 +472,24 @@ fleet) + `/todo` and `/list` commands with `/todo work` context loading
 and `/todo escalate` mission linking + the memory fence — P2 (channel
 capture provenance, morning digest) and P3 (space enrichment) remain.
 
+**Notes N1 (September 2026): landed.** The `/notes` family (`/note`
+aliases) on the items store — space `notes`, no new store. `new`/`open`
+hand the terminal to the user's editor (`editor` config → $VISUAL →
+$EDITOR → nano floor → vi; one shared resolver in config.py that the
+multiline branch's /edit converges on at merge) through the
+DirectTerminalRunner under the /terminal authority gate: interactive
+local sessions with a real TTY only, remote/channel sessions refused
+toward quick-add and personal_items. First-line `# Title` parsing with
+argument and dated-Untitled fallbacks; abandoned empty buffers store
+nothing; every save is an item_updated event and `show` surfaces the
+edit history ("edited N times, last …"); quick-add rides the /todo add
+grammar (tags supported); search covers titles+bodies; archive/reopen
+complete the lifecycle. Credential write-guard (whole-note rejection,
+editor text preserved on block) and stored-text inertness proven through
+the command surface; replay == live. N2 (context pinning with caps,
+`note:` references for missions/packs, templates) and N3 (Apple Notes
+import, note→todo links, digest inclusion) remain.
+
 **Natural-language Capitol layer (September 2026): landed.** The
 `capitol_control` session builtin — the model-callable RUNTIME surface
 (discover/workflows/describe/suggest/versions/stats/runs, keyed start

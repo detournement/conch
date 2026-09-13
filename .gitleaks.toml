@@ -33,4 +33,12 @@ regexes = [
     '''YOUR_SERVER_ID''',
     # Model identifier that trips the generic-api-key rule
     '''moonshotai\.kimi''',
+    # Synthetic fixtures planted by tests/test_memory_guard.py to prove the
+    # memory credential gate. Never real: JWT with payload "synthetic":
+    # "fixture" and signature base64("SYNTHETICSIGNATURE"); tokens carry a
+    # SyntheticFixture / SynthFix / Fak3synthetic marker.
+    '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzeW50aGV0aWMiOiJmaXh0dXJlIn0\.U1lOVEhFVElDU0lHTkFUVVJF''',
+    '''ATATT3xFfGF0SyntheticFixture[0-9]+''',
+    '''[A-Za-z0-9]{10,}Synth(?:Fix|etic)''',
+    '''Fak3synthetic''',
 ]

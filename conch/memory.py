@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+
+from .secretguard import CredentialRejected, credential_findings
+
+logger = logging.getLogger("conch.memory")
 
 
 def _state_dir() -> Path:
@@ -21,6 +26,30 @@ def _memory_path() -> Path:
 
 def _tokenize(text: str) -> set[str]:
     return {part.lower() for part in text.replace("\n", " ").split() if part.strip()}
+
+
+def credential_withheld(content: str, where: str) -> bool:
+    """Scan-on-read guard for one retrieved entry: True when it must be
+    withheld. Legacy entries predating the write gate (or slipping
+    patterns added later) are dropped from retrieval and logged by TYPE —
+    the content never reaches model context, logs, or the report."""
+    found = credential_findings(content)
+    if not found:
+        return False
+    logger.warning(
+        "memory retrieval (%s): dropped an entry matching credential "
+        "pattern(s) %s — review with /memories and remove it with /forget",
+        where, ", ".join(found),
+    )
+    return True
+
+
+def drop_credentialed(contents: List[str], where: str) -> List[str]:
+    """Filter retrieved memory contents through the scan-on-read guard."""
+    return [
+        content for content in contents
+        if not credential_withheld(str(content), where)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +130,8 @@ class MemoryStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._entries, indent=2))
+        # Owner-only, like the kernel db: memories are personal context.
+        os.chmod(tmp, 0o600)
         tmp.replace(self._path)
 
     def get_all(self) -> List[Dict[str, Union[str, int]]]:
@@ -109,6 +140,15 @@ class MemoryStore:
     def add(
         self, content: str, source: str = "user"
     ) -> Dict[str, Union[str, int]]:
+        """Append one entry. Every write path — the save_memory tool,
+        /remember, session summaries, mission consolidation — lands here,
+        so this is where the credential gate holds: an entry matching
+        credential detection is rejected whole (:class:`CredentialRejected`
+        carries type labels only), never sanitized — the same discipline as
+        the mission-lesson consolidation gate."""
+        found = credential_findings(content)
+        if found:
+            raise CredentialRejected(found)
         new_id = max((int(item["id"]) for item in self._entries), default=0) + 1
         entry = MemoryEntry(
             id=new_id,
@@ -136,6 +176,7 @@ class MemoryStore:
         contents = self._fts_rank(query, limit)
         if contents is None:
             contents = self._keyword_rank(query, limit)
+        contents = drop_credentialed(contents or [], where="build_context")
         if not contents:
             return ""
         lines = ["Relevant remembered context:"]
@@ -178,7 +219,11 @@ class MemoryStore:
                     scored.append((score, index))
             scored.sort(key=lambda item: item[0], reverse=True)
             indices = [index for _, index in scored[:limit]]
-        return [dict(pool[index]) for index in indices]
+        entries = [dict(pool[index]) for index in indices]
+        return [
+            entry for entry in entries
+            if not credential_withheld(str(entry.get("content", "")), "rank_entries")
+        ]
 
     def _fts_rank_indices(
         self, query: str, limit: int, pool: List[Dict[str, Union[str, int]]]

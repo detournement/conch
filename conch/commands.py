@@ -794,7 +794,18 @@ def handle_slash_command(
         if not arg:
             print("\n  \033[2mUsage: /remember <text>\033[0m\n")
             return None
-        entry = memory.add(arg)
+        from .secretguard import CredentialRejected
+        try:
+            entry = memory.add(arg)
+        except CredentialRejected as exc:
+            print(
+                f"\n  \033[31mNot saved: matches credential pattern(s) "
+                f"({', '.join(exc.types)}).\033[0m\n"
+                "  \033[2mMemory never stores secrets. Save a reference "
+                "instead (which env var / keychain item / config file "
+                "holds it).\033[0m\n"
+            )
+            return None
         print(f"\n  \033[1;32m✓ Saved memory #{entry['id']}:\033[0m {entry['content']}\n")
         return None
 

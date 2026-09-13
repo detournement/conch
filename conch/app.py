@@ -190,10 +190,18 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
             return  # never save provider errors as permanent memories
         summary = response.get("content", "").strip()
         if summary:
-            with serialized_agent_execution():
-                memory.add(
-                    f"[Session summary] {summary}", source="summary"
-                )
+            from .secretguard import CredentialRejected
+
+            try:
+                with serialized_agent_execution():
+                    memory.add(
+                        f"[Session summary] {summary}", source="summary"
+                    )
+            except CredentialRejected:
+                # A summary quoting credential material is dropped whole —
+                # same discipline as the mission-lesson gate. Losing one
+                # best-effort summary beats persisting a secret.
+                return
     except Exception:
         pass
 

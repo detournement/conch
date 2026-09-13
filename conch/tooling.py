@@ -1375,7 +1375,18 @@ class SaveMemoryClient:
         content = arguments.get("content", "").strip()
         if not content:
             return {"content": [{"type": "text", "text": "Error: empty memory"}]}
-        entry = self._memory.add(content, source="auto")
+        from .secretguard import CredentialRejected
+
+        try:
+            entry = self._memory.add(content, source="auto")
+        except CredentialRejected as exc:
+            return {"content": [{"type": "text", "text": (
+                "Save blocked: the content matches credential pattern(s) "
+                f"({', '.join(exc.types)}). Memory never stores secrets — "
+                "the entry was rejected whole. Save a non-secret reference "
+                "instead (e.g. which env var, keychain item, or config file "
+                "holds the credential)."
+            )}]}
         return {"content": [{"type": "text", "text": f"Saved memory #{entry['id']}: {content}"}]}
 
 
@@ -1475,10 +1486,19 @@ class SearchConversationsClient:
                 sections.append("")
 
         if self._memory:
+            from .memory import credential_withheld as _memory_read_guard
+
             mem_entries = self._memory.get_all()
             mem_hits = []
             for entry in mem_entries:
                 content = str(entry.get("content", ""))
+                # Same scan-on-read guard as memory retrieval: a legacy
+                # credential-bearing entry must not surface through search
+                # either. (Config files are intentionally NOT guarded here
+                # — finding the user's own configured keys is this tool's
+                # documented purpose; the memory store must never hold any.)
+                if _memory_read_guard(content, "search_conversations"):
+                    continue
                 content_lower = content.lower()
                 count = sum(content_lower.count(kw) for kw in keywords)
                 if count:

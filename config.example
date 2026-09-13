@@ -169,6 +169,15 @@ api_key_env=ANTHROPIC_API_KEY
 #mission_lessons_k=3
 #mission_lessons_max_chars=700
 
+# --- Personal items (todos, recipes, papers) ------------------------------------
+# The /todo and /list commands and the personal_items tool store durable
+# personal records in named spaces inside the local mission kernel. Local-only
+# by design: never sent to Capitol, never consolidated into shared lessons,
+# and the credential write-guard rejects secret-bearing items whole. No keys
+# are required. Reserved for P2 (the morning-digest cadence mission over the
+# notify channel): the local hour the digest fires.
+#items_digest_hour=8
+
 # --- Trusted SSH fleet (Swarm Phase 2) ----------------------------------------
 # Off by default and entirely opt-in: the interactive shell never depends on
 # the fleet. When you enroll trusted SSH hosts, the controller deploys bounded

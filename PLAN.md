@@ -464,6 +464,14 @@ landed three real tagged lessons, and a second mission's very next
 rehydration retrieved them in its labeled lessons block with mission-id
 provenance.
 
+**Personal items P1 (September 2026): landed.** Kernel `items` aggregate
+(event-sourced spaces: todo/recipes/papers/user-created, replay == live,
+credential write-guard, computed urgency) + the `personal_items` builtin
+(interactive and channel sessions; explicit-offer-only for sub-turns and
+fleet) + `/todo` and `/list` commands with `/todo work` context loading
+and `/todo escalate` mission linking + the memory fence — P2 (channel
+capture provenance, morning digest) and P3 (space enrichment) remain.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

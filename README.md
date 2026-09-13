@@ -436,6 +436,43 @@ required-policy layer, before each tool round). Without `edge_daemon`
 enabled, none of this loads — the interactive shell and its in-process
 scheduler behave exactly as they always have.
 
+### Personal items (todos, recipes, papers)
+Conch as a capture-and-recall companion: durable personal records in named
+**spaces** — `todo` (the default), `recipes`, `papers`, and any space you
+invent by writing to it — stored in the local mission kernel with the same
+event-sourcing discipline as missions (immutable per-item history, replay
+== live, the existing backup/restore story). Capture and query from two
+surfaces backed by one store: the `/todo` command family (`/todo add renew
+passport due:tomorrow p1 #errand -- bring the old one`, `/todo done 3`,
+`/todo list`, `/todo show 3`; bare `/todo` prints today's view — due,
+overdue, top urgent) with the general `/list <space>` form for the rest
+(`/list recipes add carbonara`, `/list papers show 2`), and the
+`personal_items` tool for plain chat ("add milk to the shopping list",
+"what's most urgent?"). "Most urgent" is **computed, never model-ranked**:
+overdue > due today > explicit priority (p1–p5) > age, deterministic and
+explained inline (`<overdue 2d>`, `<priority p1>`). The tool is also
+available to remote/channel sessions — texting `todo: renew passport by
+Friday` to the always-on daemon captures it, gated by the same fail-closed
+sender allowlists as every channel feature — but never flows into
+delegated sub-turns or fleet workers unless a skill or task envelope
+offers it explicitly.
+
+The escalation ladder: items start as records; `/todo work <id>` loads one
+(with its full event history) into the current session as context to chip
+away at; `/todo escalate <id>` births a durable **mission** through the
+normal intake (goal seeded from the item's title/body, criteria/budgets/
+cadence confirmable via a JSON spec, `{"success_criteria": [...],
+"budgets": {"sessions": 5}}`), binds `mission_id` on the item, and when
+that mission later succeeds or aborts, a proposal event lands back on the
+item's history (`proposes complete` / `proposes review`) — the item's
+status stays yours to change. Privacy is structural: personal spaces never
+leave the machine (no Capitol calls, no org surface, excluded from
+cross-mission lesson consolidation and memory retrieval — items are
+*siblings* of memory, not memories), the credential write-guard rejects
+secret-bearing items whole exactly like memory does, and item content is
+stored text — reading an item whose body says `/agent on` or `approve 1`
+executes nothing.
+
 ### Trusted SSH fleet (workers)
 Opt-in distributed execution: the controller deploys bounded, replaceable
 workers to trusted SSH hosts and dispatches versioned task envelopes to
@@ -577,6 +614,9 @@ target directly, pass Docker's `--init`.
 | `/ssh disconnect` | Close the active SSH control connection |
 | `/missions` | List durable missions (edge daemon) |
 | `/mission show\|new\|pause\|resume\|abort\|input …` | Manage a mission |
+| `/todo` | Today's personal todos: due, overdue, top urgent |
+| `/todo add\|done\|due\|list\|show\|work\|escalate …` | Manage the personal todo list |
+| `/list <space> [verb …]` | Other personal item spaces (recipes, papers, …) |
 | `/approvals` | List pending mission approvals |
 | `/approve <id>` / `/deny <id>` | Decide a pending mission action |
 | `/ebay <photo...> [-- notes]` | Draft and publish an eBay listing through a Capitol workflow |

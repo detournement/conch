@@ -518,12 +518,21 @@ class CapitolSessionClient:
         details = runtime.describe_workflow(workflow_id)
         from .packs.engine import workflow_inputs_key
 
-        inputs_key = workflow_inputs_key(runtime, workflow_id)
-        return self._text(
-            f"workflow {workflow_id} — inputs key: {inputs_key!r} "
-            "(a bare input_value on op='start' is wrapped under it)\n"
-            + _bounded_json(details)
-        )
+        try:
+            inputs_key = workflow_inputs_key(
+                runtime, workflow_id, strict=True
+            )
+            head = (
+                f"workflow {workflow_id} — request-input key: "
+                f"{inputs_key!r} (a bare input_value on op='start' is "
+                "wrapped under it)"
+            )
+        except CapitolError as exc:
+            head = (
+                f"workflow {workflow_id} — {clean_text(exc, 400)} "
+                "(use inputs={...} on op='start', not input_value)"
+            )
+        return self._text(head + "\n" + _bounded_json(details))
 
     def _op_suggest(self, arguments: dict) -> Dict[str, Any]:
         goal = self._require(arguments, "goal", "suggest")
@@ -616,7 +625,12 @@ class CapitolSessionClient:
         if input_value is not None:
             from .packs.engine import workflow_inputs_key
 
-            key_name = workflow_inputs_key(self._runtime(), workflow_id)
+            # strict: a workflow without a single request-input node
+            # refuses here with the canonical keys named, instead of
+            # sending a guessed key the gateway would reject.
+            key_name = workflow_inputs_key(
+                self._runtime(), workflow_id, strict=True
+            )
             inputs = {key_name: input_value}
         idempotency_key = str(arguments.get("idempotency_key") or "").strip()
         derived = False

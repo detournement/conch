@@ -84,6 +84,7 @@ class FakeGateway(BaseHTTPRequestHandler):
     echo_bearer_500 = False
     error_script = None
     chat_script = None
+    details_script = None
     run_counter = 0
 
     @classmethod
@@ -104,6 +105,7 @@ class FakeGateway(BaseHTTPRequestHandler):
         cls.echo_bearer_500 = False
         cls.error_script = None
         cls.chat_script = None
+        cls.details_script = None
         cls.run_counter = 0
         cls.run_events = {}   # run_id -> [event, ...] for get_workflow_events
         cls.org_agents = [{
@@ -266,6 +268,8 @@ class FakeGateway(BaseHTTPRequestHandler):
                  "name": "Approve and Publish Listing"},
             ]}
         if skill == "get_workflow_details":
+            if cls.details_script is not None:
+                return cls.details_script
             return {"fields": [{
                 "node_instance_id": "node-json-input",
                 "field_id": "value",

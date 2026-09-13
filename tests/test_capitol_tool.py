@@ -276,6 +276,46 @@ class TestStart(ToolCase):
         })
         self.assertIn("not both", text)
 
+    def test_input_value_finds_a_text_input_node(self):
+        # The live together-funding-ingest shape: many tool-config
+        # fields, one text-input request node, no json "value" field.
+        FakeGateway.details_script = {"fields": [
+            {"node_instance_id": "node-window", "field_id": "text_input",
+             "valid_types": ["str"], "required": True},
+            {"node_instance_id": "node-tool", "field_id": "composio_apps",
+             "valid_types": ["list"], "required": True},
+            {"node_instance_id": "node-search", "field_id": "query",
+             "valid_types": ["str"], "required": False},
+        ]}
+        self.call({
+            "op": "start", "workflow_id": "draft-wf",
+            "input_value": "after:2026/09/01 before:2026/09/08",
+        })
+        _, data, _ = FakeGateway.calls[-1]
+        self.assertEqual(
+            data["inputs"],
+            {"node-window.text_input": "after:2026/09/01 before:2026/09/08"},
+        )
+
+    def test_input_value_refuses_ambiguous_workflows(self):
+        FakeGateway.details_script = {"fields": [
+            {"node_instance_id": "node-a", "field_id": "alpha",
+             "valid_types": ["str"], "required": True},
+            {"node_instance_id": "node-b", "field_id": "beta",
+             "valid_types": ["str"], "required": False},
+        ]}
+        text = self.call({
+            "op": "start", "workflow_id": "draft-wf",
+            "input_value": "x",
+        })
+        self.assertIn("no single request-input node", text)
+        self.assertIn("node-a.alpha", text)
+        starts = [c for c in FakeGateway.calls if c[0] == "call_workflow"]
+        self.assertEqual(starts, [])
+        # describe reports the same guidance instead of a wrong key.
+        described = self.call({"op": "describe", "workflow_id": "draft-wf"})
+        self.assertIn("use inputs={...}", described)
+
     def test_required_policy_denies_start(self):
         register_required_policy(
             "test-deny-start",

@@ -278,11 +278,24 @@ def workflow_inputs_key(
     runtime: CapitolRuntime,
     workflow_id: str,
     cache: Optional[Dict[str, str]] = None,
+    *,
+    strict: bool = False,
 ) -> str:
-    """Canonical inputs key for the workflow's JSON request input node."""
+    """Canonical inputs key for the workflow's request-input node.
+
+    Preference order: the JSON input node (``field_id == "value"``), then
+    exactly one text input node (``field_id == "text_input"`` — verified
+    live: multi-field workflows like together-funding-ingest expose their
+    window as ``{node}.text_input`` among many tool-config fields), then
+    a single overridable field. With ``strict`` the unresolvable case
+    raises naming the required fields' canonical keys instead of
+    defaulting to ``"value"`` (which multi-field workflows reject).
+    """
     if cache is not None and workflow_id in cache:
         return cache[workflow_id]
     key = "value"
+    resolved = False
+    fields: List[Dict[str, Any]] = []
     try:
         details = runtime.describe_workflow(workflow_id) or {}
         fields = [
@@ -293,15 +306,39 @@ def workflow_inputs_key(
             field for field in fields
             if str(field.get("field_id")) == "value"
         ]
-        target = value_fields[0] if value_fields else (
-            fields[0] if len(fields) == 1 else None
-        )
+        text_fields = [
+            field for field in fields
+            if str(field.get("field_id")) == "text_input"
+        ]
+        target = None
+        if value_fields:
+            target = value_fields[0]
+        elif len(text_fields) == 1:
+            target = text_fields[0]
+        elif len(fields) == 1:
+            target = fields[0]
         if target:
             node = str(target.get("node_instance_id") or "").strip()
             field_id = str(target.get("field_id") or "value")
             key = f"{node}.{field_id}" if node else field_id
+            resolved = True
     except CapitolError:
-        pass  # fall back to the bare field id
+        if strict:
+            raise
+    if strict and not resolved:
+        required = [
+            f"{str(field.get('node_instance_id') or '').strip()}."
+            f"{field.get('field_id')}"
+            for field in fields
+            if field.get("required")
+        ]
+        raise CapitolError(
+            f"workflow {workflow_id} has no single request-input node "
+            f"({len(fields)} overridable fields) — pass the full inputs "
+            "map keyed by '<node_instance_id>.<field_id>' from the "
+            "describe fields"
+            + (f"; required: {', '.join(required)}" if required else "")
+        )
     if cache is not None:
         cache[workflow_id] = key
     return key

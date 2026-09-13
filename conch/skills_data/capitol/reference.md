@@ -49,6 +49,13 @@ Two ways to start:
 - `input_value`: one value; the tool discovers the request-input key
   from `describe` and wraps the value under it. Right for the common
   one-input workflow (funding window strings, request objects).
+  Discovery prefers the JSON input node (`field_id == "value"`), then a
+  single text input node (`field_id == "text_input"` — the shape
+  multi-field workflows like `together-funding-ingest` expose their
+  window under, among many tool-config fields), then a lone overridable
+  field. A workflow with no single request-input node makes the tool
+  refuse `input_value` and name the required `<node>.<field_id>` keys —
+  switch to the explicit `inputs` map.
 
 Only overridable fields are valid input keys; author-locked fields
 (system prompt, model, temperature) are absent from `describe` and

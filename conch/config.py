@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -88,6 +89,31 @@ def get_config_path() -> str:
     """Path to the primary Conch config file (may not exist yet)."""
     config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch"
     return str(config_dir / "config")
+
+
+def resolve_editor(config: Optional[Dict[str, str]] = None) -> str:
+    """Editor precedence: config ``editor``, then $VISUAL, then $EDITOR,
+    then nano when installed, else vi.
+
+    The value is a command string and may carry arguments
+    (``editor = code --wait``); callers shlex-split it before appending
+    the file path. One helper for every editor-backed surface (/notes
+    now, /edit when the multiline branch merges) so the ``editor`` key
+    always means the same thing. The nano floor is deliberate: on a
+    machine with neither variable set, a modeless editor is a friendlier
+    default than vi — set ``editor = vi`` to pin vi.
+    """
+    candidates = (
+        (config or {}).get("editor"),
+        os.environ.get("VISUAL"),
+        os.environ.get("EDITOR"),
+    )
+    for candidate in candidates:
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    if shutil.which("nano"):
+        return "nano"
+    return "vi"
 
 
 # ---------------------------------------------------------------------------

@@ -976,6 +976,14 @@ class InteractiveTerminalClient:
             )
         )
 
+    def handoff_available(self) -> bool:
+        """Whether this session may hand the terminal to a child right
+        now — the same gate run_argv enforces (local foreground session
+        with a real TTY). Lets callers like /notes refuse up front with
+        a useful message instead of a failed handoff."""
+        self._configure_runner()
+        return bool(self._runner.available())
+
     def _format_result(self, result, noun: str = "Interactive command") -> dict:
         if not result.approved:
             if result.error:

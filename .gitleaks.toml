@@ -41,4 +41,8 @@ regexes = [
     '''ATATT3xFfGF0SyntheticFixture[0-9]+''',
     '''[A-Za-z0-9]{10,}Synth(?:Fix|etic)''',
     '''Fak3synthetic''',
+    # Synthetic AWS access-key-id fixture used by tests/test_personal_items.py
+    # to prove the personal-items credential write-guard. Never real — the
+    # 16-char suffix is the word SYNTHETICFIXTURE.
+    '''AKIASYNTHETICFIXTURE''',
 ]

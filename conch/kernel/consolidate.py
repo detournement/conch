@@ -30,11 +30,17 @@ import re
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
-from .model import MissionKind
+from .model import ITEM_EVENT_KINDS, MissionKind
 from .store import MissionStore
 
 #: Journal event kinds worth distilling (bounded; reviews excluded — a
 #: verdict about the work is not new knowledge from the work).
+#:
+#: Personal-space fence (personal-items plan): item_* events are NEVER
+#: consolidation input. Item events live on per-item chains, so a
+#: mission's delta cannot contain them by construction; the disjointness
+#: assertion and the belt-and-braces filter in
+#: :func:`session_delta_text` keep that true as taxonomies grow.
 DELTA_EVENT_KINDS = (
     "checkpoint_recorded",
     "mission_note",
@@ -46,6 +52,10 @@ DELTA_EVENT_KINDS = (
     "action_resolved",
     "approval_requested",
     "mission_transitioned",
+)
+
+assert not set(DELTA_EVENT_KINDS) & ITEM_EVENT_KINDS, (
+    "personal-item events must never be consolidation input"
 )
 
 CONSOLIDATION_DEFAULTS = {
@@ -202,6 +212,8 @@ def session_delta_text(store: MissionStore, mission: Dict[str, Any],
     for event in store.events_since(
         mission_id, boundary, DELTA_EVENT_KINDS, limit=60
     ):
+        if event["kind"] in ITEM_EVENT_KINDS:
+            continue  # personal-space fence: items never feed lessons
         data = event["data"]
         brief = {
             key: str(data[key])[:400]

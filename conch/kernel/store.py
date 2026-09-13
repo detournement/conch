@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import time as _time
 
+from ..secretguard import CredentialRejected, credential_findings
 from ..swarm.protocol import (
     ActionClass,
     DataClassification,
@@ -55,6 +56,7 @@ from .model import (
     EVENT_KINDS,
     EVENT_SCHEMA_VERSION,
     InboxStatus,
+    ItemStatus,
     KernelError,
     MISFIRE_GRACE_SECONDS,
     MisfirePolicy,
@@ -63,10 +65,14 @@ from .model import (
     TaskState,
     WorkerState,
     check_dispatch_transition,
+    check_item_transition,
     check_task_transition,
     check_transition,
     check_worker_transition,
     kernel_id,
+    normalize_item_priority,
+    normalize_item_tags,
+    normalize_space,
     normalize_spec,
 )
 
@@ -380,6 +386,24 @@ CREATE TABLE IF NOT EXISTS dispatch_events (
     received_at REAL NOT NULL,
     PRIMARY KEY(task_id, attempt, seq)
 );
+CREATE TABLE IF NOT EXISTS items (
+    item_id TEXT PRIMARY KEY,
+    space TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    due_at REAL,
+    priority INTEGER,
+    tags TEXT NOT NULL DEFAULT '{"list":[]}',
+    source TEXT NOT NULL DEFAULT 'chat',
+    mission_id TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_items_space_status
+    ON items(space, status);
+CREATE INDEX IF NOT EXISTS idx_items_mission ON items(mission_id);
 """
 
 #: Tables rebuilt from the event journal, with the columns that must match
@@ -467,7 +491,21 @@ REPLAYED_TABLES: Dict[str, Tuple[str, ...]] = {
         "failure_class", "result", "error", "version", "created_at",
         "updated_at",
     ),
+    # Personal items (personal-items plan P1): the whole row is mission
+    # truth — every mutation is an item_* event on the item's own chain.
+    "items": (
+        "item_id", "space", "title", "body", "status", "due_at",
+        "priority", "tags", "source", "mission_id", "version",
+        "created_at", "updated_at",
+    ),
 }
+
+#: Item fields item_updated may change. Status changes ride their own
+#: events (item_completed / item_archived); the only status an update may
+#: carry is "open" — reopening a done or archived item.
+ITEM_UPDATABLE_FIELDS = frozenset({
+    "title", "body", "due_at", "priority", "tags", "space", "status",
+})
 
 #: Worker fields an admin/probe update may change through worker_updated.
 #: Trust/data labels are admin-assigned; capabilities are observed — the
@@ -916,6 +954,61 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
              _canonical(data.get("result", {})), data.get("error", ""),
              data["version"], created_at, data["task_id"]),
         )
+    elif kind == "item_added":
+        conn.execute(
+            "INSERT INTO items(item_id, space, title, body, status,"
+            " due_at, priority, tags, source, mission_id, version,"
+            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (data["item_id"], data["space"], data["title"],
+             data.get("body", ""), data["status"], data.get("due_at"),
+             data.get("priority"),
+             _canonical({"list": data.get("tags", [])}),
+             data.get("source", "chat"), data.get("mission_id", ""),
+             data["version"], created_at, created_at),
+        )
+    elif kind == "item_updated":
+        fields = data["fields"]
+        assignments = []
+        params: List[Any] = []
+        for column in sorted(fields):
+            value = fields[column]
+            if column == "tags":
+                value = _canonical({"list": value})
+            assignments.append(f'"{column}"=?')
+            params.append(value)
+        assignments.append("version=?")
+        params.append(data["version"])
+        assignments.append("updated_at=?")
+        params.append(created_at)
+        params.append(data["item_id"])
+        conn.execute(
+            "UPDATE items SET " + ", ".join(assignments)
+            + " WHERE item_id=?",
+            params,
+        )
+    elif kind == "item_completed":
+        conn.execute(
+            "UPDATE items SET status=?, version=?, updated_at=?"
+            " WHERE item_id=?",
+            (ItemStatus.DONE, data["version"], created_at,
+             data["item_id"]),
+        )
+    elif kind == "item_archived":
+        conn.execute(
+            "UPDATE items SET status=?, version=?, updated_at=?"
+            " WHERE item_id=?",
+            (ItemStatus.ARCHIVED, data["version"], created_at,
+             data["item_id"]),
+        )
+    elif kind == "item_escalated":
+        conn.execute(
+            "UPDATE items SET mission_id=?, version=?, updated_at=?"
+            " WHERE item_id=?",
+            (data["mission_id"], data["version"], created_at,
+             data["item_id"]),
+        )
+    elif kind == "item_mission_synced":
+        pass  # journal-only proposal; the user decides the item's fate
     elif kind == "session_started":
         conn.execute(
             "UPDATE missions SET last_session_at=? WHERE mission_id=?",
@@ -1211,7 +1304,29 @@ class MissionStore:
             "from": current, "to": target, "version": new_version,
             "reason": reason, "error": error,
         })
+        if target in MissionState.TERMINAL:
+            self._sync_escalated_items(conn, mission_id, target)
         return new_version
+
+    def _sync_escalated_items(self, conn: sqlite3.Connection,
+                              mission_id: str, outcome: str) -> None:
+        """Escalation sync (personal-items plan): a terminal mission
+        journals a proposal event onto every item linked to it, in the
+        same transaction as the mission's transition. Journal-only — the
+        item's status is the user's call, never moved by a mission."""
+        rows = conn.execute(
+            "SELECT item_id FROM items WHERE mission_id=? AND status!=?"
+            " ORDER BY item_id",
+            (mission_id, ItemStatus.ARCHIVED),
+        ).fetchall()
+        proposal = (
+            "complete" if outcome == MissionState.SUCCEEDED else "review"
+        )
+        for (item_id,) in rows:
+            self._append(conn, item_id, "item_mission_synced", {
+                "item_id": item_id, "mission_id": mission_id,
+                "outcome": outcome, "proposal": proposal,
+            })
 
     def _enqueue_outbox(self, conn: sqlite3.Connection, mission_id: str,
                         kind: str, payload: Dict[str, Any],
@@ -2862,6 +2977,315 @@ class MissionStore:
             data["payload"] = _json.loads(data["payload"] or "{}")
             result.append(data)
         return result
+
+    # ------------------------------------------------------------------
+    # Personal items (personal-items plan P1)
+    # ------------------------------------------------------------------
+    #
+    # Durable user records — todos, recipes, paper ideas — in named
+    # spaces, under the exact mission discipline: every mutation is one
+    # immutable event on the item's own chain applied to the projection
+    # in the same transaction. Item content is personal and local-only:
+    # it never feeds memory consolidation, never reaches Capitol or any
+    # org surface, and is stored text — never executed or parsed as
+    # instructions. The credential write-guard applies to every item
+    # write (whole-entry rejection, same as memory).
+
+    @staticmethod
+    def _guard_item_content(title: Any, body: Any, tags: Any) -> None:
+        findings: List[str] = []
+        for chunk in (title, body, " ".join(tags or [])):
+            for label in credential_findings(str(chunk or "")):
+                if label not in findings:
+                    findings.append(label)
+        if findings:
+            raise CredentialRejected(findings)
+
+    def add_item(self, title: str, *, space: str = "", body: str = "",
+                 due_at: Optional[float] = None, priority: Any = None,
+                 tags: Any = None, source: str = "chat",
+                 actor: str = "user",
+                 item_id: Optional[str] = None) -> Dict[str, Any]:
+        title = str(title or "").strip()
+        if not title:
+            raise KernelError("item title is required")
+        space = normalize_space(space)
+        priority = normalize_item_priority(priority)
+        tags = normalize_item_tags(tags)
+        if due_at is not None:
+            due_at = float(due_at)
+        self._guard_item_content(title, body, tags)
+        iid = item_id or kernel_id("item")
+
+        def fn(conn):
+            self._append(conn, iid, "item_added", {
+                "item_id": iid, "space": space, "title": title,
+                "body": str(body or ""), "status": ItemStatus.OPEN,
+                "due_at": due_at, "priority": priority, "tags": tags,
+                "source": str(source or "chat"), "mission_id": "",
+                "actor": str(actor or "user"), "version": 1,
+            })
+            return iid
+        self._mutate(fn)
+        return self.get_item(iid)  # committed above; never None
+
+    def _item_row(self, conn: sqlite3.Connection, item_id: str):
+        row = conn.execute(
+            "SELECT item_id, status, version, mission_id FROM items"
+            " WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            raise KernelError(f"unknown item {item_id!r}")
+        return row
+
+    def update_item(self, item_id: str, fields: Dict[str, Any], *,
+                    actor: str = "user", source: str = "chat",
+                    expected_version: Optional[int] = None) -> int:
+        unknown = set(fields) - ITEM_UPDATABLE_FIELDS
+        if unknown:
+            raise KernelError(
+                f"item fields {sorted(unknown)} are not updatable —"
+                " failing closed"
+            )
+        if not fields:
+            raise KernelError("update_item needs at least one field")
+        clean: Dict[str, Any] = {}
+        for key, value in fields.items():
+            if key == "title":
+                value = str(value or "").strip()
+                if not value:
+                    raise KernelError("item title cannot be empty")
+            elif key == "body":
+                value = str(value or "")
+            elif key == "due_at":
+                value = float(value) if value is not None else None
+            elif key == "priority":
+                value = normalize_item_priority(value)
+            elif key == "tags":
+                value = normalize_item_tags(value)
+            elif key == "space":
+                value = normalize_space(value)
+            elif key == "status" and value != ItemStatus.OPEN:
+                # done/archived ride their own events with their own
+                # provenance; an update may only reopen.
+                raise KernelError(
+                    "update_item may only set status='open' (reopen) —"
+                    " use complete_item / archive_item"
+                )
+            clean[key] = value
+        self._guard_item_content(
+            clean.get("title", ""), clean.get("body", ""),
+            clean.get("tags", []),
+        )
+
+        def fn(conn):
+            row = self._item_row(conn, item_id)
+            status, version = row[1], int(row[2])
+            if expected_version is not None and version != expected_version:
+                raise ConflictError(
+                    f"item {item_id} version {version} !="
+                    f" expected {expected_version}"
+                )
+            if "status" in clean:
+                check_item_transition(status, clean["status"])
+            new_version = version + 1
+            self._append(conn, item_id, "item_updated", {
+                "item_id": item_id, "fields": clean,
+                "version": new_version, "actor": str(actor or "user"),
+                "source": str(source or "chat"),
+            })
+            return new_version
+        return self._mutate(fn)
+
+    def _finish_item(self, item_id: str, kind: str, target: str,
+                     actor: str, source: str,
+                     expected_version: Optional[int]) -> int:
+        def fn(conn):
+            row = self._item_row(conn, item_id)
+            status, version = row[1], int(row[2])
+            if expected_version is not None and version != expected_version:
+                raise ConflictError(
+                    f"item {item_id} version {version} !="
+                    f" expected {expected_version}"
+                )
+            check_item_transition(status, target)
+            new_version = version + 1
+            self._append(conn, item_id, kind, {
+                "item_id": item_id, "from": status,
+                "version": new_version, "actor": str(actor or "user"),
+                "source": str(source or "chat"),
+            })
+            return new_version
+        return self._mutate(fn)
+
+    def complete_item(self, item_id: str, *, actor: str = "user",
+                      source: str = "chat",
+                      expected_version: Optional[int] = None) -> int:
+        return self._finish_item(
+            item_id, "item_completed", ItemStatus.DONE, actor, source,
+            expected_version,
+        )
+
+    def archive_item(self, item_id: str, *, actor: str = "user",
+                     source: str = "chat",
+                     expected_version: Optional[int] = None) -> int:
+        return self._finish_item(
+            item_id, "item_archived", ItemStatus.ARCHIVED, actor, source,
+            expected_version,
+        )
+
+    def escalate_item(self, item_id: str, mission_id: str, *,
+                      actor: str = "user") -> int:
+        """Bind an item to the mission its escalation created. One live
+        link per item; the mission must exist in this kernel."""
+        def fn(conn):
+            row = self._item_row(conn, item_id)
+            status, version, linked = row[1], int(row[2]), row[3]
+            if status != ItemStatus.OPEN:
+                raise KernelError(
+                    f"item {item_id} is {status}; only open items escalate"
+                )
+            if linked:
+                raise KernelError(
+                    f"item {item_id} is already escalated to {linked}"
+                )
+            self._mission_row(conn, mission_id)
+            new_version = version + 1
+            self._append(conn, item_id, "item_escalated", {
+                "item_id": item_id, "mission_id": mission_id,
+                "version": new_version, "actor": str(actor or "user"),
+            })
+            return new_version
+        return self._mutate(fn)
+
+    # -- item queries (deterministic; ties always break on item_id) --------
+
+    @staticmethod
+    def _item_dict(row) -> Dict[str, Any]:
+        data = dict(row)
+        data["tags"] = _json.loads(data["tags"]).get("list", [])
+        return data
+
+    _ITEM_SELECT = (
+        "SELECT i.*, (SELECT MIN(seq) FROM mission_events e WHERE"
+        " e.mission_id = i.item_id) AS item_seq FROM items i"
+    )
+
+    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+        row = self._read_conn().execute(
+            self._ITEM_SELECT + " WHERE i.item_id=?", (item_id,)
+        ).fetchone()
+        return self._item_dict(row) if row else None
+
+    def resolve_item(self, ref: str) -> Optional[Dict[str, Any]]:
+        """Item from a full id, unique id prefix, or #<seq> alias (the
+        seq of the item's first event — same scheme as mission task ids).
+        None when nothing (or more than one thing) matches."""
+        ref = str(ref or "").strip().lstrip("#")
+        if not ref:
+            return None
+        if ref.isdigit():
+            row = self._read_conn().execute(
+                "SELECT mission_id FROM mission_events WHERE seq=?",
+                (int(ref),),
+            ).fetchone()
+            if row is None:
+                return None
+            return self.get_item(row[0])
+        exact = self.get_item(ref)
+        if exact is not None:
+            return exact
+        rows = self._read_conn().execute(
+            "SELECT item_id FROM items WHERE item_id LIKE ? ESCAPE '\\'"
+            " LIMIT 2",
+            (ref.replace("\\", "\\\\").replace("%", r"\%")
+             .replace("_", r"\_") + "%",),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return self.get_item(rows[0][0])
+
+    def list_items(self, space: str = "", status: str = ItemStatus.OPEN,
+                   tag: str = "",
+                   limit: int = 500) -> List[Dict[str, Any]]:
+        """Items ordered by creation (created_at, then item_id). ``status``
+        may be one status, "" or "all" for every status."""
+        query = self._ITEM_SELECT
+        conditions: List[str] = []
+        params: List[Any] = []
+        if space:
+            conditions.append("i.space=?")
+            params.append(normalize_space(space))
+        if status and status != "all":
+            if status not in ItemStatus.ALL:
+                raise KernelError(f"unknown item status {status!r}")
+            conditions.append("i.status=?")
+            params.append(status)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY i.created_at, i.item_id LIMIT ?"
+        params.append(int(limit))
+        rows = self._read_conn().execute(query, params).fetchall()
+        items = [self._item_dict(row) for row in rows]
+        if tag:
+            wanted = normalize_item_tags([tag])
+            items = [
+                item for item in items
+                if all(t in item["tags"] for t in wanted)
+            ]
+        return items
+
+    def search_items(self, text: str, space: str = "",
+                     limit: int = 50) -> List[Dict[str, Any]]:
+        """Substring search over title and body (case-insensitive via
+        LIKE), all statuses, creation order."""
+        needle = str(text or "").strip()
+        if not needle:
+            return []
+        pattern = "%" + (
+            needle.replace("\\", "\\\\").replace("%", r"\%")
+            .replace("_", r"\_")
+        ) + "%"
+        query = self._ITEM_SELECT + (
+            " WHERE (i.title LIKE ? ESCAPE '\\' OR i.body LIKE ?"
+            " ESCAPE '\\')"
+        )
+        params: List[Any] = [pattern, pattern]
+        if space:
+            query += " AND i.space=?"
+            params.append(normalize_space(space))
+        query += " ORDER BY i.created_at, i.item_id LIMIT ?"
+        params.append(int(limit))
+        rows = self._read_conn().execute(query, params).fetchall()
+        return [self._item_dict(row) for row in rows]
+
+    def find_items_by_mission(self,
+                              mission_id: str) -> List[Dict[str, Any]]:
+        rows = self._read_conn().execute(
+            self._ITEM_SELECT + " WHERE i.mission_id=?"
+            " ORDER BY i.created_at, i.item_id",
+            (mission_id,),
+        ).fetchall()
+        return [self._item_dict(row) for row in rows]
+
+    def list_item_spaces(self) -> List[Dict[str, Any]]:
+        rows = self._read_conn().execute(
+            "SELECT space, COUNT(*) AS total,"
+            " SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS open"
+            " FROM items GROUP BY space ORDER BY space",
+            (ItemStatus.OPEN,),
+        ).fetchall()
+        return [
+            {"space": row["space"], "total": int(row["total"]),
+             "open": int(row["open"] or 0)}
+            for row in rows
+        ]
+
+    def item_events(self, item_id: str,
+                    limit: int = 100) -> List[Dict[str, Any]]:
+        """The item's full event history (its chain id is the item id)."""
+        return self.event_tail(item_id, limit=limit)
 
     # ------------------------------------------------------------------
     # Composite session flows (single-transaction guarantees)

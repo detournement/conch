@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import secrets
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 #: Version stamped on every kernel event row. Reading or replaying an event
 #: with any other version fails closed — an older kernel must never
@@ -48,7 +48,7 @@ class ApprovalError(KernelError):
 #: swarm protocol so mission/task/worker IDs are valid on the wire.
 KERNEL_ID_KINDS = frozenset({
     "msn", "task", "pln", "ses", "ckpt", "apr", "tmr", "act", "att",
-    "art", "bnd", "scp", "lse", "obx", "wrk", "rev",
+    "art", "bnd", "scp", "lse", "obx", "wrk", "rev", "item",
 })
 
 _ID_RE = re.compile(r"^([a-z]{2,8})-([0-9a-f]{13})-([0-9a-f]{16})$")
@@ -149,6 +149,110 @@ class TaskState:
 
     ALL = frozenset({OPEN, IN_PROGRESS, DONE, CANCELLED, FAILED})
     TERMINAL = frozenset({DONE, CANCELLED, FAILED})
+
+
+# ---------------------------------------------------------------------------
+# Personal items (personal-items plan P1): durable user records — todos,
+# recipes, paper ideas — living in named spaces. Item state is the same
+# event→projection discipline as missions; no state here is terminal
+# because a personal list is the user's to reshape (done items reopen,
+# archived items restore).
+# ---------------------------------------------------------------------------
+
+class ItemStatus:
+    OPEN = "open"
+    DONE = "done"
+    ARCHIVED = "archived"
+
+    ALL = frozenset({OPEN, DONE, ARCHIVED})
+
+
+ITEM_TRANSITIONS = {
+    ItemStatus.OPEN: frozenset({ItemStatus.DONE, ItemStatus.ARCHIVED}),
+    ItemStatus.DONE: frozenset({ItemStatus.OPEN, ItemStatus.ARCHIVED}),
+    ItemStatus.ARCHIVED: frozenset({ItemStatus.OPEN}),
+}
+
+
+def check_item_transition(current: str, target: str) -> None:
+    if current not in ItemStatus.ALL or target not in ItemStatus.ALL:
+        raise KernelError(
+            f"unknown item status in transition {current!r} -> {target!r}"
+        )
+    if target not in ITEM_TRANSITIONS[current]:
+        raise KernelError(
+            f"illegal item transition {current!r} -> {target!r}"
+        )
+
+
+#: The default space plus the two the plan names; any other space is
+#: user-created on first write (validated by :func:`normalize_space`).
+DEFAULT_ITEM_SPACE = "todo"
+BUILTIN_ITEM_SPACES = ("todo", "recipes", "papers")
+
+_SPACE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+#: Explicit user-set priority bounds (1 = most urgent). Null means "no
+#: explicit priority" and ranks below any set priority.
+ITEM_PRIORITY_MIN = 1
+ITEM_PRIORITY_MAX = 5
+
+
+def normalize_space(space: Any) -> str:
+    """Space name normalized to lowercase; empty defaults to ``todo``.
+    Unknown shapes fail closed — spaces are identifiers, not prose."""
+    name = str(space or "").strip().lower()
+    if not name:
+        return DEFAULT_ITEM_SPACE
+    if not _SPACE_RE.match(name):
+        raise KernelError(
+            f"invalid space name {name!r} (lowercase letters, digits,"
+            " - or _, max 32 chars)"
+        )
+    return name
+
+
+def normalize_item_priority(priority: Any) -> Optional[int]:
+    if priority is None or priority == "":
+        return None
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        try:
+            priority = int(str(priority).strip().lstrip("pP"))
+        except (TypeError, ValueError):
+            raise KernelError(
+                f"item priority must be an integer {ITEM_PRIORITY_MIN}.."
+                f"{ITEM_PRIORITY_MAX}, got {priority!r}"
+            )
+    if not ITEM_PRIORITY_MIN <= priority <= ITEM_PRIORITY_MAX:
+        raise KernelError(
+            f"item priority must be {ITEM_PRIORITY_MIN}.."
+            f"{ITEM_PRIORITY_MAX}, got {priority}"
+        )
+    return priority
+
+
+def normalize_item_tags(tags: Any) -> List[str]:
+    """Sorted, deduplicated, lowercased tag list (deterministic order)."""
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, (list, tuple)):
+        raise KernelError("item tags must be a list of strings")
+    clean = set()
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise KernelError("item tags must be a list of strings")
+        tag = tag.strip().lstrip("#").lower()
+        if not tag:
+            continue
+        if not _SPACE_RE.match(tag):
+            raise KernelError(
+                f"invalid tag {tag!r} (lowercase letters, digits, - or _,"
+                " max 32 chars)"
+            )
+        clean.add(tag)
+    return sorted(clean)
 
 
 TASK_TRANSITIONS = {
@@ -460,6 +564,26 @@ EVENT_KINDS = frozenset({
     "worker_transitioned",
     "dispatch_created",
     "dispatch_transitioned",
+    # Personal items (personal-items plan P1). Item events chain under the
+    # item's own id (like dispatches chain under their mission), so one
+    # event_tail(item_id) is the item's full history. item_mission_synced
+    # is journal-only: a linked mission finishing PROPOSES an outcome on
+    # the item; it never moves the item's status by itself.
+    "item_added",
+    "item_updated",
+    "item_completed",
+    "item_archived",
+    "item_escalated",
+    "item_mission_synced",
+})
+
+#: The personal-items event family. Memory consolidation and every other
+#: shared/org-bound surface must exclude these — personal spaces never
+#: leave the machine (see conch/kernel/consolidate.py and the plan's
+#: privacy rules).
+ITEM_EVENT_KINDS = frozenset({
+    "item_added", "item_updated", "item_completed", "item_archived",
+    "item_escalated", "item_mission_synced",
 })
 
 

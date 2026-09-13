@@ -108,6 +108,10 @@ class IntakeCase(unittest.TestCase):
             "remote_poll_interval": 1,
             "fake_channel_dir": str(self.chan_dir),
             "fake_allowed_senders": "alice",
+            # model-backed side tasks have their own suites; keep the
+            # intake tests hermetic
+            "mission_reviews": "false",
+            "mission_consolidation": "false",
         }
         config.update(overrides)
         return config

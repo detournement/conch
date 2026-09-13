@@ -48,7 +48,7 @@ class ApprovalError(KernelError):
 #: swarm protocol so mission/task/worker IDs are valid on the wire.
 KERNEL_ID_KINDS = frozenset({
     "msn", "task", "pln", "ses", "ckpt", "apr", "tmr", "act", "att",
-    "art", "bnd", "scp", "lse", "obx", "wrk",
+    "art", "bnd", "scp", "lse", "obx", "wrk", "rev",
 })
 
 _ID_RE = re.compile(r"^([a-z]{2,8})-([0-9a-f]{13})-([0-9a-f]{16})$")
@@ -444,6 +444,12 @@ EVENT_KINDS = frozenset({
     "session_started",
     "session_checkpointed",
     "session_abandoned",
+    # Mission judgment (roadmap: mission judgment and shared memory).
+    # review_recorded projects into the reviews table; review_skipped and
+    # plan_revised are journal facts (the plan itself rides plan_recorded).
+    "review_recorded",
+    "review_skipped",
+    "plan_revised",
     # Fleet (Swarm Phase 2). Worker events chain under mission_id "";
     # dispatch events chain under the envelope's real mission.
     "worker_enrolled",
@@ -498,6 +504,7 @@ def normalize_spec(spec: Dict[str, Any],
         "run_once", "misfire_policy", "catch_up_limit",
         "session_wall_seconds", "session_max_tool_rounds",
         "session_token_budget", "principal", "notify", "capitol",
+        "review",
     }
     unknown = set(spec) - known
     if unknown:
@@ -603,9 +610,39 @@ def normalize_spec(spec: Dict[str, Any],
                 "capitol.workflows allowlist"
             )
 
+    review_raw = spec.get("review") or {}
+    if not isinstance(review_raw, dict):
+        raise KernelError("mission spec review must be a dict")
+    review_known = {
+        "enabled", "every_sessions", "every_seconds", "stall_sessions",
+        "token_budget", "wall_seconds",
+    }
+    review_unknown = set(review_raw) - review_known
+    if review_unknown:
+        raise KernelError(
+            f"mission spec review has unknown field(s) "
+            f"{sorted(review_unknown)} — failing closed"
+        )
+    review: Dict[str, Any] = {}
+    if "enabled" in review_raw:
+        review["enabled"] = bool(review_raw["enabled"])
+    for key, minimum in (
+        ("every_sessions", 1), ("every_seconds", 0),
+        ("stall_sessions", 2), ("token_budget", 1), ("wall_seconds", 30),
+    ):
+        if key not in review_raw:
+            continue
+        value = review_raw[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise KernelError(f"review.{key} must be an integer")
+        if value < minimum:
+            raise KernelError(f"review.{key} must be at least {minimum}")
+        review[key] = value
+
     normalized: Dict[str, Any] = {
         "goal": goal,
         "capitol": capitol,
+        "review": review,
         "success_criteria": _str_list("success_criteria"),
         "constraints": _str_list("constraints"),
         "budgets": budgets,

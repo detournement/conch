@@ -290,11 +290,15 @@ class MissionEngine:
     def __init__(self, store: MissionStore, config: dict,
                  holder: str = "", session_factory: Optional[Callable] = None,
                  kernel_dir: Optional[Path] = None,
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None,
+                 review_runner: Optional[Callable] = None):
         self.store = store
         self.config = config or {}
         self.holder = holder or f"engine-{os.getpid()}"
         self._session_factory = session_factory
+        #: Review-session model runner (tests inject a scripted one); the
+        #: default makes one weak-model call with no tools.
+        self._review_runner = review_runner
         self.kernel_dir = Path(kernel_dir) if kernel_dir else (
             Path(store.path).parent
         )
@@ -486,6 +490,7 @@ class MissionEngine:
             )
             parts.append(_clip(plan_text, _SECTION_CAPS["plan"]))
 
+        tasks = self.store.open_tasks(mission_id)
         checkpoint = self.store.latest_checkpoint(mission_id)
         if checkpoint:
             parts.append(_clip(
@@ -494,7 +499,6 @@ class MissionEngine:
                 _SECTION_CAPS["checkpoint"],
             ))
 
-        tasks = self.store.open_tasks(mission_id)
         if tasks:
             task_text = "Open tasks:\n" + "\n".join(
                 f"  - [{task['state']}] {task['task_id']}: {task['title']}"
@@ -605,6 +609,18 @@ class MissionEngine:
         if mission["status"] != MissionState.READY:
             return {"mission_id": mission_id, "outcome": "skipped",
                     "error": f"not ready (status {mission['status']})"}
+        # Mission judgment: when a review is owed, it takes this session
+        # slot (the mission stays ready, so the work session runs on the
+        # next tick with any re-plan already in place). Reviews sit behind
+        # the same STOP/pause/approval gates as work sessions — an
+        # ineligible mission never reaches this branch.
+        from . import review as _review
+
+        policy = _review.resolve_policy(mission["spec"], self.config)
+        if _review.review_due(
+            self.store, mission, policy, float(self.store.clock())
+        ):
+            return self.run_review_session(mission, policy)
         spec = mission["spec"]
         session_id = kernel_id("ses")
         scope = mission["root_scope_id"]
@@ -689,6 +705,161 @@ class MissionEngine:
         return self._finish_session(
             mission, session_id, control, reply, usage, error
         )
+
+    def run_review_session(self, mission: Dict[str, Any],
+                           policy: Dict[str, Any]) -> Dict[str, Any]:
+        """One bounded critic session (mission judgment work item).
+
+        Deterministic stall detection runs BEFORE the model sees anything;
+        the verdict lands as kernel events (``review_recorded``, plus
+        ``plan_recorded``/``plan_revised`` on a re-plan, plus an outbox
+        notification on escalation) in one transaction. Budget exhaustion
+        and unusable model output degrade to a journaled skip — a review
+        can never crash or fail its mission.
+        """
+        from . import review as _review
+
+        mission_id = mission["mission_id"]
+        spec = mission["spec"]
+        scope = mission["root_scope_id"]
+        signals = _review.stall_signals(self.store, mission_id, policy)
+        review_id = kernel_id("rev")
+
+        lines = self.store.budget_status(scope)
+        reserves: Dict[str, int] = {}
+        if "reviews" in lines:
+            if lines["reviews"]["available"] < 1:
+                self.store.record_review_skip(
+                    mission_id, "review budget exhausted", review_id
+                )
+                return {"mission_id": mission_id, "session_id": review_id,
+                        "outcome": "review_skipped",
+                        "error": "review budget exhausted"}
+            reserves["reviews"] = 1
+        if "tokens" in lines:
+            available = max(lines["tokens"]["available"], 0)
+            if available <= 0:
+                self.store.record_review_skip(
+                    mission_id, "token budget exhausted", review_id
+                )
+                return {"mission_id": mission_id, "session_id": review_id,
+                        "outcome": "review_skipped",
+                        "error": "token budget exhausted"}
+            reserves["tokens"] = min(int(policy["token_budget"]), available)
+        wall_seconds = int(policy["wall_seconds"])
+        try:
+            self.store.start_session(
+                mission_id, review_id, self.holder, reserves,
+                lease_seconds=wall_seconds + 300,
+            )
+        except (BudgetExceededError, KernelError) as exc:
+            # Lost a race (budget or lease) — skip, never crash or fail.
+            try:
+                self.store.record_review_skip(
+                    mission_id, f"could not start review: {exc}", review_id
+                )
+            except KernelError:
+                pass
+            return {"mission_id": mission_id, "session_id": review_id,
+                    "outcome": "review_skipped", "error": str(exc)}
+
+        context = _review.build_review_context(self.store, mission, signals)
+        runner = self._review_runner or _review.default_runner(self.config)
+        reply, usage, error = "", {}, ""
+        try:
+            reply, usage, error = runner(mission, context, signals)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        verdict = _review.parse_verdict(reply) if not error else None
+        if verdict is None and not error:
+            error = "review reply carried no valid JSON verdict"
+        outcome = _review.resolve_outcome(verdict, signals, error)
+
+        actuals: Dict[str, int] = {}
+        if "reviews" in reserves:
+            actuals["reviews"] = 1
+        if "tokens" in reserves:
+            actuals["tokens"] = min(
+                self._tokens_used(usage), reserves["tokens"]
+            )
+        if outcome is None:
+            # Journaled skip: abandon the review session (reservation
+            # released, mission back to ready) and journal why. The next
+            # cadence period retries; the mission is never failed.
+            try:
+                self.store.release_lease(
+                    "mission_session", mission_id, self.holder
+                )
+                self.store.abandon_session(
+                    mission_id, review_id,
+                    reason="review skipped: model unusable",
+                )
+                self.store.record_review_skip(
+                    mission_id,
+                    f"review model unusable: {_clip(error, 200)}",
+                    review_id,
+                )
+            except KernelError as exc:
+                self._log(f"review {review_id} skip refused: {exc}")
+                return {"mission_id": mission_id, "session_id": review_id,
+                        "outcome": "abandoned", "error": str(exc)}
+            self._log(
+                f"review {review_id} for {mission_id}: skipped"
+                f" ({_clip(error, 120)})"
+            )
+            return {"mission_id": mission_id, "session_id": review_id,
+                    "outcome": "review_skipped", "error": error}
+
+        action = outcome["action"]
+        plan_content = None
+        plan_rationale = ""
+        if action == "re-plan":
+            plan_content = {"steps": outcome["plan"]}
+            plan_rationale = outcome.get("rationale", "")
+        notify_payload = None
+        if action == "escalate":
+            goal = _clip(spec.get("goal", ""), 120)
+            verdict_lines = "\n".join(
+                f"- [{row['verdict']}] {row['criterion']}: {row['evidence']}"
+                for row in outcome.get("criteria", [])
+            )
+            notify_payload = {
+                "text": (
+                    f"[conch mission {mission_id}] {goal} — review"
+                    " escalation\n\n"
+                    f"{outcome.get('rationale', '')}\n\n{verdict_lines}"
+                ).strip(),
+                "channel": str(spec.get("channel") or ""),
+            }
+        content = {
+            "criteria": outcome.get("criteria", []),
+            "rationale": outcome.get("rationale", ""),
+            "stall": signals,
+            "model": str((usage or {}).get("model", "")),
+        }
+        try:
+            result = self.store.record_review(
+                mission_id, review_id, self.holder,
+                action=action, content=content,
+                plan_content=plan_content, plan_rationale=plan_rationale,
+                notify_payload=notify_payload,
+                notify_dedupe_key=f"review:{review_id}",
+                actuals=actuals,
+            )
+        except KernelError as exc:
+            self._log(f"review {review_id} verdict refused: {exc}")
+            return {"mission_id": mission_id, "session_id": review_id,
+                    "outcome": "abandoned", "error": str(exc)}
+        self._log(
+            f"review {review_id} for {mission_id}: {action}"
+            + (f" (plan v{result['plan_version']})"
+               if result.get("plan_version") else "")
+        )
+        return {
+            "mission_id": mission_id, "session_id": review_id,
+            "outcome": f"review_{action.replace('-', '')}",
+            "error": "", "tokens": self._tokens_used(usage),
+        }
 
     def _build_messages(self, mission: Dict[str, Any]) -> List[dict]:
         spec = mission["spec"]

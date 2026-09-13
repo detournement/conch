@@ -74,6 +74,28 @@ def mission_detail(store: MissionStore,
     ]
     plan = store.latest_plan(mission_id)
     detail["plan"] = plan["content"] if plan else None
+    review = store.latest_review(mission_id)
+    if review:
+        content = review["content"]
+        stall = content.get("stall") or {}
+        detail["review"] = {
+            "review_id": review["review_id"],
+            "action": review["action"],
+            "created_at": review["created_at"],
+            "criteria": content.get("criteria", []),
+            "rationale": content.get("rationale", ""),
+            "stalled": bool(stall.get("stalled")),
+            "stall_detail": (
+                stall.get("repeat_detail")
+                or (
+                    "no material change across"
+                    f" {stall.get('window_sessions', '?')} sessions"
+                    if stall.get("no_material_change") else ""
+                )
+            ),
+        }
+    else:
+        detail["review"] = None
     return detail
 
 

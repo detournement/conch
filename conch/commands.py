@@ -380,6 +380,33 @@ def _handle_mission_command(command: str, arg: str, config: dict, sched):
                     if len(summary) > 500:
                         summary = summary[:500] + "…"
                     print(f"    \033[2mlast checkpoint: {summary}\033[0m")
+                review = detail.get("review")
+                if review:
+                    import time as _time
+                    stamp = _time.strftime(
+                        "%Y-%m-%d %H:%M", _time.localtime(
+                            float(review["created_at"])
+                        )
+                    )
+                    stall = (
+                        f"; stalled: {review['stall_detail']}"
+                        if review.get("stalled") else ""
+                    )
+                    print(
+                        f"    \033[2mlast review: {review['action']} "
+                        f"({stamp}{stall})\033[0m"
+                    )
+                    for crit in review.get("criteria", [])[:6]:
+                        print(
+                            f"    \033[2m  [{crit['verdict']}] "
+                            f"{crit['criterion'][:56]} — "
+                            f"{crit['evidence'][:70]}\033[0m"
+                        )
+                    if review.get("rationale"):
+                        print(
+                            f"    \033[2m  rationale: "
+                            f"{review['rationale'][:160]}\033[0m"
+                        )
                 if detail.get("last_error"):
                     print(f"    \033[31mlast error: "
                           f"{detail['last_error']}\033[0m")

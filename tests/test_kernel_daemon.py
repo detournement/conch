@@ -53,8 +53,14 @@ class DaemonCase(unittest.TestCase):
         self._daemons = []
 
     def make_daemon(self, config=None, notifier=None, clock=None):
+        # Reviews/consolidation are model-backed side tasks with their own
+        # suites; daemon tests keep them off so no default runner can ever
+        # reach a real provider.
+        merged = {"provider": "openai", "mission_reviews": "false",
+                  "mission_consolidation": "false"}
+        merged.update(config or {})
         daemon = EdgeDaemon(
-            config or {"provider": "openai"},
+            merged,
             kernel_dir=self.kernel_dir,
             state_dir=self.root,
             socket_path=self.socket_path,

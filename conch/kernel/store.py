@@ -173,6 +173,16 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 CREATE INDEX IF NOT EXISTS idx_checkpoints_mission
     ON checkpoints(mission_id, created_at);
+CREATE TABLE IF NOT EXISTS reviews (
+    review_id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_mission
+    ON reviews(mission_id, created_at);
 CREATE TABLE IF NOT EXISTS budget_scopes (
     scope_id TEXT PRIMARY KEY,
     mission_id TEXT NOT NULL,
@@ -394,6 +404,10 @@ REPLAYED_TABLES: Dict[str, Tuple[str, ...]] = {
         "checkpoint_id", "mission_id", "session_id", "summary", "state",
         "created_at",
     ),
+    "reviews": (
+        "review_id", "mission_id", "session_id", "action", "content",
+        "created_at",
+    ),
     "budget_scopes": (
         "scope_id", "mission_id", "parent_scope_id", "status", "created_at",
     ),
@@ -572,6 +586,18 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
             (data["checkpoint_id"], mission_id, data.get("session_id", ""),
              data["summary"], _canonical(data.get("state", {})), created_at),
         )
+    elif kind == "review_recorded":
+        conn.execute(
+            "INSERT INTO reviews(review_id, mission_id, session_id, action,"
+            " content, created_at) VALUES (?,?,?,?,?,?)",
+            (data["review_id"], mission_id, data.get("session_id", ""),
+             data["action"], _canonical(data.get("content", {})),
+             created_at),
+        )
+    elif kind == "review_skipped":
+        pass  # journal-only fact; advances the review cadence marker
+    elif kind == "plan_revised":
+        pass  # journal-only rationale; the plan itself rides plan_recorded
     elif kind == "budget_scope_created":
         conn.execute(
             "INSERT INTO budget_scopes(scope_id, mission_id,"
@@ -3010,6 +3036,122 @@ class MissionStore:
             return {"checkpoint_id": checkpoint_id, "outcome": outcome}
         return self._mutate(fn)
 
+    def record_review(self, mission_id: str, review_id: str, holder: str,
+                      *, action: str, content: Dict[str, Any],
+                      plan_content: Optional[Dict[str, Any]] = None,
+                      plan_rationale: str = "",
+                      notify_payload: Optional[Dict[str, Any]] = None,
+                      notify_dedupe_key: str = "",
+                      actuals: Optional[Dict[str, int]] = None
+                      ) -> Dict[str, Any]:
+        """Review-session completion: verdict + budget commit + optional
+        numbered plan revision + optional escalation notification + the
+        active→ready transition — one transaction.
+
+        The review session was started through :meth:`start_session` (same
+        lease and reservation discipline as a work session; the review_id is
+        the session/reservation id). Unlike a work session it records no
+        checkpoint and never increments ``runs`` — reviews judge work, they
+        are not work. A re-plan writes the next numbered plan version through
+        the same plans machinery ``update_plan`` uses, journaled with an
+        explicit ``plan_revised`` event carrying the rationale.
+        """
+        if action not in ("continue", "re-plan", "escalate"):
+            raise KernelError(f"invalid review action {action!r}")
+        if action == "re-plan" and plan_content is None:
+            raise KernelError("re-plan reviews require plan content")
+        plan_id = kernel_id("pln") if plan_content is not None else ""
+
+        def fn(conn):
+            row = self._mission_row(conn, mission_id)
+            status, scope_id = row[2], row[5]
+            if status != MissionState.ACTIVE:
+                raise KernelError(
+                    f"mission {mission_id} is {status}, not active"
+                )
+            current = float(self.clock())
+            lease = conn.execute(
+                "SELECT holder, expires_at FROM leases WHERE kind=? AND"
+                " resource=?",
+                ("mission_session", mission_id),
+            ).fetchone()
+            if lease is None or lease[0] != holder:
+                raise KernelError(
+                    f"session lease for {mission_id} is not held by"
+                    f" {holder!r} — refusing to record the review"
+                )
+            if float(lease[1]) <= current:
+                raise KernelError(
+                    f"session lease for {mission_id} expired — the review"
+                    " was abandoned; refusing a late verdict"
+                )
+            self._append(conn, mission_id, "review_recorded", {
+                "review_id": review_id, "session_id": review_id,
+                "action": action, "content": content,
+            })
+            reservation = conn.execute(
+                "SELECT 1 FROM budget_reservations WHERE reservation_id=?"
+                " AND scope_id=? AND status='active' LIMIT 1",
+                (review_id, scope_id),
+            ).fetchone()
+            if reservation is not None:
+                self._commit_budget(
+                    conn, mission_id, scope_id, review_id, actuals or {},
+                    note="review session",
+                )
+            plan_version = None
+            if plan_content is not None:
+                version_row = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM plans WHERE"
+                    " mission_id=?",
+                    (mission_id,),
+                ).fetchone()
+                plan_version = int(version_row[0]) + 1
+                self._append(conn, mission_id, "plan_recorded", {
+                    "plan_id": plan_id, "plan_version": plan_version,
+                    "content": plan_content,
+                })
+                self._append(conn, mission_id, "plan_revised", {
+                    "plan_id": plan_id, "review_id": review_id,
+                    "from_version": plan_version - 1,
+                    "to_version": plan_version,
+                    "rationale": str(plan_rationale),
+                })
+            if notify_payload is not None:
+                self._enqueue_outbox(
+                    conn, mission_id, "channel_notify", notify_payload,
+                    notify_dedupe_key or f"review:{review_id}",
+                )
+            self._transition(
+                conn, mission_id, MissionState.READY, None,
+                reason=f"review {review_id}: {action}",
+            )
+            conn.execute(
+                "DELETE FROM leases WHERE kind=? AND resource=? AND"
+                " holder=?",
+                ("mission_session", mission_id, holder),
+            )
+            return {
+                "review_id": review_id, "action": action,
+                "plan_id": plan_id, "plan_version": plan_version,
+            }
+        return self._mutate(fn)
+
+    def record_review_skip(self, mission_id: str, reason: str,
+                           review_id: str = "") -> None:
+        """Journal a skipped review (budget exhausted, model unusable, …).
+
+        Journal-only, but it advances the review cadence marker so a
+        persistently skipping mission journals one skip per cadence period,
+        never a skip per tick.
+        """
+        def fn(conn):
+            self._mission_row(conn, mission_id)
+            self._append(conn, mission_id, "review_skipped", {
+                "reason": str(reason), "review_id": str(review_id),
+            })
+        self._mutate(fn)
+
     def abandon_session(self, mission_id: str, session_id: str,
                         reason: str = "lease expired") -> bool:
         """Recovery path: an active mission whose session lease is gone or
@@ -3149,6 +3291,77 @@ class MissionStore:
         data = dict(row)
         data["state"] = _json.loads(data["state"])
         return data
+
+    def latest_review(self, mission_id: str) -> Optional[Dict[str, Any]]:
+        row = self._read_conn().execute(
+            "SELECT * FROM reviews WHERE mission_id=? ORDER BY"
+            " created_at DESC, review_id DESC LIMIT 1",
+            (mission_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["content"] = _json.loads(data["content"])
+        return data
+
+    def last_event(self, mission_id: str,
+                   kinds: Any) -> Optional[Dict[str, Any]]:
+        """Most recent event of the given kind(s) for one mission."""
+        wanted = sorted(str(kind) for kind in kinds)
+        if not wanted:
+            return None
+        row = self._read_conn().execute(
+            "SELECT seq, kind, data, created_at FROM mission_events WHERE"
+            " mission_id=? AND kind IN (%s) ORDER BY seq DESC LIMIT 1"
+            % ",".join("?" for _ in wanted),
+            [mission_id, *wanted],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "seq": int(row["seq"]), "kind": row["kind"],
+            "data": _json.loads(row["data"]),
+            "created_at": float(row["created_at"]),
+        }
+
+    def count_events_since(self, mission_id: str, kinds: Any,
+                           since_seq: int = 0) -> Dict[str, int]:
+        """Per-kind event counts after ``since_seq`` for one mission."""
+        wanted = sorted(str(kind) for kind in kinds)
+        if not wanted:
+            return {}
+        rows = self._read_conn().execute(
+            "SELECT kind, COUNT(*) FROM mission_events WHERE mission_id=?"
+            " AND seq>? AND kind IN (%s) GROUP BY kind"
+            % ",".join("?" for _ in wanted),
+            [mission_id, int(since_seq), *wanted],
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def events_since(self, mission_id: str, since_seq: int = 0,
+                     kinds: Any = (),
+                     limit: int = 200) -> List[Dict[str, Any]]:
+        """Events after ``since_seq`` in order, optionally kind-filtered."""
+        query = (
+            "SELECT seq, kind, data, created_at FROM mission_events WHERE"
+            " mission_id=? AND seq>?"
+        )
+        params: List[Any] = [mission_id, int(since_seq)]
+        wanted = sorted(str(kind) for kind in kinds or ())
+        if wanted:
+            query += " AND kind IN (%s)" % ",".join("?" for _ in wanted)
+            params.extend(wanted)
+        query += " ORDER BY seq LIMIT ?"
+        params.append(int(limit))
+        rows = self._read_conn().execute(query, params).fetchall()
+        return [
+            {
+                "seq": int(row["seq"]), "kind": row["kind"],
+                "data": _json.loads(row["data"]),
+                "created_at": float(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     # ------------------------------------------------------------------
     # Chain verification, replay, backup

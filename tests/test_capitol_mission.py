@@ -81,6 +81,9 @@ class SupervisionCase(unittest.TestCase):
             "capitol_base_url": f"http://127.0.0.1:{self.port}",
             "capitol_org": ORG,
             "capitol_agent": AGENT,
+            # model-backed side tasks have their own suites
+            "mission_reviews": "false",
+            "mission_consolidation": "false",
         }
         self.engine = MissionEngine(
             self.store, self.config, holder="test",
@@ -615,6 +618,8 @@ class DaemonWiringTests(unittest.TestCase):
                 "capitol_org": ORG,
                 "capitol_agent": AGENT,
                 "capitol_poll_seconds": 1,
+                "mission_reviews": "false",
+                "mission_consolidation": "false",
             }
             daemon = EdgeDaemon(
                 config, kernel_dir=root / "kernel", state_dir=root,
@@ -678,6 +683,8 @@ class DaemonWiringTests(unittest.TestCase):
                 "capitol_org": ORG,
                 "capitol_agent": AGENT,
                 "capitol_poll_seconds": 1,
+                "mission_reviews": "false",
+                "mission_consolidation": "false",
             }
             daemon = EdgeDaemon(
                 config, kernel_dir=root / "kernel", state_dir=root,

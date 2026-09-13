@@ -79,8 +79,15 @@ class EngineCase(unittest.TestCase):
         self.addCleanup(lambda: self.store.close())
 
     def engine(self, factory=None, config=None):
+        # Reviews and consolidation have their own suites
+        # (test_mission_review / test_mission_memory); the base engine
+        # config keeps them off so work-session mechanics stay isolated.
         return MissionEngine(
-            self.store, config or {"provider": "openai", "model": "gpt-4o"},
+            self.store, config or {
+                "provider": "openai", "model": "gpt-4o",
+                "mission_reviews": "false",
+                "mission_consolidation": "false",
+            },
             holder="test-daemon", session_factory=factory,
             kernel_dir=self.kernel_dir,
         )

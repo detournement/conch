@@ -71,8 +71,11 @@ class EventWakeCase(unittest.TestCase):
         self.clock = FakeClock()
 
     def make_daemon(self, config=None, session_factory=plain_factory):
+        merged = {"provider": "openai", "mission_reviews": "false",
+                  "mission_consolidation": "false"}
+        merged.update(config or {})
         daemon = EdgeDaemon(
-            config or {"provider": "openai"},
+            merged,
             kernel_dir=self.kernel_dir,
             state_dir=self.root,
             socket_path=self.socket_path,

@@ -58,3 +58,8 @@ include = ["conch*"]
     "data/*/README.md",
     "data/*/assets/*",
 ]
+# Skills shipped with conch (SKILL.md + companion reference/cookbook
+# documents, discovered by the skill loader; user skills win by name).
+"conch" = [
+    "skills_data/*/*.md",
+]

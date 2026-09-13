@@ -1,5 +1,5 @@
 """Skill system (plan 4.1): reusable skill definitions in
-~/.config/conch/skills/.
+~/.config/conch/skills/ plus skills shipped with the package.
 
 One markdown file per skill: frontmatter (name, description, allowed tools,
 optional model/provider preference, optional round budget) plus a body of
@@ -7,6 +7,12 @@ instructions/procedure. Skills are the richer sibling of custom slash
 commands: a slash command is a one-shot prompt template; a skill also scopes
 *tools* and *model*, can be invoked by the model itself (skill_manage tool,
 in-context), and drives skill-scoped subagents (plan 4.2).
+
+Built-in skills (the flow-pack precedent, ``conch/capitol/packs/data``):
+``conch/skills_data/<name>/SKILL.md`` ships with the package, discovered
+by the same loader, with companion documents (reference.md, cookbook.md)
+beside the SKILL.md that the rendered block points the model at. A user
+skill of the same name in ~/.config/conch/skills/ wins.
 """
 
 from __future__ import annotations
@@ -26,6 +32,11 @@ SKILLS_CONTEXT_MAX = 12  # skills listed in the system prompt
 def skills_dir() -> Path:
     config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch"
     return config_dir / "skills"
+
+
+def builtin_skills_dir() -> Path:
+    """Skills shipped with the package: one directory per skill."""
+    return Path(__file__).resolve().parent / "skills_data"
 
 
 def parse_skill(text: str, default_name: str) -> Optional[Dict[str, Any]]:
@@ -76,22 +87,43 @@ def parse_skill(text: str, default_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _load_skill_file(path: Path, default_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    skill = parse_skill(text, default_name)
+    if skill is None:
+        return None
+    skill["path"] = str(path)
+    return skill
+
+
 def load_skills() -> Dict[str, Dict[str, Any]]:
-    """Return {name: skill} for every *.md file in the skills dir."""
+    """Return {name: skill} — built-in package skills
+    (``skills_data/<name>/SKILL.md``) first, then every *.md file in the
+    user skills dir; a user skill wins by name (the pack-registry rule).
+    """
     skills: Dict[str, Dict[str, Any]] = {}
+    builtin_root = builtin_skills_dir()
+    if builtin_root.is_dir():
+        for entry in sorted(builtin_root.iterdir()):
+            manifest = entry / "SKILL.md"
+            if not entry.is_dir() or not manifest.is_file():
+                continue
+            skill = _load_skill_file(manifest, entry.name.strip().lower())
+            if skill is None:
+                continue
+            skill["dir"] = str(entry)
+            skill["builtin"] = True
+            skills[skill["name"]] = skill
     directory = skills_dir()
-    if not directory.is_dir():
-        return skills
-    for path in sorted(directory.glob("*.md")):
-        try:
-            text = path.read_text()
-        except OSError:
-            continue
-        skill = parse_skill(text, path.stem.strip().lower())
-        if skill is None:
-            continue
-        skill["path"] = str(path)
-        skills[skill["name"]] = skill
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.md")):
+            skill = _load_skill_file(path, path.stem.strip().lower())
+            if skill is None:
+                continue
+            skills[skill["name"]] = skill
     return skills
 
 
@@ -107,7 +139,21 @@ def render_skill(skill: Dict[str, Any]) -> str:
     header = f"[Skill: {skill['name']}]"
     if skill.get("description"):
         header += f" {skill['description']}"
-    return f"{header}\n{body}"
+    rendered = f"{header}\n{body}"
+    directory = skill.get("dir")
+    if directory:
+        companions = sorted(
+            path.name
+            for path in Path(directory).glob("*.md")
+            if path.name != "SKILL.md"
+        )
+        if companions:
+            rendered += (
+                f"\n\n[Skill files: {directory}/ — read "
+                + ", ".join(companions)
+                + " there when this skill points at them]"
+            )
+    return rendered
 
 
 def format_skill_file(

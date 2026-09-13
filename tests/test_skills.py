@@ -84,9 +84,17 @@ class TestSkillStore(SkillsDirTestCase):
         skills = load_skills()
         self.assertIn("deploy-check", skills)
 
-    def test_missing_dir_empty(self):
+    def test_missing_dir_still_serves_builtin_skills(self):
+        # Shipped skills (conch/skills_data/) load without any user dir;
+        # every one carries the builtin marker and its directory.
         self.dir.rmdir()
-        self.assertEqual(load_skills(), {})
+        skills = load_skills()
+        self.assertIn("capitol", skills)
+        self.assertIn("pack-author", skills)
+        self.assertTrue(all(
+            skill.get("builtin") and skill.get("dir")
+            for skill in skills.values()
+        ))
 
     def test_save_and_get_roundtrip(self):
         path = save_skill("release", "Cut a release", "1. tag\n2. push",
@@ -116,7 +124,8 @@ class TestSkillStore(SkillsDirTestCase):
         self.assertIn("[skill truncated]", rendered)
 
     def test_skills_context_block(self):
-        self.assertEqual(build_skills_context(), "")
+        # Shipped skills are always advertised; user skills join them.
+        self.assertIn("capitol", build_skills_context())
         self._write("deploy-check", SKILL_MD)
         ctx = build_skills_context()
         self.assertIn("deploy-check", ctx)
@@ -145,8 +154,10 @@ class TestSkillManageTool(SkillsDirTestCase):
     def _call(self, client, args):
         return client.call_tool("skill_manage", args)["content"][0]["text"]
 
-    def test_list_empty(self):
-        self.assertIn("No skills", self._call(self._client(), {"action": "list"}))
+    def test_list_shows_builtin_skills_without_user_dir(self):
+        text = self._call(self._client(), {"action": "list"})
+        self.assertIn("capitol", text)
+        self.assertIn("pack-author", text)
 
     def test_list_shows_scope(self):
         self._write("deploy-check", SKILL_MD)

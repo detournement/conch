@@ -28,6 +28,7 @@ from .tooling import (
     LocalShellClient,
     LocalShellPolicy,
     ManageToolsClient,
+    PersonalItemsClient,
     PublicApiClient,
     SSHRemoteClient,
     SaveMemoryClient,
@@ -276,6 +277,10 @@ def make_builtin_clients(
         "public_api": public_api,
         "search_conversations": search_convos,
         "todo_list": TodoListClient(),
+        # The user's durable personal store (todo/recipes/papers spaces).
+        # Deliberately available to remote/channel sessions too — channel
+        # capture is a design goal; the sender allowlists gate access.
+        "personal_items": PersonalItemsClient(),
         "delegate_task": DelegateTaskClient(),
         "skill_manage": SkillManageClient(),
         "conch_introspect": ConchIntrospectClient(),

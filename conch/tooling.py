@@ -1623,6 +1623,291 @@ class TodoListClient:
         self._items = []
 
 
+# ---------------------------------------------------------------------------
+# Personal items (personal-items plan P1): the user's durable capture-and-
+# recall store — todo lists, recipes, paper ideas — living in the mission
+# kernel's `items` aggregate. Deliberately distinct from TodoListClient
+# above: todo_list is the AGENT's in-session plan scratchpad (never
+# persisted); personal_items is the USER's data, persisted and queried
+# deterministically. Kernel imports stay inside call_tool so the classic
+# no-daemon shell never loads conch.kernel until the tool is actually used.
+# ---------------------------------------------------------------------------
+
+PERSONAL_ITEMS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "personal_items",
+        "description": (
+            "Manage the user's durable personal items: the todo list plus "
+            "named spaces like recipes and papers, stored locally and kept "
+            "across sessions. Use this when the user says things like 'add "
+            "milk to the shopping list', 'todo: renew passport by Friday', "
+            "'what's due today?', 'what's most urgent?', or 'mark X done'. "
+            "Queries are deterministic (due today, overdue, most urgent, "
+            "by space/tag/status) — relay the results as returned. This is "
+            "the user's persistent data, not your in-session todo_list "
+            "scratchpad."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "add", "update", "complete", "archive", "list",
+                        "search", "show",
+                    ],
+                },
+                "id": {
+                    "type": "string",
+                    "description": (
+                        "Item reference for update/complete/archive/show: "
+                        "the item id, a unique id prefix, or the #N alias "
+                        "shown in listings."
+                    ),
+                },
+                "space": {
+                    "type": "string",
+                    "description": (
+                        "Item space (default 'todo'; e.g. recipes, papers; "
+                        "new names create a space)."
+                    ),
+                },
+                "title": {"type": "string", "description": "Item title (for add/update)"},
+                "body": {
+                    "type": "string",
+                    "description": "Markdown body/notes (for add/update)",
+                },
+                "due": {
+                    "type": "string",
+                    "description": (
+                        "Due (for add/update): today, tomorrow, +N[mhdw], "
+                        "YYYY-MM-DD, 'YYYY-MM-DD HH:MM', or none to clear."
+                    ),
+                },
+                "priority": {
+                    "type": "integer",
+                    "description": "Explicit priority 1 (highest) to 5",
+                },
+                "tags": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Tags (for add/update)",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "done", "archived", "all"],
+                    "description": (
+                        "list: status filter (default open). update: "
+                        "'open' reopens a done/archived item."
+                    ),
+                },
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "search: the text to find. list: optional view — "
+                        "'today', 'overdue', or 'urgent'."
+                    ),
+                },
+                "tag": {"type": "string", "description": "list: tag filter"},
+                "limit": {"type": "integer", "description": "Max results"},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class PersonalItemsClient:
+    """Builtin fronting the kernel `items` aggregate.
+
+    Opens the kernel store per call and closes it after — sessions come
+    and go (remote turns build fresh ones per message) and holding a
+    writer thread open across a chat session buys nothing. Item content
+    returned here is the user's stored text: it is data, never
+    instructions to follow.
+    """
+
+    name = "personal_items"
+
+    def __init__(self):
+        self._source = "chat"
+        self._actor = "user"
+
+    def configure(self, source: str = "chat", actor: str = "user"):
+        """Provenance stamped on writes (channel wiring sets this in P2)."""
+        self._source = str(source or "chat")
+        self._actor = str(actor or "user")
+
+    @staticmethod
+    def _text(msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        # Lazy kernel imports: the no-daemon invariant (classic shell
+        # never loads conch.kernel) holds until this tool actually runs.
+        from .kernel.model import KernelError
+        from .kernel.store import MissionStore
+        from .secretguard import CredentialRejected
+
+        try:
+            store = MissionStore()
+        except Exception as exc:
+            return self._text(
+                f"personal_items error: cannot open the kernel store: {exc}"
+            )
+        try:
+            return self._dispatch(store, arguments or {})
+        except CredentialRejected as exc:
+            return self._text(
+                "Write blocked: the content matches credential pattern(s) "
+                f"({', '.join(exc.types)}). Personal items never store "
+                "secrets — the item was rejected whole. Save a non-secret "
+                "reference instead (which env var, keychain item, or "
+                "config file holds it)."
+            )
+        except KernelError as exc:
+            return self._text(f"personal_items error: {exc}")
+        finally:
+            store.close()
+
+    def _dispatch(self, store, arguments: dict) -> dict:
+        import time as _time
+
+        from .kernel import items as items_mod
+        from .kernel.model import KernelError
+
+        action = str(arguments.get("action") or "").strip().lower()
+        now = _time.time()
+
+        def resolve(required=True):
+            ref = str(arguments.get("id") or "").strip()
+            item = store.resolve_item(ref) if ref else None
+            if item is None and required:
+                raise KernelError(
+                    f"no item matching {ref!r} — use action='list' or "
+                    "'search' and reference items by #N or id prefix"
+                )
+            return item
+
+        if action == "add":
+            title = str(arguments.get("title") or "").strip()
+            if not title:
+                raise KernelError("add needs a title")
+            item = store.add_item(
+                title,
+                space=arguments.get("space") or "",
+                body=str(arguments.get("body") or ""),
+                due_at=items_mod.parse_due(arguments.get("due"), now),
+                priority=arguments.get("priority"),
+                tags=arguments.get("tags"),
+                source=self._source,
+                actor=self._actor,
+            )
+            return self._text(
+                "Added " + items_mod.item_line(item, now, with_space=True)
+            )
+        if action == "update":
+            item = resolve()
+            fields = {}
+            for key in ("title", "body", "space", "status"):
+                if arguments.get(key) is not None:
+                    fields[key] = arguments[key]
+            if arguments.get("due") is not None:
+                fields["due_at"] = items_mod.parse_due(
+                    arguments["due"], now
+                )
+            if arguments.get("priority") is not None:
+                fields["priority"] = arguments["priority"]
+            if arguments.get("tags") is not None:
+                fields["tags"] = arguments["tags"]
+            store.update_item(
+                item["item_id"], fields,
+                actor=self._actor, source=self._source,
+            )
+            updated = store.get_item(item["item_id"])
+            return self._text(
+                "Updated "
+                + items_mod.item_line(updated, now, with_space=True)
+            )
+        if action in ("complete", "archive"):
+            item = resolve()
+            if action == "complete":
+                store.complete_item(
+                    item["item_id"], actor=self._actor,
+                    source=self._source,
+                )
+                verb = "Completed"
+            else:
+                store.archive_item(
+                    item["item_id"], actor=self._actor,
+                    source=self._source,
+                )
+                verb = "Archived"
+            updated = store.get_item(item["item_id"])
+            return self._text(
+                f"{verb} "
+                + items_mod.item_line(updated, now, with_space=True)
+            )
+        if action == "show":
+            item = resolve()
+            return self._text(items_mod.item_detail(store, item, now))
+        if action == "search":
+            needle = str(arguments.get("query") or "").strip()
+            if not needle:
+                raise KernelError("search needs a query")
+            rows = store.search_items(
+                needle, space=arguments.get("space") or "",
+                limit=int(arguments.get("limit") or 25),
+            )
+            if not rows:
+                return self._text(f"No items matching {needle!r}.")
+            lines = [f"{len(rows)} item(s) matching {needle!r}:"]
+            lines.extend(
+                items_mod.item_line(item, now, with_space=True)
+                for item in rows
+            )
+            return self._text("\n".join(lines))
+        if action == "list":
+            space = arguments.get("space") or ""
+            view = str(arguments.get("query") or "").strip().lower()
+            limit = int(arguments.get("limit") or 50)
+            if view in ("today", "due", "due_today"):
+                rows = items_mod.due_today(store, now, space=space)
+                label = "due today"
+            elif view == "overdue":
+                rows = items_mod.overdue(store, now, space=space)
+                label = "overdue"
+            elif view in ("urgent", "most_urgent"):
+                rows = items_mod.most_urgent(
+                    store, now, limit=limit, space=space
+                )
+                label = "most urgent"
+            elif view:
+                raise KernelError(
+                    f"unknown list view {view!r} — use today, overdue,"
+                    " or urgent"
+                )
+            else:
+                rows = store.list_items(
+                    space=space,
+                    status=str(arguments.get("status") or "open"),
+                    tag=str(arguments.get("tag") or ""),
+                    limit=limit,
+                )
+                label = str(arguments.get("status") or "open")
+            rows = rows[:limit]
+            scope = f" in {space}" if space else ""
+            if not rows:
+                return self._text(f"No {label} items{scope}.")
+            lines = [f"{len(rows)} {label} item(s){scope}:"]
+            lines.extend(
+                items_mod.item_line(item, now, with_space=not space)
+                for item in rows
+            )
+            return self._text("\n".join(lines))
+        return self._text(f"Unknown action: {action}")
+
+
 # Tool definition for the delegate_task subagent (plan 3.1 + 4.2); the
 # client lives below with the runtime wiring.
 DELEGATE_TASK_TOOL = {
@@ -1837,6 +2122,12 @@ class DelegateTaskClient:
         "ssh_remote",
     }
 
+    # Personal-space tools never flow into a delegated sub-turn implicitly.
+    # A skill that lists one in its allowed tools is the operator's
+    # explicit offer (the fleet analogue: a worker only sees a tool its
+    # task envelope names).
+    IMPLICITLY_EXCLUDED_TOOLS = frozenset({"personal_items"})
+
     DEFAULT_ROUNDS = 10
 
     def __init__(self):
@@ -1993,14 +2284,15 @@ class DelegateTaskClient:
                 k: v for k, v in self._builtin_clients.items() if k in allowed
             }
         else:
+            excluded = self.EXCLUDED_TOOLS | self.IMPLICITLY_EXCLUDED_TOOLS
             pool = getattr(self._chat_state, "tools", None) or []
             sub_tools = [
                 t for t in pool
-                if t.get("function", {}).get("name") not in self.EXCLUDED_TOOLS
+                if t.get("function", {}).get("name") not in excluded
             ]
             sub_clients = {
                 k: v for k, v in self._builtin_clients.items()
-                if k not in self.EXCLUDED_TOOLS
+                if k not in excluded
             }
         system_prompt = self.SUBAGENT_PROMPT
         if skill is not None:
@@ -2152,6 +2444,8 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(API_LAYER_TOOL)
     if "todo_list" in clients:
         builtin.append(TODO_LIST_TOOL)
+    if "personal_items" in clients:
+        builtin.append(PERSONAL_ITEMS_TOOL)
     if "delegate_task" in clients:
         builtin.append(DELEGATE_TASK_TOOL)
     if "skill_manage" in clients:

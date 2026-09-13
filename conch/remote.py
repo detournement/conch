@@ -229,7 +229,10 @@ REMOTE_SYSTEM_PROMPT = (
     "Interactive terminal and SSH-control tools are unavailable remotely."
 )
 
-# Tools a remote session must never see.
+# Tools a remote session must never see. personal_items is deliberately
+# NOT here: channel capture ("todo: renew passport by Oct 1" over SMS) is
+# a design goal of the personal-items plan, and the fail-closed sender
+# allowlists in channels.py gate who can reach it.
 REMOTE_EXCLUDED_TOOLS = {
     "delegate_task", "conch_config", "manage_tools", "skill_manage",
     "todo_list", "api_layer", "conch_introspect", "interactive_terminal",

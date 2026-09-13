@@ -2787,7 +2787,10 @@ class ConchConfigClient:
 # goes stale; outputs are token-bounded for small local models.
 # ---------------------------------------------------------------------------
 
-INTROSPECT_OUTPUT_MAX = 4000
+# Sized to hold the full live capability report (every slash command +
+# tool + skill line) with headroom; the /notes family pushed the report
+# past the old 4000.
+INTROSPECT_OUTPUT_MAX = 4500
 
 CONCH_INTROSPECT_TOOL = {
     "type": "function",
@@ -3032,7 +3035,10 @@ class ConchIntrospectClient:
                     lines.extend(f"  {entry}" for entry in log.splitlines())
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        overview = build_map_for_root(root, budget_chars=2800)
+        # Sized so every core conch/*.py module line (alphabetical map:
+        # through runtime.py and beyond) survives the cut; notes.py's
+        # arrival pushed runtime.py out of the old 2800.
+        overview = build_map_for_root(root, budget_chars=3200)
         if overview:
             lines.append(overview)
         return "\n".join(lines)

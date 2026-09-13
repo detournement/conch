@@ -114,6 +114,9 @@ SLASH_COMMANDS = [
      "Personal todo list (bare /todo = today view)"),
     ("/list <space> [verb ...]",
      "Personal item spaces (recipes, papers, ...) — same verbs as /todo"),
+    ("/notes [new|open|add|show|search|archive|reopen ...]",
+     "Editor-backed notes (bare /notes = recent; first line '# Title')"),
+    ("/note", "Alias for /notes"),
     ("/approvals", "List pending mission approvals"),
     ("/approve <id>", "Approve a pending mission action"),
     ("/deny <id>", "Deny a pending mission action"),
@@ -896,6 +899,8 @@ def handle_slash_command(
             "  \033[1m/todo add <title> [due:...] [p1-5] [#tag] [-- body]\033[0m  Capture a todo\n"
             "  \033[1m/todo done|due|list|show|work|escalate ...\033[0m  Manage personal todos\n"
             "  \033[1m/list <space> [verb ...]\033[0m  Other item spaces (recipes, papers, ...)\n"
+            "  \033[1m/notes\033[0m               Recent notes; /notes new [title] writes one in your editor\n"
+            "  \033[1m/notes open|add|show|search|archive ...\033[0m  Manage notes (/note aliases; /notes help)\n"
             "  \033[1m/approvals\033[0m           List pending mission approvals\n"
             "  \033[1m/approve <id>\033[0m, \033[1m/deny <id>\033[0m  Decide a pending mission action\n"
             "  \033[1m/tools\033[0m               List tool groups\n"
@@ -1188,6 +1193,11 @@ def handle_slash_command(
 
     if command in ("/todo", "/list"):
         return _handle_items_command(command, arg, config, sched)
+
+    if command in ("/notes", "/note"):
+        from .notes import handle_notes_command
+
+        return handle_notes_command(arg, config, tool_map=tool_map)
 
     if command == "/remember" and memory is not None:
         if not arg:

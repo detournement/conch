@@ -290,6 +290,15 @@ def _default_session_factory(config: dict) -> Callable:
             session.builtin_clients["mission_control"] = control
             tools = list(getattr(session.chat_state, "tools", None) or [])
             tools.append(MISSION_CONTROL_TOOL)
+            # Mission authority is spec-derived: the session builtin
+            # capitol_control (interactive runtime surface) is dropped
+            # so only the envelope-scoped tool exists here — and only
+            # when the spec grants a capitol envelope at all.
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name") != "capitol_control"
+            ]
+            session.builtin_clients.pop("capitol_control", None)
             if getattr(control, "capitol", None) is not None:
                 from ..capitol.supervisor import CAPITOL_CONTROL_TOOL
 

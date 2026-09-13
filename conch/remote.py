@@ -232,7 +232,11 @@ REMOTE_SYSTEM_PROMPT = (
 # Tools a remote session must never see. personal_items is deliberately
 # NOT here: channel capture ("todo: renew passport by Oct 1" over SMS) is
 # a design goal of the personal-items plan, and the fail-closed sender
-# allowlists in channels.py gate who can reach it.
+# allowlists in channels.py gate who can reach it. capitol_control is
+# deliberately NOT here either: reads and HITL responses are the channel
+# steering surface — but the per-turn client is swapped for an
+# origin-bound variant whose effectful `start` proposes an approval
+# (see _remote_clients), mirroring the RemoteShellClient cap.
 REMOTE_EXCLUDED_TOOLS = {
     "delegate_task", "conch_config", "manage_tools", "skill_manage",
     "todo_list", "api_layer", "conch_introspect", "interactive_terminal",
@@ -337,6 +341,25 @@ class RemoteLoop:
             thread_id,
             sender,
         )
+        if "capitol_control" in clients:
+            # Origin-bound variant: reads and HITL responses pass
+            # through; an effectful start pins its exact payload into an
+            # approval on this thread (lazy import — only
+            # Capitol-configured pools carry the key).
+            from .capitol.tool import CapitolSessionClient
+
+            clients["capitol_control"] = CapitolSessionClient(
+                self.config,
+                remote_origin={
+                    "channel": channel,
+                    "thread_id": thread_id,
+                    "sender": sender,
+                },
+                approvals=self.approvals,
+                notify=lambda text, tid: self.manager.notify(
+                    text, channel=channel, thread_id=tid
+                ),
+            )
         return clients
 
     def _remote_tools(self, chat_state) -> Optional[List[dict]]:
@@ -537,6 +560,16 @@ class RemoteLoop:
                 )
             return f"No pending approval #{request_id}."
         entry_kind = str(entry.get("kind") or "command")
+        if entry_kind == "capitol_start":
+            # A model-proposed workflow start (capitol_control over a
+            # channel): consuming constructs the exact pinned
+            # call_workflow — workflow, inputs, idempotency key were
+            # frozen at propose time, never re-read from model output.
+            from .capitol.tool import consume_capitol_start
+
+            return consume_capitol_start(
+                request_id, entry, verb, self.config
+            )
         if entry_kind != "command":
             # Consuming a pack approval never runs a command: the pack's
             # flow constructs the exact typed request from the pinned

@@ -286,6 +286,15 @@ def make_builtin_clients(
         "conch_introspect": ConchIntrospectClient(),
     }
     clients["skill_manage"].configure(interactive=interactive)
+    if str(config.get("capitol_base_url") or "").strip():
+        # The model-callable Capitol runtime surface (never admin).
+        # Import stays lazy: sessions without Capitol config never load
+        # conch.capitol. Mission sessions swap this client out for the
+        # envelope-scoped one (kernel engine); remote turns swap in an
+        # origin-bound variant whose start proposes an approval.
+        from .capitol.tool import CapitolSessionClient
+
+        clients["capitol_control"] = CapitolSessionClient(config)
     import os
 
     api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")

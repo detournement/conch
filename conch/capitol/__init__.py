@@ -13,9 +13,12 @@ upload/download, outputs, and eval roll-ups.
 builder/provisioning profile; ``conch.capitol.supervisor`` binds runs to
 kernel missions and supervises them from the daemon tick.
 
-Stdlib only; models never talk to these surfaces directly (drivers and
-mission tools construct exact requests, deterministic policy authorizes).
-The ``A2Actrl`` reference client is the normative wire reference.
+Stdlib only. Model access is bounded: the ``capitol_control`` session
+tool (:mod:`conch.capitol.tool`) exposes the RUNTIME surface with
+required idempotency keys and required-policy gates; ``CapitolAdmin``
+is never model-callable, and drivers/mission tools construct exact
+requests (deterministic policy authorizes). The ``A2Actrl`` reference
+client is the normative wire reference.
 """
 
 from .errors import (  # noqa: F401

@@ -2122,11 +2122,13 @@ class DelegateTaskClient:
         "ssh_remote",
     }
 
-    # Personal-space tools never flow into a delegated sub-turn implicitly.
-    # A skill that lists one in its allowed tools is the operator's
-    # explicit offer (the fleet analogue: a worker only sees a tool its
-    # task envelope names).
-    IMPLICITLY_EXCLUDED_TOOLS = frozenset({"personal_items"})
+    # Personal-space and external-control tools never flow into a
+    # delegated sub-turn implicitly. A skill that lists one in its
+    # allowed tools is the operator's explicit offer (the fleet
+    # analogue: a worker only sees a tool its task envelope names).
+    IMPLICITLY_EXCLUDED_TOOLS = frozenset({
+        "personal_items", "capitol_control",
+    })
 
     DEFAULT_ROUNDS = 10
 
@@ -2446,6 +2448,12 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(TODO_LIST_TOOL)
     if "personal_items" in clients:
         builtin.append(PERSONAL_ITEMS_TOOL)
+    if "capitol_control" in clients:
+        # Lazy import: only Capitol-configured sessions ever construct
+        # the client (bootstrap), so only they pay for this module.
+        from .capitol.tool import CAPITOL_SESSION_TOOL
+
+        builtin.append(CAPITOL_SESSION_TOOL)
     if "delegate_task" in clients:
         builtin.append(DELEGATE_TASK_TOOL)
     if "skill_manage" in clients:

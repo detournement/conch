@@ -256,6 +256,30 @@ callers, the ledger, and logs only ever see a fingerprint. The admin token
 (a platform user JWT) is resolved per call from `CAPITOL_ADMIN_TOKEN` or a
 registry `x_user_token` and is scrubbed from every error.
 
+**Ask for Capitol things in plain language.** With Capitol configured, every
+chat session carries the model-callable `capitol_control` tool, so "backfill
+funding intake for the first week of September", "how's that run doing?",
+"answer its question with …", or "grab the packet docx" just work: the model
+discovers the agent card and workflow catalog (it never invents workflow ids),
+describes inputs before starting, starts runs under a required idempotency key
+(derived from workflow+inputs when omitted, so a retried ask replays instead
+of double-running), watches to a hard deadline and summarizes events —
+relaying any Human-in-the-Loop question verbatim for you to answer — and
+fetches outputs, eval roll-ups, and artifacts (quarantine-dir paths only, with
+digests to verify). It is a runtime surface only: every admin/provisioning op
+and pack mutation is refused with the exact user-explicit `/capitol admin …` /
+`/capitol pack …` command named. Authority follows the session: interactive
+sessions get the full runtime surface; over Slack/SMS reads and HITL answers
+work while an effectful start becomes an origin-bound "approve N" in the
+thread (the exact workflow/inputs/key are pinned at propose time); delegated
+sub-turns and fleet workers only see the tool when a skill or task envelope
+names it; mission sessions keep their envelope-scoped variant. Two shipped
+skills back this up (`conch/skills_data/`, discoverable via `/skills` and
+`skill_manage` like user skills): **capitol** — the operating procedure,
+op reference, and cookbook recipes for this machine's real workflows — and
+**pack-author** — flow-pack anatomy, the implemented `conch.flow_pack.v1`
+grammar, and the authoring loop ending in `/capitol pack verify`.
+
 Dev-time live and differential tests exercise all of this against a local
 Capitol stack behind `CONCH_CAPITOL_LIVE=1` (they skip cleanly when the stack,
 CLI, or token is absent); see `tests/test_capitol_live.py` and

@@ -472,6 +472,26 @@ fleet) + `/todo` and `/list` commands with `/todo work` context loading
 and `/todo escalate` mission linking + the memory fence — P2 (channel
 capture provenance, morning digest) and P3 (space enrichment) remain.
 
+**Natural-language Capitol layer (September 2026): landed.** The
+`capitol_control` session builtin — the model-callable RUNTIME surface
+(discover/workflows/describe/suggest/versions/stats/runs, keyed start
+with digest-derived default keys, bounded watch-and-summarize, both HITL
+kinds, outputs/evals, quarantine-bounded artifacts; admin and pack
+mutations refused naming the user-explicit /capitol command; policy
+events `capitol.run.start`/`capitol.hitl.respond`; personal_items
+availability precedent, remote start = origin-bound approval whose
+consume replays the pinned payload, mission sessions keep the
+envelope-scoped tool) + the shipped-skills convention
+(`conch/skills_data/`, user skills win by name) carrying the **capitol**
+skill (core arc + hard rules, op reference, this-machine cookbook) and
+the **pack-author** skill (invariants verbatim, the implemented
+`conch.flow_pack.v1` grammar pinned to manifest constants by tests,
+authoring loop + drill recipes). Live-drilled against the local stack
+(the ingest smoke exposed and fixed the inputs-key heuristic for
+multi-field workflows: text-input request nodes now resolve, ambiguity
+refuses with the canonical keys named). 72 new tests (1,714 total on
+Python 3.9 and 3.14, ruff clean).
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

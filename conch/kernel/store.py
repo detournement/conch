@@ -598,6 +598,8 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
         pass  # journal-only fact; advances the review cadence marker
     elif kind == "plan_revised":
         pass  # journal-only rationale; the plan itself rides plan_recorded
+    elif kind == "completion_denied":
+        pass  # journal-only fact; the mission state never moved
     elif kind == "budget_scope_created":
         conn.execute(
             "INSERT INTO budget_scopes(scope_id, mission_id,"
@@ -1295,6 +1297,18 @@ class MissionStore:
             self._mission_row(conn, mission_id)
             self._append(conn, mission_id, "mission_note", {
                 "text": str(text), "author": str(author),
+            })
+        self._mutate(fn)
+
+    def record_completion_denied(self, mission_id: str, reason: str,
+                                 author: str = "") -> None:
+        """Journal that a complete_mission request was refused by the
+        allow_model_completion spec gate. Journal-only: the mission's
+        state and version are untouched."""
+        def fn(conn):
+            self._mission_row(conn, mission_id)
+            self._append(conn, mission_id, "completion_denied", {
+                "reason": str(reason), "author": str(author),
             })
         self._mutate(fn)
 

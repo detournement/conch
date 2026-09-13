@@ -35,6 +35,7 @@ from .model import (
     MissionKind,
     MissionState,
     kernel_id,
+    model_completion_allowed,
 )
 from .store import MissionStore, default_kernel_dir
 
@@ -234,6 +235,24 @@ class MissionControlClient:
                 "after this session. Finish your remaining local work."
             )
         if op == "complete_mission":
+            mission = store.get_mission(mission_id)
+            if mission is not None and not model_completion_allowed(
+                mission["spec"]
+            ):
+                store.record_completion_denied(
+                    mission_id,
+                    "complete_mission refused: spec disallows model "
+                    "completion (cadence mission)",
+                    author=self._session_id,
+                )
+                return self._text(
+                    "complete_mission denied: this cadence mission has no "
+                    "terminal success criteria and its spec sets "
+                    "allow_model_completion=false — only an operator "
+                    "finishes it. The mission stays on its schedule; use "
+                    "set_next_wake to adjust cadence or request_input to "
+                    "park it for the user."
+                )
             self.staged["outcome"] = MissionState.SUCCEEDED
             self.staged["summary"] = str(arguments.get("text") or "")
             return self._text("Mission completion staged.")

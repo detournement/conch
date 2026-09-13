@@ -24,6 +24,7 @@ from conch.kernel.model import (
     EVENT_SCHEMA_VERSION,
     KernelError,
     MissionState,
+    model_completion_allowed,
     normalize_spec,
 )
 from conch.kernel.store import MissionStore
@@ -96,6 +97,65 @@ class TestSpecNormalization(unittest.TestCase):
     def test_misfire_policy_validated(self):
         with self.assertRaises(KernelError):
             normalize_spec({"goal": "x", "misfire_policy": "improvise"})
+
+    def test_allow_model_completion_defaults_off_for_cadence_specs(self):
+        # Recurring schedule + no success criteria = cadence mission: the
+        # model may not self-complete it.
+        self.assertFalse(
+            normalize_spec({"goal": "daily digest"})[
+                "allow_model_completion"
+            ]
+        )
+        # Success criteria, run-once, or no recurrence carry completion
+        # semantics — default stays permissive.
+        self.assertTrue(
+            normalize_spec({"goal": "x", "success_criteria": ["done"]})[
+                "allow_model_completion"
+            ]
+        )
+        self.assertTrue(
+            normalize_spec({"goal": "x", "run_once": True})[
+                "allow_model_completion"
+            ]
+        )
+        self.assertTrue(
+            normalize_spec({"goal": "x", "cadence_seconds": 0})[
+                "allow_model_completion"
+            ]
+        )
+        # Explicit values win in both directions.
+        self.assertTrue(
+            normalize_spec(
+                {"goal": "x", "allow_model_completion": True}
+            )["allow_model_completion"]
+        )
+        self.assertFalse(
+            normalize_spec({
+                "goal": "x", "success_criteria": ["done"],
+                "allow_model_completion": False,
+            })["allow_model_completion"]
+        )
+
+    def test_allow_model_completion_must_be_boolean(self):
+        with self.assertRaises(KernelError):
+            normalize_spec({"goal": "x", "allow_model_completion": "yes"})
+        with self.assertRaises(KernelError):
+            normalize_spec({"goal": "x", "allow_model_completion": 1})
+
+    def test_model_completion_allowed_handles_legacy_specs(self):
+        # Stored specs normalized before the field existed have no key —
+        # they get the same cadence-style default as new specs.
+        self.assertFalse(model_completion_allowed(
+            {"goal": "d", "cadence_seconds": 86400}
+        ))
+        self.assertTrue(model_completion_allowed(
+            {"goal": "d", "cadence_seconds": 86400,
+             "success_criteria": ["x"]}
+        ))
+        self.assertTrue(model_completion_allowed(
+            {"goal": "d", "cadence_seconds": 86400,
+             "allow_model_completion": True}
+        ))
 
     def test_capitol_bind_scheduled_normalizes_and_gates(self):
         spec = normalize_spec({

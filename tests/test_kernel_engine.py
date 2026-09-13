@@ -529,5 +529,100 @@ class TestMissionControlClient(EngineCase):
         self.assertIn("error", result["content"][0]["text"])
 
 
+class TestModelCompletionKnob(EngineCase):
+    """allow_model_completion: cadence missions (recurring schedule, no
+    success criteria) default to refusing complete_mission — a weak model
+    must not self-complete a run-forever digest/watch. The denial is a
+    journaled fact and a steering tool message; the mission stays on its
+    schedule."""
+
+    def test_cadence_mission_denies_completion_and_journals(self):
+        factory = ScriptedFactory(script=[
+            {"op": "complete_mission", "text": "digest looks done to me"},
+        ])
+        engine = self.engine(factory)
+        mission_id = self.make_ready(engine, success_criteria=[])
+        result = engine.run_session(mission_id)
+        # The completion never staged: the session parked on its cadence.
+        self.assertEqual(result["outcome"], MissionState.WAITING_TIMER)
+        mission = self.store.get_mission(mission_id)
+        self.assertEqual(mission["status"], MissionState.WAITING_TIMER)
+        events = self.store.events_since(
+            mission_id, 0, ("completion_denied",)
+        )
+        self.assertEqual(len(events), 1)
+        self.assertIn("cadence", events[0]["data"]["reason"])
+        # The new event kind replays cleanly.
+        ok, detail = self.store.replay_matches_live()
+        self.assertTrue(ok, detail)
+
+    def test_denial_tool_message_steers_and_stages_nothing(self):
+        engine = self.engine()
+        mission_id = self.make_ready(engine, success_criteria=[])
+        client = MissionControlClient(self.store, mission_id, "ses-1")
+        result = client.call_tool(
+            "mission_control", {"op": "complete_mission", "text": "done"}
+        )
+        text = result["content"][0]["text"]
+        self.assertIn("denied", text)
+        self.assertIn("set_next_wake", text)
+        self.assertIsNone(client.staged["outcome"])
+
+    def test_explicit_allow_overrides_the_cadence_default(self):
+        factory = ScriptedFactory(script=[
+            {"op": "complete_mission", "text": "operator opted in"},
+        ])
+        engine = self.engine(factory)
+        mission_id = self.make_ready(
+            engine, success_criteria=[], allow_model_completion=True
+        )
+        result = engine.run_session(mission_id)
+        self.assertEqual(result["outcome"], MissionState.SUCCEEDED)
+
+    def test_success_criteria_missions_still_complete(self):
+        # BASE_SPEC carries success criteria — completion semantics exist,
+        # so the default stays permissive (also covered by
+        # test_complete_mission_terminal_and_notifies).
+        factory = ScriptedFactory(script=[
+            {"op": "complete_mission", "text": "all criteria met"},
+        ])
+        engine = self.engine(factory)
+        mission_id = self.make_ready(engine)
+        result = engine.run_session(mission_id)
+        self.assertEqual(result["outcome"], MissionState.SUCCEEDED)
+
+    def test_fail_mission_is_not_gated(self):
+        # The knob governs self-declared success only; a genuinely broken
+        # cadence mission may still fail itself.
+        factory = ScriptedFactory(script=[
+            {"op": "fail_mission", "text": "credentials revoked"},
+        ])
+        engine = self.engine(factory)
+        mission_id = self.make_ready(engine, success_criteria=[])
+        result = engine.run_session(mission_id)
+        self.assertEqual(result["outcome"], MissionState.FAILED)
+
+    def test_spec_update_can_turn_completion_off_for_live_missions(self):
+        # The operator path used on the live repo-digest mission: update
+        # the spec through the store API, then the gate holds.
+        engine = self.engine()
+        mission_id = self.make_ready(engine)  # criteria => allowed
+        mission = self.store.get_mission(mission_id)
+        spec = dict(mission["spec"])
+        spec["allow_model_completion"] = False
+        self.store.update_spec(mission_id, spec)
+        client = MissionControlClient(self.store, mission_id, "ses-2")
+        result = client.call_tool(
+            "mission_control", {"op": "complete_mission", "text": "done"}
+        )
+        self.assertIn("denied", result["content"][0]["text"])
+        self.assertEqual(
+            len(self.store.events_since(
+                mission_id, 0, ("completion_denied",)
+            )),
+            1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

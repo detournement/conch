@@ -450,6 +450,9 @@ EVENT_KINDS = frozenset({
     "review_recorded",
     "review_skipped",
     "plan_revised",
+    # complete_mission refused by the allow_model_completion spec gate —
+    # a journal-only fact (the mission's state never moved).
+    "completion_denied",
     # Fleet (Swarm Phase 2). Worker events chain under mission_id "";
     # dispatch events chain under the envelope's real mission.
     "worker_enrolled",
@@ -504,7 +507,7 @@ def normalize_spec(spec: Dict[str, Any],
         "run_once", "misfire_policy", "catch_up_limit",
         "session_wall_seconds", "session_max_tool_rounds",
         "session_token_budget", "principal", "notify", "capitol",
-        "review",
+        "review", "allow_model_completion",
     }
     unknown = set(spec) - known
     if unknown:
@@ -664,4 +667,39 @@ def normalize_spec(spec: Dict[str, Any],
         if raw < 1:
             raise KernelError(f"mission spec {key} must be positive")
         normalized[key] = min(raw, SESSION_CEILINGS[key])
+    if "allow_model_completion" in spec:
+        if not isinstance(spec["allow_model_completion"], bool):
+            raise KernelError(
+                "mission spec allow_model_completion must be a boolean"
+            )
+        normalized["allow_model_completion"] = spec["allow_model_completion"]
+    else:
+        normalized["allow_model_completion"] = not cadence_style_spec(
+            normalized
+        )
     return normalized
+
+
+def cadence_style_spec(spec: Dict[str, Any]) -> bool:
+    """True for cadence missions: a recurring schedule with no terminal
+    success-criteria semantics. These run forever by design (digests,
+    watches), so "done" is an operator judgment — the model finishing one
+    is nearly always a weak-model mistake."""
+    return (
+        int(spec.get("cadence_seconds") or 0) > 0
+        and not bool(spec.get("run_once", False))
+        and not list(spec.get("success_criteria") or [])
+    )
+
+
+def model_completion_allowed(spec: Dict[str, Any]) -> bool:
+    """Effective ``allow_model_completion`` for a (possibly legacy) spec.
+
+    Specs normalized before the field existed carry no key; they get the
+    same default as new specs: cadence-style missions may not be completed
+    by the model, everything else may.
+    """
+    value = spec.get("allow_model_completion")
+    if isinstance(value, bool):
+        return value
+    return not cadence_style_spec(spec)

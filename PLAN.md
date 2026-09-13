@@ -394,6 +394,76 @@ machine: the daemon now runs under launchd (`conch-edge install`
 round-trip), and a fake-channel drill answered inbound messages and woke
 a parked mission with no shell attached.
 
+**Mission judgment and shared memory (September 2026): landed.** The
+roadmap's second S–M work item (Sequencing), closing the judgment gap on
+the Phase 1 kernel. Two pieces.
+
+(1) *Critic/self-review sessions* (`conch/kernel/review.py`): every
+standard mission owes a cheap review session every N work sessions or
+daily — whichever first; spec `review` object overrides
+`mission_review_*` config keys — on the weak model when configured,
+falling back to the main model. Stall detection is deterministic and
+computed from kernel events BEFORE the model sees anything: a mission is
+stalled when ≥N sessions checkpointed with zero material events
+(plan_recorded, task_created/transitioned, action_recorded/resolved,
+artifact_recorded, approval_requested, binding_recorded/updated — notes,
+checkpoints, and budget bookkeeping are deliberately non-material), or
+when the same step failed repeatedly (≥2 failed attempts of one task, or
+consecutive checkpoints carrying the same error). The critic scores each
+success criterion (met/on-track/stalled/at-risk + one-line evidence) and
+its verdict lands in one kernel transaction: `review_recorded` (a new
+replayed `reviews` projection `/mission show` renders), re-plans as the
+next numbered plan version through the existing plans machinery
+journaled with an explicit `plan_revised` event + rationale, escalations
+through the existing outbox notify path. Deterministic policy overrides
+the model: a stalled mission may never "continue" (coerced to
+escalation, never silent), unusable model output on a stalled mission
+escalates, otherwise it is a journaled `review_skipped`. Reviews reuse
+the session lease/reservation discipline (crash → lease expiry → normal
+reconcile), never expose tools, never increment `runs` or write
+checkpoints, honor a `reviews` budget line when declared (exhaustion is
+a journaled skip that advances the cadence marker), and sit behind the
+same STOP/pause gates as work sessions.
+
+(2) *Cross-mission memory consolidation*
+(`conch/kernel/consolidate.py`): after each work-session checkpoint (and
+on completion), a weak-model pass distills durable lessons from that
+session's journal delta into the shared memory store (`conch/memory.py`)
+tagged `mission:<id>` + topic — deduplicated (normalized match + token
+overlap), size-capped per lesson/pass/store (oldest mission lessons
+evicted first; user memories untouched), and hard-scrubbed on OUTPUT:
+lessons carrying credential-like tokens, secret keywords, org UUIDs,
+channel/user identifiers, emails, or phone-like numbers are rejected
+whole, extending the secret-canary discipline to the shared tier. Any
+mission's rehydration then retrieves the top-K relevant lessons
+(in-memory FTS5 over goal/plan/task keywords via
+`MemoryStore.rank_entries`, own lessons excluded) into a clearly labeled
+"Lessons from prior missions" block under a hard char cap, inside the
+unchanged MAX_CONTEXT_CHARS bound. Consolidation is skippable
+(`mission_consolidation=false`) and runs post-checkpoint on a worker
+thread with a timeout — failure or timeout is a logged skip; the session
+path never waits.
+
+Gates in tests (38 new; 1,542 total on Python 3.9 and 3.14, ruff clean at
+each commit): the stall fixture (N quiet sessions + a repeatedly failing
+task) triggers a review whose re-plan is a journaled numbered plan
+revision with replay == live; consolidation from mission A measurably
+changes mission B's rehydrated context (exact lesson retrieval, size
+bound held); an exhausted review budget skips with a journaled event and
+never crashes; a credential planted in a journal never reaches
+consolidated memories or another mission's context even when the model
+echoes it; the no-daemon invariant is untouched. Verified live on this
+machine against the launchd daemon's repo-digest mission (its model host
+unreachable, so the daemon ran on the documented env-override provider):
+a real review session scored both criteria `met` with journal evidence
+(action `continue`, `review_recorded` seq 205, model
+deepseek/deepseek-v4-flash) and `/mission show` renders the verdict; the
+first live consolidation pass demonstrated the timeout-skip path (20s
+cap, logged skip, session unaffected), a follow-up pass with a wider cap
+landed three real tagged lessons, and a second mission's very next
+rehydration retrieved them in its labeled lessons block with mission-id
+provenance.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

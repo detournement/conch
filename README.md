@@ -368,6 +368,37 @@ remote loop section): inbound Slack/SMS/email get full agent turns around
 the clock, no shell attached, and external events wake parked missions
 immediately instead of waiting out their timers.
 
+**Mission judgment.** Every standard mission also gets a scheduled critic
+session — every N work sessions or daily (whichever comes first; spec
+`review` object or `mission_review_*` config keys), on the cheap
+`weak_model` when configured, falling back to the main model. Stall
+detection is deterministic and runs before the model sees anything: no
+material kernel-event change (plan versions, task movement, external
+actions, artifacts, approvals, bindings) across the last N sessions, or
+the same step failing repeatedly. The critic scores each success
+criterion (met / on-track / stalled / at-risk with one-line evidence) and
+lands exactly one action as kernel events: **continue**, **re-plan** (a
+new numbered plan version through the normal plans machinery, journaled
+as an explicit `plan_revised` event with rationale), or **escalate** (a
+channel notification through the outbox — never silent; a stalled mission
+may never "continue"). Reviews are bounded sessions with no tools, obey a
+`reviews` budget line when the spec declares one (exhaustion is a
+journaled skip, never a crash), are suppressed by STOP/pause like any
+session, and `/mission show` renders the latest verdict.
+
+**Shared memory across missions.** After each checkpoint a weak-model
+consolidation pass distills durable, non-secret lessons from that
+session's journal delta into the shared memory store, tagged with mission
+id + topic, deduplicated and size-capped; a deterministic scrubber
+rejects anything resembling credentials, org UUIDs, or channel identities
+whole. Any mission's next rehydration then retrieves the top-K relevant
+lessons (FTS match on its goal/plan/task keywords, hard char cap) into a
+clearly labeled "Lessons from prior missions" block, so what one mission
+learns the others get for free — within the same overall context bound.
+Consolidation is skippable (`mission_consolidation = false`) and runs as
+a post-checkpoint side task with a timeout: failure or timeout is a
+logged skip, never a blocked session.
+
 The first daemon start migrates existing `tasks.json` schedules into the
 kernel (original preserved as `tasks.json.bak`); `/schedule`, `/tasks`, and
 `/cancel` keep their exact UX, now executed by the daemon. Two daemons can

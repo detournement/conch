@@ -296,7 +296,12 @@ class TestKernelNeverContainsCanary(SecretCanaryCase):
             return "session complete", {"total_tokens": 11}
 
         daemon = EdgeDaemon(
-            self.config, kernel_dir=root / "kernel", state_dir=root,
+            # Reviews/consolidation would call the (canary-keyed) provider;
+            # their canary coverage lives in TestConsolidationAndReview*
+            # below with scripted runners.
+            {**self.config, "mission_reviews": "false",
+             "mission_consolidation": "false"},
+            kernel_dir=root / "kernel", state_dir=root,
             socket_path=socket_path, session_factory=factory,
         )
         daemon.start()
@@ -340,6 +345,93 @@ class TestKernelNeverContainsCanary(SecretCanaryCase):
             content = path.read_bytes().decode("utf-8", errors="replace")
             self._assert_clean(content, f"kernel file {path.name}")
         self.assertGreaterEqual(swept, 2)
+
+
+class TestConsolidationNeverLeaksCanary(SecretCanaryCase):
+    """Mission-judgment extension: a credential-bearing string planted in
+    a mission journal never reaches consolidated shared memories or
+    another mission's rehydrated context — even when the consolidation
+    model actively tries to save it (worst case), because the output
+    scrubber is a deterministic hard gate, not a prompt."""
+
+    def test_planted_credential_never_reaches_memory_or_other_missions(self):
+        from conch.kernel.engine import MissionEngine
+        from conch.kernel.store import MissionStore
+        from conch.memory import MemoryStore
+
+        kernel_dir = Path(self._tmp.name) / "kernel"
+        store = MissionStore(kernel_dir / "kernel.db")
+        self.addCleanup(store.close)
+
+        leaked_lessons = json.dumps({"lessons": [
+            # one genuinely clean lesson must survive, proving the gate
+            # rejects lessons, not consolidation itself
+            {"topic": "git digests", "lesson": (
+                "git log --since=24h is enough for the daily digest;"
+                " skip full clones."
+            )},
+            # the model echoes the credential and other banned identities
+            {"topic": "auth", "lesson": f"reuse {CANARY} for the sandbox"},
+            {"topic": "orgs", "lesson": (
+                "provision under org"
+                " 123e4567-e89b-12d3-a456-426614174000"
+            )},
+            {"topic": "slack", "lesson": "ping U0AAAAAA7 about digests"},
+            {"topic": "contact", "lesson": "mail ops@example.com nightly"},
+        ]})
+        seen_input = {}
+
+        def malicious_consolidator(text):
+            seen_input["text"] = text
+            return leaked_lessons, ""
+
+        def factory(mission, messages, control, caps):
+            # the work session's own summary also carries the credential
+            return f"fetched with token {CANARY}", {"total_tokens": 5}
+
+        engine = MissionEngine(
+            store, {
+                "provider": "openai", "mission_reviews": "false",
+                # every scripted lesson must reach the scrubber — the
+                # per-pass cap must not truncate the malicious tail
+                "mission_consolidation_max_lessons": "8",
+            },
+            holder="canary", session_factory=factory,
+            consolidator=malicious_consolidator, kernel_dir=kernel_dir,
+        )
+        mission_a = engine.create_mission({
+            "goal": "produce the daily repo digest",
+            "budgets": {}, "cadence_seconds": 86400,
+        }, activate=True)
+        # worst case: the credential is IN the journal before the session
+        store.record_note(mission_a, f"api key is {CANARY}")
+        engine.run_session(mission_a)
+
+        # the consolidation input really contained the credential — the
+        # scrubber, not luck, kept it out of shared memory
+        self.assertIn(CANARY, seen_input["text"])
+        entries = MemoryStore().get_all()
+        self.assertEqual(len(entries), 1, entries)
+        self.assertIn("git log --since=24h", entries[0]["content"])
+        memory_bytes = json.dumps(entries)
+        self._assert_clean(memory_bytes, "consolidated shared memories")
+        self.assertNotIn("123e4567", memory_bytes)
+        self.assertNotIn("U0AAAAAA7", memory_bytes)
+        self.assertNotIn("ops@example.com", memory_bytes)
+
+        # mission B rehydrates the clean lesson — and nothing else
+        mission_b = engine.create_mission({
+            "goal": "write the weekly digest from git log",
+            "budgets": {}, "cadence_seconds": 86400,
+        }, activate=True)
+        context = engine.build_context(store.get_mission(mission_b))
+        self.assertIn("git log --since=24h", context)
+        self._assert_clean(context, "another mission's rehydrated context")
+
+        # and the state-file sweep stays clean end to end
+        for path in self._walk_state_files():
+            content = path.read_bytes().decode("utf-8", errors="replace")
+            self._assert_clean(content, f"state file {path.name}")
 
 
 if __name__ == "__main__":

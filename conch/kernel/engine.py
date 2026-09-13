@@ -44,6 +44,7 @@ MAX_CONTEXT_CHARS = 16000
 _SECTION_CAPS = {
     "spec": 2500,
     "plan": 2500,
+    "lessons": 800,
     "checkpoint": 4000,
     "tasks": 2000,
     "events": 3500,
@@ -291,7 +292,8 @@ class MissionEngine:
                  holder: str = "", session_factory: Optional[Callable] = None,
                  kernel_dir: Optional[Path] = None,
                  log: Optional[Callable[[str], None]] = None,
-                 review_runner: Optional[Callable] = None):
+                 review_runner: Optional[Callable] = None,
+                 consolidator: Optional[Callable] = None):
         self.store = store
         self.config = config or {}
         self.holder = holder or f"engine-{os.getpid()}"
@@ -299,6 +301,8 @@ class MissionEngine:
         #: Review-session model runner (tests inject a scripted one); the
         #: default makes one weak-model call with no tools.
         self._review_runner = review_runner
+        #: Post-checkpoint consolidation model runner (tests inject).
+        self._consolidator = consolidator
         self.kernel_dir = Path(kernel_dir) if kernel_dir else (
             Path(store.path).parent
         )
@@ -491,6 +495,20 @@ class MissionEngine:
             parts.append(_clip(plan_text, _SECTION_CAPS["plan"]))
 
         tasks = self.store.open_tasks(mission_id)
+        try:
+            from . import consolidate as _consolidate
+
+            lessons = _consolidate.lessons_block(
+                mission,
+                plan["content"].get("steps", []) if plan else [],
+                [task["title"] for task in tasks],
+                self.config,
+            )
+        except Exception:
+            lessons = ""  # the memory tier can never break rehydration
+        if lessons:
+            parts.append(_clip(lessons, _SECTION_CAPS["lessons"]))
+
         checkpoint = self.store.latest_checkpoint(mission_id)
         if checkpoint:
             parts.append(_clip(
@@ -983,6 +1001,22 @@ class MissionEngine:
             self.store.record_note(
                 mission_id, f"input requested: {staged['question']}",
                 author=session_id,
+            )
+        # Cross-mission memory consolidation: a post-checkpoint side task
+        # (the checkpoint above already committed). Bounded by its own
+        # timeout; any failure is a logged skip — it can never block or
+        # break the session path.
+        try:
+            from . import consolidate as _consolidate
+
+            _consolidate.after_checkpoint(
+                self.store, mission, session_id, self.config,
+                log=self._log, runner=self._consolidator,
+            )
+        except Exception as exc:
+            self._log(
+                f"consolidation for {mission_id} session {session_id}"
+                f" skipped: {type(exc).__name__}: {exc}"
             )
         return {
             "mission_id": mission_id, "session_id": session_id,

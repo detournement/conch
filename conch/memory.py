@@ -142,6 +142,76 @@ class MemoryStore:
         lines.extend(f"- {content}" for content in contents)
         return "\n".join(lines)
 
+    def rank_entries(
+        self,
+        query: str,
+        limit: int = 5,
+        source_prefix: str = "",
+        exclude_source: str = "",
+    ) -> List[Dict[str, Union[str, int]]]:
+        """Full entries (not just contents) ranked against a query, with
+        optional source filtering — mission rehydration retrieves shared
+        cross-mission lessons this way (``source_prefix="mission:"``,
+        excluding the requesting mission's own)."""
+        if not query.strip():
+            return []
+        pool = [
+            entry for entry in self._entries
+            if (
+                not source_prefix
+                or str(entry.get("source", "")).startswith(source_prefix)
+            )
+            and (
+                not exclude_source
+                or str(entry.get("source", "")) != exclude_source
+            )
+        ]
+        if not pool:
+            return []
+        indices = self._fts_rank_indices(query, limit, pool)
+        if indices is None:
+            q_tokens = _tokenize(query)
+            scored = []
+            for index, entry in enumerate(pool):
+                score = len(q_tokens & _tokenize(str(entry["content"])))
+                if score:
+                    scored.append((score, index))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            indices = [index for _, index in scored[:limit]]
+        return [dict(pool[index]) for index in indices]
+
+    def _fts_rank_indices(
+        self, query: str, limit: int, pool: List[Dict[str, Union[str, int]]]
+    ) -> Optional[List[int]]:
+        """bm25-ranked pool indices via in-memory FTS5, or None without
+        FTS5 support."""
+        keywords = [kw for kw in query.lower().split() if kw]
+        if not keywords:
+            return []
+        match = " OR ".join('"%s"*' % kw.replace('"', '""') for kw in keywords)
+        conn = None
+        try:
+            conn = sqlite3.connect(":memory:")
+            conn.execute("CREATE VIRTUAL TABLE mem USING fts5(content)")
+            conn.executemany(
+                "INSERT INTO mem(rowid, content) VALUES (?, ?)",
+                [
+                    (index, str(entry["content"]))
+                    for index, entry in enumerate(pool)
+                ],
+            )
+            rows = conn.execute(
+                "SELECT rowid FROM mem WHERE mem MATCH ? "
+                "ORDER BY bm25(mem) LIMIT ?",
+                (match, limit),
+            ).fetchall()
+        except sqlite3.Error:
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        return [int(row[0]) for row in rows]
+
     def _fts_rank(
         self, query: str, limit: int
     ) -> Optional[List[str]]:

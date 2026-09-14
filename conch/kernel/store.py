@@ -51,6 +51,7 @@ from .model import (
     BindingStatus,
     BudgetExceededError,
     CATCH_UP_HARD_CAP,
+    CompilationStatus,
     ConflictError,
     DispatchState,
     EVENT_KINDS,
@@ -64,6 +65,7 @@ from .model import (
     StaleGenerationError,
     TaskState,
     WorkerState,
+    check_compilation_transition,
     check_dispatch_transition,
     check_item_transition,
     check_task_transition,
@@ -404,6 +406,34 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS idx_items_space_status
     ON items(space, status);
 CREATE INDEX IF NOT EXISTS idx_items_mission ON items(mission_id);
+CREATE TABLE IF NOT EXISTS compilations (
+    compilation_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    card_version INTEGER NOT NULL,
+    approved_version INTEGER NOT NULL DEFAULT 0,
+    approved_digest TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL DEFAULT '',
+    decision_origin TEXT NOT NULL DEFAULT '',
+    decided_at REAL,
+    decision_reason TEXT NOT NULL DEFAULT '',
+    materialization TEXT NOT NULL DEFAULT '{}',
+    drill TEXT NOT NULL DEFAULT '{}',
+    mission_id TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compilation_cards (
+    compilation_id TEXT NOT NULL,
+    card_version INTEGER NOT NULL,
+    card TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT '',
+    guidance TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    PRIMARY KEY(compilation_id, card_version)
+);
 """
 
 #: Tables rebuilt from the event journal, with the columns that must match
@@ -497,6 +527,20 @@ REPLAYED_TABLES: Dict[str, Tuple[str, ...]] = {
         "item_id", "space", "title", "body", "status", "due_at",
         "priority", "tags", "source", "mission_id", "version",
         "created_at", "updated_at",
+    ),
+    # Process compilations (process-compiler plan C1/C2): both tables are
+    # mission truth — cards, approval, materialization refs, and drill
+    # results all ride compilation_* events on the compilation's chain.
+    "compilations": (
+        "compilation_id", "status", "goal", "card_version",
+        "approved_version", "approved_digest", "decided_by",
+        "decision_origin", "decided_at", "decision_reason",
+        "materialization", "drill", "mission_id", "version",
+        "created_at", "updated_at",
+    ),
+    "compilation_cards": (
+        "compilation_id", "card_version", "card", "digest", "author",
+        "guidance", "created_at",
     ),
 }
 
@@ -1009,6 +1053,83 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
         )
     elif kind == "item_mission_synced":
         pass  # journal-only proposal; the user decides the item's fate
+    elif kind == "compilation_created":
+        conn.execute(
+            "INSERT INTO compilations(compilation_id, status, goal,"
+            " card_version, approved_version, approved_digest, decided_by,"
+            " decision_origin, decided_at, decision_reason,"
+            " materialization, drill, mission_id, version, created_at,"
+            " updated_at)"
+            " VALUES (?,?,?,1,0,'','','',NULL,'','{}','{}','',?,?,?)",
+            (data["compilation_id"], data["status"], data["goal"],
+             data["version"], created_at, created_at),
+        )
+        conn.execute(
+            "INSERT INTO compilation_cards(compilation_id, card_version,"
+            " card, digest, author, guidance, created_at)"
+            " VALUES (?,1,?,?,?,'',?)",
+            (data["compilation_id"], _canonical(data["card"]),
+             data["digest"], data.get("author", ""), created_at),
+        )
+    elif kind == "compilation_card_recorded":
+        # A new card version always re-arms review: status back to
+        # compiled, the prior approval pin cleared (revision invalidates
+        # approval, the pack-engine rule).
+        conn.execute(
+            "INSERT INTO compilation_cards(compilation_id, card_version,"
+            " card, digest, author, guidance, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (data["compilation_id"], data["card_version"],
+             _canonical(data["card"]), data["digest"],
+             data.get("author", ""), data.get("guidance", ""),
+             created_at),
+        )
+        conn.execute(
+            "UPDATE compilations SET status=?, card_version=?,"
+            " approved_version=0, approved_digest='', decided_by='',"
+            " decision_origin='', decided_at=NULL, decision_reason='',"
+            " version=?, updated_at=? WHERE compilation_id=?",
+            (data["status"], data["card_version"], data["version"],
+             created_at, data["compilation_id"]),
+        )
+    elif kind == "compilation_decided":
+        conn.execute(
+            "UPDATE compilations SET status=?, approved_version=?,"
+            " approved_digest=?, decided_by=?, decision_origin=?,"
+            " decided_at=?, decision_reason=?, version=?, updated_at=?"
+            " WHERE compilation_id=?",
+            (data["status"],
+             data["card_version"] if data["status"] == "approved" else 0,
+             data["digest"] if data["status"] == "approved" else "",
+             data["decided_by"], data["decision_origin"], created_at,
+             data.get("reason", ""), data["version"], created_at,
+             data["compilation_id"]),
+        )
+    elif kind == "compilation_transitioned":
+        conn.execute(
+            "UPDATE compilations SET status=?, mission_id=CASE WHEN ?=''"
+            " THEN mission_id ELSE ? END, version=?, updated_at=?"
+            " WHERE compilation_id=?",
+            (data["to"], data.get("mission_id", ""),
+             data.get("mission_id", ""), data["version"], created_at,
+             data["compilation_id"]),
+        )
+    elif kind == "compilation_materialization_recorded":
+        # The event carries the full cumulative materialization state, so
+        # replaying any prefix of the journal reproduces the column.
+        conn.execute(
+            "UPDATE compilations SET materialization=?, version=?,"
+            " updated_at=? WHERE compilation_id=?",
+            (_canonical(data["materialization"]), data["version"],
+             created_at, data["compilation_id"]),
+        )
+    elif kind == "compilation_drill_recorded":
+        conn.execute(
+            "UPDATE compilations SET drill=?, version=?, updated_at=?"
+            " WHERE compilation_id=?",
+            (_canonical(data["drill"]), data["version"], created_at,
+             data["compilation_id"]),
+        )
     elif kind == "session_started":
         conn.execute(
             "UPDATE missions SET last_session_at=? WHERE mission_id=?",
@@ -3286,6 +3407,363 @@ class MissionStore:
                     limit: int = 100) -> List[Dict[str, Any]]:
         """The item's full event history (its chain id is the item id)."""
         return self.event_tail(item_id, limit=limit)
+
+    # ------------------------------------------------------------------
+    # Process compilations (process-compiler plan C1/C2). The compilation
+    # aggregate is event-sourced under its own chain id; the store owns
+    # structural invariants (status machine, approval origin binding,
+    # secret guard); semantic card validation is the compiler's job
+    # (conch.capitol.compiler.card) and happens before anything lands
+    # here.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _guard_card(card: Dict[str, Any]) -> str:
+        """Minimal structural check + credential guard; returns the
+        card's canonical digest. Cards are data about infrastructure —
+        secret bytes never belong in one (whole-card rejection)."""
+        if not isinstance(card, dict):
+            raise KernelError("an architecture card must be a dict")
+        goal = str(card.get("goal") or "").strip()
+        if not goal:
+            raise KernelError("an architecture card requires a goal")
+        text = _canonical(card)
+        findings = credential_findings(text)
+        if findings:
+            raise CredentialRejected(sorted(set(findings)))
+        return "sha256:" + hashlib.sha256(
+            text.encode("utf-8")
+        ).hexdigest()
+
+    def create_compilation(self, card: Dict[str, Any], *,
+                           actor: str = "user",
+                           compilation_id: Optional[str] = None
+                           ) -> Dict[str, Any]:
+        digest = self._guard_card(card)
+        cid = compilation_id or kernel_id("cmp")
+        goal = str(card.get("goal") or "").strip()
+
+        def fn(conn):
+            self._append(conn, cid, "compilation_created", {
+                "compilation_id": cid,
+                "status": CompilationStatus.COMPILED,
+                "goal": goal, "card": card, "digest": digest,
+                "author": str(actor or "user"), "version": 1,
+            })
+            return cid
+        self._mutate(fn)
+        return self.get_compilation(cid)  # committed above; never None
+
+    def _compilation_row(self, conn: sqlite3.Connection,
+                         compilation_id: str):
+        row = conn.execute(
+            "SELECT compilation_id, status, card_version, version,"
+            " approved_version, approved_digest, materialization"
+            " FROM compilations WHERE compilation_id=?",
+            (compilation_id,),
+        ).fetchone()
+        if row is None:
+            raise KernelError(f"unknown compilation {compilation_id!r}")
+        return row
+
+    def record_compilation_card(self, compilation_id: str,
+                                card: Dict[str, Any], *,
+                                actor: str = "user",
+                                guidance: str = "") -> int:
+        """Record a new card version (recompilation). Allowed only while
+        the compilation is still a design (compiled/rejected/approved —
+        revising an approved card invalidates its approval); materialized
+        and later compilations are infrastructure, never mutated."""
+        digest = self._guard_card(card)
+
+        def fn(conn):
+            row = self._compilation_row(conn, compilation_id)
+            status, card_version, version = row[1], int(row[2]), int(row[3])
+            if status not in (CompilationStatus.COMPILED,
+                              CompilationStatus.REJECTED,
+                              CompilationStatus.APPROVED):
+                raise KernelError(
+                    f"compilation {compilation_id} is {status}; new card"
+                    " versions are only recorded before materialization"
+                )
+            if status != CompilationStatus.COMPILED:
+                check_compilation_transition(
+                    status, CompilationStatus.COMPILED
+                )
+            new_version = card_version + 1
+            self._append(conn, compilation_id,
+                         "compilation_card_recorded", {
+                             "compilation_id": compilation_id,
+                             "card_version": new_version, "card": card,
+                             "digest": digest,
+                             "status": CompilationStatus.COMPILED,
+                             "author": str(actor or "user"),
+                             "guidance": str(guidance or ""),
+                             "version": version + 1,
+                         })
+            return new_version
+        return self._mutate(fn)
+
+    def decide_compilation(self, compilation_id: str, verb: str, *,
+                           decided_by: str = "",
+                           origin_channel: str = "local",
+                           origin_thread: str = "",
+                           origin_sender: str = "",
+                           reason: str = "") -> Dict[str, Any]:
+        """Approve or reject the compilation's CURRENT card version.
+
+        The authorization moment: approval pins the exact card version
+        and digest that materialization will honor. v1 is local-only —
+        any non-local decision origin is refused, which also blocks a
+        session or channel surface from ever approving a card (no
+        self-approval; approval is a user act at the shell).
+        """
+        if verb not in ("approve", "reject"):
+            raise KernelError(f"unknown compilation verb {verb!r}")
+        if str(origin_channel or "") != "local":
+            raise ApprovalError(
+                "compilation approvals are origin-bound and local-only "
+                f"in v1; refusing a decision from origin "
+                f"{origin_channel!r}"
+            )
+        decision_origin = ":".join(
+            (origin_channel, origin_thread, origin_sender)
+        )
+
+        def fn(conn):
+            row = self._compilation_row(conn, compilation_id)
+            status, card_version, version = row[1], int(row[2]), int(row[3])
+            target = (
+                CompilationStatus.APPROVED if verb == "approve"
+                else CompilationStatus.REJECTED
+            )
+            check_compilation_transition(status, target)
+            digest_row = conn.execute(
+                "SELECT digest FROM compilation_cards WHERE"
+                " compilation_id=? AND card_version=?",
+                (compilation_id, card_version),
+            ).fetchone()
+            self._append(conn, compilation_id, "compilation_decided", {
+                "compilation_id": compilation_id, "status": target,
+                "card_version": card_version,
+                "digest": str(digest_row[0]) if digest_row else "",
+                "decided_by": str(decided_by or ""),
+                "decision_origin": decision_origin,
+                "reason": str(reason or ""),
+                "version": version + 1,
+            })
+            return {
+                "compilation_id": compilation_id, "status": target,
+                "card_version": card_version,
+                "digest": str(digest_row[0]) if digest_row else "",
+            }
+        return self._mutate(fn)
+
+    def transition_compilation(self, compilation_id: str, target: str, *,
+                               reason: str = "",
+                               mission_id: str = "") -> None:
+        def fn(conn):
+            row = self._compilation_row(conn, compilation_id)
+            status, version = row[1], int(row[3])
+            check_compilation_transition(status, target)
+            self._append(conn, compilation_id,
+                         "compilation_transitioned", {
+                             "compilation_id": compilation_id,
+                             "from": status, "to": target,
+                             "reason": str(reason or ""),
+                             "mission_id": str(mission_id or ""),
+                             "version": version + 1,
+                         })
+        self._mutate(fn)
+
+    def record_compilation_materialization(
+        self, compilation_id: str, materialization: Dict[str, Any], *,
+        complete: bool = False, error: str = "",
+    ) -> None:
+        """Record the full cumulative materialization state (receipts +
+        rollback refs). ``complete=True`` additionally advances
+        approved → materialized; re-recording a complete state on an
+        already-materialized compilation is a no-op transition (replay).
+        """
+        if not isinstance(materialization, dict):
+            raise KernelError("materialization must be a dict")
+        payload = dict(materialization)
+        if error:
+            payload["error"] = str(error)[:1000]
+
+        def fn(conn):
+            row = self._compilation_row(conn, compilation_id)
+            status, version = row[1], int(row[3])
+            if status not in (CompilationStatus.APPROVED,
+                              CompilationStatus.MATERIALIZED,
+                              CompilationStatus.VERIFIED,
+                              CompilationStatus.OPERATING):
+                raise KernelError(
+                    f"compilation {compilation_id} is {status}; "
+                    "materialization records need an approved card"
+                )
+            self._append(conn, compilation_id,
+                         "compilation_materialization_recorded", {
+                             "compilation_id": compilation_id,
+                             "materialization": payload,
+                             "complete": bool(complete),
+                             "version": version + 1,
+                         })
+            if complete and status == CompilationStatus.APPROVED:
+                self._append(conn, compilation_id,
+                             "compilation_transitioned", {
+                                 "compilation_id": compilation_id,
+                                 "from": status,
+                                 "to": CompilationStatus.MATERIALIZED,
+                                 "reason": "materialization complete",
+                                 "mission_id": "",
+                                 "version": version + 2,
+                             })
+        self._mutate(fn)
+
+    def record_compilation_drill(self, compilation_id: str,
+                                 result: Dict[str, Any], *,
+                                 passed: bool) -> None:
+        """Attach a drill result. A pass advances materialized →
+        verified; a failure leaves status=materialized with the failure
+        attached (rollback stays on offer)."""
+        if not isinstance(result, dict):
+            raise KernelError("drill result must be a dict")
+        payload = dict(result, passed=bool(passed))
+
+        def fn(conn):
+            row = self._compilation_row(conn, compilation_id)
+            status, version = row[1], int(row[3])
+            if status not in (CompilationStatus.MATERIALIZED,
+                              CompilationStatus.VERIFIED,
+                              CompilationStatus.OPERATING):
+                raise KernelError(
+                    f"compilation {compilation_id} is {status}; drills"
+                    " run against materialized compilations"
+                )
+            self._append(conn, compilation_id,
+                         "compilation_drill_recorded", {
+                             "compilation_id": compilation_id,
+                             "drill": payload,
+                             "version": version + 1,
+                         })
+            if passed and status == CompilationStatus.MATERIALIZED:
+                self._append(conn, compilation_id,
+                             "compilation_transitioned", {
+                                 "compilation_id": compilation_id,
+                                 "from": status,
+                                 "to": CompilationStatus.VERIFIED,
+                                 "reason": "acceptance drill passed",
+                                 "mission_id": "",
+                                 "version": version + 2,
+                             })
+        self._mutate(fn)
+
+    # -- compilation queries (deterministic ordering) ---------------------
+
+    @staticmethod
+    def _compilation_dict(row) -> Dict[str, Any]:
+        data = dict(row)
+        for key in ("materialization", "drill"):
+            try:
+                data[key] = _json.loads(data[key] or "{}")
+            except ValueError:
+                data[key] = {}
+        return data
+
+    _COMPILATION_SELECT = (
+        "SELECT c.*, (SELECT MIN(seq) FROM mission_events e WHERE"
+        " e.mission_id = c.compilation_id) AS compilation_seq"
+        " FROM compilations c"
+    )
+
+    def get_compilation(self,
+                        compilation_id: str) -> Optional[Dict[str, Any]]:
+        row = self._read_conn().execute(
+            self._COMPILATION_SELECT + " WHERE c.compilation_id=?",
+            (compilation_id,),
+        ).fetchone()
+        return self._compilation_dict(row) if row else None
+
+    def resolve_compilation(self, ref: str) -> Optional[Dict[str, Any]]:
+        """Compilation from a full id, unique id prefix, or #<seq> alias
+        (the seq of its first event — the items scheme)."""
+        ref = str(ref or "").strip().lstrip("#")
+        if not ref:
+            return None
+        if ref.isdigit():
+            row = self._read_conn().execute(
+                "SELECT mission_id FROM mission_events WHERE seq=?",
+                (int(ref),),
+            ).fetchone()
+            if row is None:
+                return None
+            return self.get_compilation(row[0])
+        exact = self.get_compilation(ref)
+        if exact is not None:
+            return exact
+        rows = self._read_conn().execute(
+            "SELECT compilation_id FROM compilations WHERE"
+            " compilation_id LIKE ? ESCAPE '\\' LIMIT 2",
+            (ref.replace("\\", "\\\\").replace("%", r"\%")
+             .replace("_", r"\_") + "%",),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return self.get_compilation(rows[0][0])
+
+    def list_compilations(self, status: str = ""
+                          ) -> List[Dict[str, Any]]:
+        query = self._COMPILATION_SELECT
+        params: List[Any] = []
+        if status:
+            if status not in CompilationStatus.ALL:
+                raise KernelError(
+                    f"unknown compilation status {status!r}"
+                )
+            query += " WHERE c.status=?"
+            params.append(status)
+        query += " ORDER BY c.created_at, c.compilation_id"
+        rows = self._read_conn().execute(query, params).fetchall()
+        return [self._compilation_dict(row) for row in rows]
+
+    def compilation_card(self, compilation_id: str,
+                         card_version: Optional[int] = None
+                         ) -> Optional[Dict[str, Any]]:
+        """One card version (default: the latest) with parsed content."""
+        conn = self._read_conn()
+        if card_version is None:
+            row = conn.execute(
+                "SELECT * FROM compilation_cards WHERE compilation_id=?"
+                " ORDER BY card_version DESC LIMIT 1",
+                (compilation_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM compilation_cards WHERE compilation_id=?"
+                " AND card_version=?",
+                (compilation_id, int(card_version)),
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["card"] = _json.loads(data["card"])
+        return data
+
+    def compilation_card_versions(self, compilation_id: str
+                                  ) -> List[Dict[str, Any]]:
+        rows = self._read_conn().execute(
+            "SELECT compilation_id, card_version, digest, author,"
+            " guidance, created_at FROM compilation_cards WHERE"
+            " compilation_id=? ORDER BY card_version",
+            (compilation_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def compilation_events(self, compilation_id: str,
+                           limit: int = 100) -> List[Dict[str, Any]]:
+        """The compilation's full event history (its own chain id)."""
+        return self.event_tail(compilation_id, limit=limit)
 
     # ------------------------------------------------------------------
     # Composite session flows (single-transaction guarantees)

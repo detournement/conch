@@ -48,7 +48,7 @@ class ApprovalError(KernelError):
 #: swarm protocol so mission/task/worker IDs are valid on the wire.
 KERNEL_ID_KINDS = frozenset({
     "msn", "task", "pln", "ses", "ckpt", "apr", "tmr", "act", "att",
-    "art", "bnd", "scp", "lse", "obx", "wrk", "rev", "item",
+    "art", "bnd", "scp", "lse", "obx", "wrk", "rev", "item", "cmp",
 })
 
 _ID_RE = re.compile(r"^([a-z]{2,8})-([0-9a-f]{13})-([0-9a-f]{16})$")
@@ -253,6 +253,68 @@ def normalize_item_tags(tags: Any) -> List[str]:
             )
         clean.add(tag)
     return sorted(clean)
+
+
+# ---------------------------------------------------------------------------
+# Process compilations (process-compiler plan C1/C2): a stated goal becomes
+# governed infrastructure through a reviewed Architecture Card. The
+# compilation is its own event-sourced aggregate — cards, versions, the
+# approval decision, materialization receipts, and drill results all chain
+# under the compilation's own id (the items/dispatch pattern), so one
+# event_tail(compilation_id) is the full audit trail and replay == live.
+# ---------------------------------------------------------------------------
+
+class CompilationStatus:
+    COMPILED = "compiled"          # a card version awaits human review
+    APPROVED = "approved"          # origin-bound user approval recorded
+    REJECTED = "rejected"          # user rejected; revise births a new card
+    MATERIALIZED = "materialized"  # every declared asset provisioned
+    VERIFIED = "verified"          # the generated acceptance drill passed
+    OPERATING = "operating"        # supervising mission created (dry-run)
+    ROLLED_BACK = "rolled_back"    # terminal: materialized assets reverted
+
+    ALL = frozenset({
+        COMPILED, APPROVED, REJECTED, MATERIALIZED, VERIFIED, OPERATING,
+        ROLLED_BACK,
+    })
+    TERMINAL = frozenset({ROLLED_BACK})
+
+
+COMPILATION_TRANSITIONS = {
+    CompilationStatus.COMPILED: frozenset({
+        CompilationStatus.APPROVED, CompilationStatus.REJECTED,
+    }),
+    CompilationStatus.APPROVED: frozenset({
+        # revise invalidates the approval (back to compiled); a partial
+        # materialization may be rolled back before ever completing.
+        CompilationStatus.COMPILED, CompilationStatus.MATERIALIZED,
+        CompilationStatus.ROLLED_BACK,
+    }),
+    CompilationStatus.REJECTED: frozenset({CompilationStatus.COMPILED}),
+    CompilationStatus.MATERIALIZED: frozenset({
+        CompilationStatus.VERIFIED, CompilationStatus.ROLLED_BACK,
+    }),
+    CompilationStatus.VERIFIED: frozenset({
+        CompilationStatus.OPERATING, CompilationStatus.ROLLED_BACK,
+    }),
+    CompilationStatus.OPERATING: frozenset({
+        CompilationStatus.ROLLED_BACK,
+    }),
+    CompilationStatus.ROLLED_BACK: frozenset(),
+}
+
+
+def check_compilation_transition(current: str, target: str) -> None:
+    if (current not in CompilationStatus.ALL
+            or target not in CompilationStatus.ALL):
+        raise KernelError(
+            f"unknown compilation status in transition {current!r} -> "
+            f"{target!r}"
+        )
+    if target not in COMPILATION_TRANSITIONS[current]:
+        raise KernelError(
+            f"illegal compilation transition {current!r} -> {target!r}"
+        )
 
 
 TASK_TRANSITIONS = {
@@ -575,6 +637,23 @@ EVENT_KINDS = frozenset({
     "item_archived",
     "item_escalated",
     "item_mission_synced",
+    # Process compilations (process-compiler plan C1/C2). Compilation
+    # events chain under the compilation's own id; every projected column
+    # of the compilations tables is written only through these events.
+    "compilation_created",
+    "compilation_card_recorded",
+    "compilation_decided",
+    "compilation_transitioned",
+    "compilation_materialization_recorded",
+    "compilation_drill_recorded",
+})
+
+#: The compilation event family (used by surfaces that enumerate or
+#: exclude aggregate families, mirroring ITEM_EVENT_KINDS).
+COMPILATION_EVENT_KINDS = frozenset({
+    "compilation_created", "compilation_card_recorded",
+    "compilation_decided", "compilation_transitioned",
+    "compilation_materialization_recorded", "compilation_drill_recorded",
 })
 
 #: The personal-items event family. Memory consolidation and every other

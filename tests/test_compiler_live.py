@@ -39,29 +39,38 @@ class TestCompilerLiveProof(unittest.TestCase):
         self.packs_dir = root / "packs"
         self.prefix = f"conch-compile-live-{live.unique_suffix()}"
 
-    def live_card(self):
-        """The candidate card, uniquely prefixed and self-contained
-        (its own collection; synthetic drill rows only)."""
+    def live_card(self, discovery):
+        """The candidate card, uniquely prefixed, reusing a discovered
+        ledger collection (the plan's candidate reuses the existing
+        collection; synthetic drill rows keep the drill account-free)."""
         raw = copy.deepcopy(candidate_card())
         text = json.dumps(raw)
         raw = json.loads(text.replace("conch-compile", self.prefix))
-        # Self-contained: create a disposable ledger collection instead
-        # of depending on org state.
-        ledger = f"{self.prefix}-ledger"
-        raw["assets"]["reuse"] = []
-        raw["assets"]["create"]["collections"] = [{
-            "identity": ledger, "name": ledger,
-            "description": "disposable compiled-process ledger",
+        collections = discovery.get("collections") or []
+        ledger = next(
+            (row for row in collections
+             if row.get("name") == "together-funding-requests"),
+            collections[0] if collections else None,
+        )
+        if ledger is None:
+            raise unittest.SkipTest(
+                "the live org has no collections to reuse"
+            )
+        raw["assets"]["reuse"] = [{
+            "kind": "collection", "id": ledger["id"],
+            "name": ledger["name"],
+            "reason": "the ledger the report summarizes",
         }]
+        raw["assets"]["create"]["collections"] = []
         stage = raw["assets"]["create"]["workflows"][0]["stages"][1]
         stage["system_prompt"] = (
             "You summarize funding-ledger activity. Your input is either "
             "'today' or a JSON array of synthetic ledger rows. When it "
             "parses as a JSON array, summarize exactly those rows and "
             "nothing else (do not call tools). Otherwise search "
-            f"collection $collection:{ledger} for today's events. Start "
-            "your report with the exact line FUNDING LEDGER DAILY REPORT "
-            "then one line per event."
+            f"collection $collection:{ledger['id']} for today's events. "
+            "Start your report with the exact line FUNDING LEDGER DAILY "
+            "REPORT then one line per event."
         )
         return raw
 
@@ -81,7 +90,7 @@ class TestCompilerLiveProof(unittest.TestCase):
             "live discovery must include the node catalog",
         )
         card = normalize_card(
-            self.live_card(), discovery, prefix=self.prefix,
+            self.live_card(discovery), discovery, prefix=self.prefix,
         )
         compilation = self.store.create_compilation(card, actor="live")
         cid = compilation["compilation_id"]

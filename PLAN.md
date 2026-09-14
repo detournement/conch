@@ -510,6 +510,46 @@ multi-field workflows: text-input request nodes now resolve, ambiguity
 refuses with the canonical keys named). 72 new tests (1,714 total on
 Python 3.9 and 3.14, ruff clean).
 
+**ProcessCompiler C1+C2 (September 2026): landed.** A stated goal becomes
+governed, operating infrastructure through a reviewed compilation step
+(`/compile`, process-compiler plan; C3 — mission-proposal door,
+recompile-diff UX, auto-classes — deliberately not started). C1: the
+versioned Architecture Card (`conch.architecture_card.v1`,
+`conch/capitol/compiler/card.py`) with fail-closed validation,
+code-enforced reuse-first, synthetic-only drill fixtures, secretguard,
+deterministic uuid5 asset identities, and a generated
+`conch.flow_pack.v1` manifest that must pass the pack loader; the bounded
+compilation session (capitol + pack-author skills loaded,
+`capitol_control` read/discovery only, the `compiler_workspace` emit tool
+returning validation failures to the model, mission-session budgets); the
+`compilations` kernel aggregate (events chain under the compilation's own
+id: cards, versions, the origin-bound local-only approval pinning the
+card digest, materialization receipts, drill results; replay == live);
+and the `/compile` family (compile/list/show[--diff]/approve/reject/
+revise/status; interactive-only — every non-local origin is refused,
+which also forecloses self-approval). C2: materialization drives
+`CapitolAdmin` in the card's declared order with per-step
+`compile:{id}:{step}` idempotency keys (re-materializing replays;
+partial failure records receipts and offers `/compile rollback`, which
+reverts in reverse via the recorded rollback refs and never deletes
+adopted assets), workflow payloads generated deterministically from the
+approved stages against the live node catalog
+(`conch/capitol/compiler/graph.py`, the together-funding uuid5 pattern
+generalized), the generated pack + drill fixtures installed into the
+packs dir, and the validation gate (fail-closed pack load → the new
+`workflow_drill` acceptance kind, shared with `/capitol pack verify` →
+dry-run supervising mission) advancing
+compiled→materialized→verified→operating. Safety invariants tested:
+materialization refuses without `capitol_admin`, non-local base URLs
+refused (v1), approval origin-bound and local-only, fixtures never
+reference real accounts, generated packs load fail-closed, cards are
+credential-guarded whole. Live proof on the local stack: the plan's
+candidate ("weekday 5pm — summarize the day's funding-ledger activity
+into a short report and notify me") compiled, approved, materialized
+with `conch-compile-*` assets, drilled green, and left operating with
+the schedule DISABLED and the mission dry-run; the opt-in
+`tests/test_compiler_live.py` additionally proves the rollback arc.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

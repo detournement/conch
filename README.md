@@ -285,6 +285,40 @@ Capitol stack behind `CONCH_CAPITOL_LIVE=1` (they skip cleanly when the stack,
 CLI, or token is absent); see `tests/test_capitol_live.py` and
 `tests/test_capitol_crossclient.py`.
 
+**The ProcessCompiler (`/compile`).** A stated goal becomes governed,
+operating infrastructure through a reviewed compilation step. `/compile
+"<goal>"` runs a bounded design session (the capitol + pack-author skills
+loaded, `capitol_control` restricted to read/discovery — the session designs,
+it never provisions) that discovers what already exists and emits a versioned
+**Architecture Card**: goal and success criteria, process narrative,
+reuse-vs-create asset lists (created workflows as declarative stage graphs
+with deterministic uuid5 identities), the generated flow-pack manifest, caps
+and approval classes, HITL points, eval criteria, synthetic drill fixtures,
+rollout rung (shadow by default), rollback plan, estimates, and open
+questions. Reuse-first is enforced in code — a card that recreates an
+existing workflow/collection/agent is rejected at validation naming the
+existing id — and validation is fail-closed everywhere (unknown fields, bad
+stages, non-catalog tools, real-looking accounts in fixtures, credential
+bytes anywhere). Cards are kernel events (the `compilations` aggregate:
+replay == live, versions diff cleanly, recompilation is a new version).
+Review with `/compile show|approve|reject|revise`: approval is an
+origin-bound, local-only kernel record pinning the exact card digest — the
+session can never approve its own card, and a revision voids any approval.
+`/compile materialize` then drives `CapitolAdmin` in the card's declared
+order (collections → workflows → agent + exact allowlist → schedules),
+writes the generated pack + drill fixtures, and is idempotent end-to-end
+(re-materializing replays receipts; partial failure stops with everything
+recorded and `/compile rollback <id>` reverts it all via the recorded
+rollback refs, never deleting adopted pre-existing assets). The validation
+gate loads the pack fail-closed, runs the generated acceptance drill
+(`workflow_drill`, also runnable via `/capitol pack verify`), and only on a
+pass creates the dry-run supervising mission — status advances
+compiled→materialized→verified→operating, one kernel event each. v1 is
+interactive-only and materializes on the local stack only; materialization
+authority is exactly your `capitol_admin` authority. The live end-to-end
+proof (materialize → drill → mission → rollback) runs behind
+`CONCH_CAPITOL_LIVE=1` in `tests/test_compiler_live.py`.
+
 ### Budget-aware turns
 Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
 

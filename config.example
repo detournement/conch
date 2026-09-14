@@ -307,6 +307,19 @@ api_key_env=ANTHROPIC_API_KEY
 #capitol_platform_url=http://localhost:8811
 #capitol_admin_token_env=CAPITOL_ADMIN_TOKEN
 
+# ProcessCompiler (/compile): a stated goal becomes a reviewed Architecture
+# Card and, on your approval, a materialized + drilled + supervised process.
+# v1 is interactive-only and materializes on the local stack only;
+# materialization additionally requires capitol_admin=true. Created assets
+# carry the compile_asset_prefix (disposable, rollback-safe); session bounds
+# mirror mission sessions; compile_drill_timeout bounds each acceptance-
+# drill run's wait.
+#compile_asset_prefix=conch-compile
+#compile_wall_seconds=600
+#compile_max_tool_rounds=15
+#compile_token_budget=200000
+#compile_drill_timeout=600
+
 # eBay pilot (/ebay <photo...> [-- notes]): sandbox photo→listing driver.
 # Identity + seller prerequisites for ebay.draft_request.v1 (ask the org
 # operator; the sandbox seller-policy IDs come from the provisioned org).

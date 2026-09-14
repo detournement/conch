@@ -24,6 +24,39 @@ def _index_path() -> Path:
     return _state_dir() / "index.json"
 
 
+def _atomic_write_text(path: Path, text: str):
+    """Crash-safe file replacement: write to a unique tmp file in the same
+    directory, fsync it, then ``os.replace`` over the target.
+
+    The old ``.tmp`` + ``Path.replace`` pattern had two failure modes that
+    both produced the 2db46ee5 incident shape (valid JSON prefix followed
+    by stale bytes): the tmp name was shared, so a second writer (shell +
+    edge daemon) could tear a write in progress, and the data was never
+    fsynced, so a power cut could publish the rename before the content
+    reached disk. The unique name plus fsync-before-replace closes both;
+    the target file is either the complete old content or the complete new
+    content, never a mix. The target's permission bits are preserved.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            tmp.chmod(path.stat().st_mode & 0o7777)
+        except OSError:
+            pass  # new file: keep the umask default
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _slugify_title(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
     cleaned = cleaned[:60] if cleaned else "New conversation"
@@ -67,10 +100,7 @@ class Conversation:
     def save(self):
         self.updated_at = datetime.now().isoformat()
         self.title = self.title or _extract_title(self.messages)
-        _state_dir().mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2))
-        tmp.replace(self.path)
+        _atomic_write_text(self.path, json.dumps(self.to_dict(), indent=2))
 
     @classmethod
     def load(cls, path: Path) -> "Conversation":
@@ -233,10 +263,7 @@ class ConversationManager:
             return {"schema_version": SCHEMA_VERSION, "conversations": []}
 
     def _save_index(self):
-        _state_dir().mkdir(parents=True, exist_ok=True)
-        tmp = _index_path().with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._index, indent=2))
-        tmp.replace(_index_path())
+        _atomic_write_text(_index_path(), json.dumps(self._index, indent=2))
 
     def _upsert_index_entry(self, conv: Conversation):
         entry = {

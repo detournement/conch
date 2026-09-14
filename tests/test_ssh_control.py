@@ -224,6 +224,12 @@ class _FakeManager:
             raise SSHValidationError("no active SSH connection")
         return self.target
 
+    def is_known(self, target):
+        return bool(self.remembered)
+
+    def was_lost(self, target):
+        return False
+
     def is_connected(self, target):
         return self.connected
 
@@ -403,6 +409,283 @@ class TestSSHRemoteClient(unittest.TestCase):
         )
         self.assertIn("declined", result["content"][0]["text"].lower())
         self.assertEqual(manager.disconnected, [])
+
+
+_FAKE_SSH = r'''#!/usr/bin/env python3
+"""Fake OpenSSH client: a real Unix-socket master daemon per ControlPath."""
+import os
+import socket
+import sys
+
+args = sys.argv[1:]
+
+
+def opt(flag):
+    try:
+        return args[args.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+sock_path = opt("-S")
+op = opt("-O")
+user = opt("-l") or ""
+
+
+def ping(payload):
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(sock_path)
+        s.sendall(payload)
+        return s.recv(1) == b"k"
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+if op == "check":
+    sys.exit(0 if ping(b"chck") else 255)
+if op == "exit":
+    sys.exit(0 if ping(b"exit") else 255)
+if "-M" in args:
+    # Emulate `ssh -M -N -f`: daemonize a master that owns the socket.
+    ready_r, ready_w = os.pipe()
+    pid = os.fork()
+    if pid:
+        os.close(ready_w)
+        os.read(ready_r, 1)
+        os._exit(0)
+    os.close(ready_r)
+    os.setsid()
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(sock_path)
+    server.listen(8)
+    with open(sock_path + ".pid", "w") as fh:
+        fh.write(str(os.getpid()))
+    os.write(ready_w, b"r")
+    os.close(ready_w)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    while True:
+        conn, _ = server.accept()
+        data = conn.recv(4)
+        conn.sendall(b"k")
+        conn.close()
+        if data == b"exit":
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+            os._exit(0)
+
+# Multiplexed exec: fails exactly like OpenSSH when the master is gone.
+if not ping(b"ping"):
+    sys.stderr.write("Control socket connect failed\n")
+    sys.exit(255)
+sep = args.index("--")
+host = args[sep + 1]
+command = args[sep + 2] if len(args) > sep + 2 else ""
+ident = (user + "@" if user else "") + host
+sys.stdout.write("REMOTE(%s):%s\n" % (ident, command))
+sys.exit(0)
+'''
+
+
+class _ExecutingRunner:
+    """Terminal-handoff stand-in that really executes the connect argv."""
+
+    def __init__(self):
+        self.policy = None
+        self.calls = []
+
+    def set_policy(self, policy):
+        self.policy = policy
+
+    def available(self):
+        return True
+
+    def run(self, argv, **_kwargs):
+        self.calls.append(list(argv))
+        proc = subprocess.run(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        return TerminalRunResult(approved=True, returncode=proc.returncode)
+
+
+class TestSSHUserSequenceRegression(unittest.TestCase):
+    """Reproduce the reported transcript against a fake ssh with real
+    sockets: connect(user@host) then exec(host-only) must succeed, and every
+    liveness claim must be backed by a real -O check."""
+
+    HOST = "192.0.2.152"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        fake_ssh = base / "bin" / "ssh"
+        fake_ssh.parent.mkdir()
+        fake_ssh.write_text(_FAKE_SSH)
+        fake_ssh.chmod(0o755)
+        patcher = patch.dict(
+            os.environ,
+            {"PATH": f"{fake_ssh.parent}{os.pathsep}{os.environ['PATH']}"},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.manager = SSHControlManager(runtime_dir=base / "run")
+        self.addCleanup(self.manager.close)
+        self.runner = _ExecutingRunner()
+        self.client = SSHRemoteClient(manager=self.manager, runner=self.runner)
+        self.answers = []
+        self.client.set_policy(
+            LocalShellPolicy(
+                interactive=True,
+                allow_auto_execute=True,
+                input_fn=lambda _prompt: (
+                    self.answers.pop(0) if self.answers else ""
+                ),
+                tty_check=lambda: True,
+            )
+        )
+        self.addCleanup(self._kill_masters)
+
+    def _kill_masters(self):
+        for pid_file in Path(self.tmp.name).rglob("*.pid"):
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (OSError, ValueError):
+                pass
+
+    def _call(self, arguments):
+        with patch("sys.stdout", io.StringIO()), patch(
+            "sys.stderr", io.StringIO()
+        ):
+            result = self.client.call_tool("ssh_remote", dict(arguments))
+        return result["content"][0]["text"]
+
+    def _connect(self, user="conchremote", host=None):
+        arguments = {"action": "connect", "host": host or self.HOST}
+        if user:
+            arguments["user"] = user
+        return self._call(arguments)
+
+    def _kill_master(self, identity_target):
+        path = self.manager.control_path(identity_target)
+        pid_file = Path(str(path) + ".pid")
+        os.kill(int(pid_file.read_text()), 9)
+
+    def test_user_transcript_connect_userhost_then_exec_hostonly(self):
+        text = self._connect()
+        self.assertIn(f"conchremote@{self.HOST} is active", text)
+        text = self._call(
+            {"action": "exec", "host": self.HOST, "command": "uname -a"}
+        )
+        self.assertNotIn("Error", text)
+        self.assertIn(f"REMOTE(conchremote@{self.HOST}):uname -a", text)
+        text = self._call({"action": "status", "host": self.HOST})
+        self.assertEqual(text, f"SSH conchremote@{self.HOST}: connected.")
+
+    def test_connect_accepts_user_at_host_in_host_field(self):
+        text = self._connect(user="", host=f"conchremote@{self.HOST}")
+        self.assertIn(f"conchremote@{self.HOST} is active", text)
+        text = self._call(
+            {"action": "exec", "host": self.HOST, "command": "id"}
+        )
+        self.assertIn(f"REMOTE(conchremote@{self.HOST}):id", text)
+
+    def test_second_connect_already_active_only_when_check_passes(self):
+        self._connect()
+        self.assertEqual(len(self.runner.calls), 1)
+        text = self._connect()
+        self.assertIn("already active", text)
+        self.assertEqual(len(self.runner.calls), 1)
+        target = SSHTarget(self.HOST, "conchremote")
+        self._kill_master(target)
+        text = self._connect()
+        self.assertNotIn("already active", text)
+        self.assertIn("is active", text)
+        self.assertEqual(len(self.runner.calls), 2)
+
+    def test_killed_master_reports_lost_and_prompts_reconnect(self):
+        self._connect()
+        target = SSHTarget(self.HOST, "conchremote")
+        socket_path = self.manager.control_path(target)
+        self._kill_master(target)
+        self.assertTrue(socket_path.exists())
+        text = self._call(
+            {"action": "exec", "host": self.HOST, "command": "id"}
+        )
+        self.assertIn("lost", text)
+        self.assertIn("reconnect", text)
+        self.assertFalse(socket_path.exists())
+        text = self._call({"action": "status", "host": self.HOST})
+        self.assertIn("lost", text)
+        self.assertIn("reconnect", text)
+
+    def test_two_users_on_one_host_is_ambiguous(self):
+        self._connect(user="alice")
+        self._connect(user="bob")
+        text = self._call(
+            {"action": "exec", "host": self.HOST, "command": "id"}
+        )
+        self.assertIn("multiple active SSH connections", text)
+        self.assertIn(f"alice@{self.HOST}", text)
+        self.assertIn(f"bob@{self.HOST}", text)
+        text = self._call(
+            {
+                "action": "exec",
+                "host": self.HOST,
+                "user": "alice",
+                "command": "id",
+            }
+        )
+        self.assertIn(f"REMOTE(alice@{self.HOST}):id", text)
+
+    def test_master_survives_handoff_pty_close(self):
+        """The persisted master must outlive the interactive handoff PTY.
+
+        OpenSSH's ``-f`` post-auth fork daemonizes (setsid), detaching the
+        master from the handoff terminal session; the fake ssh mirrors that.
+        Closing the PTY that hosted the bootstrap must not kill the master.
+        """
+        import pty as pty_module
+
+        target = SSHTarget(self.HOST, "conchremote")
+        argv = self.manager.connect_argv(target)
+        pid, pty_fd = pty_module.fork()
+        if pid == 0:
+            try:
+                os.execvp(argv[0], argv)
+            finally:
+                os._exit(127)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        os.close(pty_fd)
+        self.assertTrue(self.manager.is_connected(target))
+        self.assertEqual(
+            self._call({"action": "status", "host": self.HOST}),
+            f"SSH conchremote@{self.HOST}: connected.",
+        )
+
+    def test_disconnect_cleans_socket_and_registry(self):
+        self._connect()
+        target = SSHTarget(self.HOST, "conchremote")
+        socket_path = self.manager.control_path(target)
+        self.assertTrue(socket_path.exists())
+        self.answers.append("y")
+        text = self._call({"action": "disconnect", "host": self.HOST})
+        self.assertIn("closed", text)
+        self.assertFalse(socket_path.exists())
+        self.assertFalse(self.manager.is_known(target))
+        text = self._call({"action": "status"})
+        self.assertEqual(text, "No active SSH control connection.")
 
 
 class TestRemoteChannelBoundary(unittest.TestCase):

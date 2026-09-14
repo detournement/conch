@@ -1071,6 +1071,37 @@ class SSHRemoteClient(LocalShellClient):
             port=arguments.get("port"),
         )
 
+    def _require_connected(self, target):
+        """None when a live master answers ``-O check``; honest error text
+        otherwise. Reads registration before the probe purges stale state."""
+
+        was_known = self.manager.is_known(target)
+        if self.manager.is_connected(target):
+            return None
+        if was_known or self.manager.was_lost(target):
+            # Registered but the -O check probe failed: the master died
+            # (or its ControlPersist window elapsed) since we last spoke.
+            return self._text(
+                f"Error: SSH control connection to {target.identity} was "
+                "lost (the control master no longer responds); reconnect "
+                "interactively."
+            )
+        return self._text(
+            f"Error: no active SSH control connection to {target.identity}; "
+            "connect interactively first."
+        )
+
+    def _status_line(self, target) -> str:
+        was_known = self.manager.is_known(target)
+        if self.manager.is_connected(target):
+            return f"SSH {target.identity}: connected."
+        if was_known or self.manager.was_lost(target):
+            return (
+                f"SSH {target.identity}: connection lost (the control "
+                "master no longer responds) — reconnect interactively."
+            )
+        return f"SSH {target.identity}: not connected."
+
     def _status(self, arguments: dict) -> dict:
         from .ssh_control import SSHValidationError
 
@@ -1079,11 +1110,7 @@ class SSHRemoteClient(LocalShellClient):
                 target = self._target(arguments)
             except SSHValidationError as exc:
                 return self._text(f"Error: {exc}")
-            connected = self.manager.is_connected(target)
-            return self._text(
-                f"SSH {target.identity}: "
-                f"{'connected' if connected else 'not connected'}."
-            )
+            return self._text(self._status_line(target))
         try:
             target = self.manager.resolve()
         except SSHValidationError:
@@ -1094,23 +1121,19 @@ class SSHRemoteClient(LocalShellClient):
                 "Active SSH connections: "
                 + ", ".join(target.identity for target in targets)
             )
-        connected = self.manager.is_connected(target)
-        return self._text(
-            f"SSH {target.identity}: "
-            f"{'connected' if connected else 'not connected'}."
-        )
+        return self._text(self._status_line(target))
 
     def _connect(self, arguments: dict) -> dict:
-        from .ssh_control import SSHTarget, SSHValidationError
+        from .ssh_control import SSHValidationError, merge_ssh_target
 
         host = str(arguments.get("host", "") or "")
         if not host:
             return self._text("Error: host is required for SSH connect.")
         try:
-            target = SSHTarget(
-                host=host,
-                user=str(arguments.get("user", "") or ""),
-                port=arguments.get("port"),
+            target = merge_ssh_target(
+                host,
+                str(arguments.get("user", "") or ""),
+                arguments.get("port"),
             )
             timeout = int(arguments.get("timeout", 0) or 0)
         except (SSHValidationError, TypeError, ValueError) as exc:
@@ -1198,11 +1221,9 @@ class SSHRemoteClient(LocalShellClient):
             timeout = int(arguments.get("timeout", 60) or 60)
         except (SSHValidationError, TypeError, ValueError) as exc:
             return self._text(f"Error: {exc}")
-        if not self.manager.is_connected(target):
-            return self._text(
-                f"Error: no active SSH control connection to {target.identity}; "
-                "connect interactively first."
-            )
+        failure = self._require_connected(target)
+        if failure is not None:
+            return failure
         print(
             f"\n  \033[1;33m⚠ Run over SSH ({target.identity}):\033[0m "
             f"\033[1m{self._terminal._display(command, limit=0)}\033[0m",
@@ -1226,11 +1247,9 @@ class SSHRemoteClient(LocalShellClient):
             timeout = int(arguments.get("timeout", 0) or 0)
         except (SSHValidationError, TypeError, ValueError) as exc:
             return self._text(f"Error: {exc}")
-        if not self.manager.is_connected(target):
-            return self._text(
-                f"Error: no active SSH control connection to {target.identity}; "
-                "connect interactively first."
-            )
+        failure = self._require_connected(target)
+        if failure is not None:
+            return failure
         description = (
             f"Open interactive SSH shell on {target.identity}?"
             if not command

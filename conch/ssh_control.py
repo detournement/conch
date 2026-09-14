@@ -118,6 +118,21 @@ def parse_ssh_target(value: str, port=None) -> SSHTarget:
     )
 
 
+def merge_ssh_target(host: str, user: str = "", port=None) -> SSHTarget:
+    """Build a target accepting ``user@host`` in the host field."""
+
+    parsed = parse_ssh_target(host, port)
+    user = validate_ssh_user(user)
+    if parsed.user and user and parsed.user != user:
+        raise SSHValidationError(
+            f"conflicting SSH users: '{parsed.user}' in host "
+            f"and '{user}' in user"
+        )
+    return SSHTarget(
+        host=parsed.host, user=parsed.user or user, port=parsed.port
+    )
+
+
 @dataclass(frozen=True)
 class SSHTarget:
     host: str
@@ -166,6 +181,7 @@ class SSHControlManager:
         self._control_paths: dict[str, Path] = {}
         self._owned_targets: dict[str, SSHTarget] = {}
         self._targets: dict[str, SSHTarget] = {}
+        self._lost_targets: dict[str, SSHTarget] = {}
         self._active_identity = ""
         self._closed = False
         atexit.register(self.cleanup_all)
@@ -291,6 +307,7 @@ class SSHControlManager:
 
     def remember(self, target: SSHTarget) -> None:
         self._targets[target.identity] = target
+        self._lost_targets.pop(target.identity, None)
         self._active_identity = target.identity
 
     def resolve(
@@ -301,7 +318,10 @@ class SSHControlManager:
         port=None,
     ) -> SSHTarget:
         if host:
-            return SSHTarget(host=host, user=user, port=port)
+            target = merge_ssh_target(host, user, port)
+            if target.user:
+                return target
+            return self._resolve_host_only(target)
         if user or port not in (None, ""):
             raise SSHValidationError("host is required with user or port")
         target = self._targets.get(self._active_identity)
@@ -310,6 +330,51 @@ class SSHControlManager:
                 "no active SSH connection; connect with user and host first"
             )
         return target
+
+    def _resolve_host_only(self, wanted: SSHTarget) -> SSHTarget:
+        """Match a host-only request to the unique live connection there.
+
+        Connections register under their full identity (``user@host[:port]``),
+        so a bare host must not be keyed literally: probe the registered
+        targets for this host and adopt the single live one regardless of
+        user. Two live users on one host is ambiguous and must be spelled out.
+        """
+
+        candidates: dict[str, SSHTarget] = {}
+        for registry in (self._owned_targets, self._targets):
+            for target in registry.values():
+                if target.host != wanted.host:
+                    continue
+                if wanted.port is not None and target.port != wanted.port:
+                    continue
+                candidates[target.identity] = target
+        active = [
+            target
+            for target in candidates.values()
+            if self.is_connected(target)
+        ]
+        if len(active) == 1:
+            return active[0]
+        if len(active) > 1:
+            identities = ", ".join(
+                sorted(target.identity for target in active)
+            )
+            raise SSHValidationError(
+                f"multiple active SSH connections match host "
+                f"{wanted.identity}: {identities}; specify the user"
+            )
+        if not candidates:
+            # Nothing registered any more; a recently lost master for this
+            # host still resolves so callers keep reporting the loss
+            # honestly instead of inventing a never-connected identity.
+            for target in self._lost_targets.values():
+                if target.host == wanted.host and (
+                    wanted.port is None or target.port == wanted.port
+                ):
+                    candidates[target.identity] = target
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        return wanted
 
     def _socket_is_owned(self, path: Path) -> bool:
         try:
@@ -320,11 +385,42 @@ class SSHControlManager:
             return False
         return not hasattr(os, "getuid") or info.st_uid == os.getuid()
 
+    def is_known(self, target: SSHTarget) -> bool:
+        """Was this exact identity registered (owned or remembered)?"""
+
+        return (
+            target.identity in self._owned_targets
+            or target.identity in self._targets
+        )
+
+    def was_lost(self, target: SSHTarget) -> bool:
+        """Did a previously active master for this identity stop answering?"""
+
+        return target.identity in self._lost_targets
+
+    def _purge_stale(self, target: SSHTarget) -> None:
+        """Forget a dead master so a reconnect can reserve a fresh path."""
+
+        self._lost_targets[target.identity] = target
+        self._remove_owned_socket(target)
+        self._owned_targets.pop(target.identity, None)
+        self._control_paths.pop(target.identity, None)
+        self._targets.pop(target.identity, None)
+        if self._active_identity == target.identity:
+            self._active_identity = next(iter(self._targets), "")
+
     def is_connected(self, target: SSHTarget) -> bool:
+        """True only when the control socket answers a real ``-O check``.
+
+        A dead or missing master is purged from the registry so its state is
+        never reported as active again and a reconnect starts clean.
+        """
+
         if target.identity not in self._owned_targets:
             return False
         path = self.control_path(target)
         if not self._socket_is_owned(path):
+            self._purge_stale(target)
             return False
         try:
             proc = subprocess.run(
@@ -336,10 +432,14 @@ class SSHControlManager:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
+            # Transient local failure: stay honest ("not connected") but do
+            # not destroy state that may still be alive.
             return False
         connected = proc.returncode == 0
         if connected:
             self.remember(target)
+        else:
+            self._purge_stale(target)
         return connected
 
     def connected_targets(self) -> list[SSHTarget]:
@@ -382,6 +482,7 @@ class SSHControlManager:
         self._owned_targets.pop(target.identity, None)
         self._control_paths.pop(target.identity, None)
         self._targets.pop(target.identity, None)
+        self._lost_targets.pop(target.identity, None)
         if self._active_identity == target.identity:
             self._active_identity = next(iter(self._targets), "")
         return success

@@ -1171,3 +1171,17 @@ plus `deploy/phone-bootstrap.sh` (registers the two users, mints
 conch's token to a 0600 env file by reference, creates the DM room,
 prints Element + ntfy app steps). README "Phone: sovereign setup"
 walks the whole thing. The worktree/branch map is unchanged.
+
+Live drill evidence (September 2026, isolated compose project
+`conch-matrix-test` + isolated-XDG daemon; the live daemon untouched;
+stack torn down after): a real Conduit + ntfy pair was bootstrapped
+with three users. The phone-side user's message got a full daemon
+answer in the room; a file-write request produced
+"Approval needed [#1]" in the Matrix room AND a priority-4 ntfy push
+(title "Conch: approval needed", matrix.to click deep-link, verified
+over ntfy's subscribe API); `approve 1` from a room member who was NOT
+allowlisted was dropped with no execution and no reply; `approve 1`
+from the allowlisted user ran the exact pinned command and posted the
+result; the /sync since-cursor survived a daemon restart (epoch 1→2)
+with no message lost or double-answered, every pass under the
+channel_intake lease.

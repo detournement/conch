@@ -33,6 +33,8 @@ services:
     ports:
       - "${PHONE_BIND_ADDR:-127.0.0.1}:${PHONE_MATRIX_PORT:-6167}:6167"
     environment:
+      # Empty CONDUIT_CONFIG = configure entirely from environment.
+      CONDUIT_CONFIG: ""
       CONDUIT_SERVER_NAME: "${PHONE_SERVER_NAME:-conch.local}"
       CONDUIT_ADDRESS: "0.0.0.0"
       CONDUIT_PORT: "6167"

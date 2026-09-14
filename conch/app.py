@@ -390,7 +390,40 @@ class TypeaheadBuffer:
                 break
 
 
-def chat_loop():
+def _startup_conversation(conv_mgr, model_name, provider, system_prompt,
+                          fresh=False):
+    """Pick the conversation the shell starts in: the most recent one by
+    default, a brand-new one when --new was passed or nothing usable
+    exists (no history, or every stored file was corrupt and quarantined).
+    Returns (conversation, messages) with messages ready for the loop."""
+    current_conv = None if fresh else conv_mgr.get_most_recent()
+    if current_conv and current_conv.messages:
+        messages = list(current_conv.messages)
+        # Only strip textual tool-call artifacts (model-emitted junk);
+        # preserve real tool messages, tool_calls, and list content so
+        # they remain searchable on disk.
+        _clean = []
+        for _m in messages:
+            _content = _m.get("content", "")
+            if isinstance(_content, str):
+                _s = _content.strip()
+                if _s.startswith(("[Called tool:", "<tool_called", "[Tool result", "<tool_result")):
+                    continue
+            _clean.append(_m)
+        messages = _clean
+        current_conv.messages = messages
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_prompt
+        if provider == "anthropic":
+            sanitize_anthropic_messages(messages)
+        return current_conv, messages
+    current_conv = conv_mgr.create(model=model_name, provider=provider)
+    messages = [{"role": "system", "content": system_prompt}]
+    current_conv.messages = messages
+    return current_conv, messages
+
+
+def chat_loop(new_conversation=False):
     # Startup wiring lives in conch.bootstrap so headless modes can reuse it;
     # this function owns only the interactive composition (warnings printed
     # to stderr, startup failures become process exits).
@@ -461,30 +494,9 @@ def chat_loop():
     session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
 
     conv_mgr = ConversationManager()
-    current_conv = conv_mgr.get_most_recent()
-    if current_conv and current_conv.messages:
-        messages = list(current_conv.messages)
-        # Only strip textual tool-call artifacts (model-emitted junk);
-        # preserve real tool messages, tool_calls, and list content so
-        # they remain searchable on disk.
-        _clean = []
-        for _m in messages:
-            _content = _m.get("content", "")
-            if isinstance(_content, str):
-                _s = _content.strip()
-                if _s.startswith(("[Called tool:", "<tool_called", "[Tool result", "<tool_result")):
-                    continue
-            _clean.append(_m)
-        messages = _clean
-        current_conv.messages = messages
-        if messages and messages[0].get("role") == "system":
-            messages[0]["content"] = system_prompt
-        if provider == "anthropic":
-            sanitize_anthropic_messages(messages)
-    else:
-        current_conv = conv_mgr.create(model=model_name, provider=provider)
-        messages = [{"role": "system", "content": system_prompt}]
-        current_conv.messages = messages
+    current_conv, messages = _startup_conversation(
+        conv_mgr, model_name, provider, system_prompt, fresh=new_conversation
+    )
 
     history_file = _history_path()
     os.makedirs(os.path.dirname(history_file), exist_ok=True)
@@ -1207,12 +1219,38 @@ def chat_loop():
         conv_mgr.close()
 
 
+_USAGE = """\
+usage: conch [--new] [prompt ...]
+
+The LLM-assisted shell. With no arguments, resumes your most recent
+conversation; any other arguments are sent as a one-shot prompt.
+
+options:
+  -h, --help     Show this help and exit.
+  -V, --version  Show the version and exit.
+  -n, --new      Start the interactive shell with a fresh conversation
+                 instead of resuming the most recent one (same as /new
+                 inside the shell)."""
+
+
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--version", "-V"):
         from . import __version__
         print(f"conch {__version__}")
         return
-    if len(sys.argv) > 1:
+    if argv and argv[0] in ("--help", "-h"):
+        print(_USAGE)
+        return
+    new_conversation = False
+    if argv and argv[0] in ("--new", "-n"):
+        new_conversation = True
+        argv = argv[1:]
+        if argv:
+            print("conch: --new starts the interactive shell and takes no "
+                  "prompt", file=sys.stderr)
+            sys.exit(2)
+    if argv:
         config = load_config()
         apply_agent_mode_from_config(config)
         try:
@@ -1238,7 +1276,7 @@ def main():
         system_prompt = _build_system_prompt(
             base_prompt, location, provider, model_name, config
         )
-        user_text = " ".join(sys.argv[1:])
+        user_text = " ".join(argv)
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)
         session = build_agent_session(
@@ -1263,4 +1301,4 @@ def main():
         finally:
             session.close()
     else:
-        chat_loop()
+        chat_loop(new_conversation=new_conversation)

@@ -433,6 +433,8 @@ After a failed turn, Conch pings the Ollama server before sending your next mess
 ### Conversations
 Full conversation persistence with `/new`, `/switch`, `/convos`, `/delete`, and `/clear`. Titles are set automatically from your first message.
 
+The shell resumes your most recent conversation on startup; `conch --new` (or `-n`) starts with a fresh one instead. Conversation files are written crash-safely (unique tmp file, fsync, atomic rename), and a corrupt file never blocks startup: the valid JSON prefix is salvaged when possible, otherwise the file is quarantined to `<name>.json.corrupt-<timestamp>` and the shell falls through to the next conversation.
+
 ### Tool profiles
 Switch between named tool presets: `/profile minimal` (core local-agent tools), `/profile dev` (GitHub, Jira), `/profile comms` (Gmail, Slack), `/profile full` (everything). Define your own in config with `profile_<name> = group1, group2`, or pick one per session with `tool_profile=<name>`. On Ollama and custom local endpoints the minimal profile is active by default — `/profile full` overrides. When more tools are available than the provider's cap, Conch sends a small always-on agent core plus the tools most relevant to the current message.
 

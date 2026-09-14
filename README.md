@@ -192,8 +192,8 @@ The `delegate_task` tool runs a self-contained subtask in a fresh context with a
 ### Skills
 Reusable procedures live in `~/.config/conch/skills/` — one markdown file per skill with frontmatter (`name`, `description`, `tools`, optional `model` and `rounds`) and a body of instructions. Where a custom slash command is a one-shot prompt template, a skill also scopes *tools* and *model*, and the model can invoke it itself: available skills are listed in the system prompt and loaded on demand with the `skill_manage` tool. Use `/skills` to list, `/skill <name> [task]` to run one on a task, or `delegate_task(skill=...)` for an isolated run. The **in-chat skill builder** closes the loop: ask conch to "turn what we just did into a skill" and it drafts the file (steps, commands, pitfalls, verification) and saves it via `skill_manage` — after showing you the file and getting a y/n confirmation, never silently.
 
-### Remote loop (Slack, SMS, email)
-With `remote_enabled=true`, conch messages you proactively and you can steer it from anywhere: scheduled task output is delivered over your `notify_channel`, and inbound replies are polled (Slack bot channel, Twilio SMS, IMAP inbox) and routed into conversations — a channel thread *is* a conch conversation, so replies resume it. Safety is enforced in code, not prompts: inbound senders must be on a per-channel allowlist (no allowlist = no inbound, fail closed); remote sessions are capped at **safe_auto** permissions regardless of local agent mode; and remote sessions never see self-management, delegation, direct-terminal, or SSH-control tools. Mutating local commands create short-lived approvals bound to the exact channel, sender, thread, command, and timeout. Approval execution reruns lifecycle hooks, and approvals cannot be replayed from another conversation. Channel approvals can never produce a local password/passphrase prompt.
+### Remote loop (Matrix, Slack, SMS, email)
+With `remote_enabled=true`, conch messages you proactively and you can steer it from anywhere: scheduled task output is delivered over your `notify_channel`, and inbound replies are polled (Matrix /sync long-poll, Slack bot channel, Twilio SMS, IMAP inbox) and routed into conversations — a channel thread *is* a conch conversation, so replies resume it. Safety is enforced in code, not prompts: inbound senders must be on a per-channel allowlist (no allowlist = no inbound, fail closed); remote sessions are capped at **safe_auto** permissions regardless of local agent mode; and remote sessions never see self-management, delegation, direct-terminal, or SSH-control tools. Mutating local commands create short-lived approvals bound to the exact channel, sender, thread, command, and timeout. Approval execution reruns lifecycle hooks, and approvals cannot be replayed from another conversation. Channel approvals can never produce a local password/passphrase prompt.
 
 Slack photo attachments are captured too: message `files[]` from allowlisted senders are downloaded with the bot bearer, validated by content (JPEG/PNG/GIF/WebP magic bytes, 12 MB cap, ≤12 per message), and quarantined under the XDG state dir before any flow may use them. This needs the **`files:read`** bot scope on the Slack app (plus the usual `chat:write` and `channels:history`/`groups:history`/`im:history` for the channel type) — add it to the app manifest and reinstall the app. Because Slack's `conversations.history` never returns replies inside threads, conch also remembers each thread it posts into and polls `conversations.replies` for those, so a thread can carry a full back-and-forth.
 
@@ -212,6 +212,87 @@ and wake it immediately (a parked `waiting_input`/`waiting_timer` mission
 runs its next session at the next scheduler slot — no timer wait). Local
 processes can post arbitrary events the same way through the control
 socket's `event.post` op.
+
+### Phone: sovereign setup (Matrix + ntfy)
+The sovereign phone-interaction layer: conversation over **Matrix** on
+your own homeserver, interrupts over **ntfy** on your own push server —
+no Slack workspace, no Twilio account, no third party in the message
+path. Both adapters are stdlib-only (no new Python dependencies).
+
+**What rides where.** The Matrix room carries the conversation: your
+messages get full (safe_auto-capped) agent turns, an Element thread maps
+to one conch conversation (`thread_id` = room + thread root), image
+attachments from allowlisted senders are quarantined with the same
+content-sniffing caps as Slack, and `approve N` / `deny N` consume
+origin-bound approvals — the origin is the exact (matrix, room/thread,
+sender) triple, so an approve from the wrong thread or the wrong user id
+does nothing. ntfy carries interrupts: with `notify_push = ntfy`,
+approval requests, mission digests, and milestones are POSTed to your
+topic as real push notifications (title/priority/tags), and tapping one
+deep-links into the Element room (`ntfy_click`, defaulting to a
+matrix.to link). Every remote-safety invariant is unchanged for Matrix
+sessions: fail-closed allowlists of **full** Matrix user IDs
+(`@user:server` — exact match, so lookalike homeservers fail), the
+safe_auto cap, excluded tools, bounded replies, and the daemon's
+`channel_intake` lease covering the Matrix poller.
+
+**Setup.** `deploy/docker-compose.phone.yml` runs
+[Conduit](https://conduit.rs) (a lightweight Matrix homeserver) and
+[ntfy](https://ntfy.sh), both pinned by image digest, with named
+volumes, federation off, and everything bound to 127.0.0.1 (set
+`PHONE_BIND_ADDR` to your tailnet IP to reach it from the phone — never
+a public port). Then `deploy/phone-bootstrap.sh` registers your user and
+the `conch` user, mints conch's access token into a 0600 env file **by
+reference** (`matrix_token_env` names the variable; the token never
+enters conch config or logs), creates the DM room, and prints the
+config block plus the Element and ntfy-app steps. Config surface:
+`matrix_homeserver`, `matrix_room`, `matrix_allowed_senders`,
+`matrix_token_env`, `matrix_user`, `matrix_sync_timeout_ms` (the /sync
+long-poll window — the server parameter *is* the poll loop's block), and
+`ntfy_url` / `ntfy_topic` / `ntfy_token_env` / `ntfy_priority` /
+`ntfy_click` with `notify_push = ntfy` routing.
+
+**E2EE, honestly.** The Python standard library cannot do Olm/Megolm,
+and conch does not pretend otherwise. v1 gives you two documented modes:
+
+- **Unencrypted room on your own homeserver (the simple default).** The
+  transport is TLS (or your tailnet); messages sit in plaintext only in
+  Conduit's database on your own box. That is sovereign — the exposure
+  is "someone who already owns your server can read your chat with the
+  agent that runs on the same server."
+- **pantalaimon (the E2EE path).** A self-hosted proxy daemon that
+  transparently handles encryption; conch just points
+  `matrix_homeserver` at it (default `http://localhost:8009`) and gains
+  E2EE rooms with zero code changes. Honesty required here too: the
+  upstream [matrix-org/pantalaimon](https://github.com/matrix-org/pantalaimon)
+  repository is **archived** (last release 0.10.5, September 2022, still
+  built on the deprecated libolm). It still works against current
+  client-server v3 endpoints and is still the standard answer for
+  E2EE-unaware bots, but treat it as frozen software: pin what you
+  deploy, and know that a community Rust successor (pantalaimon-rs,
+  vodozemac-based) exists but is very young. If E2EE-at-rest matters
+  more to you than software freshness, run pantalaimon; if you would
+  rather not depend on archived crypto code, use the unencrypted-room
+  mode knowingly.
+
+**Push metadata note.** Element's default push runs through Google/Apple
+gateways and Matrix's push gateway — metadata (not content) leaves your
+box. For fully sovereign notifications on Android, use Element with
+**UnifiedPush** and let your own ntfy server be the distributor; on iOS
+there is no UnifiedPush, which is exactly why conch's interrupt path
+posts to ntfy directly (the ntfy iOS app polls your server). You can
+also mute Element notifications entirely and rely on the ntfy topic.
+
+**Named upgrade paths (deliberately not built in v1):**
+- *One-tap approve.* ntfy action buttons could carry an "Approve"
+  HTTP action, but that needs an authenticated endpoint conch does not
+  have — the upgrade path is a **tailnet-only listener** (bound to the
+  tailscale interface, token-checked, origin-verified against the
+  pending approval), never a public endpoint. Until then, approving is
+  typing `approve N` in the Matrix room — one line, same phone.
+- *UnifiedPush for Element itself* (Android): point Element at your ntfy
+  server as the UnifiedPush distributor so even conversation
+  notifications never touch Google's gateway.
 
 ### Capitol as a governed execution fabric
 Conch drives
@@ -826,7 +907,7 @@ approvals, and the existing UI/storage/tooling surfaces.
 conch/
 ├── app.py           Main chat loop and CLI entrypoint
 ├── capitol/         Capitol A2A adapter, admin, supervision + use-case drivers
-├── channels.py      Slack/SMS/email gateways + sender allowlists
+├── channels.py      Matrix/Slack/SMS/email gateways + ntfy push + allowlists
 ├── cli.py           One-shot ask entrypoint
 ├── commands.py      Slash command handlers (+ user-defined commands)
 ├── composio.py      Composio OAuth integration

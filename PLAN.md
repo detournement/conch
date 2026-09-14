@@ -1136,3 +1136,38 @@ verification machine (it is covered by tests). Verified live:
 Gates all live in tests (`tests/test_kernel_*.py`, plus the kernel
 secret-canary sweep and the no-daemon compat gate): 1,183 tests green on
 Python 3.14 and 3.9 with ruff clean at every commit.
+
+## Sovereign phone layer — Matrix + ntfy (September 2026)
+
+The remote loop gained a transport the user owns end to end: a
+**MatrixChannel** (stdlib urllib against the client-server API of the
+user's OWN homeserver — /sync long-poll with a persisted since-cursor,
+m.room.message send with m.thread relations, thread_id = room + thread
+root, full-user-id fail-closed allowlists, media-API attachment capture
+into the existing quarantine with the Slack caps, access token strictly
+by env reference) and an **NtfyNotifier** (outbound-only POST to a
+self-hosted ntfy topic; `notify_push = ntfy` routes interrupts —
+approval requests, digests, mission milestones — as real push
+notifications with click deep-links into the Element room, while
+`notify_channel = matrix` keeps the conversation on Matrix).
+
+Invariants unchanged and tested per channel: Matrix sessions are remote
+sessions (safe_auto cap, REMOTE_EXCLUDED_TOOLS, origin-bound expiring
+approvals where origin = matrix + room/thread + sender, bounded
+replies, thread == conversation), and the daemon's `channel_intake`
+lease covers the Matrix poller exactly as the others.
+
+E2EE is handled honestly: stdlib cannot do Olm/Megolm, so v1 documents
+(a) unencrypted rooms on the user's own homeserver over TLS/tailnet as
+the simple sovereign default and (b) pantalaimon as the E2EE proxy path
+— noting plainly that upstream pantalaimon is archived (0.10.5, 2022,
+libolm). Named upgrade paths, deliberately not built: a one-tap approve
+button (needs an authenticated tailnet-only listener — never a public
+endpoint) and UnifiedPush for Element's own notifications on Android.
+
+Self-host deploy: `deploy/docker-compose.phone.yml` (Conduit + ntfy,
+digest-pinned, named volumes, federation off, 127.0.0.1/tailnet binds)
+plus `deploy/phone-bootstrap.sh` (registers the two users, mints
+conch's token to a 0600 env file by reference, creates the DM room,
+prints Element + ntfy app steps). README "Phone: sovereign setup"
+walks the whole thing. The worktree/branch map is unchanged.

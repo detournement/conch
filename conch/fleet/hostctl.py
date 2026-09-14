@@ -36,11 +36,13 @@ secret bytes never appear in arguments, outputs, receipts, or logs.
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -585,10 +587,103 @@ def cmd_artifact_has(host: Host, args) -> dict:
             "present": present}
 
 
+#: OpenSSH key type token in an allowed-signers entry (ssh-ed25519,
+#: rsa-sha2-512, ecdsa-sha2-nistp256, sk-ssh-ed25519@openssh.com, ...).
+_KEY_TYPE_RE = re.compile(r"^(?:sk-)?(?:ssh|ecdsa|rsa)-[A-Za-z0-9@.-]+$")
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def _bad_signer_line(number: int, line: str, why: str) -> HostctlError:
+    snippet = line if len(line) <= 100 else line[:97] + "..."
+    return HostctlError(
+        f"allowed_signers line {number} is not a valid OpenSSH"
+        f" allowed-signers entry ({why}): {snippet!r} — refusing the"
+        " whole install"
+    )
+
+
+def _validate_signer_line(line: str, number: int) -> None:
+    try:
+        tokens = shlex.split(line, comments=False, posix=True)
+    except ValueError as exc:
+        raise _bad_signer_line(number, line, f"unbalanced quoting: {exc}")
+    if len(tokens) < 3:
+        raise _bad_signer_line(
+            number, line,
+            "expected principal, optional options, key type, and key"
+        )
+    key_index = 0
+    for index, token in enumerate(tokens[1:], start=1):
+        if _KEY_TYPE_RE.fullmatch(token):
+            key_index = index
+            break
+        if token == "cert-authority" or "=" in token:
+            continue  # an options token (namespaces=..., valid-after=...)
+        raise _bad_signer_line(
+            number, line, f"unexpected token {token!r} before the key type"
+        )
+    if not key_index:
+        raise _bad_signer_line(number, line, "no OpenSSH key type found")
+    if key_index + 1 >= len(tokens):
+        raise _bad_signer_line(number, line, "missing base64 key material")
+    key_type, key_b64 = tokens[key_index], tokens[key_index + 1]
+    if not _BASE64_RE.fullmatch(key_b64) or len(key_b64) % 4:
+        raise _bad_signer_line(
+            number, line, "key material is not valid base64"
+        )
+    try:
+        blob = base64.b64decode(key_b64, validate=True)
+    except ValueError:
+        raise _bad_signer_line(
+            number, line, "key material is not valid base64"
+        )
+    # The wire blob embeds its own type (4-byte length + string); it must
+    # agree with the declared type token.
+    if len(blob) < 4:
+        raise _bad_signer_line(number, line, "key blob is truncated")
+    type_len = int.from_bytes(blob[:4], "big")
+    embedded = blob[4:4 + type_len].decode("utf-8", "replace")
+    if type_len <= 0 or embedded != key_type:
+        raise _bad_signer_line(
+            number, line,
+            f"key blob type {embedded!r} does not match declared type"
+            f" {key_type!r}"
+        )
+
+
+def validate_allowed_signers(payload: bytes) -> int:
+    """Fail closed unless every non-comment, non-blank line parses as an
+    OpenSSH allowed-signers entry (principal, optional options, key type,
+    base64 key — ssh-keygen(1) ALLOWED SIGNERS). Returns the entry count.
+
+    Field regression (2026-09-14): redirecting the artifact builder's
+    stdout used to prepend build-summary lines to the trust anchor;
+    installing such a file silently poisons every later deploy. The bad
+    line is named so the operator can see exactly what leaked in.
+    """
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HostctlError(f"allowed_signers is not valid UTF-8: {exc}")
+    entries = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        _validate_signer_line(stripped, number)
+        entries += 1
+    if not entries:
+        raise HostctlError(
+            "allowed_signers carries no signer entries — refusing"
+        )
+    return entries
+
+
 def cmd_trust_install(host: Host, args) -> dict:
     payload = sys.stdin.buffer.read(1024 * 1024)
     if not payload.strip():
         raise HostctlError("trust-install expects allowed-signers on stdin")
+    entries = validate_allowed_signers(payload)
     with _DeployLock(host):
         if args.op_id:
             existing = host.load_receipt(args.op_id)
@@ -599,6 +694,7 @@ def cmd_trust_install(host: Host, args) -> dict:
             "ok": True, "op": "trust-install",
             "sha256": hashlib.sha256(payload).hexdigest(),
             "path": str(host.allowed_signers),
+            "entries": entries,
         }
         if args.op_id:
             receipt = host.record_receipt(args.op_id, receipt)

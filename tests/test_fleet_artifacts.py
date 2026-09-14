@@ -248,5 +248,44 @@ class TestBuildScriptAndDockerfile(unittest.TestCase):
         self.assertNotIn("USER root", worker_block)
 
 
+@unittest.skipUnless(HAVE_SSH_KEYGEN, "ssh-keygen not on PATH")
+class TestBuildToolStdoutContract(ArtifactCase):
+    """Field regression (2026-09-14): the build summary went to stdout,
+    so the documented `--emit-allowed-signers > allowed_signers` yielded
+    five summary lines before the signer line — a malformed trust anchor.
+    stdout must carry the signer line and nothing else."""
+
+    def _run_tool(self, *extra):
+        key, pub = generate_signing_key(self.root / "keys")
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "build_worker_artifact.py"),
+             "--out", str(self.root / "dist" / "conch-worker.pyz"),
+             "--packages", "conch",
+             "--sign-key", str(key),
+             "--principal", "fleet@test", *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+            cwd=str(ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        return proc, allowed_signers_line("fleet@test", pub)
+
+    def test_emit_allowed_signers_stdout_is_exactly_the_signer_line(self):
+        proc, expected = self._run_tool("--emit-allowed-signers")
+        self.assertEqual(proc.stdout.decode(), expected)
+        # The human summary still exists — on stderr.
+        stderr = proc.stderr.decode()
+        for label in ("artifact:", "sha256:", "size:", "manifest:",
+                      "signature:"):
+            self.assertIn(label, stderr)
+
+    def test_allowed_signers_out_writes_the_anchor_file(self):
+        anchor = self.root / "dist" / "allowed_signers"
+        proc, expected = self._run_tool(
+            "--allowed-signers-out", str(anchor)
+        )
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(anchor.read_text(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

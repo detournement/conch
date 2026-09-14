@@ -687,6 +687,13 @@ python tools/build_worker_artifact.py --out dist/conch-worker.pyz \
     --principal fleet@you --emit-allowed-signers > allowed_signers
 ```
 
+The build summary prints to stderr, so the redirection yields exactly the
+one signer line; `--allowed-signers-out PATH` writes the trust anchor
+straight to a file instead. `trust-install` validates that every
+non-comment line of the incoming file parses as an OpenSSH
+allowed-signers entry and refuses the whole install (naming the bad
+line) otherwise.
+
 Lifecycle (enroll → probe → deploy → dispatch):
 
 1. **Enroll** a host interactively with strict host-key verification, then

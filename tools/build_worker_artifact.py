@@ -6,9 +6,13 @@ Usage:
         [--sign-key ~/.config/conch/fleet/signing-key] \
         [--principal fleet@example.org --emit-allowed-signers]
 
-Prints the artifact digest and the manifest path. Signing uses OpenSSH
-sshsig (ssh-keygen -Y sign); verification on hosts is mandatory and
-fail-closed — see conch/fleet/artifacts.py.
+The human-readable build summary goes to stderr so that stdout carries
+only machine output: with --emit-allowed-signers, redirecting stdout
+(`> allowed_signers`) yields exactly the one signer line and nothing
+else. --allowed-signers-out PATH writes the trust anchor to a file
+directly. Signing uses OpenSSH sshsig (ssh-keygen -Y sign);
+verification on hosts is mandatory and fail-closed — see
+conch/fleet/artifacts.py.
 """
 
 import argparse
@@ -48,30 +52,51 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--emit-allowed-signers", action="store_true",
-        help="Print the allowed-signers line for --sign-key's public key.",
+        help="Print the allowed-signers line for --sign-key's public key"
+             " to stdout (the only stdout output, so redirection yields a"
+             " valid allowed_signers file).",
+    )
+    parser.add_argument(
+        "--allowed-signers-out", default="", metavar="PATH",
+        help="Write the allowed-signers line for --sign-key's public key"
+             " to PATH.",
     )
     args = parser.parse_args(argv)
     out = Path(args.out)
     packages = tuple(
         name.strip() for name in args.packages.split(",") if name.strip()
     )
+    emit = sys.stderr  # summary is human-readable; stdout is machine output
     try:
         manifest = build_worker_artifact(out, packages=packages)
         manifest_path = write_manifest(out, manifest)
-        print(f"artifact: {out}")
-        print(f"sha256:   {manifest['artifact']['sha256']}")
-        print(f"size:     {manifest['artifact']['size']}")
-        print(f"manifest: {manifest_path}")
+        print(f"artifact: {out}", file=emit)
+        print(f"sha256:   {manifest['artifact']['sha256']}", file=emit)
+        print(f"size:     {manifest['artifact']['size']}", file=emit)
+        print(f"manifest: {manifest_path}", file=emit)
         if args.sign_key:
             sig = sign_manifest(manifest_path, args.sign_key)
-            print(f"signature: {sig}")
-            if args.emit_allowed_signers:
+            print(f"signature: {sig}", file=emit)
+            if args.emit_allowed_signers or args.allowed_signers_out:
                 if not args.principal:
-                    parser.error("--emit-allowed-signers needs --principal")
+                    parser.error(
+                        "--emit-allowed-signers/--allowed-signers-out"
+                        " need --principal"
+                    )
                 pub = Path(args.sign_key + ".pub")
-                sys.stdout.write(
-                    allowed_signers_line(args.principal, pub)
-                )
+                signer_line = allowed_signers_line(args.principal, pub)
+                if args.emit_allowed_signers:
+                    sys.stdout.write(signer_line)
+                if args.allowed_signers_out:
+                    anchor = Path(args.allowed_signers_out)
+                    anchor.parent.mkdir(parents=True, exist_ok=True)
+                    anchor.write_text(signer_line, encoding="utf-8")
+                    print(f"allowed_signers: {anchor}", file=emit)
+        elif args.emit_allowed_signers or args.allowed_signers_out:
+            parser.error(
+                "--emit-allowed-signers/--allowed-signers-out need"
+                " --sign-key"
+            )
     except ArtifactError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -694,6 +694,108 @@ class TestSystemdUnitText(SignedDeployCase):
         self.assertIn("process profile", result["error"])
 
 
+@unittest.skipUnless(HAVE_SSH_KEYGEN, "ssh-keygen not on PATH")
+class TestTrustInstallValidation(HostctlCase):
+    """trust-install fails closed on anything that is not a valid OpenSSH
+    allowed-signers file, naming the offending line — a malformed anchor
+    silently poisons every later deploy (field report 2026-09-14)."""
+
+    def setUp(self):
+        super().setUp()
+        _, self.pub = generate_signing_key(self.root / "keys")
+        self.good_line = allowed_signers_line("fleet@thom", self.pub)
+
+    def test_valid_anchor_installs_with_entry_count(self):
+        payload = (
+            "# trust anchor for the conch fleet\n"
+            "\n"
+            + self.good_line
+        ).encode()
+        result = hostctl_json(
+            ["trust-install", "--op-id", "t-valid"], self.home, payload
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["entries"], 1)
+        self.assertEqual(
+            (self.home / "keys" / "allowed_signers").read_bytes(), payload
+        )
+
+    def test_build_summary_prefix_refuses_naming_the_bad_line(self):
+        """The exact malformed file from the field report: five build
+        summary lines redirected into the anchor before the signer line."""
+        payload = (
+            "artifact: dist/conch-worker.pyz\n"
+            "sha256:   13b49c61bbd83259fcbae6bc3e4645d548362f1ea1aa2be9"
+            "92e235adcb3f688c\n"
+            "size:     1747825\n"
+            "manifest: dist/conch-worker.pyz.manifest.json\n"
+            "signature: dist/conch-worker.pyz.manifest.json.sig\n"
+            + self.good_line
+        ).encode()
+        result = hostctl_json(
+            ["trust-install", "--op-id", "t-summary"], self.home, payload,
+            expect_rc=1,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("line 1", result["error"])
+        self.assertIn("artifact: dist/conch-worker.pyz", result["error"])
+        self.assertFalse((self.home / "keys" / "allowed_signers").exists())
+
+    def test_garbage_key_material_refuses(self):
+        principal, options, key_type, _ = self.good_line.split(None, 3)
+        payload = (
+            f"{principal} {options} {key_type} not!base64!!\n".encode()
+        )
+        result = hostctl_json(
+            ["trust-install", "--op-id", "t-b64"], self.home, payload,
+            expect_rc=1,
+        )
+        self.assertIn("base64", result["error"])
+        self.assertFalse((self.home / "keys" / "allowed_signers").exists())
+
+    def test_key_blob_type_mismatch_refuses(self):
+        """A blob whose embedded type disagrees with the declared token
+        is not the key it claims to be."""
+        line = self.good_line.replace("ssh-ed25519", "ssh-rsa", 1)
+        self.assertNotEqual(line, self.good_line)
+        result = hostctl_json(
+            ["trust-install", "--op-id", "t-type"], self.home,
+            line.encode(), expect_rc=1,
+        )
+        self.assertIn("does not match declared type", result["error"])
+
+    def test_comments_only_anchor_refuses(self):
+        result = hostctl_json(
+            ["trust-install", "--op-id", "t-empty"], self.home,
+            b"# nothing here\n", expect_rc=1,
+        )
+        self.assertIn("no signer entries", result["error"])
+
+    def test_documented_build_command_output_installs_verbatim(self):
+        """README flow end to end: the build tool's stdout (redirected as
+        `> allowed_signers`) must be exactly what trust-install accepts."""
+        key_dir = self.root / "buildkeys"
+        key, _ = generate_signing_key(key_dir)
+        repo_root = Path(hostctl.__file__).resolve().parents[2]
+        proc = subprocess.run(
+            [sys.executable,
+             str(repo_root / "tools" / "build_worker_artifact.py"),
+             "--out", str(self.root / "dist" / "conch-worker.pyz"),
+             "--packages", "conch",
+             "--sign-key", str(key),
+             "--principal", "fleet@you", "--emit-allowed-signers"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+            cwd=str(repo_root),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        result = hostctl_json(
+            ["trust-install", "--op-id", "t-readme"], self.home,
+            proc.stdout,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["entries"], 1)
+
+
 class TestRpcRelay(HostctlCase):
     def _serve_once(self, socket_path, reply: bytes, capture: dict):
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

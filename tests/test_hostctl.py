@@ -48,10 +48,12 @@ STUB_WORKER_MAIN = (
 )
 
 
-def run_hostctl(argv, home, stdin_bytes=b""):
+def run_hostctl(argv, home, stdin_bytes=b"", env_extra=None):
     """Drive hostctl exactly as SSH would: a real subprocess over pipes."""
     env = dict(os.environ)
     env["CONCH_FLEET_HOME"] = str(home)
+    if env_extra:
+        env.update(env_extra)
     proc = subprocess.run(
         [sys.executable, "-m", "conch.fleet.hostctl", *argv],
         input=stdin_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -60,8 +62,8 @@ def run_hostctl(argv, home, stdin_bytes=b""):
     return proc
 
 
-def hostctl_json(argv, home, stdin_bytes=b"", expect_rc=0):
-    proc = run_hostctl(argv, home, stdin_bytes)
+def hostctl_json(argv, home, stdin_bytes=b"", expect_rc=0, env_extra=None):
+    proc = run_hostctl(argv, home, stdin_bytes, env_extra=env_extra)
     if expect_rc is not None:
         assert proc.returncode == expect_rc, (
             f"rc={proc.returncode} stdout={proc.stdout!r}"
@@ -692,6 +694,198 @@ class TestSystemdUnitText(SignedDeployCase):
         )
         self.assertIn("systemctl", result["error"])
         self.assertIn("process profile", result["error"])
+
+
+#: Fake systemctl for worker-start verification: state machine selected by
+#: CONCH_TEST_SYSTEMCTL_MODE (immediate | slow-start | crash-loop), state
+#: persisted in CONCH_TEST_SYSTEMCTL_DIR across invocations.
+FAKE_SYSTEMCTL = """\
+#!/usr/bin/env python3
+import os, sys
+
+mode = os.environ.get("CONCH_TEST_SYSTEMCTL_MODE", "immediate")
+state = os.environ["CONCH_TEST_SYSTEMCTL_DIR"]
+args = sys.argv[1:]
+
+
+def marker(name):
+    return os.path.join(state, name)
+
+
+def count(name, bump=False):
+    value = 0
+    if os.path.exists(marker(name)):
+        with open(marker(name)) as fh:
+            value = int(fh.read())
+    if bump:
+        value += 1
+        with open(marker(name), "w") as fh:
+            fh.write(str(value))
+    return value
+
+
+if "daemon-reload" in args:
+    sys.exit(0)
+if "enable" in args:
+    with open(marker("enabled"), "w") as fh:
+        fh.write("1")
+    sys.exit(0)
+if "stop" in args:
+    try:
+        os.unlink(marker("enabled"))
+    except OSError:
+        pass
+    sys.exit(0)
+
+
+def unit_state():
+    if not os.path.exists(marker("enabled")):
+        return "inactive", "dead"
+    if mode == "immediate":
+        return "active", "running"
+    if mode == "slow-start":
+        if count("show_polls") >= 3:
+            return "active", "running"
+        return "activating", "start"
+    if mode == "crash-loop":
+        return "failed", "failed"
+    return "inactive", "dead"
+
+
+if "show" in args:
+    if os.path.exists(marker("enabled")):
+        count("show_polls", bump=True)
+    active, sub = unit_state()
+    print(active)
+    print(sub)
+    sys.exit(0)
+if "is-active" in args:
+    active, _ = unit_state()
+    print(active)
+    sys.exit(0 if active == "active" else 3)
+if "status" in args:
+    active, sub = unit_state()
+    print("conch-worker-w1.service - Conch fleet worker w1")
+    print("     Active: %s (%s)" % (active, sub))
+    if mode == "crash-loop":
+        print("    Process: 13467 ExecStart=python3 ..."
+              " (code=exited, status=218/CAPABILITIES)")
+    sys.exit(0 if active == "active" else 3)
+sys.exit(0)
+"""
+
+FAKE_JOURNALCTL = """\
+#!/usr/bin/env python3
+print("(python3)[13467]: conch-worker-w1.service: Failed to drop"
+      " capabilities: Operation not permitted")
+print("(python3)[13467]: conch-worker-w1.service: Failed at step"
+      " CAPABILITIES spawning python3: Operation not permitted")
+print("systemd[5217]: conch-worker-w1.service: Main process exited,"
+      " code=exited, status=218/CAPABILITIES")
+print("systemd[5217]: conch-worker-w1.service: Failed with result"
+      " 'exit-code'.")
+"""
+
+
+class TestWorkerStartVerification(SignedDeployCase):
+    """Field regression (2026-09-14): `systemctl --user enable --now`
+    returns 0 even when the unit immediately dies into a restart loop, so
+    worker-start reported ok:true for a broken deploy. It must confirm
+    active (running) and fail with the status + journal tail otherwise."""
+
+    def setUp(self):
+        super().setUp()
+        self.deploy(op_id="d1", profile="systemd")
+        hostctl_json(
+            ["activate", "--worker", "w1", "--op-id", "a1",
+             "--digest", self.digests["artifact"]], self.home,
+        )
+        self.fake_bin = self.root / "fakebin"
+        self.fake_bin.mkdir()
+        self.fake_state = self.root / "fakestate"
+        self.fake_state.mkdir()
+        for name, body in (("systemctl", FAKE_SYSTEMCTL),
+                           ("journalctl", FAKE_JOURNALCTL)):
+            script = self.fake_bin / name
+            script.write_text(body)
+            script.chmod(0o755)
+
+    def _env(self, mode):
+        return {
+            "PATH": f"{self.fake_bin}:{os.environ.get('PATH', '')}",
+            "CONCH_TEST_SYSTEMCTL_MODE": mode,
+            "CONCH_TEST_SYSTEMCTL_DIR": str(self.fake_state),
+            "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
+            "CONCH_FLEET_START_TIMEOUT": "5.0",
+        }
+
+    def test_crash_loop_reports_failure_with_status_and_journal(self):
+        result = hostctl_json(
+            ["worker-start", "--worker", "w1", "--profile", "systemd"],
+            self.home, expect_rc=1, env_extra=self._env("crash-loop"),
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("did not reach active (running)", result["error"])
+        # The systemctl status and the journal tail are both surfaced —
+        # the 218/CAPABILITIES crash-loop shape is self-diagnosing.
+        self.assertIn("status=218/CAPABILITIES", result["error"])
+        self.assertIn("Failed at step CAPABILITIES", result["error"])
+
+    def test_slow_start_polls_until_active_running(self):
+        result = hostctl_json(
+            ["worker-start", "--worker", "w1", "--profile", "systemd"],
+            self.home, env_extra=self._env("slow-start"),
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["already_running"])
+        polls = int((self.fake_state / "show_polls").read_text())
+        self.assertGreaterEqual(polls, 3, "did not poll through activating")
+
+    def test_immediately_active_unit_reports_ok(self):
+        result = hostctl_json(
+            ["worker-start", "--worker", "w1", "--profile", "systemd"],
+            self.home, env_extra=self._env("immediate"),
+        )
+        self.assertTrue(result["ok"])
+        self.assertIn("unit", result)
+
+    def test_process_profile_refuses_a_worker_that_dies_at_spawn(self):
+        crasher = (
+            "import sys\n"
+            "sys.stderr.write('boom: cannot start\\n')\n"
+            "sys.exit(3)\n"
+        )
+        artifact, manifest_path = _stub_artifact(
+            self.root / "crasher", main_py=crasher
+        )
+        sig = sign_manifest(manifest_path, self.key)
+        digests = {}
+        for label, path in (("artifact", artifact),
+                            ("manifest", manifest_path),
+                            ("signature", sig)):
+            digest = sha256_file(path)
+            digests[label] = digest
+            hostctl_json(["artifact-put", "--digest", digest], self.home,
+                         path.read_bytes())
+        hostctl_json(
+            ["deploy", "--worker", "w3", "--op-id", "d-crash",
+             "--artifact-digest", digests["artifact"],
+             "--manifest-digest", digests["manifest"],
+             "--signature-digest", digests["signature"],
+             "--profile", "process"], self.home,
+        )
+        hostctl_json(
+            ["activate", "--worker", "w3", "--op-id", "a-crash",
+             "--digest", digests["artifact"]], self.home,
+        )
+        result = hostctl_json(
+            ["worker-start", "--worker", "w3", "--profile", "process",
+             "--python", sys.executable],
+            self.home, expect_rc=1,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("exited immediately", result["error"])
+        self.assertIn("boom: cannot start", result["error"])
 
 
 @unittest.skipUnless(HAVE_SSH_KEYGEN, "ssh-keygen not on PATH")

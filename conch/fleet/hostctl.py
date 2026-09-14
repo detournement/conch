@@ -973,6 +973,71 @@ def _worker_running(host: Host, worker: str, record: dict) -> bool:
     return False
 
 
+def _tail_lines(path: Path, count: int = 10) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(lines.splitlines()[-count:]).strip()
+
+
+def _systemd_unit_state(systemctl: str, unit: str) -> "tuple":
+    out = _run(
+        [systemctl, "--user", "show", unit,
+         "--property=ActiveState,SubState", "--value"],
+        timeout=10,
+    )
+    lines = out.stdout.decode("utf-8", "replace").splitlines()
+    active = lines[0].strip() if lines else ""
+    sub = lines[1].strip() if len(lines) > 1 else ""
+    return active, sub
+
+
+def _unit_failure_detail(systemctl: str, unit: str) -> str:
+    status = _run(
+        [systemctl, "--user", "status", unit, "--no-pager", "-l"],
+        timeout=10,
+    )
+    detail = status.stdout.decode("utf-8", "replace").strip()
+    parts = [f"systemctl status: {detail}" if detail else
+             "systemctl status: (no output)"]
+    journalctl = shutil.which("journalctl")
+    if journalctl:
+        journal = _run(
+            [journalctl, "--user", "-u", unit, "-n", "10", "--no-pager"],
+            timeout=10,
+        )
+        text = journal.stdout.decode("utf-8", "replace").strip()
+        if text:
+            parts.append(f"last journal lines: {text}")
+    return "; ".join(parts)
+
+
+def _await_unit_running(systemctl: str, unit: str) -> None:
+    """Block until the unit reaches active (running), fail closed if it
+    enters failed or does not settle within the window.
+
+    Field regression (2026-09-14): ``enable --now`` returns 0 even for a
+    unit that immediately dies into a restart loop, so worker-start used
+    to report ok for a broken deploy. The failure detail carries the
+    systemctl status and the last journal lines so the caller can see
+    *why* without a manual journalctl dig.
+    """
+    timeout = float(os.environ.get("CONCH_FLEET_START_TIMEOUT", "5.0"))
+    deadline = time.monotonic() + timeout
+    while True:
+        active, sub = _systemd_unit_state(systemctl, unit)
+        if active == "active" and sub == "running":
+            return
+        if active == "failed" or time.monotonic() >= deadline:
+            raise HostctlError(
+                f"unit {unit} did not reach active (running) — state is"
+                f" {active or 'unknown'} ({sub or 'unknown'});"
+                f" {_unit_failure_detail(systemctl, unit)}"
+            )
+        time.sleep(0.2)
+
+
 def systemd_unit_text(host: Host, worker: str, record: dict, *,
                       python: str = "", memory_max: str = "2G",
                       cpu_quota: str = "100%", tasks_max: int = 256,
@@ -1097,6 +1162,19 @@ def _start_worker(host: Host, worker: str, record: dict, args) -> dict:
         _atomic_write_bytes(
             _pidfile(host, worker), f"{proc.pid}\n".encode("ascii")
         )
+        # A worker that dies at spawn (bad interpreter, broken release)
+        # must not be reported as started.
+        settle = float(os.environ.get("CONCH_FLEET_SPAWN_SETTLE", "1.0"))
+        deadline = time.monotonic() + settle
+        while time.monotonic() < deadline:
+            status = proc.poll()
+            if status is not None:
+                tail = _tail_lines(log_path)
+                raise HostctlError(
+                    f"worker process exited immediately (rc={status})"
+                    + (f" — last log lines: {tail}" if tail else "")
+                )
+            time.sleep(0.1)
         return {"profile": profile, "pid": proc.pid}
     if profile == "systemd":
         systemctl = shutil.which("systemctl")
@@ -1132,6 +1210,9 @@ def _start_worker(host: Host, worker: str, record: dict, args) -> dict:
                     f"{' '.join(argv[1:])} failed: "
                     + out.stderr.decode("utf-8", "replace").strip()
                 )
+        # enable --now returns 0 even for a unit dying into a restart
+        # loop: confirm it actually reached active (running).
+        _await_unit_running(systemctl, _unit_name(worker))
         return {"profile": profile, "unit": str(unit_path)}
     if profile == "docker":
         docker = os.environ.get("CONCH_FLEET_DOCKER", "docker")

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -127,6 +128,35 @@ class Conversation:
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             schema_version=data.get("schema_version", 1),
         )
+
+
+def _salvage_valid_prefix(text: str) -> Optional[Dict[str, Any]]:
+    """Recover a conversation dict from the valid JSON prefix of a corrupt
+    file (the power-outage shape: complete old JSON followed by stale
+    trailing bytes). Returns the parsed dict only when the prefix decodes
+    cleanly AND looks like a conversation (a dict carrying the schema's
+    ``id`` and a ``messages`` list); anything else is not salvageable."""
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text.lstrip())
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if not isinstance(obj.get("id"), str) or not obj["id"]:
+        return None
+    if not isinstance(obj.get("messages"), list):
+        return None
+    return obj
+
+
+def _quarantine_path(path: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    candidate = path.with_name(f"{path.name}.corrupt-{stamp}")
+    while candidate.exists():
+        candidate = path.with_name(
+            f"{path.name}.corrupt-{stamp}-{uuid.uuid4().hex[:4]}"
+        )
+    return candidate
 
 
 def _fts_match_expression(query: str) -> str:
@@ -305,7 +335,65 @@ class ConversationManager:
         path = _state_dir() / f"{conv_id}.json"
         if not path.exists():
             return None
-        return Conversation.load(path)
+        try:
+            return Conversation.load(path)
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+            return self._recover_corrupt(conv_id, path)
+
+    def _recover_corrupt(self, conv_id: str, path: Path) -> Optional[Conversation]:
+        """A corrupt conversation file must never crash the shell.
+
+        First try valid-prefix salvage (the power-outage shape: complete
+        old JSON followed by stale trailing bytes). The original bytes are
+        always kept at ``<name>.json.corrupt-<timestamp>``; on salvage the
+        recovered content is written back atomically, otherwise the file
+        is quarantined under that name, dropped from the index, and the
+        caller falls through to the next conversation (or a fresh one).
+        One warning line names the preserved file either way.
+        """
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        salvaged = _salvage_valid_prefix(text)
+        backup = _quarantine_path(path)
+        try:
+            os.replace(path, backup)
+        except OSError:
+            return None  # someone else already moved it; nothing to load
+        if salvaged is not None:
+            try:
+                _atomic_write_text(path, json.dumps(salvaged, indent=2))
+                path.chmod(backup.stat().st_mode & 0o7777)
+                conv = Conversation.load(path)
+            except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                salvaged = None  # fall through to quarantine
+            else:
+                print(
+                    f"conch: conversation {conv_id} was corrupt; recovered "
+                    f"{len(conv.messages)} messages from the valid prefix "
+                    f"(original kept at {backup})",
+                    file=sys.stderr,
+                )
+                return conv
+        self._drop_index_entry(conv_id)
+        print(
+            f"conch: conversation {conv_id} is corrupt and could not be "
+            f"recovered; quarantined to {backup}",
+            file=sys.stderr,
+        )
+        return None
+
+    def _drop_index_entry(self, conv_id: str):
+        entries = [
+            item for item in self._index["conversations"]
+            if item.get("id") != conv_id
+        ]
+        if len(entries) != len(self._index["conversations"]):
+            self._index["conversations"] = entries
+            self._save_index()
+        if self._search_index.available():
+            try:
+                self._search_index.remove_conversation(conv_id)
+            except sqlite3.Error:
+                pass
 
     def delete(self, conv_id: str) -> bool:
         path = _state_dir() / f"{conv_id}.json"
@@ -327,10 +415,14 @@ class ConversationManager:
         return list(self._index.get("conversations", []))
 
     def get_most_recent(self) -> Optional[Conversation]:
-        conversations = self.list_all()
-        if not conversations:
-            return None
-        return self.load(conversations[0]["id"])
+        # A corrupt most-recent file loads as None (salvage failed →
+        # quarantined); fall through to the next conversation so startup
+        # always proceeds.
+        for entry in self.list_all():
+            conv = self.load(entry["id"])
+            if conv is not None:
+                return conv
+        return None
 
     def search(
         self, query: str, *, max_results: int = 20, context_chars: int = 120

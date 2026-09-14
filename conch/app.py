@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import datetime
 import os
@@ -47,6 +48,7 @@ from .tooling import (
     set_agent_mode,
 )
 from . import mcp as mcp_mod
+from . import multiline
 
 # Names still importable from conch.app for backwards compatibility (tests
 # and external callers); their implementations live in conch.bootstrap now.
@@ -278,6 +280,9 @@ class TypeaheadBuffer:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._old_settings = None
+        # Newlines with more input already pending are interior to a paste;
+        # coalesce them so a block pasted mid-turn queues as one message.
+        self.coalesce_pastes = True
 
     def start(self):
         if not sys.stdin.isatty():
@@ -330,30 +335,57 @@ class TypeaheadBuffer:
         return lines
 
     def _loop(self):
+        # Read whole chunks at the fd level: sys.stdin.read(1) would slurp a
+        # pasted block into Python's userspace buffer, after which select()
+        # on the fd never fires and the rest of the paste is stranded.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        fd = sys.stdin.fileno()
+        prev_cr = False
         while not self._stop.is_set():
             try:
-                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                ready, _, _ = select.select([fd], [], [], 0.1)
                 if not ready or self._stop.is_set():
                     continue
-                ch = sys.stdin.read(1)
-                if not ch:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
                     break
-                if ch in ("\r", "\n"):
-                    if self._buffer:
-                        self._queued.append(self._buffer)
-                        sys.stderr.write(
-                            f"\r\033[K  \033[2m(queued: {self._buffer[:60]})\033[0m\n"
+                if not data:
+                    break
+                text = decoder.decode(data)
+                idx = 0
+                while idx < len(text):
+                    ch = text[idx]
+                    idx += 1
+                    if ch == "\n" and prev_cr:
+                        prev_cr = False
+                        continue  # CRLF: the CR already ended this line
+                    prev_cr = ch == "\r"
+                    if ch in ("\r", "\n"):
+                        pending = idx < len(text) or bool(
+                            select.select([fd], [], [], 0.02)[0]
                         )
-                        sys.stderr.flush()
+                        if self.coalesce_pastes and pending:
+                            self._buffer += "\n"  # mid-paste newline: one block
+                        elif self._buffer:
+                            self._queued.append(self._buffer)
+                            preview = self._buffer.replace(
+                                "\n", multiline.HISTORY_NEWLINE_MARK
+                            )[:60]
+                            sys.stderr.write(
+                                f"\r\033[K  \033[2m(queued: {preview})\033[0m\n"
+                            )
+                            sys.stderr.flush()
+                            self._buffer = ""
+                    elif ch in ("\x7f", "\x08"):
+                        if self._buffer:
+                            self._buffer = self._buffer[:-1]
+                    elif ch == "\x03":
                         self._buffer = ""
-                elif ch in ("\x7f", "\x08"):
-                    if self._buffer:
-                        self._buffer = self._buffer[:-1]
-                elif ch == "\x03":
-                    self._buffer = ""
-                    self._stop.set()
-                elif ch >= " ":
-                    self._buffer += ch
+                        self._stop.set()
+                        break
+                    elif ch >= " " or ch == "\t":
+                        self._buffer += ch
             except (EOFError, OSError, ValueError):
                 break
 
@@ -480,6 +512,15 @@ def chat_loop():
     readline.set_completer(_completer)
     readline.set_completer_delims(" ")
     readline.parse_and_bind("tab: complete")
+
+    # Multiline input (README "Multiline input & paste"): GNU readline 8.1+
+    # gets true bracketed paste; libedit (macOS system Pythons) ignores the
+    # directive, so read_user_message's pending-input drain reassembles
+    # pastes there instead. multiline_paste=false disables paste coalescing
+    # (fences, backslash continuation, /paste, and /edit keep working).
+    multiline.enable_bracketed_paste()
+    _paste_coalesce = get_bool(config, "multiline_paste", True)
+    _drain_fn = multiline.drain_pending_input if _paste_coalesce else (lambda: "")
 
     def _save_current():
         current_conv.messages = messages
@@ -624,6 +665,7 @@ def chat_loop():
     _print_banner()
 
     _typeahead = TypeaheadBuffer()
+    _typeahead.coalesce_pastes = _paste_coalesce
     _typeahead_enabled = True
     _typeahead_queued: list[str] = []
     _typeahead_partial = ""
@@ -769,16 +811,36 @@ def chat_loop():
     _backend_failed = False  # preflight the server after a failed turn (plan 3.3)
     try:
         while True:
+            if _typeahead_partial and "\n" in _typeahead_partial:
+                # A block pasted while the model was streaming: libedit's
+                # insert_text silently drops text containing newlines
+                # (verified on macOS 3.9–3.14), so it can't be prefilled —
+                # queue the whole block as one message instead.
+                _typeahead_queued.append(_typeahead_partial)
+                _typeahead_partial = ""
             if _typeahead_queued:
                 user_input = _typeahead_queued.pop(0)
-                print(f"\033[1;33myou:\033[0m \033[2m{user_input}\033[0m")
+                multiline.echo_message_block(user_input, "\033[1;33myou:\033[0m ")
             else:
                 if _typeahead_partial:
                     prefill = _typeahead_partial
                     _typeahead_partial = ""
                     readline.set_startup_hook(lambda: readline.insert_text(prefill))
+
+                def _prompt_input(prompt):
+                    # The typeahead prefill must ride on the first physical
+                    # line only, not re-insert on every continuation read.
+                    try:
+                        return input(prompt)
+                    finally:
+                        readline.set_startup_hook()
+
                 try:
-                    user_input = input("\033[1;33myou:\033[0m ")
+                    user_input = multiline.read_user_message(
+                        "\033[1;33myou:\033[0m ",
+                        input_fn=_prompt_input,
+                        drain_fn=_drain_fn,
+                    )
                 except EOFError:
                     print("\n")
                     break
@@ -792,16 +854,62 @@ def chat_loop():
                     continue
                 finally:
                     readline.set_startup_hook()
+                if user_input is None:
+                    print("  \033[2m(cancelled — nothing sent)\033[0m\n")
+                    continue
 
             stripped = user_input.strip()
             if not stripped:
                 continue
-            if stripped.lower() in ("exit", "quit", "/q"):
+
+            # /paste and /edit compose a literal message: the block they
+            # return is never re-parsed as commands or exit words, and
+            # multiline input (pasted or composed) is always chat — interior
+            # lines must never dispatch as slash commands.
+            _literal_block = False
+            if multiline.is_slash_command(user_input):
+                _head = stripped.split(maxsplit=1)
+                _name = _head[0].lower()
+                _arg = _head[1].strip() if len(_head) > 1 else ""
+                if _name in ("/paste", "/edit"):
+                    if _name == "/edit" or _arg in ("--editor", "-e"):
+                        # Same gate as /notes' editor verbs: the editor only
+                        # takes the terminal in an interactive local session
+                        # with a live TTY (remote/channel sessions refuse).
+                        _term = chat_state.tool_map.get("interactive_terminal")
+                        _check = getattr(_term, "handoff_available", None)
+                        if not callable(_check) or not _check():
+                            print(
+                                "  \033[31m/edit needs the interactive local"
+                                " session — the same gate as /terminal."
+                                "\033[0m\n  \033[2m/paste composes a literal"
+                                " block without the editor.\033[0m\n"
+                            )
+                            continue
+                        block = multiline.edit_in_editor(config)
+                        if block:
+                            multiline.echo_message_block(
+                                block, "\033[1;33myou:\033[0m "
+                            )
+                    else:
+                        print(
+                            "  \033[2mPaste now — end with a line that is "
+                            "exactly '.' or Ctrl+D; Ctrl+C cancels.\033[0m"
+                        )
+                        block = multiline.read_paste_block()
+                    if not block or not block.strip():
+                        print("  \033[2m(nothing to send)\033[0m\n")
+                        continue
+                    user_input = block
+                    stripped = user_input.strip()
+                    _literal_block = True
+
+            if not _literal_block and stripped.lower() in ("exit", "quit", "/q"):
                 break
 
             _set_foreground_policies()
 
-            if stripped.startswith("/"):
+            if not _literal_block and multiline.is_slash_command(user_input):
                 result = handle_slash_command(
                     stripped,
                     config,

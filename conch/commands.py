@@ -133,6 +133,8 @@ SLASH_COMMANDS = [
     ("/resettools", "Reset tool-calling if the model drifts to textual calls"),
     ("/rounds <n>", "Set max tool call rounds"),
     ("/queue", "Toggle typeahead input"),
+    ("/paste", "Paste lines literally; end with a lone '.' or Ctrl+D"),
+    ("/edit", "Compose the next message in your editor"),
     ("/status", "Show version, provider, model, context window, and config"),
     ("/cost", "Show session token usage and cost"),
 ]
@@ -913,6 +915,8 @@ def handle_slash_command(
             "  \033[1m/capitol <subcommand>\033[0m  Control Capitol workflows/runs/artifacts/packs (/capitol help)\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
+            "  \033[1m/paste\033[0m               Paste lines literally; end with a lone '.' or Ctrl+D\n"
+            "  \033[1m/edit\033[0m                Compose the next message in your editor (also /paste --editor)\n"
             "  \033[1m/status\033[0m              Show provider, model, context window, and config\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
@@ -1523,6 +1527,16 @@ def handle_slash_command(
             print("\n  \033[1;32m✓ Typeahead disabled\033[0m\n")
             return "queue_off"
         print("\n  \033[2mUsage: /queue on | /queue off  (on by default)\033[0m\n")
+        return None
+
+    if command in ("/paste", "/edit"):
+        # The interactive prompt loop (conch.app) intercepts these before
+        # dispatch; reaching here means a non-interactive surface where
+        # there is no terminal to read a block from.
+        print(
+            "\n  \033[2m/paste and /edit compose a message at the "
+            "interactive chat prompt.\033[0m\n"
+        )
         return None
 
     if command == "/status":

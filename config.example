@@ -66,10 +66,11 @@ api_key_env=ANTHROPIC_API_KEY
 # Command prefixes that never prompt (comma-separated).
 #allow_prefixes=git status, ls, cat
 
-# Editor for editor-backed commands (/notes new, /notes open). Resolution:
-# this key → $VISUAL → $EDITOR → nano if installed → vi. The value may carry
-# arguments (e.g. `code --wait`). The editor runs through the direct terminal
-# handoff, so these commands work in interactive local sessions only.
+# Editor for every editor-backed command (/edit, /paste --editor,
+# /notes new, /notes open). Resolution: this key → $VISUAL → $EDITOR →
+# nano if installed → vi. The value may carry arguments (e.g. `code --wait`).
+# The editor takes the terminal under the /terminal gate, so these commands
+# work in interactive local sessions only.
 #editor=nano
 
 # Interactive credentials are never configured here. Use `/terminal <command>`
@@ -88,6 +89,12 @@ api_key_env=ANTHROPIC_API_KEY
 # Per-turn budgets: tool rounds are set with /rounds; an optional token cap
 # makes the model summarize progress instead of stopping abruptly.
 #turn_token_budget=40000
+
+# Reassemble multi-line pastes at the chat prompt into one message (on by
+# default; GNU readline 8.1+ additionally gets true bracketed paste). Turn
+# off only if your terminal delivers typed input in bursts that get
+# mistaken for pastes. /paste and /edit always work regardless.
+#multiline_paste=true
 
 # Small fast model for side tasks (session summaries, history compaction).
 #weak_model=qwen3-8b

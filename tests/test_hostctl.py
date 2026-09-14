@@ -774,6 +774,12 @@ if "status" in args:
 sys.exit(0)
 """
 
+FAKE_LOGINCTL = """\
+#!/usr/bin/env python3
+import os
+print("Linger=" + os.environ.get("CONCH_TEST_LINGER", "yes"))
+"""
+
 FAKE_JOURNALCTL = """\
 #!/usr/bin/env python3
 print("(python3)[13467]: conch-worker-w1.service: Failed to drop"
@@ -787,11 +793,9 @@ print("systemd[5217]: conch-worker-w1.service: Failed with result"
 """
 
 
-class TestWorkerStartVerification(SignedDeployCase):
-    """Field regression (2026-09-14): `systemctl --user enable --now`
-    returns 0 even when the unit immediately dies into a restart loop, so
-    worker-start reported ok:true for a broken deploy. It must confirm
-    active (running) and fail with the status + journal tail otherwise."""
+class FakeSystemdCase(SignedDeployCase):
+    """Deployed+activated worker plus a fake systemctl/journalctl/loginctl
+    harness on PATH (state under a per-test dir)."""
 
     def setUp(self):
         super().setUp()
@@ -805,19 +809,28 @@ class TestWorkerStartVerification(SignedDeployCase):
         self.fake_state = self.root / "fakestate"
         self.fake_state.mkdir()
         for name, body in (("systemctl", FAKE_SYSTEMCTL),
-                           ("journalctl", FAKE_JOURNALCTL)):
+                           ("journalctl", FAKE_JOURNALCTL),
+                           ("loginctl", FAKE_LOGINCTL)):
             script = self.fake_bin / name
             script.write_text(body)
             script.chmod(0o755)
 
-    def _env(self, mode):
+    def _env(self, mode, linger="yes"):
         return {
             "PATH": f"{self.fake_bin}:{os.environ.get('PATH', '')}",
             "CONCH_TEST_SYSTEMCTL_MODE": mode,
             "CONCH_TEST_SYSTEMCTL_DIR": str(self.fake_state),
+            "CONCH_TEST_LINGER": linger,
             "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
             "CONCH_FLEET_START_TIMEOUT": "5.0",
         }
+
+
+class TestWorkerStartVerification(FakeSystemdCase):
+    """Field regression (2026-09-14): `systemctl --user enable --now`
+    returns 0 even when the unit immediately dies into a restart loop, so
+    worker-start reported ok:true for a broken deploy. It must confirm
+    active (running) and fail with the status + journal tail otherwise."""
 
     def test_crash_loop_reports_failure_with_status_and_journal(self):
         result = hostctl_json(
@@ -886,6 +899,65 @@ class TestWorkerStartVerification(SignedDeployCase):
         self.assertFalse(result["ok"])
         self.assertIn("exited immediately", result["error"])
         self.assertIn("boom: cannot start", result["error"])
+
+
+class TestLingerSurfacing(FakeSystemdCase):
+    """Field finding (2026-09-14): with Linger=no a user-scope worker
+    (systemd and process profiles alike) silently dies when the SSH
+    session ends. probe must report the state and worker-start must
+    refuse without --force while it is off."""
+
+    def test_probe_reports_linger_state(self):
+        for linger, expected in (("yes", "yes"), ("no", "no")):
+            result = hostctl_json(
+                ["probe"], self.home,
+                env_extra=self._env("immediate", linger=linger),
+            )
+            self.assertEqual(result["systemd"]["linger"], expected)
+
+    def test_probe_without_loginctl_reports_unknown(self):
+        if shutil.which("loginctl"):
+            self.skipTest("host has a real loginctl on PATH")
+        # systemctl faked, loginctl deliberately absent → unknown.
+        lonely = self.root / "lonelybin"
+        lonely.mkdir()
+        shutil.copy(self.fake_bin / "systemctl", lonely / "systemctl")
+        (lonely / "systemctl").chmod(0o755)
+        env = self._env("immediate")
+        env["PATH"] = f"{lonely}:{os.environ.get('PATH', '')}"
+        result = hostctl_json(["probe"], self.home, env_extra=env)
+        self.assertEqual(result["systemd"]["linger"], "unknown")
+
+    def test_worker_start_refuses_when_linger_off(self):
+        result = hostctl_json(
+            ["worker-start", "--worker", "w1", "--profile", "systemd"],
+            self.home, expect_rc=1,
+            env_extra=self._env("immediate", linger="no"),
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("linger is OFF", result["error"])
+        self.assertIn("loginctl enable-linger", result["error"])
+        self.assertIn("sudo or polkit", result["error"])
+        self.assertIn("--force", result["error"])
+
+    def test_worker_start_force_overrides_with_a_warning(self):
+        result = hostctl_json(
+            ["worker-start", "--worker", "w1", "--profile", "systemd",
+             "--force"],
+            self.home, env_extra=self._env("immediate", linger="no"),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["linger"], "no")
+        self.assertIn("enable-linger", result["warning"])
+
+    def test_process_profile_is_gated_too(self):
+        result = hostctl_json(
+            ["worker-start", "--worker", "w1", "--profile", "process",
+             "--python", sys.executable],
+            self.home, expect_rc=1,
+            env_extra=self._env("immediate", linger="no"),
+        )
+        self.assertIn("process worker dies", result["error"])
 
 
 @unittest.skipUnless(HAVE_SSH_KEYGEN, "ssh-keygen not on PATH")

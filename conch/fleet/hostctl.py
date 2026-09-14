@@ -383,6 +383,45 @@ def cmd_install_verify(host: Host, args) -> dict:
     }
 
 
+def _login_user() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if not user:
+        try:
+            import pwd
+
+            user = pwd.getpwuid(os.getuid()).pw_name
+        except (ImportError, KeyError, OSError):
+            user = ""
+    return user
+
+
+def _linger_state() -> str:
+    """loginctl linger for the current user: "yes" / "no" / "unknown".
+
+    Without linger the user systemd manager is torn down when the last
+    login session ends, taking every user-scope worker (systemd *and*
+    process profile) with it — the field report's silent-death mode.
+    """
+    loginctl = shutil.which("loginctl")
+    user = _login_user()
+    if not loginctl or not user:
+        return "unknown"
+    try:
+        out = _run(
+            [loginctl, "show-user", user, "--property=Linger"], timeout=10
+        )
+    except HostctlError:
+        return "unknown"
+    if out.returncode != 0:
+        return "unknown"
+    value = out.stdout.decode("utf-8", "replace").strip()
+    if value == "Linger=yes":
+        return "yes"
+    if value == "Linger=no":
+        return "no"
+    return "unknown"
+
+
 def _probe_systemd() -> dict:
     systemctl = shutil.which("systemctl")
     if not systemctl:
@@ -408,6 +447,7 @@ def _probe_systemd() -> dict:
         "present": True, "version": version, "features": features,
         "sandboxing": sandboxing,
         "user_manager": bool(os.environ.get("XDG_RUNTIME_DIR")),
+        "linger": _linger_state(),
     }
 
 
@@ -1305,10 +1345,35 @@ def cmd_worker_start(host: Host, args) -> dict:
         return {"ok": True, "op": "worker-start", "worker": worker,
                 "already_running": True,
                 "profile": record.get("profile") or "process"}
+    profile = record.get("profile") or "process"
+    linger = ""
+    if profile in ("systemd", "process"):
+        # Without linger, the user manager (and this worker) dies with
+        # the last login session — the "keeps running when the terminal
+        # closes" promise silently breaks (field report 2026-09-14).
+        linger = _linger_state()
+        if linger == "no" and not getattr(args, "force", False):
+            user = _login_user() or "<user>"
+            raise HostctlError(
+                f"user linger is OFF (loginctl Linger=no): a user-scope"
+                f" {profile} worker dies as soon as the login session"
+                f" ends. Run `loginctl enable-linger {user}` on this host"
+                " first (needs sudo or polkit authorization — do it in"
+                " the interactive enrollment flow), or pass --force to"
+                " start a worker that will not survive logout"
+            )
     detail = _start_worker(host, worker, record, args)
     host.save_worker(worker, record)
-    return dict({"ok": True, "op": "worker-start", "worker": worker,
-                 "already_running": False}, **detail)
+    result = {"ok": True, "op": "worker-start", "worker": worker,
+              "already_running": False}
+    if linger:
+        result["linger"] = linger
+    if linger == "no":
+        result["warning"] = (
+            "linger is off — this worker dies at logout; enable with"
+            f" `loginctl enable-linger {_login_user() or '<user>'}`"
+        )
+    return dict(result, **detail)
 
 
 def cmd_worker_stop(host: Host, args) -> dict:
@@ -1532,6 +1597,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--worker", required=True)
     p.add_argument("--profile", default="",
                    choices=["", "systemd", "process", "docker"])
+    p.add_argument("--force", action="store_true",
+                   help="Start even when loginctl linger is off (the"
+                        " worker will die at logout).")
     p.add_argument("--python", default="")
     p.add_argument("--memory-max", default="2G")
     p.add_argument("--cpu-quota", default="100%")

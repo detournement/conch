@@ -701,7 +701,13 @@ Lifecycle (enroll → probe → deploy → dispatch):
    streamed to the host and installed by verified sha256 (stdlib-only, so a
    bare host needs only `python3`). A host is `autonomy_capable` only when
    unattended key auth works; password-only hosts enroll but never run
-   unattended.
+   unattended. While you are still in the interactive session, enable
+   session lingering for the worker user — `loginctl enable-linger <user>`
+   (it usually needs sudo/polkit, which is why it belongs in this
+   interactive step and not an unattended path). Without linger the user
+   systemd manager is torn down at logout, killing every user-scope worker
+   (systemd *and* process profiles); `probe` reports the linger state and
+   `worker-start` refuses without `--force` while it is off.
 2. **Probe** records the host's arch/OS, Python, systemd version and
    sandboxing, Docker, disk, cgroups, GPU (`nvidia-smi`), and reachable
    local model endpoints as *observed capabilities* — kept separate from

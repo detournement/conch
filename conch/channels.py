@@ -2,13 +2,20 @@
 
 Outbound: conch messages the user proactively (scheduled task results,
 approval requests, notifications). Inbound: polled replies resume/steer
-sessions. Three gateways, all stdlib-only:
+sessions. Four gateways, all stdlib-only:
 
+- Matrix: self-hosted homeserver (access token by env reference),
+  /sync long-poll, m.room.message send with thread relations
 - Slack: bot token (SLACK_BOT_TOKEN), chat.postMessage / conversations.history
 - SMS: Twilio REST API (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN), polling the
   Messages list (webhooks would be lower latency but need a public endpoint;
   polling works behind NAT)
 - Email: SMTP send + IMAP UNSEEN polling (EMAIL_PASSWORD)
+
+Plus one outbound-only push notifier (ntfy) for interrupts: approval
+requests, digests, mission milestones. It is not a Channel — it has no
+inbound side — and is routed by ``notify_push = ntfy`` so a conversation
+transport (Matrix) and an interrupt transport (ntfy) can coexist.
 
 Safety posture (plan 4.3): inbound is fail-closed — a channel with no
 configured sender allowlist accepts NO inbound messages. Remote sessions are
@@ -24,6 +31,7 @@ import os
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from time import time_ns
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -145,6 +153,397 @@ class Channel:
     def poll(self, state: Dict[str, Any]) -> List[InboundMessage]:
         """New inbound messages since the cursor in *state* (mutated)."""
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Matrix (sovereign phone channel)
+# ---------------------------------------------------------------------------
+
+class MatrixChannel(Channel):
+    """Matrix client-server API over plain urllib (no SDK, no new deps).
+
+    Config: ``matrix_homeserver`` (base URL — your own homeserver, or a
+    local pantalaimon proxy for E2EE rooms), ``matrix_room`` (default
+    room id), ``matrix_allowed_senders`` (FULL Matrix user IDs,
+    ``@user:server`` — fail closed), optional ``matrix_user`` (the bot's
+    own user id; discovered via /whoami when unset) and
+    ``matrix_sync_timeout_ms`` (long-poll window, default 10000). The
+    access token is held by reference only: the env var named by
+    ``matrix_token_env`` (default MATRIX_ACCESS_TOKEN). It rides the
+    Authorization header and is never logged, echoed, or put in a URL.
+
+    Polling: ``/sync`` long-poll. The server's ``timeout`` parameter maps
+    naturally onto the poll loop — one ``poll()`` call blocks up to the
+    sync window and returns as soon as anything arrives. The ``since``
+    cursor persists in channel cursor state (``matrix_since``) exactly
+    like the other channels' cursors; the very first sync only
+    establishes the cursor (no history replay), matching the SMS
+    first-poll rule.
+
+    Threads: ``thread_id`` is the room id, or ``<room id>|<thread root
+    event id>`` when the message carries an ``m.thread`` relation —
+    replies are sent with the same relation (plus the reply fallback) so
+    an Element thread carries a whole conversation, mirroring Slack.
+
+    Attachments: ``m.image`` events from allowlisted senders are fetched
+    through the media API (authenticated v1 endpoint, falling back to
+    the legacy v3 path for older servers), validated exactly like Slack
+    (image magic bytes, size cap, per-message cap) and quarantined.
+
+    E2EE, honestly: stdlib cannot do Olm/Megolm. v1 supports (a)
+    unencrypted rooms on your OWN homeserver over TLS — sovereign
+    transport, plaintext at rest on your own box — or (b) pointing
+    ``matrix_homeserver`` at a self-hosted pantalaimon proxy, which
+    handles encryption transparently. See README "Phone: sovereign
+    setup" for the trade-offs.
+    """
+
+    name = "matrix"
+    SYNC_FILTER = '{"room":{"timeline":{"limit":50}}}'
+    DEFAULT_SYNC_TIMEOUT_MS = 10000
+
+    def _token(self) -> str:
+        env = (self.config.get("matrix_token_env") or "MATRIX_ACCESS_TOKEN").strip()
+        return os.environ.get(env, "").strip()
+
+    def _homeserver(self) -> str:
+        return (self.config.get("matrix_homeserver") or "").strip().rstrip("/")
+
+    def _room(self) -> str:
+        return (self.config.get("matrix_room") or "").strip()
+
+    def is_configured(self) -> bool:
+        return bool(self._token() and self._homeserver() and self._room())
+
+    def _sync_timeout_ms(self) -> int:
+        try:
+            value = int(self.config.get("matrix_sync_timeout_ms",
+                                        self.DEFAULT_SYNC_TIMEOUT_MS))
+        except (TypeError, ValueError):
+            value = self.DEFAULT_SYNC_TIMEOUT_MS
+        return max(0, min(value, 60000))
+
+    def _request(self, path: str, params: Optional[dict] = None,
+                 body: Optional[dict] = None, method: str = "",
+                 timeout: float = 15.0) -> dict:
+        url = self._homeserver() + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        headers = {"Authorization": f"Bearer {self._token()}"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(
+            url, data=data, headers=headers,
+            method=method or ("POST" if data is not None else "GET"),
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    # -- identity ------------------------------------------------------------
+
+    def _own_user(self, state: Dict[str, Any]) -> str:
+        """The bot's own user id (to skip echoes of our own sends).
+        Config ``matrix_user`` wins; otherwise /whoami once, cached in
+        cursor state."""
+        configured = (self.config.get("matrix_user") or "").strip()
+        if configured:
+            return configured
+        cached = str(state.get("matrix_own_user") or "").strip()
+        if cached:
+            return cached
+        try:
+            result = self._request("/_matrix/client/v3/account/whoami")
+        except Exception:
+            return ""
+        user_id = str(result.get("user_id") or "").strip()
+        if user_id:
+            state["matrix_own_user"] = user_id
+        return user_id
+
+    # -- send ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_thread(thread_id: str) -> tuple:
+        """``room`` or ``room|thread-root`` → (room_id, root_event_id)."""
+        raw = str(thread_id or "").strip()
+        if "|" in raw:
+            room, root = raw.split("|", 1)
+            return room.strip(), root.strip()
+        return raw, ""
+
+    def send(self, text: str, thread_id: str = "") -> tuple:
+        if not self.is_configured():
+            return False, ("matrix not configured (matrix_homeserver +"
+                           " matrix_room + MATRIX_ACCESS_TOKEN)")
+        room, root = self._split_thread(thread_id)
+        room = room or self._room()
+        content: Dict[str, Any] = {"msgtype": "m.text", "body": text}
+        if root:
+            content["m.relates_to"] = {
+                "rel_type": "m.thread",
+                "event_id": root,
+                # Reply fallback so clients without thread support still
+                # render the message in context (spec 11.6.2.1).
+                "is_falling_back": True,
+                "m.in_reply_to": {"event_id": root},
+            }
+        txn_id = f"conch{time_ns()}"
+        path = (f"/_matrix/client/v3/rooms/{urllib.parse.quote(room)}"
+                f"/send/m.room.message/{txn_id}")
+        try:
+            result = self._request(path, body=content, method="PUT")
+        except Exception as exc:
+            return False, f"matrix send failed: {exc}"
+        return True, str(result.get("event_id") or "")
+
+    # -- attachments -------------------------------------------------------------
+
+    def _download_media(self, mxc_url: str) -> bytes:
+        """Fetch mxc:// media with the bearer. Tries the authenticated
+        v1.11 endpoint first, then the legacy v3 path for older servers.
+        The token rides only the Authorization header."""
+        raw = str(mxc_url or "")
+        if not raw.startswith("mxc://"):
+            raise ValueError("not an mxc URL")
+        server, _, media_id = raw[len("mxc://"):].partition("/")
+        if not server or not media_id or "/" in media_id:
+            raise ValueError("malformed mxc URL")
+        quoted = (urllib.parse.quote(server), urllib.parse.quote(media_id))
+        paths = (
+            "/_matrix/client/v1/media/download/%s/%s" % quoted,
+            "/_matrix/media/v3/download/%s/%s" % quoted,
+        )
+        last_error: Exception = OSError("no media endpoint answered")
+        for path in paths:
+            req = urllib.request.Request(
+                self._homeserver() + path,
+                headers={"Authorization": f"Bearer {self._token()}"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.read(ATTACHMENT_MAX_BYTES + 1)
+            except Exception as exc:
+                last_error = exc
+        raise last_error
+
+    def _capture_image(self, content: dict, event_id: str,
+                       index: int) -> Optional[Attachment]:
+        info = content.get("info") if isinstance(content.get("info"), dict) else {}
+        name = _safe_filename(content.get("body"), fallback=f"image-{index}")
+        declared_mime = str(info.get("mimetype") or "").lower()
+        if declared_mime not in IMAGE_MIME_ALLOWLIST:
+            return None  # not an image: never fetched
+        try:
+            declared_size = int(info.get("size") or 0)
+        except (TypeError, ValueError):
+            declared_size = 0
+        if declared_size > ATTACHMENT_MAX_BYTES:
+            _warn(f"matrix: {name} over the "
+                  f"{ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB cap, skipped")
+            return None
+        mxc = str(content.get("url") or "")
+        if not mxc:
+            return None  # v1 handles unencrypted media only (no `file`)
+        try:
+            data = self._download_media(mxc)
+        except Exception:
+            _warn(f"matrix: download failed for attachment {name!r}, skipped")
+            return None
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            _warn(f"matrix: {name} over the size cap after download, skipped")
+            return None
+        sniffed = sniff_image_mime(data)
+        if sniffed not in IMAGE_MIME_ALLOWLIST:
+            _warn(f"matrix: {name} is not a recognized image, skipped")
+            return None
+        directory = quarantine_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_event = _safe_filename(event_id, fallback="event")
+        path = directory / f"matrix-{safe_event}-{index}-{name}"
+        path.write_bytes(data)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return Attachment(
+            filename=name,
+            mime_type=sniffed,
+            size_bytes=len(data),
+            path=str(path),
+            remote_id=event_id,
+        )
+
+    # -- polling -------------------------------------------------------------------
+
+    def _inbound_from(self, room_id: str, event: dict,
+                      own_user: str) -> Optional[InboundMessage]:
+        if event.get("type") != "m.room.message":
+            return None
+        sender = str(event.get("sender") or "").strip()
+        if not sender or (own_user and sender == own_user):
+            return None  # never react to our own messages
+        content = event.get("content") if isinstance(event.get("content"), dict) else {}
+        msgtype = str(content.get("msgtype") or "")
+        event_id = str(event.get("event_id") or "")
+        relates = content.get("m.relates_to")
+        thread_id = room_id
+        if isinstance(relates, dict) and relates.get("rel_type") == "m.thread":
+            root = str(relates.get("event_id") or "").strip()
+            if root:
+                thread_id = f"{room_id}|{root}"
+        text = ""
+        attachments: List[Attachment] = []
+        if msgtype in ("m.text", "m.notice"):
+            text = str(content.get("body") or "").strip()
+        elif msgtype == "m.image":
+            # Fetch bytes only for allowlisted senders — a stranger's
+            # message is dropped later anyway; its media is never fetched.
+            if self.sender_allowed(sender):
+                attachment = self._capture_image(content, event_id, 0)
+                if attachment is not None:
+                    attachments.append(attachment)
+        else:
+            return None
+        if not text and not attachments:
+            return None
+        return InboundMessage(
+            channel="matrix",
+            sender=sender,
+            text=text,
+            thread_id=thread_id,
+            ts=str(event.get("origin_server_ts") or ""),
+            attachments=attachments,
+        )
+
+    def poll(self, state: Dict[str, Any]) -> List[InboundMessage]:
+        if not self.is_configured():
+            return []
+        since = str(state.get("matrix_since") or "")
+        params: Dict[str, Any] = {"filter": self.SYNC_FILTER}
+        timeout_ms = self._sync_timeout_ms() if since else 0
+        params["timeout"] = timeout_ms
+        if since:
+            params["since"] = since
+        try:
+            result = self._request(
+                "/_matrix/client/v3/sync", params=params,
+                timeout=15.0 + timeout_ms / 1000.0,
+            )
+        except Exception:
+            return []
+        next_batch = str(result.get("next_batch") or "")
+        if next_batch:
+            state["matrix_since"] = next_batch
+        if not since:
+            return []  # first sync only establishes the cursor
+        own_user = self._own_user(state)
+        collected: List[InboundMessage] = []
+        joined = (result.get("rooms") or {}).get("join") or {}
+        for room_id, room in joined.items():
+            if not isinstance(room, dict):
+                continue
+            events = ((room.get("timeline") or {}).get("events")) or []
+            captured = 0
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                if captured >= MAX_ATTACHMENTS_PER_MESSAGE and \
+                        str((event.get("content") or {}).get("msgtype")) == "m.image":
+                    _warn("matrix: attachment cap reached, extra images skipped")
+                    continue
+                inbound = self._inbound_from(str(room_id), event, own_user)
+                if inbound is not None:
+                    captured += len(inbound.attachments)
+                    collected.append(inbound)
+        return collected
+
+
+# ---------------------------------------------------------------------------
+# ntfy push notifier (outbound-only interrupts)
+# ---------------------------------------------------------------------------
+
+class NtfyNotifier:
+    """Outbound push over a self-hosted ntfy topic (POST, stdlib only).
+
+    Not a Channel: there is no inbound side, no allowlist, no cursor —
+    it exists so interrupts (approval requests, digests, mission
+    milestones) reach a phone as real push notifications while Matrix
+    carries the conversation. Config: ``ntfy_url`` + ``ntfy_topic``;
+    optional ``ntfy_token_env`` (default NTFY_TOKEN — the token itself
+    is held by reference and rides only the Authorization header),
+    ``ntfy_priority`` (default priority), ``ntfy_click`` (deep link; when
+    unset and ``matrix_room`` is configured, a matrix.to link to that
+    room is used so tapping the notification opens Element).
+
+    v1 actions are click/view deep-links only. A one-tap approve button
+    would need an authenticated HTTP endpoint that does not exist yet;
+    the named upgrade path is a tailnet-only listener (see README) —
+    never a public endpoint.
+    """
+
+    def __init__(self, config: dict):
+        self.config = config or {}
+
+    def _token(self) -> str:
+        env = (self.config.get("ntfy_token_env") or "NTFY_TOKEN").strip()
+        return os.environ.get(env, "").strip()
+
+    def _base(self) -> str:
+        return (self.config.get("ntfy_url") or "").strip().rstrip("/")
+
+    def _topic(self) -> str:
+        return (self.config.get("ntfy_topic") or "").strip()
+
+    def is_configured(self) -> bool:
+        return bool(self._base() and self._topic())
+
+    def _click_url(self, click: str) -> str:
+        explicit = click or (self.config.get("ntfy_click") or "").strip()
+        if explicit:
+            return explicit
+        room = (self.config.get("matrix_room") or "").strip()
+        if room:
+            return "https://matrix.to/#/" + urllib.parse.quote(room)
+        return ""
+
+    @staticmethod
+    def _header_safe(value: str) -> str:
+        """ntfy headers are plain HTTP headers: strip newlines and
+        anything outside latin-1 (the body carries the full text)."""
+        cleaned = str(value or "").replace("\n", " ").replace("\r", " ")
+        return cleaned.encode("latin-1", errors="ignore").decode("latin-1")[:200]
+
+    def send(self, text: str, title: str = "", priority: str = "",
+             tags: str = "", click: str = "") -> tuple:
+        if not self.is_configured():
+            return False, "ntfy not configured (ntfy_url + ntfy_topic)"
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+        title = title or (self.config.get("ntfy_title") or "conch").strip()
+        if title:
+            headers["Title"] = self._header_safe(title)
+        priority = priority or (self.config.get("ntfy_priority") or "").strip()
+        if priority:
+            headers["Priority"] = self._header_safe(priority)
+        if tags:
+            headers["Tags"] = self._header_safe(tags)
+        click_url = self._click_url(click)
+        if click_url:
+            headers["Click"] = self._header_safe(click_url)
+        token = self._token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        url = f"{self._base()}/{urllib.parse.quote(self._topic())}"
+        req = urllib.request.Request(
+            url, data=str(text or "").encode(), headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode() or "{}")
+        except Exception as exc:
+            return False, f"ntfy push failed: {exc}"
+        return True, str(result.get("id") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +1096,7 @@ class FakeChannel(Channel):
 # ---------------------------------------------------------------------------
 
 CHANNEL_TYPES = {
+    "matrix": MatrixChannel,
     "slack": SlackChannel,
     "sms": TwilioSMSChannel,
     "email": EmailChannel,
@@ -714,12 +1114,34 @@ class ChannelManager:
             channel = cls(self.config)
             if channel.is_configured():
                 self.channels[name] = channel
+        self.push_notifier = NtfyNotifier(self.config)
 
     def configured(self) -> List[str]:
         return sorted(self.channels)
 
     def get(self, name: str) -> Optional[Channel]:
         return self.channels.get((name or "").strip().lower())
+
+    # -- push interrupts (ntfy) ---------------------------------------------
+
+    def push_enabled(self) -> bool:
+        """Push is routed only when ``notify_push = ntfy`` is set AND the
+        notifier is configured — conversation channels stay unaffected."""
+        transport = str(self.config.get("notify_push") or "").strip().lower()
+        return transport == "ntfy" and self.push_notifier.is_configured()
+
+    def push_interrupt(self, text: str, title: str = "",
+                       priority: str = "", tags: str = "") -> tuple:
+        """Best-effort push for interrupts (approvals, digests,
+        milestones). Never raises; returns (ok, detail)."""
+        if not self.push_enabled():
+            return False, "push not configured (notify_push=ntfy + ntfy_url/ntfy_topic)"
+        try:
+            return self.push_notifier.send(
+                text, title=title, priority=priority, tags=tags
+            )
+        except Exception as exc:  # pushing must never break delivery
+            return False, f"ntfy push failed: {exc}"
 
     def notify(self, text: str, channel: str = "", thread_id: str = "") -> tuple:
         """Send *text* over *channel* (default: config notify_channel)."""

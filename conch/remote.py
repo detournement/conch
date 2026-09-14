@@ -327,6 +327,18 @@ class RemoteLoop:
 
     # --- turn execution ----------------------------------------------------
 
+    def _notify_interrupt(self, text: str, channel: str, thread_id: str):
+        """Approval requests are interrupts: deliver over the thread's
+        channel AND (when ``notify_push = ntfy`` is routed) as a push
+        notification, so a phone buzzes even when the conversation
+        transport is quiet. Push is best-effort and never gates the
+        channel delivery."""
+        self.manager.push_interrupt(
+            text, title="Conch: approval needed", priority="high",
+            tags="lock",
+        )
+        return self.manager.notify(text, channel=channel, thread_id=thread_id)
+
     def _remote_clients(
         self, pool: Dict[str, Any], channel: str, thread_id: str, sender: str
     ) -> Dict[str, Any]:
@@ -336,7 +348,7 @@ class RemoteLoop:
         }
         clients["local_shell"] = RemoteShellClient(
             self.approvals,
-            lambda text, tid: self.manager.notify(text, channel=channel, thread_id=tid),
+            lambda text, tid: self._notify_interrupt(text, channel, tid),
             channel,
             thread_id,
             sender,
@@ -356,8 +368,8 @@ class RemoteLoop:
                     "sender": sender,
                 },
                 approvals=self.approvals,
-                notify=lambda text, tid: self.manager.notify(
-                    text, channel=channel, thread_id=tid
+                notify=lambda text, tid: self._notify_interrupt(
+                    text, channel, tid
                 ),
             )
         return clients

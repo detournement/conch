@@ -217,7 +217,7 @@ api_key_env=ANTHROPIC_API_KEY
 # give co-located workers the same group and cap the group's concurrency.
 #fleet_resource_group_caps=ollama-box-1:1,ollama-box-2:2
 
-# --- Remote loop (Slack / SMS / email) ----------------------------------------
+# --- Remote loop (Matrix / Slack / SMS / email) --------------------------------
 # Opt-in remote operation: scheduled output is delivered over notify_channel,
 # and inbound replies are polled and routed into conversations. SAFETY:
 # inbound senders MUST be allowlisted per channel (no allowlist = no inbound);
@@ -238,6 +238,46 @@ api_key_env=ANTHROPIC_API_KEY
 # dropped across handoffs. `input msn-<id> <text>` from an allowlisted
 # sender answers that mission and wakes it immediately.
 #remote_host=daemon
+
+# Matrix — the sovereign phone channel (see README "Phone: sovereign setup").
+# Point matrix_homeserver at YOUR homeserver (deploy/docker-compose.phone.yml
+# ships Conduit + ntfy; deploy/phone-bootstrap.sh mints the token file).
+# The access token is held by reference: matrix_token_env names the env var
+# (default MATRIX_ACCESS_TOKEN) — it is never stored or logged. Allowed
+# senders are FULL Matrix user IDs (@user:server) and fail closed: no
+# allowlist means no inbound. thread mapping: an Element thread is one
+# conch conversation (thread_id = room id + thread root). Image attachments
+# from allowlisted senders are quarantined with the same caps as Slack.
+# E2EE: stdlib cannot do Olm/Megolm — either use an unencrypted room on
+# your own homeserver over TLS (plaintext at rest on your own box), or run
+# pantalaimon and point matrix_homeserver at it (http://localhost:8009).
+#matrix_homeserver=http://localhost:6167
+#matrix_room=!AbCdEf:conch.local
+#matrix_allowed_senders=@you:conch.local
+#matrix_token_env=MATRIX_ACCESS_TOKEN
+# The bot's own user id (skips echoes of its own sends); discovered via
+# /whoami when unset.
+#matrix_user=@conch:conch.local
+# /sync long-poll window in ms (0-60000). One poll blocks up to this long
+# and returns as soon as a message arrives.
+#matrix_sync_timeout_ms=10000
+
+# ntfy — outbound push for INTERRUPTS (approval requests, digests, mission
+# milestones) while Matrix carries the conversation. Self-hosted topic;
+# notify_push=ntfy routes interrupt pushes, notify_channel keeps routing
+# conversation deliveries. The optional access token is by reference
+# (ntfy_token_env, default NTFY_TOKEN). ntfy_click deep-links the
+# notification tap; when unset and matrix_room is set, a matrix.to link
+# to the room is used (opens Element). v1 actions are click/view only —
+# one-tap approve needs an authenticated endpoint that does not exist
+# yet (upgrade path: a tailnet-only listener, never a public endpoint).
+#notify_push=ntfy
+#ntfy_url=http://localhost:8093
+#ntfy_topic=conch-alerts
+#ntfy_token_env=NTFY_TOKEN
+#ntfy_priority=default
+#ntfy_title=conch
+#ntfy_click=
 
 # Fake loopback channel — tests, demos, and acceptance drills ONLY. Inbound
 # messages are JSON lines ({"sender","text","thread_id"}) appended to

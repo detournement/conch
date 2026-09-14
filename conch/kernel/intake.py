@@ -1,7 +1,8 @@
 """Daemon-hosted remote channel intake (always-on daemon work item).
 
-The edge daemon hosts the remote channel loop so inbound Slack/SMS/email
-messages get full agent turns 24/7 with no interactive shell attached.
+The edge daemon hosts the remote channel loop so inbound Matrix/Slack/
+SMS/email messages get full agent turns 24/7 with no interactive shell
+attached.
 Every remote-safety invariant is :class:`conch.remote.RemoteLoop`'s own —
 fail-closed sender allowlists, the safe_auto permission cap, origin-bound
 expiring approvals, ``REMOTE_EXCLUDED_TOOLS``, reply-length caps, and
@@ -113,7 +114,7 @@ class ChannelIntake:
             if not self._unconfigured_logged:
                 self._log(
                     "channel intake: remote_enabled is set but no channel"
-                    " is configured (slack/sms/email)"
+                    " is configured (matrix/slack/sms/email)"
                 )
                 self._unconfigured_logged = True
             return 0

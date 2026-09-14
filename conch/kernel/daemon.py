@@ -13,7 +13,7 @@ Responsibilities:
   the outbox, and periodically reconciles leases and expires approvals.
 - **Channel intake hosting** (:mod:`conch.kernel.intake`): with
   ``remote_enabled`` set (and ``remote_host`` not ``shell``), the daemon
-  polls Slack/SMS/email under the kernel ``channel_intake`` lease and
+  polls Matrix/Slack/SMS/email under the kernel ``channel_intake`` lease and
   answers inbound messages 24/7 with full agent turns — no interactive
   shell required, every remote-safety invariant unchanged.
 - **Graceful SIGTERM/SIGINT**: stop accepting work, finish the in-flight
@@ -385,9 +385,13 @@ class EdgeDaemon:
         """Deliver one channel notification. Returns (ok, transport, error).
 
         With no channel configured the notification is delivered to the
-        daemon log — a real, queryable delivery record. Configuring Slack
-        (or SMS/email) upgrades the same path to a live channel without any
-        mission changes.
+        daemon log — a real, queryable delivery record. Configuring a
+        channel (Matrix/Slack/SMS/email) upgrades the same path to a live
+        channel without any mission changes. With ``notify_push = ntfy``
+        routed, every outbox notification (digests, approval requests,
+        mission milestones) is ALSO pushed — best-effort, and when no
+        conversation channel is configured a successful push counts as
+        the delivery (transport ``ntfy``).
         """
         if self._notifier is not None:
             return self._notifier(payload)
@@ -397,14 +401,25 @@ class EdgeDaemon:
 
         manager = ChannelManager(self.config)
         target = channel or (self.config.get("notify_channel") or "")
+        pushed, _push_detail = manager.push_interrupt(
+            text, title=str(payload.get("title") or "conch"),
+        )
         if not manager.configured() or not manager.get(target or ""):
             if target and manager.get(target) is None and manager.configured():
                 pass  # named channel missing; fall through to log delivery
+            if pushed:
+                return True, "ntfy", ""
             self.log(f"notify (no channel configured):\n{text}")
             return True, "log", ""
         ok, detail = manager.notify(text, channel=target)
         if ok:
-            return True, target or "default", ""
+            transport = target or "default"
+            return True, transport + ("+ntfy" if pushed else ""), ""
+        if pushed:
+            # The conversation channel failed but the interrupt landed:
+            # record the real transport; the channel will heal on retry
+            # of future notifications.
+            return True, "ntfy", ""
         return False, "", str(detail)
 
     def deliver_outbox(self, limit: int = 8) -> int:

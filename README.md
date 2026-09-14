@@ -150,7 +150,11 @@ API keys are used by reference from the standard env vars and never printed;
 providers without a key are reported as unverifiable rather than silently
 blessed. After pruning or adding models, update the `MODEL_VERIFIED`
 annotations in `conch/providers.py` with the audit date — the test suite
-fails on any catalog entry without one.
+fails on any catalog entry without one. Note the annotation's limit:
+verification confirms the model exists and answers a forced tool call on
+the *auditing* account — per-account entitlement can still differ, and a
+key without access to a cataloged model simply falls through the provider
+fallback chain at runtime (which reports the degradation clearly).
 
 ## Features
 

@@ -216,21 +216,34 @@ shell never imports it.
   fleet-path secret-canary sweep (keys/bearers never in envelopes, events,
   receipts, argv, or logs).
 
-**Needs a real Linux/SSH host for final live verification** (deferred — no
-remote SSH/Docker host reachable and macOS has no systemd during this run):
+**Real Linux/SSH host verification: first field run completed 2026-09-14**
+(Ubuntu 26.04 LTS, systemd 259, cgroups v2, 2× NVIDIA GPU). The full
+lifecycle ran end to end over real OpenSSH — probe → trust-install →
+artifact-put ×3 → fail-closed signed deploy → activate → worker-start →
+live worker.status RPC over SSH stdio — and the security posture held
+(signature verification, digest/size pinning, informative fail-closed
+protocol errors). The worker runs live under the **process** profile. The
+run produced six findings, all fixed same-day: the systemd unit carried
+system-scope-only capability directives (user scope always EPERMs —
+directives removed), the documented build command redirected the human
+summary into allowed_signers (summary → stderr; trust-install now
+validates the anchor), worker-start reported ok for a unit dying into a
+restart loop (now confirms active (running) with status+journal on
+failure), Linger=no silently killed workers at logout (probe reports it;
+worker-start refuses without --force; enrollment docs gained the
+enable-linger step), the rpc CLI didn't match its docs (positional worker
++ --op convenience), and the model-catalog docs now note the
+per-account-entitlement limit of audit annotations. Still needing the
+live host:
 
-- Real OpenSSH enrollment and dispatch against a remote host: the interactive
-  strict-host-key first-enroll through the secure terminal, the BatchMode
-  autonomy check, hostctl streamed/installed over a real SSH session, and
-  `WorkerTransport` driving `conch-hostctl rpc` over SSH stdio. Tonight these
-  ran through injected runners and the local-socket fake transport (wire and
-  supervisor logic byte-identical; only the SSH hop is substituted).
-- Live hardened systemd unit on Linux: `systemd-analyze security` on the
-  generated unit and a real `systemctl --user enable --now` / stop / restart
-  cycle for `worker start/stop/status` and the systemd rollback swap. The
-  unit text is validated directive-by-directive in tests today.
-- GPU residency scheduling against an actual `nvidia-smi` host and a shared
-  Ollama endpoint under real concurrent load.
+- systemd-profile start verification: the capability-directive fix landed
+  after the field run — the re-run should see the unit reach
+  active (running) and exercise stop/restart plus the systemd rollback
+  swap.
+- A rollback exercise on the live host (`rollback` was not exercised —
+  only one revision existed during the first run).
+- GPU residency scheduling against an actual `nvidia-smi` host and a
+  shared Ollama endpoint under real concurrent load (unchanged).
 
 **Swarm Phase 3 — full Capitol integration (September 2026): landed.**
 Conch drives Capitol as a governed, subordinate process-execution fabric —

@@ -889,6 +889,23 @@ def systemd_unit_text(host: Host, worker: str, record: dict, *,
     network is denied by default except localhost so a worker can reach
     local model endpoints but nothing else; pass a wider allow-list only
     for workers that genuinely need one.
+
+    The unit is only ever installed **user scope** (``systemctl --user``
+    throughout this module), so every directive must be valid under an
+    unprivileged user manager. Capability directives
+    (CapabilityBoundingSet / AmbientCapabilities) are deliberately absent:
+    a user manager cannot manipulate capabilities — spawning fails with
+    ``status=218/CAPABILITIES`` — and an unprivileged process cannot gain
+    capabilities in the first place, so they add no hardening here. If a
+    system-scope unit is ever emitted, thread a ``scope`` parameter
+    through and reinstate them for ``system`` only. ProtectHostname is
+    likewise omitted: user managers ignore it with a warning on hosts
+    that prohibit unprivileged UTS namespaces, and the kernel already
+    denies hostname changes to unprivileged processes. The remaining
+    sandbox directives (ProtectSystem/ProtectHome/PrivateTmp/Protect*,
+    seccomp filters, IPAddress*) are all user-scope-valid on systemd with
+    unprivileged user namespaces, as is the cgroup resource block on
+    cgroups v2.
     """
     worker_dir = host.worker_dir(worker)
     current = record.get("current", "")
@@ -916,6 +933,12 @@ UMask=0077
 
 # Hardening: the worker is replaceable compute with no business
 # credentials; it may touch only its own directory and localhost.
+# This is a user-scope unit: capability directives are deliberately
+# absent (an unprivileged user manager cannot drop or grant
+# capabilities — both EPERM at spawn — and an unprivileged process
+# cannot gain them anyway), and ProtectHostname is omitted (ignored
+# with a warning under user managers; the kernel already denies
+# hostname changes to unprivileged processes).
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=tmpfs
@@ -926,14 +949,11 @@ ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
-ProtectHostname=yes
 ProtectProc=invisible
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM

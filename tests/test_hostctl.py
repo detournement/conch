@@ -5,8 +5,8 @@ host, the content-addressed artifact store (atomic, idempotent), the
 fail-closed signed deploy chain, idempotent deploy/activate/rollback
 receipts (repeated deployment is a no-op), the deployment lock, worker
 lifecycle under the process profile with a real supervised subprocess,
-hardened systemd unit text validation (textual — systemd-analyze is not
-available on macOS), and the bounded RPC relay.
+hardened systemd unit validation (textual everywhere, plus a real
+systemd-analyze verify on hosts that have it), and the bounded RPC relay.
 """
 
 import hashlib
@@ -592,10 +592,11 @@ class TestProcessProfileLifecycle(SignedDeployCase):
 
 
 class TestSystemdUnitText(SignedDeployCase):
-    """systemd-analyze is unavailable on macOS: the unit is validated
-    textually here; live-Linux verification is a documented follow-up."""
+    """Textual validation everywhere; when systemd-analyze exists on the
+    test host the rendered unit is additionally verified for real
+    (macOS lacks systemd-analyze, so that check skips cleanly there)."""
 
-    def test_unit_contains_every_required_hardening_directive(self):
+    def _unit_text(self):
         self.deploy(op_id="d1", profile="systemd")
         hostctl_json(
             ["activate", "--worker", "w1", "--op-id", "a1",
@@ -607,7 +608,10 @@ class TestSystemdUnitText(SignedDeployCase):
             self.home,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr.decode())
-        text = proc.stdout.decode()
+        return proc.stdout.decode()
+
+    def test_unit_contains_every_required_hardening_directive(self):
+        text = self._unit_text()
         for directive in (
             "NoNewPrivileges=yes",
             "ProtectSystem=strict",
@@ -618,7 +622,6 @@ class TestSystemdUnitText(SignedDeployCase):
             "ProtectControlGroups=yes",
             "RestrictSUIDSGID=yes",
             "LockPersonality=yes",
-            "CapabilityBoundingSet=",
             "SystemCallFilter=@system-service",
             "IPAddressDeny=any",
             "IPAddressAllow=localhost",
@@ -636,6 +639,40 @@ class TestSystemdUnitText(SignedDeployCase):
         self.assertIn("[Unit]", text)
         self.assertIn("[Service]", text)
         self.assertIn("[Install]", text)
+
+    def test_unit_omits_system_scope_only_directives(self):
+        """Field regression (2026-09-14): the unit is only ever installed
+        user-scope, where capability manipulation always EPERMs
+        (status=218/CAPABILITIES) — the directives must be absent, not
+        empty — and ProtectHostname is ignored with a warning."""
+        text = self._unit_text()
+        for directive in (
+            "CapabilityBoundingSet",
+            "AmbientCapabilities",
+            "ProtectHostname",
+        ):
+            self.assertNotRegex(
+                text, rf"(?m)^\s*{directive}\s*=",
+                f"{directive}= must not appear in a user-scope unit",
+            )
+
+    @unittest.skipUnless(
+        shutil.which("systemd-analyze"),
+        "systemd-analyze not on this host (e.g. macOS)",
+    )
+    def test_unit_passes_systemd_analyze_verify_user_scope(self):
+        text = self._unit_text()
+        unit_path = self.root / "conch-worker-w1.service"
+        unit_path.write_text(text)
+        proc = subprocess.run(
+            ["systemd-analyze", "verify", "--user", str(unit_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        self.assertEqual(
+            proc.returncode, 0,
+            f"systemd-analyze verify --user failed:\n"
+            f"{proc.stdout.decode()}\n{proc.stderr.decode()}",
+        )
 
     def test_unit_text_refuses_without_activated_revision(self):
         proc = run_hostctl(["unit-text", "--worker", "ghost"], self.home)

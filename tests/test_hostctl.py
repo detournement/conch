@@ -1106,6 +1106,75 @@ class TestRpcRelay(HostctlCase):
         self.assertEqual(capture["request"], request)
         self.assertEqual(proc.stdout, b'{"ok": true, "result": 42}\n')
 
+    def test_rpc_accepts_positional_worker(self):
+        """Field DX finding (2026-09-14): the README documented
+        `conch-hostctl rpc <worker>` but the CLI demanded --worker."""
+        run_dir = self.home / "workers" / "w1" / "run"
+        run_dir.mkdir(parents=True)
+        capture = {}
+        thread = self._serve_once(
+            run_dir / "supervisor.sock", b'{"ok": true}\n', capture
+        )
+        request = b'{"v": 1, "op": "worker.status", "args": {}}\n'
+        proc = run_hostctl(["rpc", "w1"], self.home, request)
+        thread.join(timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        self.assertEqual(capture["request"], request)
+
+    def test_rpc_op_mints_a_valid_protocol_request(self):
+        from conch.swarm.protocol import RpcRequest, parse_id
+
+        run_dir = self.home / "workers" / "w1" / "run"
+        run_dir.mkdir(parents=True)
+        capture = {}
+        thread = self._serve_once(
+            run_dir / "supervisor.sock", b'{"ok": true}\n', capture
+        )
+        proc = run_hostctl(
+            ["rpc", "w1", "--op", "worker.status"], self.home
+        )
+        thread.join(timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        request = json.loads(capture["request"].decode())
+        # The minted request passes real protocol validation.
+        parsed = RpcRequest(**request)
+        self.assertEqual(parsed.op, "worker.status")
+        self.assertEqual(parse_id(parsed.rpc_id), "rpc")
+
+    def test_rpc_op_rejects_unknown_op(self):
+        result = hostctl_json(
+            ["rpc", "w1", "--op", "worker.selfdestruct"], self.home,
+            expect_rc=1,
+        )
+        self.assertIn("unknown rpc op", result["error"])
+        self.assertIn("worker.status", result["error"])
+
+    def test_rpc_conflicting_worker_names_refused(self):
+        result = hostctl_json(
+            ["rpc", "w1", "--worker", "w2", "--op", "worker.status"],
+            self.home, expect_rc=1,
+        )
+        self.assertIn("two different worker names", result["error"])
+
+    def test_rpc_without_any_worker_name_refused(self):
+        result = hostctl_json(
+            ["rpc", "--op", "worker.status"], self.home, expect_rc=1,
+        )
+        self.assertIn("needs a worker name", result["error"])
+
+    def test_rpc_op_set_mirrors_the_swarm_protocol(self):
+        """hostctl is standalone (stdlib-only) so it carries its own copy
+        of the op set and wire versions — they must never drift."""
+        from conch.swarm import protocol
+
+        self.assertEqual(hostctl.RPC_OPS, protocol.RPC_OPS)
+        self.assertEqual(
+            hostctl.RPC_PROTOCOL_VERSION, protocol.PROTOCOL_VERSION
+        )
+        self.assertEqual(
+            hostctl.RPC_SCHEMA_VERSION, protocol.RpcRequest.SCHEMA_VERSION
+        )
+
     def test_rpc_without_worker_socket_fails_cleanly(self):
         result = hostctl_json(
             ["rpc", "--worker", "ghost"], self.home,

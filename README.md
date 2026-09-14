@@ -723,7 +723,11 @@ Lifecycle (enroll → probe → deploy → dispatch):
    the **docker** profile for strict isolation.
 4. **Dispatch** goes over `WorkerTransport` — a fixed JSON request/response
    line each way carried by `conch-hostctl rpc <worker>` over SSH stdio (no
-   secrets or prompts in argv, no worker network port). The controller
+   secrets or prompts in argv, no worker network port; the worker name may
+   also be passed as `--worker <worker>`). For manual debugging,
+   `conch-hostctl rpc <worker> --op worker.status` mints a valid request
+   itself — canonical `rpc_id` included — instead of requiring a
+   hand-built JSON line on stdin. The controller
    schedules by filter→score (protocol/state/trust/data ceiling/model
    residency/capacity, with shared-endpoint resource groups so one Ollama
    box is never oversubscribed), offers with a fencing token + controller

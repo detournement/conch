@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -66,6 +67,26 @@ MAX_RPC_BYTES = 1024 * 1024
 
 #: Hard bound on artifact-put payloads.
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
+
+#: Worker RPC operations and wire versions for the ``rpc --op``
+#: convenience. Must mirror ``conch.swarm.protocol`` (RPC_OPS,
+#: PROTOCOL_VERSION, RpcRequest.SCHEMA_VERSION) — this file is
+#: stdlib-only and standalone on bare hosts, so it cannot import them;
+#: a test cross-checks the two stay identical.
+RPC_OPS = frozenset({
+    "worker.status",
+    "task.offer",
+    "task.start",
+    "task.cancel",
+    "task.status",
+    "task.events",
+    "task.events_ack",
+    "task.resume",
+    "artifact.put",
+    "artifact.get",
+})
+RPC_PROTOCOL_VERSION = 1
+RPC_SCHEMA_VERSION = 1
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1437,9 +1458,39 @@ def _read_line_bounded(stream, bound: int) -> bytes:
     return b"".join(chunks)
 
 
+def _new_rpc_id() -> str:
+    """Canonical rpc ID — the ``rpc-{unix_ms:013x}-{16 hex}`` shape of
+    ``conch.swarm.protocol.new_id("rpc")``."""
+    return f"rpc-{int(time.time() * 1000):013x}-{secrets.token_hex(8)}"
+
+
 def cmd_rpc(host: Host, args) -> None:
-    worker = _check_name(args.worker, "worker name")
-    request = _read_line_bounded(sys.stdin.buffer, MAX_RPC_BYTES)
+    positional = getattr(args, "worker_pos", "") or ""
+    flagged = args.worker or ""
+    if positional and flagged and positional != flagged:
+        raise HostctlError(
+            f"rpc got two different worker names ({positional!r} and"
+            f" --worker {flagged!r}) — pick one"
+        )
+    if not (flagged or positional):
+        raise HostctlError(
+            "rpc needs a worker name (positional or --worker)"
+        )
+    worker = _check_name(flagged or positional, "worker name")
+    if args.op:
+        # Debugging convenience: mint a valid request (canonical rpc_id,
+        # known op) instead of demanding a hand-built JSON line on stdin.
+        if args.op not in RPC_OPS:
+            raise HostctlError(
+                f"unknown rpc op {args.op!r} — one of {sorted(RPC_OPS)}"
+            )
+        request = (json.dumps({
+            "rpc_id": _new_rpc_id(), "op": args.op, "args": {},
+            "schema_version": RPC_SCHEMA_VERSION,
+            "protocol_version": RPC_PROTOCOL_VERSION,
+        }, sort_keys=True) + "\n").encode("utf-8")
+    else:
+        request = _read_line_bounded(sys.stdin.buffer, MAX_RPC_BYTES)
     if not request.strip():
         raise HostctlError("rpc expects one JSON request line on stdin")
     record = host.load_worker(worker)
@@ -1626,7 +1677,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("rpc",
                        help="Relay one JSON request line to the worker.")
-    p.add_argument("--worker", required=True)
+    p.add_argument("worker_pos", nargs="?", default="", metavar="worker",
+                   help="Worker name (same as --worker).")
+    p.add_argument("--worker", default="",
+                   help="Worker name (same as the positional argument).")
+    p.add_argument("--op", default="", metavar="OP",
+                   help="Mint a valid request for this protocol op"
+                        " (canonical rpc_id included) instead of reading"
+                        " a JSON line from stdin — e.g. --op"
+                        " worker.status for debugging.")
     p.add_argument("--timeout", type=float, default=30.0)
 
     return parser

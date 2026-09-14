@@ -87,6 +87,61 @@ class HelperTests(unittest.TestCase):
         self.assertIn("/edit", names)
 
 
+class QueuedPreviewTests(unittest.TestCase):
+    """format_queued_preview: the one-line echo for typeahead-queued input.
+
+    A truncated preview must say so explicitly (ellipsis + captured tally);
+    a fitting single-line message must come back verbatim with no marker.
+    """
+
+    def test_short_message_verbatim_no_marker(self):
+        self.assertEqual(multiline.format_queued_preview("hello there", 60), "hello there")
+
+    def test_exact_fit_no_marker(self):
+        text = "x" * 60
+        self.assertEqual(multiline.format_queued_preview(text, 60), text)
+
+    def test_long_single_line_gets_ellipsis_and_tally(self):
+        text = "word " * 80  # 400 chars — the shape of the reported bug
+        preview = multiline.format_queued_preview(text, 60)
+        self.assertLessEqual(len(preview), 60)
+        self.assertIn("…", preview)
+        self.assertRegex(preview, r"… \(\+\d+ more chars queued\)$")
+        head = preview.split("…")[0]
+        self.assertTrue(text.startswith(head))
+        # Visible + hidden must account for every captured character.
+        import re
+
+        hidden = int(re.search(r"\(\+(\d+) more chars queued\)", preview).group(1))
+        self.assertEqual(len(head) + hidden, len(text))
+
+    def test_multiline_shows_first_line_and_totals(self):
+        text = "first line\nsecond\nthird"
+        preview = multiline.format_queued_preview(text, 60)
+        self.assertEqual(preview, "first line… (+2 lines, %d chars)" % len(text))
+        self.assertNotIn("\n", preview)
+
+    def test_multiline_single_extra_line_singular(self):
+        preview = multiline.format_queued_preview("a\nb", 60)
+        self.assertEqual(preview, "a… (+1 line, 3 chars)")
+
+    def test_multiline_long_first_line_stays_within_width(self):
+        text = ("y" * 200) + "\ntail"
+        preview = multiline.format_queued_preview(text, 60)
+        self.assertLessEqual(len(preview), 60)
+        self.assertNotIn("\n", preview)
+        self.assertRegex(preview, r"y+… \(\+1 line, 205 chars\)$")
+
+    def test_tiny_width_still_shows_content_and_marker(self):
+        preview = multiline.format_queued_preview("z" * 100, 10)
+        self.assertTrue(preview.startswith("z"))
+        self.assertIn("more chars queued", preview)
+
+    def test_crlf_normalized_before_line_count(self):
+        preview = multiline.format_queued_preview("a\r\nb", 60)
+        self.assertEqual(preview, "a… (+1 line, 3 chars)")
+
+
 class ReadUserMessageTests(unittest.TestCase):
     def setUp(self):
         patcher = patch.object(multiline, "_print_paste_hint", lambda n: None)

@@ -369,9 +369,14 @@ class TypeaheadBuffer:
                             self._buffer += "\n"  # mid-paste newline: one block
                         elif self._buffer:
                             self._queued.append(self._buffer)
-                            preview = self._buffer.replace(
-                                "\n", multiline.HISTORY_NEWLINE_MARK
-                            )[:60]
+                            # Budget the preview to the terminal minus the
+                            # "  (queued: )" chrome; format_queued_preview
+                            # adds an explicit "… (+N …)" marker when it has
+                            # to cut, so a long capture never looks lost.
+                            cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+                            preview = multiline.format_queued_preview(
+                                self._buffer, max(20, cols - 12)
+                            )
                             sys.stderr.write(
                                 f"\r\033[K  \033[2m(queued: {preview})\033[0m\n"
                             )

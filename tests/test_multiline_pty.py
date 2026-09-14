@@ -299,6 +299,24 @@ class TypeaheadCoalesceTests(PtyTestCase):
         self.assertEqual(s.parsed("QUEUED=")[0], [])
         self.assertEqual(s.parsed("PARTIAL=")[0], "a\nb")
 
+    def test_long_queued_message_intact_and_preview_marked(self):
+        # Regression: a long message typed mid-turn was echoed as a bare
+        # 60-char prefix, so it looked like the rest was lost even though
+        # the full text was queued. The queued content must stay
+        # byte-identical, and the on-screen preview must carry an explicit
+        # truncation marker with the captured tally.
+        message = " ".join("word%03d" % i for i in range(50))  # 399 chars
+        s = self.session("typeahead")
+        s.send(message.encode() + b"\r")
+        self.assertTrue(s.wait_for("PARTIAL="), s.transcript())
+        self.assertEqual(s.parsed("QUEUED=")[0], [message])
+        preview_lines = [
+            line for line in s.transcript().splitlines() if "(queued:" in line
+        ]
+        self.assertEqual(len(preview_lines), 1, s.transcript())
+        self.assertIn("more chars queued)", preview_lines[0])
+        self.assertNotIn(message, preview_lines[0])  # preview was actually cut
+
 
 if __name__ == "__main__":
     unittest.main()

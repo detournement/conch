@@ -242,6 +242,45 @@ def echo_message_block(text: str, header: str = "") -> None:
     sys.stdout.flush()
 
 
+def format_queued_preview(text: str, width: int = 60) -> str:
+    """One-line, width-bounded preview of a queued (typeahead) message.
+
+    A bare prefix cut looks like the rest of the input was lost, so any
+    trimming is made explicit: an ellipsis plus a tally of what was captured
+    beyond the visible part. A single-line message that fits is returned
+    verbatim with no marker.
+
+    - single line, too long:  "first-chars… (+M more chars queued)"
+    - multiline:              "first-line… (+K lines, M chars)"  (M = total)
+
+    The result never exceeds ``width`` unless width is too small to hold the
+    marker itself, in which case one character of content is still shown.
+    """
+    text = normalize_newlines(text)
+    if "\n" in text:
+        first, _, rest = text.partition("\n")
+        extra = rest.count("\n") + 1
+        suffix = "… (+%d line%s, %d chars)" % (
+            extra,
+            "" if extra == 1 else "s",
+            len(text),
+        )
+        return first[: max(1, width - len(suffix))] + suffix
+    if len(text) <= width:
+        return text
+    # The hidden-count digits change the suffix length, which changes how
+    # much content fits, which changes the hidden count: iterate to a fixed
+    # point (converges in a couple of steps since only digit width moves).
+    keep = max(1, width - len("… (+ more chars queued)") - len(str(len(text))))
+    for _ in range(4):
+        suffix = "… (+%d more chars queued)" % (len(text) - keep)
+        new_keep = max(1, width - len(suffix))
+        if new_keep == keep:
+            break
+        keep = new_keep
+    return text[:keep] + suffix
+
+
 def _print_paste_hint(count: int) -> None:
     sys.stdout.write(
         "\033[2m  (pasted %d line%s — Enter sends, Ctrl+C discards)\033[0m\n"

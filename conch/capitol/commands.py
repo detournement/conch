@@ -699,12 +699,12 @@ def _cmd_packs(tokens: List[str], config: dict):
         _print()
         return
     if sub == "verify":
-        _verify_pack(rest[0])
+        _verify_pack(rest[0], config)
         return
     raise CapitolError("usage: /capitol pack list|show|verify <name>")
 
 
-def _verify_pack(name: str):
+def _verify_pack(name: str, config: Optional[dict] = None):
     """Validate the manifest (fail closed) and run the pack's acceptance
     drill — the funding pack's verify pattern generalized."""
     from .packs import load_pack
@@ -747,6 +747,19 @@ def _verify_pack(name: str):
             )
         _print(f"    \033[1;32m✓ {len(report)} scenario(s) equivalent"
                "\033[0m\n")
+        return
+    if kind == "workflow_drill":
+        # Compiled packs: synthetic fixtures through the REAL workflows
+        # on the serving stack, expected gates asserted (fail closed).
+        from .compiler.drill import run_workflow_drill
+
+        _print("    acceptance: running the workflow drill against the "
+               "serving stack …")
+        evidence = run_workflow_drill(
+            pack, config or {}, log=lambda line: _print(f"  {line}")
+        )
+        _print(f"    \033[1;32m✓ {len(evidence.get('runs') or [])} "
+               "drill run(s) passed\033[0m\n")
         return
     raise CapitolError(
         f"acceptance kind {kind!r} is not runnable by this engine "

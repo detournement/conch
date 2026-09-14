@@ -129,6 +129,7 @@ SLASH_COMMANDS = [
     ("/apps", "List connectable services"),
     ("/ebay <photo...> [-- notes]", "eBay pilot: draft + publish a sandbox listing from photos (Capitol A2A)"),
     ("/capitol <subcommand> [...]", "Control Capitol workflows, runs, artifacts, and flow packs (A2Actrl parity; /capitol help)"),
+    ("/compile <goal|subcommand> [...]", "ProcessCompiler: compile a goal into a reviewed Architecture Card, then materialize it (/compile help)"),
     ("/reload", "Reload MCP tools"),
     ("/resettools", "Reset tool-calling if the model drifts to textual calls"),
     ("/rounds <n>", "Set max tool call rounds"),
@@ -913,6 +914,7 @@ def handle_slash_command(
             "  \033[1m/apps\033[0m                List connectable services\n"
             "  \033[1m/ebay <photo...> [-- notes]\033[0m  Draft + publish a sandbox eBay listing (Capitol A2A)\n"
             "  \033[1m/capitol <subcommand>\033[0m  Control Capitol workflows/runs/artifacts/packs (/capitol help)\n"
+            "  \033[1m/compile <goal>\033[0m      Compile a goal into a reviewed, materialized process (/compile help)\n"
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
             "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
             "  \033[1m/paste\033[0m               Paste lines literally; end with a lone '.' or Ctrl+D\n"
@@ -1684,6 +1686,15 @@ def handle_slash_command(
         from .capitol.commands import run_capitol_command
 
         run_capitol_command(arg, config)
+        return None
+
+    if command == "/compile":
+        # ProcessCompiler (process-compiler plan C1/C2): goal → reviewed
+        # Architecture Card → materialized, drilled, supervised process.
+        # Interactive-only in v1; imported lazily like /capitol.
+        from .capitol.compiler.commands import run_compile_command
+
+        run_compile_command(arg, config, origin="local")
         return None
 
     # User-defined slash commands (builtins above always take precedence)

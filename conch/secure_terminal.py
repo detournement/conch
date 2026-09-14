@@ -218,6 +218,15 @@ class DirectTerminalRunner:
                 "program or press Ctrl+C to return.\n",
                 flush=True,
             )
+            # Quiesce Conch's own output before the child owns the terminal:
+            # any text still sitting in a userspace buffer (stderr is not
+            # line-buffered; stdout fragments may lack a newline) would
+            # otherwise surface mid-session inside the child's interaction.
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except (AttributeError, OSError, ValueError):
+                    pass
             proc = None
             result: TerminalRunResult
             try:

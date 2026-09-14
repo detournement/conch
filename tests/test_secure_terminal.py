@@ -70,6 +70,57 @@ class TestTypeaheadHandoffBoundary(unittest.TestCase):
         self.assertTrue(thread.joined)
         self.assertTrue(reader.is_running())
 
+    def test_suspend_fails_closed_and_drops_latch_with_stuck_reader(self):
+        reader = TypeaheadBuffer()
+        reader._thread = _StuckReaderThread()
+        with self.assertRaisesRegex(RuntimeError, "handoff refused"):
+            reader.suspend_for_handoff()
+        # The latch must not stay raised after a refused handoff, or
+        # typeahead would never work again once the zombie exits.
+        self.assertFalse(reader._suspended)
+
+    def test_start_is_structurally_impossible_while_suspended(self):
+        reader = TypeaheadBuffer()
+        reader.suspend_for_handoff()
+        stdin = _TTYBuffer(0)
+        with patch("conch.app.sys.stdin", stdin), patch(
+            "conch.app.termios.tcgetattr"
+        ) as tcgetattr, patch("conch.app.threading.Thread") as thread_cls:
+            reader.start()
+        tcgetattr.assert_not_called()
+        thread_cls.assert_not_called()
+        self.assertFalse(reader.is_running())
+        reader.resume_after_handoff()
+
+    def test_handoff_window_captures_are_purged_never_queued_or_echoed(self):
+        reader = TypeaheadBuffer()
+        reader.suspend_for_handoff()
+        # Plant bytes as if something had reached the buffers while the
+        # child owned the terminal (i.e. credential-adjacent input).
+        reader._buffer = "hunter2"
+        reader._queued.append("hunter2")
+        with patch("sys.stdout", io.StringIO()) as out, patch(
+            "sys.stderr", io.StringIO()
+        ) as err:
+            reader.resume_after_handoff()
+        self.assertEqual(reader.get_queued(), [])
+        self.assertEqual(reader.stop(), "")
+        self.assertNotIn("hunter2", out.getvalue())
+        self.assertNotIn("hunter2", err.getvalue())
+
+    def test_handoff_guard_discards_prehandoff_input_with_notice(self):
+        reader = TypeaheadBuffer()
+        reader._buffer = "typed-before"
+        reader._queued.append("queued-before")
+        notices = []
+        with reader.handoff_guard(notify=lambda: notices.append(True)):
+            self.assertTrue(reader._suspended)
+            self.assertEqual(reader.get_queued(), [])
+        self.assertEqual(notices, [True])
+        self.assertFalse(reader._suspended)
+        self.assertEqual(reader.get_queued(), [])
+        self.assertEqual(reader.stop(), "")
+
 
 class TestDirectTerminalRunner(unittest.TestCase):
     def test_explicit_confirmation_required_even_in_agent_mode(self):
@@ -132,6 +183,42 @@ class TestDirectTerminalRunner(unittest.TestCase):
             self.assertNotIn(forbidden, kwargs)
         self.assertFalse(hasattr(result, "stdout"))
         discard_input.assert_called_once_with()
+
+    def test_std_streams_are_flushed_before_child_spawns(self):
+        events = []
+
+        class _RecordingStream(io.StringIO):
+            def __init__(self, tag):
+                super().__init__()
+                self._tag = tag
+
+            def flush(self):
+                events.append("flush-" + self._tag)
+                super().flush()
+
+        def _spawn(*_args, **_kwargs):
+            events.append("spawn")
+            return _FakeProcess()
+
+        runner = DirectTerminalRunner(
+            TerminalHandoffPolicy(
+                local_session=True,
+                input_fn=lambda _prompt: "y",
+                tty_check=lambda: True,
+            )
+        )
+        with patch("sys.stdout", _RecordingStream("out")), patch(
+            "sys.stderr", _RecordingStream("err")
+        ), patch(
+            "conch.secure_terminal.subprocess.Popen", side_effect=_spawn
+        ), patch(
+            "conch.secure_terminal.discard_pending_terminal_input"
+        ):
+            result = runner.run(["child"], description="Run?")
+        self.assertTrue(result.approved)
+        spawn_at = events.index("spawn")
+        self.assertIn("flush-out", events[:spawn_at])
+        self.assertIn("flush-err", events[:spawn_at])
 
     def test_terminal_flags_restored_when_spawn_fails(self):
         stdin = _TTYBuffer(0)

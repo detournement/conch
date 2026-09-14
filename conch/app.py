@@ -280,11 +280,20 @@ class TypeaheadBuffer:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._old_settings = None
+        self._suspended = False
+        # Self-pipe: stop() writes one byte so the reader's select() wakes
+        # immediately instead of finishing a 100ms tick, and the loop exits
+        # without ever touching the stdin fd again.
+        self._wake_r, self._wake_w = os.pipe()
         # Newlines with more input already pending are interior to a paste;
         # coalesce them so a block pasted mid-turn queues as one message.
         self.coalesce_pastes = True
 
     def start(self):
+        if self._suspended:
+            # A terminal handoff owns stdin: restarting capture here would
+            # race the child for keystrokes (credential prompts included).
+            return
         if not sys.stdin.isatty():
             return
         if self._thread is not None and self._thread.is_alive():
@@ -304,8 +313,12 @@ class TypeaheadBuffer:
     def stop(self) -> str:
         """Stop capturing and restore terminal. Returns un-entered partial text."""
         self._stop.set()
+        try:
+            os.write(self._wake_w, b"\0")
+        except OSError:
+            pass
         if self._thread:
-            self._thread.join(timeout=0.5)
+            self._thread.join(timeout=1.0)
             if not self._thread.is_alive():
                 self._thread = None
         if self._old_settings is not None:
@@ -329,6 +342,62 @@ class TypeaheadBuffer:
             )
         return partial
 
+    def suspend_for_handoff(self) -> tuple[str, list[str]]:
+        """Park capture before a terminal handoff, or refuse the handoff.
+
+        The latch is raised first so any concurrent ``start()`` becomes a
+        no-op, then the reader is stopped and joined — if it cannot be
+        proven parked, the latch is dropped and the handoff is refused.
+        Returns the (partial, queued) input captured *before* the handoff
+        so the caller can discard it explicitly.
+        """
+        self._suspended = True
+        try:
+            partial = self.stop()
+        except BaseException:
+            self._suspended = False
+            raise
+        if self.is_running():
+            self._suspended = False
+            raise RuntimeError(
+                "Conch input reader did not stop; terminal handoff refused"
+            )
+        return partial, self.get_queued()
+
+    def resume_after_handoff(self) -> None:
+        """Purge the handoff window and lift the latch.
+
+        Anything that reached these buffers while a child owned the terminal
+        is credential-adjacent by definition: it is discarded, never echoed,
+        and never queued as a message. The caller decides whether to
+        ``start()`` capture again.
+        """
+        self._buffer = ""
+        self._queued.clear()
+        self._suspended = False
+
+    @contextlib.contextmanager
+    def handoff_guard(self, notify=None):
+        """Bracket a terminal handoff with the full input/output handshake.
+
+        Entry parks the reader (fail-closed), reports discarded pre-handoff
+        input through ``notify``, and flushes Conch's stdout/stderr so no
+        buffered text can surface inside the child's session. Exit purges
+        anything captured during the window and lifts the suspension latch.
+        """
+        partial, queued = self.suspend_for_handoff()
+        if (partial or queued) and notify is not None:
+            notify()
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (AttributeError, OSError, ValueError):
+                pass
+        try:
+            yield
+        finally:
+            self.resume_after_handoff()
+
     def get_queued(self) -> list[str]:
         lines = list(self._queued)
         self._queued.clear()
@@ -340,10 +409,19 @@ class TypeaheadBuffer:
         # on the fd never fires and the rest of the paste is stranded.
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         fd = sys.stdin.fileno()
+        wake = self._wake_r
         prev_cr = False
         while not self._stop.is_set():
             try:
-                ready, _, _ = select.select([fd], [], [], 0.1)
+                ready, _, _ = select.select([fd, wake], [], [], 0.1)
+                if wake in ready:
+                    # stop() poked the self-pipe: drain it and exit at the
+                    # loop check without touching the stdin fd again.
+                    try:
+                        os.read(wake, 64)
+                    except OSError:
+                        pass
+                    continue
                 if not ready or self._stop.is_set():
                     continue
                 try:
@@ -352,6 +430,11 @@ class TypeaheadBuffer:
                     break
                 if not data:
                     break
+                if self._suspended:
+                    # Handoff window: these bytes belong to the child's
+                    # session (possibly credentials). Drop them unprocessed —
+                    # never buffered, never queued, never echoed.
+                    continue
                 text = decoder.decode(data)
                 idx = 0
                 while idx < len(text):
@@ -373,14 +456,18 @@ class TypeaheadBuffer:
                             # "  (queued: )" chrome; format_queued_preview
                             # adds an explicit "… (+N …)" marker when it has
                             # to cut, so a long capture never looks lost.
-                            cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-                            preview = multiline.format_queued_preview(
-                                self._buffer, max(20, cols - 12)
-                            )
-                            sys.stderr.write(
-                                f"\r\033[K  \033[2m(queued: {preview})\033[0m\n"
-                            )
-                            sys.stderr.flush()
+                            # A stopping reader stays silent: printing while
+                            # the main thread hands the terminal to a child
+                            # (or to input()) would interleave with it.
+                            if not self._stop.is_set():
+                                cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+                                preview = multiline.format_queued_preview(
+                                    self._buffer, max(20, cols - 12)
+                                )
+                                sys.stderr.write(
+                                    f"\r\033[K  \033[2m(queued: {preview})\033[0m\n"
+                                )
+                                sys.stderr.flush()
                             self._buffer = ""
                     elif ch in ("\x7f", "\x08"):
                         if self._buffer:
@@ -688,19 +775,13 @@ def chat_loop(new_conversation=False):
     _typeahead_partial = ""
     _handoff_depth = 0
 
-    def _pause_typeahead(*, preserve: bool = True):
+    def _pause_typeahead():
         nonlocal _typeahead_partial
         partial = _typeahead.stop_for_handoff()
         queued = _typeahead.get_queued()
-        if preserve:
-            if partial:
-                _typeahead_partial += partial
-            _typeahead_queued.extend(queued)
-        elif partial or queued:
-            print(
-                "  \033[2m(discarded pre-handoff typeahead for credential "
-                "safety)\033[0m"
-            )
+        if partial:
+            _typeahead_partial += partial
+        _typeahead_queued.extend(queued)
 
     def _safe_input(prompt):
         """Pause typeahead so input() can read stdin normally."""
@@ -713,19 +794,32 @@ def chat_loop(new_conversation=False):
             if _typeahead_enabled:
                 _typeahead.start()
 
+    def _discard_notice():
+        print(
+            "  \033[2m(discarded pre-handoff typeahead for credential "
+            "safety)\033[0m"
+        )
+
     @contextlib.contextmanager
     def _terminal_handoff_context():
-        """Suspend every Conch stdin reader while a child owns the terminal."""
+        """Suspend every Conch stdin reader while a child owns the terminal.
+
+        The guard parks the reader fail-closed, discards pre-handoff
+        typeahead with a visible notice, flushes Conch's own output so
+        nothing buffered leaks into the child's session, and purges anything
+        that reached the capture buffers during the window before capture is
+        allowed to restart.
+        """
 
         nonlocal _handoff_depth
-        _pause_typeahead(preserve=False)
-        _handoff_depth += 1
-        try:
-            yield
-        finally:
-            _handoff_depth -= 1
-            if _typeahead_enabled:
-                _typeahead.start()
+        with _typeahead.handoff_guard(notify=_discard_notice):
+            _handoff_depth += 1
+            try:
+                yield
+            finally:
+                _handoff_depth -= 1
+        if _typeahead_enabled:
+            _typeahead.start()
 
     def _set_foreground_policies():
         standard = LocalShellPolicy(

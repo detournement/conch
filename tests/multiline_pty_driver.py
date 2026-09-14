@@ -87,6 +87,50 @@ def main():
         emit("QUEUED=", repr(buf.get_queued()))
         emit("PARTIAL=", repr(partial))
 
+    elif mode == "handoff":
+        import time
+
+        from conch.app import TypeaheadBuffer
+        from conch.secure_terminal import (
+            DirectTerminalRunner,
+            TerminalHandoffPolicy,
+        )
+
+        # Make stdout deliberately block-buffered (PYTHONUNBUFFERED would
+        # defeat the point): the unterminated fragment below must reach the
+        # terminal only because the handoff flushes it before the child runs.
+        sys.stdout = open(  # noqa: SIM115 — process-lifetime stream swap
+            1, "w", buffering=1 << 20, closefd=False
+        )
+
+        buf = TypeaheadBuffer()
+        buf.start()
+        emit("READY")
+        time.sleep(1.0)  # the harness types pre-handoff bytes now
+
+        sys.stdout.write("ERRFRAG:connect interactively first.")  # no flush
+
+        runner = DirectTerminalRunner(
+            TerminalHandoffPolicy(
+                local_session=True,
+                input_fn=lambda _prompt: "y",
+                handoff_context=lambda: buf.handoff_guard(
+                    notify=lambda: emit("DISCARD-NOTICE")
+                ),
+                tty_check=lambda: True,
+            )
+        )
+        child = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "handoff_sudo_child.py",
+        )
+        result = runner.run(
+            [sys.executable, child], description="Hand off?", timeout=30
+        )
+        emit("RC=", repr(result.returncode))
+        emit("QUEUED=", repr(buf.get_queued()))
+        emit("PARTIAL=", repr(buf.stop()))
+
     emit("DONE")
 
 

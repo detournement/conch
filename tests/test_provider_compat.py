@@ -21,6 +21,7 @@ from unittest.mock import patch
 from conch.providers import (
     KNOWN_MODELS,
     MODEL_PRICING,
+    MODEL_VERIFIED,
     PROVIDER_TOOL_LIMITS,
     DEFAULT_CHAT_MODEL_BY_PROVIDER,
     _anthropic_max_tokens,
@@ -73,8 +74,20 @@ class TestReasoningModelDetection(unittest.TestCase):
                 f"{model} should be detected as strict reasoning model",
             )
 
+    def test_gpt5_reasoning_family_detected(self):
+        # Verified live 2026-09-14: these reject non-default temperature.
+        for model in ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.5"):
+            self.assertTrue(
+                _openai_is_strict_reasoning_model(model),
+                f"{model} should be detected as strict reasoning model",
+            )
+
     def test_gpt_not_detected(self):
-        for model in ("gpt-4o", "gpt-4o-mini", "gpt-5.4", "gpt-4.1-nano"):
+        # gpt-5.4* and gpt-5.6* accept custom temperature (verified live).
+        for model in (
+            "gpt-4o", "gpt-4o-mini", "gpt-5.4", "gpt-5.4-mini",
+            "gpt-5.6-sol", "gpt-4.1-nano",
+        ):
             self.assertFalse(
                 _openai_is_strict_reasoning_model(model),
                 f"{model} should NOT be detected as strict reasoning model",
@@ -108,6 +121,33 @@ class TestBuildOpenAIRequestBody(unittest.TestCase):
         )
         self.assertEqual(body["max_completion_tokens"], 2048)
         self.assertNotIn("max_tokens", body)
+
+    def test_gpt56_tools_force_no_reasoning(self):
+        """gpt-5.6-{sol,terra,luna} reject function tools on chat completions
+        unless reasoning_effort="none" (verified live 2026-09-14)."""
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            body = build_openai_chat_request_body(
+                model, [{"role": "user", "content": "hi"}],
+                temperature=0.7, max_completion_tokens=1024,
+                tools=[_make_tool("t")],
+            )
+            self.assertEqual(body.get("reasoning_effort"), "none", model)
+
+    def test_gpt56_without_tools_keeps_reasoning(self):
+        body = build_openai_chat_request_body(
+            "gpt-5.6-sol", [{"role": "user", "content": "hi"}],
+            temperature=0.7, max_completion_tokens=1024,
+        )
+        self.assertNotIn("reasoning_effort", body)
+
+    def test_other_models_never_get_reasoning_effort(self):
+        for model in ("gpt-4o", "gpt-5.5", "o3-mini"):
+            body = build_openai_chat_request_body(
+                model, [{"role": "user", "content": "hi"}],
+                temperature=0.7, max_completion_tokens=1024,
+                tools=[_make_tool("t")],
+            )
+            self.assertNotIn("reasoning_effort", body, model)
 
     def test_tools_sanitized(self):
         tools = [{"function": {"name": "t", "parameters": {
@@ -573,26 +613,85 @@ class TestModelCatalog(unittest.TestCase):
         self.assertIn("o4-mini", openai_models)
         self.assertIn("gpt-5.4", openai_models)
         self.assertIn("gpt-5.5", openai_models)
-        self.assertIn("gpt-5.3-codex", openai_models)
-        self.assertIn("gpt-5.6", openai_models)
         self.assertIn("gpt-5.6-sol", openai_models)
         self.assertIn("gpt-5.6-terra", openai_models)
         self.assertIn("gpt-5.6-luna", openai_models)
 
+    def test_openai_pruned_models_stay_out(self):
+        """Pruned/quarantined 2026-09-14: bare gpt-5.6 does not exist, and
+        the pro/codex models are v1/responses-only — conch's chat-completions
+        path cannot tool-call them."""
+        openai_models = KNOWN_MODELS["openai"]
+        for model in ("gpt-5.6", "gpt-5.3-codex", "gpt-5.4-pro", "o3-pro", "o1-pro"):
+            self.assertNotIn(model, openai_models)
+            self.assertNotIn(model, MODEL_PRICING)
+
     def test_anthropic_has_current_models(self):
         anthropic_models = KNOWN_MODELS["anthropic"]
-        self.assertIn("claude-fable-5", anthropic_models)
         self.assertIn("claude-opus-5", anthropic_models)
         self.assertIn("claude-sonnet-5", anthropic_models)
         self.assertIn("claude-opus-4-8", anthropic_models)
         self.assertIn("claude-opus-4-7", anthropic_models)
         self.assertIn("claude-sonnet-4-6", anthropic_models)
+        self.assertIn("claude-haiku-4-5", anthropic_models)
+
+    def test_anthropic_pruned_models_stay_out(self):
+        """Pruned 2026-09-14: absent from /v1/models and 404 on direct probe."""
+        anthropic_models = KNOWN_MODELS["anthropic"]
+        for model in ("claude-fable-5", "claude-sonnet-4-7"):
+            self.assertNotIn(model, anthropic_models)
+            self.assertNotIn(model, MODEL_PRICING)
 
     def test_cerebras_has_current_models(self):
         cerebras_models = KNOWN_MODELS["cerebras"]
         self.assertIn("gpt-oss-120b", cerebras_models)
         self.assertIn("gemma-4-31b", cerebras_models)
         self.assertIn("zai-glm-4.7", cerebras_models)
+
+
+class TestModelVerificationAnnotations(unittest.TestCase):
+    """Every hardcoded cloud catalog entry must carry a live-audit
+    annotation in MODEL_VERIFIED (tools/audit_models.py): either the ISO
+    date it last passed the existence + forced-tool-call audit, or an
+    explicit "unverified YYYY-MM-DD (<reason>)" marker. This makes adding a
+    model without auditing it a conscious, visible act. Ollama/custom are
+    exempt: they have no hardcoded catalog and are verified live at runtime.
+    """
+
+    DATE_RE = r"\d{4}-\d{2}-\d{2}"
+
+    def test_every_catalog_entry_is_annotated(self):
+        import re
+        pattern = re.compile(
+            rf"^({self.DATE_RE}|unverified {self.DATE_RE} \(.+\))$"
+        )
+        for provider, models in KNOWN_MODELS.items():
+            if provider in ("ollama", "custom"):
+                continue
+            for model in models:
+                self.assertIn(
+                    model, MODEL_VERIFIED,
+                    f"{provider}/{model} has no verification annotation — "
+                    "run tools/audit_models.py and record the date",
+                )
+                self.assertRegex(
+                    MODEL_VERIFIED[model], pattern,
+                    f"{provider}/{model} annotation must be an ISO date or "
+                    "'unverified YYYY-MM-DD (<reason>)'",
+                )
+
+    def test_no_stale_annotations(self):
+        cataloged = {
+            model
+            for provider, models in KNOWN_MODELS.items()
+            for model in models
+        }
+        for model in MODEL_VERIFIED:
+            self.assertIn(
+                model, cataloged,
+                f"MODEL_VERIFIED entry '{model}' is not in any catalog — "
+                "remove it or restore the model",
+            )
 
 
 class TestCerebrasConfigLoading(unittest.TestCase):

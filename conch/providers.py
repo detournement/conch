@@ -16,15 +16,25 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 
+# Every cloud catalog entry must pass the live audit (existence via the
+# provider's model-list endpoint + a forced native tool-call probe) before
+# it is listed — run `python tools/audit_models.py` and record the date in
+# MODEL_VERIFIED below. See tests/test_provider_compat.py
+# (TestModelVerificationAnnotations): adding a model without an audit
+# annotation fails the suite.
 KNOWN_MODELS = {
+    # UNVERIFIED as of the 2026-09-14 audit: no CEREBRAS_API_KEY was
+    # available on the audit machine, so this catalog is carried forward
+    # from earlier live checks rather than re-blessed. Re-audit with a key
+    # before relying on it.
     "cerebras": [
         "gpt-oss-120b",
         "gemma-4-31b",
         "zai-glm-4.7",
     ],
-    # AWS Bedrock via its OpenAI-compatible endpoint. Moonshot Kimi models
-    # verified live in this account (us-east-2). Kimi K3 is still not in
-    # Bedrock's managed catalog (as of 2026-08); use OpenRouter for it.
+    # AWS Bedrock via its OpenAI-compatible endpoint (us-east-2), all three
+    # re-verified with forced tool-call probes 2026-09-14. Kimi K3 is still
+    # not in Bedrock's managed catalog; use OpenRouter for it.
     "bedrock": [
         "moonshotai.kimi-k2.5",
         "moonshot.kimi-k2-thinking",
@@ -34,22 +44,31 @@ KNOWN_MODELS = {
     ],
     # OpenRouter (openrouter.ai) — OpenAI-compatible gateway to frontier
     # models not available on other providers here. All listed models
-    # advertise native tool calling and streaming.
+    # re-verified for native tool calling 2026-09-14.
     "openrouter": [
         "moonshotai/kimi-k3",
         "z-ai/glm-5.2",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-flash",
     ],
-    # Conch requires tool calling, so only tool-capable models are listed
-    # (e.g. o1-mini is excluded: it supports neither tools nor system messages).
+    # Conch requires native tool calling over /v1/chat/completions, so only
+    # models that pass the forced-tool probe there are listed (e.g. o1-mini
+    # is excluded: it supports neither tools nor system messages).
+    #
+    # Pruned 2026-09-14:
+    #   gpt-5.6 — does not exist; only the sol/terra/luna variants shipped.
+    # Quarantined 2026-09-14 (exist, but are v1/responses-only and reject
+    # tool calls on chat completions, which is the only API conch speaks):
+    #   gpt-5.3-codex, gpt-5.4-pro, o3-pro, o1-pro
+    # Re-add them only if/when conch grows a v1/responses adapter.
     "openai": [
-        "gpt-5.6",
+        # gpt-5.6-{sol,terra,luna} tool-call on chat completions only with
+        # reasoning_effort="none" (sent automatically by
+        # build_openai_chat_request_body).
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-5.5",
-        "gpt-5.3-codex",
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.4-nano",
@@ -64,17 +83,17 @@ KNOWN_MODELS = {
         "o3",
         "o3-mini",
         "o1",
-        "o3-pro",
-        "o1-pro",
-        "gpt-5.4-pro",
     ],
+    # Pruned 2026-09-14 (absent from /v1/models AND 404 on a direct probe):
+    #   claude-fable-5, claude-sonnet-4-7
+    # claude-haiku-4-5 is kept although the list endpoint only shows the
+    # dated ID (claude-haiku-4-5-20251001): the alias resolves and passed
+    # the tool probe.
     "anthropic": [
-        "claude-fable-5",
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
-        "claude-sonnet-4-7",
         "claude-sonnet-4-6",
         "claude-opus-4-6",
         "claude-haiku-4-5",
@@ -86,6 +105,50 @@ KNOWN_MODELS = {
     # Custom OpenAI-compatible endpoints define their model in config
     # (custom_model); nothing is hardcoded.
     "custom": [],
+}
+
+# Audit trail for every cloud catalog entry: the date the model last passed
+# the live existence + forced-tool-call audit (tools/audit_models.py), or
+# "unverified YYYY-MM-DD (<reason>)" when the audit could not run. A catalog
+# entry without an annotation here fails the test suite.
+_CEREBRAS_UNVERIFIED = "unverified 2026-09-14 (no CEREBRAS_API_KEY on audit machine)"
+MODEL_VERIFIED = {
+    "gpt-oss-120b": _CEREBRAS_UNVERIFIED,
+    "gemma-4-31b": _CEREBRAS_UNVERIFIED,
+    "zai-glm-4.7": _CEREBRAS_UNVERIFIED,
+    "moonshotai.kimi-k2.5": "2026-09-14",
+    "moonshot.kimi-k2-thinking": "2026-09-14",
+    "zai.glm-5": "2026-09-14",
+    "moonshotai/kimi-k3": "2026-09-14",
+    "z-ai/glm-5.2": "2026-09-14",
+    "deepseek/deepseek-v4-pro": "2026-09-14",
+    "deepseek/deepseek-v4-flash": "2026-09-14",
+    "gpt-5.6-sol": "2026-09-14",
+    "gpt-5.6-terra": "2026-09-14",
+    "gpt-5.6-luna": "2026-09-14",
+    "gpt-5.5": "2026-09-14",
+    "gpt-5.4": "2026-09-14",
+    "gpt-5.4-mini": "2026-09-14",
+    "gpt-5.4-nano": "2026-09-14",
+    "gpt-5-mini": "2026-09-14",
+    "gpt-5-nano": "2026-09-14",
+    "gpt-4.1": "2026-09-14",
+    "gpt-4.1-mini": "2026-09-14",
+    "gpt-4.1-nano": "2026-09-14",
+    "gpt-4o": "2026-09-14",
+    "gpt-4o-mini": "2026-09-14",
+    "o4-mini": "2026-09-14",
+    "o3": "2026-09-14",
+    "o3-mini": "2026-09-14",
+    "o1": "2026-09-14",
+    "claude-opus-5": "2026-09-14",
+    "claude-sonnet-5": "2026-09-14",
+    "claude-opus-4-8": "2026-09-14",
+    "claude-opus-4-7": "2026-09-14",
+    "claude-sonnet-4-6": "2026-09-14",
+    "claude-opus-4-6": "2026-09-14",
+    "claude-haiku-4-5": "2026-09-14",
+    "claude-sonnet-4-5-20250929": "2026-09-14",
 }
 
 DEFAULT_API_KEY_ENVS = {
@@ -143,14 +206,11 @@ MODEL_CONTEXT_WINDOWS = {
     "deepseek/deepseek-v4-pro": 1048576,
     "deepseek/deepseek-v4-flash": 1048576,
     # openai
-    "gpt-5.6": 1050000,
     "gpt-5.6-sol": 1050000,
     "gpt-5.6-terra": 1050000,
     "gpt-5.6-luna": 1050000,
     "gpt-5.5": 1050000,
-    "gpt-5.3-codex": 400000,
     "gpt-5.4": 400000,
-    "gpt-5.4-pro": 400000,
     "gpt-5.4-mini": 400000,
     "gpt-5.4-nano": 400000,
     "gpt-5-mini": 400000,
@@ -163,17 +223,12 @@ MODEL_CONTEXT_WINDOWS = {
     "o4-mini": 200000,
     "o3": 200000,
     "o3-mini": 200000,
-    "o3-pro": 200000,
     "o1": 200000,
-    "o1-mini": 128000,
-    "o1-pro": 200000,
     # anthropic (1M is the default window from Sonnet 4.6 / Opus 4.6 onward)
-    "claude-fable-5": 1000000,
     "claude-opus-5": 1000000,
     "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4-7": 1000000,
-    "claude-sonnet-4-7": 1000000,
     "claude-sonnet-4-6": 1000000,
     "claude-opus-4-6": 1000000,
     "claude-haiku-4-5": 200000,
@@ -816,14 +871,11 @@ MODEL_PRICING = {
     "z-ai/glm-5.2":                (0.98, 3.08),
     "deepseek/deepseek-v4-pro":    (0.435, 0.87),
     "deepseek/deepseek-v4-flash":  (0.14, 0.28),
-    "gpt-5.6":                     (5.00, 30.00),
     "gpt-5.6-sol":                 (5.00, 30.00),
     "gpt-5.6-terra":               (2.00, 12.00),
     "gpt-5.6-luna":                (0.20, 1.20),
     "gpt-5.5":                     (5.00, 30.00),
-    "gpt-5.3-codex":               (1.75, 14.00),
     "gpt-5.4":                     (2.50, 15.00),
-    "gpt-5.4-pro":                 (15.00, 120.00),
     "gpt-5.4-mini":                (0.75, 4.50),
     "gpt-5.4-nano":                (0.20, 1.25),
     "gpt-5-mini":                  (0.75, 4.50),
@@ -836,11 +888,7 @@ MODEL_PRICING = {
     "o4-mini":                     (1.10, 4.40),
     "o3":                          (2.00, 8.00),
     "o3-mini":                     (1.10, 4.40),
-    "o3-pro":                      (20.00, 80.00),
     "o1":                          (15.00, 60.00),
-    "o1-mini":                     (1.10, 4.40),
-    "o1-pro":                      (150.00, 600.00),
-    "claude-fable-5":              (10.00, 50.00),
     "claude-opus-5":               (5.00, 25.00),
     "claude-sonnet-5":             (2.00, 10.00),
     "claude-sonnet-4-6":           (3.00, 15.00),
@@ -849,13 +897,22 @@ MODEL_PRICING = {
     "claude-sonnet-4-5-20250929":  (3.00, 15.00),
     "claude-opus-4-8":             (5.00, 25.00),
     "claude-opus-4-7":             (5.00, 25.00),
-    "claude-sonnet-4-7":           (3.00, 15.00),
 }
 
 
 def _openai_is_strict_reasoning_model(model: str) -> bool:
-    """OpenAI o-series models reject custom sampling params; use max_completion_tokens only."""
-    return bool(re.match(r"^o\d", model.lower().strip()))
+    """OpenAI reasoning models reject custom sampling params (temperature
+    must stay at its default); use max_completion_tokens only.
+
+    Covers the o-series plus the gpt-5/gpt-5.5 reasoning family. Verified
+    live 2026-09-14: gpt-5.5, gpt-5-mini, and gpt-5-nano return HTTP 400
+    for any non-default temperature, while gpt-5.4* and gpt-5.6* accept it.
+    """
+    name = model.lower().strip()
+    return bool(
+        re.match(r"^o\d", name)
+        or re.match(r"^gpt-5(\.5)?(-(mini|nano|pro|chat-latest))?$", name)
+    )
 
 
 def _anthropic_max_tokens(model: str) -> int:
@@ -915,6 +972,12 @@ def build_openai_chat_request_body(
         body["temperature"] = temperature
     if tools:
         body["tools"] = _sanitize_tools_for_openai(tools)
+        # gpt-5.6-{sol,terra,luna} reject function tools on chat completions
+        # at any reasoning_effort other than "none" (the API points to
+        # v1/responses otherwise). Verified live 2026-09-14: with
+        # reasoning_effort="none" the forced-tool probe passes on all three.
+        if model.lower().startswith("gpt-5.6"):
+            body["reasoning_effort"] = "none"
     return body
 
 

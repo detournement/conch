@@ -107,9 +107,9 @@ are rejected.
 
 | Provider | Models | Cost |
 |----------|--------|------|
-| Cerebras | gpt-oss-120b, gemma-4-31b, zai-glm-4.7 (deprecated 2026-08-17) | Paid / free tier |
-| OpenAI | gpt-5.6 family (sol/terra/luna), gpt-5.5, gpt-5.3-codex, gpt-5.4 family, gpt-4.1 family, gpt-4o, o3, o4-mini, o1 (all tool-capable; o1-mini is not supported) | Paid |
-| Anthropic | claude-fable-5, claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 | Paid |
+| Cerebras | gpt-oss-120b, gemma-4-31b, zai-glm-4.7 (catalog unverified in the 2026-09-14 audit: no key available — re-audit before relying on it) | Paid / free tier |
+| OpenAI | gpt-5.6-sol/terra/luna, gpt-5.5, gpt-5.4 family, gpt-5-mini/nano, gpt-4.1 family, gpt-4o, gpt-4o-mini, o3, o3-mini, o4-mini, o1 (all verified tool-capable 2026-09-14; o1-mini is not supported, and gpt-5.3-codex, gpt-5.4-pro, o3-pro, o1-pro are v1/responses-only so conch cannot use them) | Paid |
+| Anthropic | claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5, claude-sonnet-4-5-20250929 (all verified tool-capable 2026-09-14) | Paid |
 | Bedrock (AWS) | moonshotai.kimi-k2.5, moonshot.kimi-k2-thinking via Bedrock's OpenAI-compatible endpoint; auth is a long-term Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK` (region via `bedrock_region`, default us-east-2) | Paid (AWS) |
 | OpenRouter | moonshotai/kimi-k3 (2.8T MoE, 1M context, $3/$15 per MTok), z-ai/glm-5.2 (~750B MoE, 1M context, $0.98/$3.08 per MTok), deepseek/deepseek-v4-pro and deepseek/deepseek-v4-flash (1M context); key in `OPENROUTER_API_KEY` | Paid |
 | Ollama | Discovered live from your server's `/api/tags`, filtered to models that advertise the `tools` capability | Free (local) |
@@ -129,6 +129,28 @@ causes revalidation. Missing capability metadata fails closed: older servers
 that cannot positively report native tool support expose no selectable
 models. If a local service is unavailable, its models are not shown and
 requests are blocked without contaminating conversation history.
+
+#### Auditing the cloud catalogs
+
+The cloud model catalogs are hardcoded and go stale as providers rename and
+decommission models. Re-run the live audit periodically (quarterly, or before
+a release):
+
+```bash
+python tools/audit_models.py                     # every provider
+python tools/audit_models.py --provider openai   # one provider
+python tools/audit_models.py --prune-suggestions # entries to remove
+```
+
+For each cataloged model it checks existence against the provider's
+model-list endpoint and then runs one minimal forced-tool-call probe (tiny
+request, capped output tokens, one retry on transients) to prove native tool
+calling — the same bar Ollama and custom endpoints are held to at runtime.
+API keys are used by reference from the standard env vars and never printed;
+providers without a key are reported as unverifiable rather than silently
+blessed. After pruning or adding models, update the `MODEL_VERIFIED`
+annotations in `conch/providers.py` with the audit date — the test suite
+fails on any catalog entry without one.
 
 ## Features
 

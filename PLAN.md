@@ -1258,3 +1258,43 @@ from the allowlisted user ran the exact pinned command and posted the
 result; the /sync since-cursor survived a daemon restart (epoch 1→2)
 with no message lost or double-answered, every pass under the
 channel_intake lease.
+
+## llama-idx — the inference registry integration (September 2026)
+
+The self-hosted fleet got a control plane: **llama-idx**
+(`~/llama-idx`, own public-safe repo), a stdlib+SQLite registry that
+llama.cpp/Ollama/OpenAI-compatible boxes self-register with (one curl,
+idempotent upsert, flavor autodetected), that health-polls them
+(200/503 → up/degraded, 3-strike down with capped backoff, never waking
+sleeping models) and pre-answers the tools-only question with conch's
+own forced tool-call probe (identity-cached, serialized per provider,
+loaded-models-first, router catalogs never force-loaded). Conch reads
+one endpoint — `GET /v1/inference` — instead of per-box config.
+
+Conch side (`conch/llamaidx.py`, ~R2 of the llama-idx plan):
+`llamaidx_url` (+ optional `llamaidx_token_env`, name-only) config keys;
+`/models` grows an llamaidx section of namespaced entries
+(`llamaidx/provider/model`, degraded providers marked, down providers
+absent); `/model llamaidx/gpubox/qwen3-32b` routes through the EXISTING
+ollama/custom adapters by flavor — no new inference code. The registry
+verdict gates listing; conch's probe-on-select still runs before
+committing (belt and braces — a stale registry verdict is caught by the
+component that talks to the model). Fallback chains gained a registry
+tier (same-flavor first, largest-ctx first) between same-provider
+alternates and any cloud hop, resolved at use in the runtime.
+`local_only` applies to the registry URL and every discovered base_url;
+`.ts.net` and CGNAT 100.64/10 now count as local. Unset = feature off,
+zero new traffic.
+
+Gates in tests (24 new in tests/test_llamaidx.py against a fake
+registry + fake provider boxes: list/select/route/absent-when-down/
+degraded-marker/probe-on-select/namespacing/local_only/fallback incl. a
+live chat_turn rescue through a registry box). Live drill evidence
+(2026-09-15, isolated XDG, no real inference hardware — the A6000 box
+has no endpoint yet, the .152 box is hardware-broken): the real
+registry served from its own repo, the test suite's fake llama.cpp
+provider registered as a real HTTP process via the documented one-curl,
+conch listed `llamaidx/gpubox/qwen3-32b`, selected it (its probe hit
+the fake box), and routed a chat turn to it through the custom adapter.
+R3 remains: push heartbeat, deregistration tombstones, fleet tie-in
+(`labels.host` join to worker resource_groups).

@@ -41,6 +41,23 @@ api_key_env=ANTHROPIC_API_KEY
 #custom_context_window=32768
 #api_key_env=MY_ENDPOINT_KEY
 
+# --- llama-idx inference registry (discovery) --------------------------------
+# One endpoint that knows the whole self-hosted fleet (llama.cpp, Ollama,
+# OpenAI-compatible boxes that come and go): github.com/detournement/llama-idx.
+# With llamaidx_url set, /models grows an llamaidx section with namespaced
+# entries (llamaidx/provider/model) and /model llamaidx/gpubox/qwen3-32b
+# switches to one — routed through the existing ollama/custom adapters by
+# flavor; the registry only supplies flavor + base_url + model id. Only the
+# registry's tool-VERIFIED models are listed; conch still runs its own
+# probe-on-select. Down providers vanish; degraded ones show a marker.
+# Fallback chains draw registry boxes before any cloud hop. local_only
+# applies to the registry URL and every discovered provider base_url.
+# Unset = feature off, zero new traffic.
+#llamaidx_url=http://registry.example:8642
+# Registries running read_auth=true: NAME of the env var with the read
+# token (never the token itself).
+#llamaidx_token_env=LLAMAIDX_TOKEN
+
 # --- OpenRouter ---------------------------------------------------------------
 # Frontier models not on the other providers, via openrouter.ai:
 #   moonshotai/kimi-k3           (2.8T MoE, 1M context, $3/$15 per MTok)

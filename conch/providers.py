@@ -283,7 +283,10 @@ def is_local_inference_url(url: str) -> bool:
     return (
         "." not in hostname
         or hostname.endswith(
-            (".local", ".lan", ".internal", ".home.arpa")
+            # .ts.net covers tailnet MagicDNS names; tailnet IPs
+            # (100.64.0.0/10 shared space) already pass the is_global
+            # check above.
+            (".local", ".lan", ".internal", ".home.arpa", ".ts.net")
         )
     )
 
@@ -1061,6 +1064,19 @@ def get_fallback_chain(current_provider: str, current_model: str, config: Option
             if alt_model != current_model:
                 chain.append((current_provider, alt_model, False))
 
+    # Step 1.5: the llama-idx registry tier — other up, tool-verified
+    # boxes from the owned fleet (same-flavor first, largest context
+    # first), before any cloud cross-provider hop. Entries keep their
+    # namespaced name; the runtime resolves flavor/base_url at use.
+    try:
+        from .llamaidx import llamaidx_fallback_candidates
+
+        chain.extend(
+            llamaidx_fallback_candidates(config, current_provider, current_model)
+        )
+    except Exception:
+        pass  # discovery must never break fallback
+
     # Step 2: cross-provider fallbacks. Local sessions are isolated from
     # cloud providers by default; opting out requires local_only=false.
     from .config import local_only_enabled
@@ -1646,6 +1662,9 @@ def clear_local_model_caches() -> None:
             _custom_props_cache,
         ):
             cache.clear()
+    from .llamaidx import clear_llamaidx_cache
+
+    clear_llamaidx_cache()
 
 
 def get_custom_base_url(config: Optional[dict] = None) -> str:

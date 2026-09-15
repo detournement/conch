@@ -114,6 +114,7 @@ are rejected.
 | OpenRouter | moonshotai/kimi-k3 (2.8T MoE, 1M context, $3/$15 per MTok), z-ai/glm-5.2 (~750B MoE, 1M context, $0.98/$3.08 per MTok), deepseek/deepseek-v4-pro and deepseek/deepseek-v4-flash (1M context); key in `OPENROUTER_API_KEY` | Paid |
 | Ollama | Discovered live from your server's `/api/tags`, filtered to models that advertise the `tools` capability | Free (local) |
 | Custom | Models discovered from an OpenAI-compatible `/v1/models` endpoint (vLLM, LM Studio, llama.cpp); each visible model must pass a forced native tool-call probe | Depends |
+| llama-idx | The whole self-hosted fleet discovered from one [llama-idx](https://github.com/detournement/llama-idx) registry (`llamaidx_url`); entries route through the ollama/custom adapters by flavor | Free (local) |
 
 Ollama models are never hardcoded: `/models`, `/model`, `/provider ollama`,
 and the fallback chain all use the live list from your server, and switching
@@ -129,6 +130,41 @@ causes revalidation. Missing capability metadata fails closed: older servers
 that cannot positively report native tool support expose no selectable
 models. If a local service is unavailable, its models are not shown and
 requests are blocked without contaminating conversation history.
+
+#### llama-idx registry discovery
+
+When the fleet is more than one box, per-box configuration stops scaling:
+[llama-idx](https://github.com/detournement/llama-idx) is the
+owned-and-operated registry that every llama.cpp/Ollama/OpenAI-compatible
+server self-registers with (one curl), and conch discovers them all from
+one endpoint:
+
+```
+# ~/.config/conch/config
+llamaidx_url=http://registry.example:8642
+```
+
+- `/models` grows an **llamaidx** section with namespaced entries
+  (`llamaidx/gpubox/qwen3-32b`, with context size); `/model
+  llamaidx/gpubox/qwen3-32b` switches to one. Routing goes through the
+  **existing** adapters by flavor — ollama flavor via the ollama adapter
+  (`ollama_base_url` pointed at the box), llama.cpp/OpenAI-compatible via
+  the custom adapter — the registry only supplies flavor + base_url +
+  model id.
+- Only the registry's **tool-verified** models are listed (it runs the
+  same forced tool-call probe conch uses, cached by model identity), and
+  conch still runs its own probe-on-select before committing — belt and
+  braces; a stale registry verdict is caught by the component that
+  actually talks to the model.
+- Down providers vanish from lists; degraded (loading/recovering)
+  providers stay visible with a marker. Fallback chains gain a registry
+  tier: other up, tool-verified boxes are tried before any cloud hop.
+- `local_only` still applies to the registry URL and to every discovered
+  provider's base_url (tailnet `.ts.net` names and CGNAT 100.64/10
+  addresses count as local). A registry cannot override the policy.
+- Registries with `read_auth=true`: set `llamaidx_token_env` to the NAME
+  of the env var holding the read token. Unset `llamaidx_url` = feature
+  off, zero new traffic.
 
 #### Auditing the cloud catalogs
 

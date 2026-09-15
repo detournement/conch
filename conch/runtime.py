@@ -1772,6 +1772,21 @@ def chat_turn(
                     fb_fn = RAW_FNS.get(fb_provider)
                     if not fb_fn:
                         continue
+                    # Registry-sourced candidates carry a namespaced name
+                    # (llamaidx/provider/model); resolve flavor + base_url
+                    # + verbatim model id and route through the existing
+                    # adapter via config overrides. No new inference code.
+                    fb_overrides = None
+                    if fb_model.startswith("llamaidx/"):
+                        from .llamaidx import (
+                            llamaidx_selection_overrides,
+                            resolve_llamaidx_model,
+                        )
+
+                        registry_entry = resolve_llamaidx_model(fb_model, config)
+                        if registry_entry is None or registry_entry.get("degraded"):
+                            continue
+                        fb_overrides = llamaidx_selection_overrides(registry_entry)
                     if needs_ctx_switch and sys.stdin.isatty():
                         print(
                             f"  \033[1;33m⚠ {failed_provider}/{failed_model} failed.\033[0m",
@@ -1796,6 +1811,8 @@ def chat_turn(
                     fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
                     fb_config["chat_model"] = fb_model
                     fb_config["model"] = fb_model
+                    if fb_overrides:
+                        fb_config.update(fb_overrides)
                     if needs_ctx_switch:
                         normalize_messages_on_switch(messages, fb_provider)
                     fb_messages = normalize_messages_for_provider(messages, fb_provider)
@@ -1833,6 +1850,8 @@ def chat_turn(
                         config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
                         config["chat_model"] = fb_model
                         config["model"] = fb_model
+                        if fb_overrides:
+                            config.update(fb_overrides)
                         stream_fn = STREAM_FNS.get(provider) if on_token else None
                         raw_fn = RAW_FNS.get(provider)
                         send_messages = fb_messages

@@ -1294,6 +1294,78 @@ def _handle_items_command(command: str, arg: str, config: dict, sched):
         store.close()
 
 
+def _switch_to_llamaidx_model(
+    name: str, config: dict, provider: str
+) -> Optional[tuple]:
+    """Switch to a registry-discovered model (``llamaidx/provider/model``).
+
+    The registry supplied flavor + base_url + model id; routing goes
+    through the existing ollama/custom adapters. The registry's tools
+    verdict gated the listing; conch's own probe-on-select still runs
+    here, belt and braces, before anything is committed to the session.
+    """
+    from .llamaidx import (
+        get_llamaidx_url,
+        list_llamaidx_models,
+        llamaidx_selection_overrides,
+        resolve_llamaidx_model,
+    )
+
+    if not get_llamaidx_url(config):
+        print(
+            "\n  \033[31mNo registry configured — set llamaidx_url in"
+            " ~/.config/conch/config\033[0m\n"
+        )
+        return None
+    entry = resolve_llamaidx_model(name, config, force_refresh=True)
+    if entry is None:
+        print(f"\n  \033[31mModel '{name}' is not in the registry catalog\033[0m")
+        available = [e["name"] for e in list_llamaidx_models(config) or []]
+        if available:
+            shown = ", ".join(available[:6])
+            more = ", ..." if len(available) > 6 else ""
+            print(f"  \033[2mRegistered tool-verified models: {shown}{more}\033[0m\n")
+        else:
+            print(
+                "  \033[2mThe registry is unreachable or has no"
+                " tool-verified models (down providers vanish).\033[0m\n"
+            )
+        return None
+    overrides = llamaidx_selection_overrides(entry)
+    trial = dict(config)
+    trial.update(overrides)
+    if entry["degraded"]:
+        print(
+            f"\n  \033[33mNote: provider '{entry['provider_name']}' is degraded"
+            " (loading/recovering) — validating anyway.\033[0m"
+        )
+    # Probe-on-select, belt and braces: the component that talks to the
+    # model enforces the tools-only invariant even when the registry said
+    # yes (its verdict can be stale).
+    if overrides["provider"] == "ollama":
+        ok, reason = validate_ollama_model(entry["model_id"], trial)
+    else:
+        from .providers import validate_custom_model
+
+        ok, reason = validate_custom_model(entry["model_id"], trial)
+    if ok is not True:
+        print(
+            f"\n  \033[31mCannot switch: {reason or 'validation failed'}\033[0m"
+        )
+        print(
+            "  \033[2mThe registry lists this model as tool-verified;"
+            " conch's own probe disagrees or the provider is unreachable"
+            " — trust the probe.\033[0m\n"
+        )
+        return None
+    config.update(overrides)
+    print(
+        f"\n  \033[1;32mSwitched to {overrides['provider']}/{entry['model_id']}"
+        f"\033[0m \033[2m(via {entry['name']} at {entry['base_url']})\033[0m\n"
+    )
+    return (overrides["provider"], entry["model_id"], RAW_FNS[overrides["provider"]])
+
+
 def handle_slash_command(
     cmd: str,
     config: dict,
@@ -1785,6 +1857,30 @@ def handle_slash_command(
                 prefix = "\033[1;32m●\033[0m" if current else "\033[2m○\033[0m"
                 suffix = "  \033[2m(current)\033[0m" if current else ""
                 print(f"    {prefix} {model}{suffix}")
+        from .llamaidx import get_llamaidx_url, list_llamaidx_models
+
+        registry_url = get_llamaidx_url(config)
+        if registry_url:
+            print(f"  \033[1;36mllamaidx\033[0m \033[2m({registry_url})\033[0m")
+            entries = list_llamaidx_models(config, force_refresh=True)
+            if entries is None:
+                print(f"    \033[2m(registry unreachable at {registry_url})\033[0m")
+            elif not entries:
+                print("    \033[2m(no tool-verified models registered)\033[0m")
+            else:
+                for entry in entries:
+                    current = (
+                        entry["model_id"] == model_name
+                        and provider in ("ollama", "custom")
+                    )
+                    prefix = "\033[1;32m●\033[0m" if current else "\033[2m○\033[0m"
+                    ctx = f"  \033[2mctx={entry['ctx']}\033[0m" if entry.get("ctx") else ""
+                    marker = (
+                        "  \033[33m(degraded: provider loading/recovering)\033[0m"
+                        if entry["degraded"]
+                        else ""
+                    )
+                    print(f"    {prefix} {entry['name']}{ctx}{marker}")
         print()
         return None
 
@@ -1802,6 +1898,8 @@ def handle_slash_command(
         if not new_model:
             print("\n  \033[2mUsage: /model <verified-name>\033[0m\n")
             return None
+        if new_model.startswith("llamaidx/"):
+            return _switch_to_llamaidx_model(new_model, config, provider)
         new_provider = None
         for provider_name, models in KNOWN_MODELS.items():
             if provider_name != "ollama" and new_model in models:

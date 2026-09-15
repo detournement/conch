@@ -72,6 +72,12 @@ ENV_CONFIG_KEYS = {
     # Fleet controller (the fleet awakening). Off by default: the shell
     # never imports conch.fleet unless this is enabled.
     "CONCH_FLEET_CONTROLLER": "fleet_controller",
+    # llama-idx inference registry (discovery only). Unset = feature off,
+    # zero new startup traffic. llamaidx_token_env names the env var
+    # holding the registry's read token (read_auth registries) — the
+    # token itself is never a config value.
+    "CONCH_LLAMAIDX_URL": "llamaidx_url",
+    "CONCH_LLAMAIDX_TOKEN_ENV": "llamaidx_token_env",
 }
 
 

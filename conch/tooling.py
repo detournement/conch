@@ -2475,20 +2475,18 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(TODO_LIST_TOOL)
     if "personal_items" in clients:
         builtin.append(PERSONAL_ITEMS_TOOL)
-    if "capitol_control" in clients:
-        # Lazy import: only Capitol-configured sessions ever construct
-        # the client (bootstrap), so only they pay for this module.
-        from .capitol.tool import CAPITOL_SESSION_TOOL
-
-        builtin.append(CAPITOL_SESSION_TOOL)
     if "delegate_task" in clients:
         builtin.append(DELEGATE_TASK_TOOL)
-    if "fleet_delegate" in clients:
-        # Lazy import: only fleet_controller-configured sessions ever
-        # construct the client (bootstrap), so only they pay for this.
-        from .fleet.delegate import FLEET_DELEGATE_TOOL
+    # Product tools (capitol_control, fleet_delegate, ...) advertise
+    # their schemas through the session-tool seam. Only sessions whose
+    # config gate passed carry the client (bootstrap), so only they pay
+    # for the schema import.
+    from .plugins import load_builtin_plugins, session_tool_providers
 
-        builtin.append(FLEET_DELEGATE_TOOL)
+    load_builtin_plugins()
+    for provider_name, provider in session_tool_providers():
+        if provider_name in clients:
+            builtin.append(provider.tool_def())
     if "skill_manage" in clients:
         builtin.append(SKILL_MANAGE_TOOL)
     if "conch_introspect" in clients:

@@ -286,23 +286,20 @@ def make_builtin_clients(
         "conch_introspect": ConchIntrospectClient(),
     }
     clients["skill_manage"].configure(interactive=interactive)
-    if str(config.get("capitol_base_url") or "").strip():
-        # The model-callable Capitol runtime surface (never admin).
-        # Import stays lazy: sessions without Capitol config never load
-        # conch.capitol. Mission sessions swap this client out for the
-        # envelope-scoped one (kernel engine); remote turns swap in an
-        # origin-bound variant whose start proposes an approval.
-        from .capitol.tool import CapitolSessionClient
+    # Product tools plug in through the session-tool seam: each provider
+    # owns its config gate (capitol_control needs capitol_base_url,
+    # fleet_delegate needs fleet_controller) and lazy-imports its product
+    # code, so unconfigured sessions never load the adapters. Mission
+    # sessions swap these clients out for envelope-scoped ones (kernel
+    # engine); remote turns swap capitol_control for an origin-bound
+    # variant whose start proposes an approval.
+    from .plugins import load_builtin_plugins, session_tool_providers
 
-        clients["capitol_control"] = CapitolSessionClient(config)
-    if get_bool(config, "fleet_controller"):
-        # The model-callable fleet delegation surface (local sessions
-        # only: remote turns exclude it, workers deny-list it, delegated
-        # sub-turns don't inherit it implicitly). Import stays lazy so
-        # non-fleet installs never load conch.fleet.
-        from .fleet.delegate import FleetDelegateClient
-
-        clients["fleet_delegate"] = FleetDelegateClient(config)
+    load_builtin_plugins()
+    for name, provider in session_tool_providers():
+        client = provider.build_session_client(config)
+        if client is not None:
+            clients[name] = client
     import os
 
     api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")

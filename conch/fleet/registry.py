@@ -88,6 +88,25 @@ class FleetRegistry:
             fields["profiles"] = [str(p) for p in probe["profiles"]]
         return self.store.update_worker(worker_id, fields)
 
+    def record_skills(self, worker_id: str, skills: List[str]) -> int:
+        """Record the skills a worker reports as installed (observed fact,
+        via ``worker.status``). Like every capability, this can narrow
+        scheduling but never widen authority."""
+        worker = self.require(worker_id)
+        capabilities = dict(worker.get("capabilities") or {})
+        clean = sorted({str(s).strip().lower() for s in skills if s})
+        if capabilities.get("skills") == clean:
+            return int(worker["version"])
+        capabilities["skills"] = clean
+        return self.store.update_worker(
+            worker_id, {"capabilities": capabilities}
+        )
+
+    def worker_skills(self, worker: Dict[str, Any]) -> List[str]:
+        capabilities = worker.get("capabilities") or {}
+        skills = capabilities.get("skills")
+        return list(skills) if isinstance(skills, list) else []
+
     def record_deployment(self, worker_id: str, *, artifact_digest: str,
                           config_digest: str = "",
                           runtime_profile: str = "") -> int:
@@ -180,6 +199,23 @@ class FleetRegistry:
         if envelope.model:
             if not self.worker_has_model(worker, envelope.model):
                 return False
+        if envelope.skills:
+            # Skill-addressed dispatch: the worker must have reported the
+            # named skill(s) installed. Fail closed on never-probed
+            # workers — an unknown skill inventory is not assumed-capable.
+            installed = set(self.worker_skills(worker))
+            if not set(envelope.skills).issubset(installed):
+                return False
+        # Owner-grant ceiling: an envelope may not name tools or action
+        # classes beyond what this worker has been granted — the scheduler
+        # never places work a worker's ceiling would refuse.
+        from .authority import worker_ceiling
+
+        ceiling = worker_ceiling(worker)
+        if not set(envelope.tools).issubset(ceiling["tools"]):
+            return False
+        if not set(envelope.action_classes).issubset(ceiling["actions"]):
+            return False
         return True
 
     @staticmethod

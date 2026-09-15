@@ -40,8 +40,14 @@ from ..swarm.protocol import FailureClass, TaskEnvelope, new_id
 #: is allowed but rebound to the brokered client.
 WORKER_TOOL_DENYLIST = frozenset({
     "conch_config", "manage_tools", "interactive_terminal", "ssh_remote",
-    "skill_manage",
+    "skill_manage", "fleet_delegate",
 })
+
+#: Files a task leaves under ``<workspace>/out`` are published as
+#: content-addressed artifacts on completion (bounded count and size).
+ARTIFACT_OUT_DIR = "out"
+ARTIFACT_MAX_FILES = 32
+ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
 
 WORKER_SYSTEM_PROMPT = (
     "You are a Conch fleet worker executing one bounded, delegated task on "
@@ -53,6 +59,10 @@ WORKER_SYSTEM_PROMPT = (
     "handled by a separate agent, call delegate_task — it is brokered by "
     "the controller and its result returns to you."
 )
+
+
+class SkillUnavailable(Exception):
+    """The envelope names a skill this host does not have (policy failure)."""
 
 
 class DelegationRequested(BaseException):
@@ -131,15 +141,50 @@ class TaskExecutor:
             "error": error, "payload": payload or {},
         }, sort_keys=True), encoding="utf-8")
 
+    # -- skill resolution (skill-addressed dispatch) ------------------------------
+
+    def _resolve_skills(self) -> List[Dict[str, Any]]:
+        """Load the envelope's named skills from THIS host's skill set.
+
+        Fail closed: a skill the envelope names but the host does not have
+        is a policy failure, never a silent no-skill run. (The controller
+        validates availability before dispatch; this is the worker-side
+        recheck.)
+        """
+        if not self.envelope.skills:
+            return []
+        from ..skills import get_skill
+
+        resolved = []
+        for name in self.envelope.skills:
+            skill = get_skill(name)
+            if skill is None:
+                raise SkillUnavailable(
+                    f"skill {name!r} is not installed on this worker — "
+                    "refusing the task (install the skill or dispatch "
+                    "without --skill)"
+                )
+            resolved.append(skill)
+        return resolved
+
     # -- tool intersection ------------------------------------------------------
 
-    def _build_tools(self, config: dict):
-        """Clients + tool definitions restricted to the envelope's tools."""
+    def _build_tools(self, config: dict,
+                     skills: Optional[List[Dict[str, Any]]] = None):
+        """Clients + tool definitions restricted to the envelope's tools.
+
+        A skill that scopes tools narrows the intersection further — the
+        envelope stays the outer authority bound; a skill can only shrink
+        it, never widen it.
+        """
         from ..bootstrap import make_builtin_clients
         from ..memory import MemoryStore
         from ..tooling import default_permissions, inject_builtin_tools
 
         requested = set(self.envelope.tools) - WORKER_TOOL_DENYLIST
+        for skill in skills or []:
+            if skill.get("tools") is not None:
+                requested &= set(skill["tools"])
         memory = MemoryStore()
         permissions = default_permissions()
         all_clients = make_builtin_clients(
@@ -167,13 +212,24 @@ class TaskExecutor:
 
     # -- messages ---------------------------------------------------------------
 
-    def _fresh_messages(self, config: dict) -> List[dict]:
+    def _fresh_messages(self, config: dict,
+                        skills: Optional[List[Dict[str, Any]]] = None
+                        ) -> List[dict]:
         context = self.envelope.context.strip()
         user = self.envelope.task
         if context:
             user += f"\n\nContext:\n{context}"
+        system = WORKER_SYSTEM_PROMPT
+        if skills:
+            from ..skills import render_skill
+
+            for skill in skills:
+                system += (
+                    "\n\nYou are acting as the following skill — follow "
+                    "its procedure:\n\n" + render_skill(skill)
+                )
         return [
-            {"role": "system", "content": WORKER_SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
 
@@ -233,11 +289,23 @@ class TaskExecutor:
         provider, raw_fn = self._resolve_execution(config)
         config = dict(config)
         config["provider"] = provider
-        clients, tools = self._build_tools(config)
+        try:
+            skills = self._resolve_skills()
+        except SkillUnavailable as exc:
+            self.spool.emit(
+                "failed", {"error": str(exc)},
+                failure_class=FailureClass.POLICY,
+            )
+            self._write_result(
+                "failure", failure_class=FailureClass.POLICY,
+                error=str(exc),
+            )
+            return 1
+        clients, tools = self._build_tools(config, skills)
         if resume and self._resume_path().is_file():
             messages = self._resume_messages()
         else:
-            messages = self._fresh_messages(config)
+            messages = self._fresh_messages(config, skills)
             self.spool.emit("started", {
                 "task_id": self.task_id, "attempt": self.attempt,
                 "principal": self.envelope.principal,
@@ -273,15 +341,18 @@ class TaskExecutor:
                 error="worker produced no reply (provider error?)",
             )
             return 1
+        artifacts = self._publish_artifacts()
         self.spool.emit("result", {
             "summary": summary[:4000],
             "input_tokens": int(usage.get("input_tokens", 0)),
             "output_tokens": int(usage.get("output_tokens", 0)),
+            "artifacts": artifacts,
         })
         self._write_result("success", payload={
             "summary": summary,
             "input_tokens": int(usage.get("input_tokens", 0)),
             "output_tokens": int(usage.get("output_tokens", 0)),
+            "artifacts": artifacts,
         })
         # A clean completion supersedes any stale resume marker.
         try:
@@ -289,6 +360,48 @@ class TaskExecutor:
         except OSError:
             pass
         return 0
+
+    def _publish_artifacts(self) -> List[Dict[str, Any]]:
+        """Publish files the task left in ``<workspace>/out`` into the
+        worker's content-addressed store; return their references.
+
+        Bounded and best-effort: artifact transfer must never turn a
+        successful task into a failure. The controller pulls the bytes by
+        digest over ``artifact.get`` (digest-verified both ways)."""
+        import hashlib
+        import shutil
+
+        out_dir = self.workspace / ARTIFACT_OUT_DIR
+        if not out_dir.is_dir():
+            return []
+        store = self.home / "artifacts" / "sha256"
+        references: List[Dict[str, Any]] = []
+        total = 0
+        try:
+            files = sorted(
+                path for path in out_dir.rglob("*") if path.is_file()
+            )
+        except OSError:
+            return []
+        for path in files[:ARTIFACT_MAX_FILES]:
+            try:
+                size = path.stat().st_size
+                if total + size > ARTIFACT_MAX_BYTES:
+                    break
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                store.mkdir(parents=True, exist_ok=True)
+                target = store / digest
+                if not target.is_file():
+                    shutil.copyfile(path, target)
+                references.append({
+                    "name": str(path.relative_to(out_dir)),
+                    "digest": digest,
+                    "size": size,
+                })
+                total += size
+            except OSError:
+                continue
+        return references
 
     def _park_for_delegation(self, messages: List[dict],
                              delegation: DelegationRequested) -> None:

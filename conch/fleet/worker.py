@@ -305,6 +305,7 @@ class WorkerSupervisor:
             "incarnation": self.incarnation,
             "heartbeat_seq": self._heartbeat_seq,
             "protocol_version": PROTOCOL_VERSION,
+            "skills": self._installed_skills(),
             "uptime_seconds": max(0.0, _now() - self._started_at),
             "queue": {
                 "in_flight": self._in_flight_count(),
@@ -313,6 +314,18 @@ class WorkerSupervisor:
             },
             "tasks": tasks,
         }
+
+    @staticmethod
+    def _installed_skills() -> List[str]:
+        """Skill names available on this host (capability reporting for
+        skill-addressed dispatch). Built-in skills ship inside the signed
+        artifact; user skills come from the worker account's config dir."""
+        try:
+            from ..skills import load_skills
+
+            return sorted(load_skills().keys())
+        except Exception:
+            return []
 
     def _offer_receipt(self, row: Dict[str, Any],
                        duplicate: bool) -> Dict[str, Any]:

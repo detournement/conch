@@ -233,7 +233,17 @@ class TestObsoleteFenceRejected(GatesCase):
 
 class TestEffectivelyOnceLedger(GatesCase):
     def test_side_effecting_completion_records_ledger_once(self):
-        self.start_worker(script_obj=[{"content": "published"}])
+        worker_id, _home, _script = self.start_worker(
+            script_obj=[{"content": "published"}]
+        )
+        # A PUBLISH envelope only places on a worker whose owner grant
+        # raises its ceiling past the READ-only default (fleet awakening).
+        from conch.fleet import authority
+
+        authority.apply_grant(
+            self.registry, worker_id,
+            authority.validate_grant([ActionClass.PUBLISH], None),
+        )
         plane = self.make_plane()
         envelope = self.envelope(
             action_classes=(ActionClass.READ, ActionClass.PUBLISH),

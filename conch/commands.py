@@ -105,6 +105,7 @@ SLASH_COMMANDS = [
     ("/terminal <command>", "Run with direct, non-recorded terminal input/output"),
     ("/ssh <action>", "Connect, execute, open a shell, show status, or disconnect"),
     ("/verbose", "Toggle showing tool args and results"),
+    ("/tks [on|off]", "Toggle the per-message token stats line (tokens, cost, tok/s)"),
     ("/schedule <interval> <prompt>", "Schedule a recurring task"),
     ("/tasks", "List scheduled tasks"),
     ("/cancel <id>", "Cancel a scheduled task"),
@@ -1217,6 +1218,7 @@ def handle_slash_command(
             "  \033[1m/ssh shell [command]\033[0m Open a remote TTY (use for remote sudo)\n"
             "  \033[1m/ssh status|disconnect\033[0m  Inspect or close the active connection\n"
             "  \033[1m/verbose\033[0m             Toggle showing tool args + output\n"
+            "  \033[1m/tks [on|off]\033[0m        Toggle the per-message token stats line (tok/s)\n"
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
             "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
@@ -1359,6 +1361,25 @@ def handle_slash_command(
         if arg in ("off", "false", "0"):
             return "verbose_off"
         return "verbose_toggle"
+
+    if command == "/tks":
+        # Session-scoped flip of the per-message token-stats line
+        # (config dict is shared with chat_loop; set show_token_stats
+        # in the config file to persist a preference).
+        from .config import get_bool
+
+        if arg in ("on", "true", "1"):
+            enabled = True
+        elif arg in ("off", "false", "0"):
+            enabled = False
+        else:
+            enabled = not get_bool(config, "show_token_stats", default=True)
+        config["show_token_stats"] = "true" if enabled else "false"
+        state = "\033[1;32mon\033[0m" if enabled else "\033[33moff\033[0m"
+        print(f"\n  Token stats after each message: {state}"
+              "  \033[2m(this session; persist with show_token_stats"
+              " in the config file)\033[0m\n")
+        return None
 
     if command in ("/search", "/s", "/find", "/grep") and conv_mgr is not None:
         if not arg:

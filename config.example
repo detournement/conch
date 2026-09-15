@@ -90,6 +90,12 @@ api_key_env=ANTHROPIC_API_KEY
 # (rm, dd, git push --force, ...) always prompt, even in agent/yolo mode.
 #permission_mode=safe_auto
 
+# Per-message token stats line (tokens in/out, cost, tok/s, context gauge)
+# after every assistant reply. On by default; /tks toggles it for the
+# session. tok/s is exact when the backend reports generation time
+# (Ollama, llama.cpp timings) and a ~-labeled wall-clock estimate otherwise.
+#show_token_stats=true
+
 # Command prefixes that never prompt (comma-separated).
 #allow_prefixes=git status, ls, cat
 

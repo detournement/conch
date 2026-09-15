@@ -249,6 +249,54 @@ def format_context_gauge(used_tokens: int, window: int) -> str:
     return f"ctx {color}{pct:.0f}%\033[0m"
 
 
+def format_token_speed(usage: dict) -> str:
+    """Generation speed for one turn, e.g. ``42.3 tok/s`` or ``~118 tok/s``.
+
+    Server-reported generation time (Ollama ``eval_duration``, llama.cpp
+    ``timings``) gives the exact figure. When any generating call lacked
+    it, the whole turn falls back to wall-clock — which also counts
+    prompt processing and network — so the value is an estimate and
+    carries a leading ``~``. Empty string when there is nothing honest
+    to say (no output tokens, or no measured duration at all).
+    """
+    out_tokens = usage.get("output_tokens") or 0
+    if not out_tokens:
+        return ""
+    gen_seconds = float(usage.get("gen_seconds") or 0.0)
+    if gen_seconds > 0 and not usage.get("speed_estimated"):
+        seconds, prefix = gen_seconds, ""
+    else:
+        seconds, prefix = float(usage.get("wall_seconds") or 0.0), "~"
+    if seconds <= 0:
+        return ""
+    speed = out_tokens / seconds
+    text = f"{speed:.0f}" if speed >= 100 else f"{speed:.1f}"
+    return f"{prefix}{text} tok/s"
+
+
+def record_call_timing(total_usage: dict, usage: dict,
+                       wall_seconds: float) -> None:
+    """Accumulate one model call's timing onto the turn's usage.
+
+    ``wall_seconds`` is measured around the provider call (so it never
+    includes tool execution). Calls that produced output without a
+    server-reported ``gen_seconds`` mark the turn ``speed_estimated``:
+    a single opaque call downgrades the whole turn's tok/s to the
+    labeled wall-clock estimate rather than mixing exact and estimated
+    denominators.
+    """
+    total_usage["wall_seconds"] = (
+        total_usage.get("wall_seconds", 0.0) + max(float(wall_seconds), 0.0)
+    )
+    gen_seconds = float(usage.get("gen_seconds") or 0.0)
+    if gen_seconds > 0:
+        total_usage["gen_seconds"] = (
+            total_usage.get("gen_seconds", 0.0) + gen_seconds
+        )
+    elif usage.get("output_tokens"):
+        total_usage["speed_estimated"] = True
+
+
 # ---------------------------------------------------------------------------
 # Tool-result truncation: budget scaled to the context window (plan 1.5)
 # ---------------------------------------------------------------------------
@@ -1789,6 +1837,7 @@ def chat_turn(
             _append_leading_system_context(send_messages, todo_block)
 
         stream_fn = STREAM_FNS.get(provider) if on_token else None
+        _call_started = time.monotonic()
         if stream_fn:
             response = stream_fn(config, send_messages, send_tools if send_tools else None, on_token)
         else:
@@ -1799,6 +1848,7 @@ def chat_turn(
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)
         total_usage["model"] = response.get("_model", total_usage["model"])
+        record_call_timing(total_usage, usage, time.monotonic() - _call_started)
         # Calibrate char->token estimates against the provider's real prompt
         # token count (Ollama reports prompt_eval_count on every response).
         if usage.get("input_tokens"):
@@ -1821,6 +1871,7 @@ def chat_turn(
                     file=sys.stderr,
                 )
                 time.sleep(1)
+                _call_started = time.monotonic()
                 if stream_fn:
                     response = stream_fn(
                         config, send_messages, send_tools, on_token
@@ -1833,6 +1884,9 @@ def chat_turn(
                 total_usage["output_tokens"] += usage.get("output_tokens", 0)
                 total_usage["model"] = response.get(
                     "_model", total_usage["model"]
+                )
+                record_call_timing(
+                    total_usage, usage, time.monotonic() - _call_started
                 )
             if is_error_response(response):
                 err_detail = error_detail(response)
@@ -1923,6 +1977,7 @@ def chat_turn(
                         _append_leading_system_context(
                             fb_messages, todo_block
                         )
+                    _call_started = time.monotonic()
                     with Spinner(f"Retrying with {fb_provider}/{fb_model}"):
                         response = fb_fn(fb_config, fb_messages, fb_tools)
                     if not is_error_response(response):
@@ -1962,6 +2017,10 @@ def chat_turn(
                         )
                         total_usage["model"] = response.get(
                             "_model", total_usage["model"]
+                        )
+                        record_call_timing(
+                            total_usage, usage,
+                            time.monotonic() - _call_started,
                         )
                         if usage.get("input_tokens"):
                             record_token_calibration(

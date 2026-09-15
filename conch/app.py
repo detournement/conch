@@ -100,6 +100,31 @@ def _detect_location() -> str:
         return ""
 
 
+def format_turn_stats_line(turn_usage: dict, cost_str: str, gauge: str,
+                           used_model: str, config: dict) -> str:
+    """The dim per-message stats line, or "" when suppressed.
+
+    Gated on ``show_token_stats`` (on by default; ``/tks`` flips it for
+    the session). Tokens and cost come from the turn's usage; tok/s is
+    server-reported generation speed when the backend provides one
+    (Ollama, llama.cpp) and a ``~``-labeled wall-clock estimate
+    otherwise (see runtime.format_token_speed).
+    """
+    from .config import get_bool
+    from .runtime import format_token_speed
+
+    if not get_bool(config, "show_token_stats", default=True):
+        return ""
+    in_tok = turn_usage.get("input_tokens", 0)
+    out_tok = turn_usage.get("output_tokens", 0)
+    speed = format_token_speed(turn_usage)
+    speed_part = f"  {speed}" if speed else ""
+    return (
+        f"  \033[2m{in_tok:,} in / {out_tok:,} out  {cost_str}{speed_part}"
+        f"  {gauge}\033[2m  ({used_model})\033[0m"
+    )
+
+
 def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "", model: str = "", config: dict = None) -> str:
     """Build the session system prompt.
 
@@ -1215,7 +1240,9 @@ def chat_loop(new_conversation=False):
                     _printer.flush()
                 print("\n\033[2m[no response]\033[0m\n")
 
-            # Display token/cost info with a context-usage gauge
+            # Display token/cost/speed info with a context-usage gauge.
+            # Session accounting and the context warning always run; only
+            # the stats line itself is gated (show_token_stats / /tks).
             in_tok = turn_usage.get("input_tokens", 0)
             out_tok = turn_usage.get("output_tokens", 0)
             used_model = turn_usage.get("model", model_name)
@@ -1238,7 +1265,11 @@ def chat_loop(new_conversation=False):
                 ctx_window = get_context_limit(provider, config)
                 gauge = format_context_gauge(ctx_used, ctx_window)
                 cost_str = f"~${cost:.4f}" if cost > 0.0001 else "free"
-                print(f"  \033[2m{in_tok:,} in / {out_tok:,} out  {cost_str}  {gauge}\033[2m  ({used_model})\033[0m")
+                stats_line = format_turn_stats_line(
+                    turn_usage, cost_str, gauge, used_model, config
+                )
+                if stats_line:
+                    print(stats_line)
                 if ctx_window and ctx_used / ctx_window >= 0.8:
                     print(
                         f"  \033[33m⚠ Context {ctx_used / ctx_window * 100:.0f}% full — "

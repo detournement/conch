@@ -93,6 +93,7 @@ you explicitly configure or approve.
 | `chat_prompt:<provider>/<model-glob>` | — | Path to a custom chat system-prompt template for matching models |
 | `ask_prompt:<provider>/<model-glob>` | — | Same for ask mode |
 | `permission_mode` | `prompt_all` | Shell approval policy: `prompt_all`, `safe_auto`, or `yolo` |
+| `show_token_stats` | `true` | Per-message token stats line (tokens, cost, tok/s, context gauge); `/tks` toggles per session |
 | `allow_prefixes` | — | Comma-separated command prefixes that never prompt, e.g. `git status, ls` |
 | `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds (clamped to 1–86400) |
 | `hook_pre_tool_use` | — | Shell script gating every tool call (JSON on stdin; non-zero exit blocks) |
@@ -1023,6 +1024,7 @@ target directly, pass Docker's `--init`.
 | `/cost` | Show session token usage |
 | `/status` | Show provider, model, context window/usage, and config |
 | `/verbose` | Toggle showing tool args and results |
+| `/tks [on\|off]` | Toggle the per-message token stats line (tokens, cost, tok/s) |
 | `/rounds <n>` | Set max tool call rounds |
 | `/queue` | Toggle typeahead input |
 | `/paste` | Paste lines literally; end with a lone `.` or Ctrl+D |

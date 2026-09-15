@@ -69,6 +69,9 @@ ENV_CONFIG_KEYS = {
     # interactive shell keeps its in-process scheduler and never imports
     # the kernel unless this is enabled.
     "CONCH_EDGE_DAEMON": "edge_daemon",
+    # Fleet controller (the fleet awakening). Off by default: the shell
+    # never imports conch.fleet unless this is enabled.
+    "CONCH_FLEET_CONTROLLER": "fleet_controller",
 }
 
 

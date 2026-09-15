@@ -7,10 +7,13 @@ closes. It refuses to start unless ``edge_daemon=true`` is configured (or
 
 ``conch-hostctl`` and ``conch-worker`` are live as of Swarm Phase 2: the
 on-host fleet control utility (install/probe/deploy/rollback/RPC relay)
-and the bounded worker supervisor. ``conch-controller`` remains dormant:
-it prints a clear "not yet enabled" message and exits nonzero until its
-phase lands. The interactive ``conch`` entrypoint is untouched and never
-depends on any of these.
+and the bounded worker supervisor.
+
+``conch-controller`` is live as of the fleet awakening: the supervised
+fleet controller that drives the distributed task plane. It is gated on
+``fleet_controller=true`` (or ``CONCH_FLEET_CONTROLLER=true``) exactly
+the way conch-edge is gated. The interactive ``conch`` entrypoint is
+untouched and never depends on any of these.
 """
 
 from __future__ import annotations
@@ -21,53 +24,85 @@ from typing import List, Optional
 
 from . import __version__
 
-#: Exit status for a dormant entrypoint (EX_UNAVAILABLE from sysexits.h).
-DORMANT_EXIT_CODE = 69
 
-_DORMANT_MESSAGE = (
-    "{prog}: not yet enabled in this build — {role} ships in a later phase "
-    "of the Conch swarm roadmap. The interactive `conch` shell is fully "
-    "functional without it; see PLAN.md (\"Swarm Phase 0\") for status."
-)
-
-
-def _build_parser(prog: str, description: str) -> argparse.ArgumentParser:
-    """Shared argparse plumbing: later phases add subcommands to this."""
-    parser = argparse.ArgumentParser(
-        prog=prog,
-        description=description,
-        epilog=(
-            "This entrypoint is currently dormant; it parses arguments and "
-            "exits. See PLAN.md for the roadmap."
-        ),
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"{prog} {__version__}",
-    )
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        default="",
-        help="Config file override (accepted now, used once enabled).",
-    )
-    return parser
-
-
-def _dormant(prog: str, role: str) -> int:
-    print(_DORMANT_MESSAGE.format(prog=prog, role=role), file=sys.stderr)
-    return DORMANT_EXIT_CODE
+#: Exit status when the controller is not enabled in config (EX_CONFIG).
+CONTROLLER_DISABLED_EXIT_CODE = 78
 
 
 def controller_main(argv: Optional[List[str]] = None) -> int:
-    parser = _build_parser(
-        "conch-controller",
-        "Conch organizational controller: durable mission kernel, policy, "
-        "budgets, approvals, and fleet scheduling (dormant).",
+    """The fleet controller daemon (live: the fleet awakening)."""
+    parser = argparse.ArgumentParser(
+        prog="conch-controller",
+        description=(
+            "Conch fleet controller: owns the fleet kernel (worker "
+            "registry, dispatches, grants) and drives the distributed "
+            "task plane end to end — scheduling queued task envelopes "
+            "onto eligible workers over SSH stdio RPC, lease/heartbeat "
+            "sweeps, failure-class retries, cancellation propagation, "
+            "and artifact pull. It coexists with conch-edge: separate "
+            "kernel scope (~/.local/state/conch/fleet), separate lock "
+            "and epoch, separate control socket. The documented default "
+            "is to run it supervised: `conch-controller install` sets up "
+            "launchd (macOS) or a systemd user unit (Linux)."
+        ),
     )
-    parser.parse_args(argv)
-    return _dormant("conch-controller", "the mission controller daemon")
+    parser.add_argument(
+        "--version", action="version",
+        version=f"conch-controller {__version__}",
+    )
+    parser.add_argument(
+        "--config", metavar="PATH", default="",
+        help="Extra config file layered over the standard conch config.",
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Run a single supervision tick and exit (smoke testing).",
+    )
+    parser.add_argument(
+        "command", nargs="?", default="run", metavar="command",
+        choices=("run", "install", "uninstall", "status"),
+        help=(
+            "run (default): run the controller in the foreground. "
+            "install: set up and start the launchd/systemd-supervised "
+            "daemon. uninstall: stop and remove it. status: supervisor "
+            "state and controller health."
+        ),
+    )
+    args = parser.parse_args(argv)
+    from .config import get_bool, load_config
+
+    config = load_config()
+    if args.config:
+        from pathlib import Path
+
+        from .config import _parse_config_file
+
+        config.update(_parse_config_file(Path(args.config)))
+    if args.command == "status":
+        from .fleet.controller import controller_status_cmd
+
+        return controller_status_cmd(config)
+    if args.command == "uninstall":
+        from .fleet.controller import controller_uninstall_cmd
+
+        return controller_uninstall_cmd(config)
+    if not get_bool(config, "fleet_controller"):
+        print(
+            "conch-controller: the fleet controller is not enabled. Set "
+            "`fleet_controller = true` in your conch config (or "
+            "CONCH_FLEET_CONTROLLER=true) to let the controller drive "
+            "fleet workers; the interactive shell is fully functional "
+            "without it. See README \"Trusted SSH fleet\".",
+            file=sys.stderr,
+        )
+        return CONTROLLER_DISABLED_EXIT_CODE
+    if args.command == "install":
+        from .fleet.controller import controller_install_cmd
+
+        return controller_install_cmd(config)
+    from .fleet.controller import run_controller_daemon
+
+    return run_controller_daemon(config, once=args.once)
 
 
 #: Exit status when the edge daemon is not enabled in config (EX_CONFIG).

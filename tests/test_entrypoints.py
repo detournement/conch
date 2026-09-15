@@ -1,23 +1,24 @@
 """Swarm console entrypoints.
 
-``conch-edge`` is live (Swarm Phase 1) but gated on ``edge_daemon=true`` —
-without it the command refuses with a clear pointer, so shell-only users
-cannot start a daemon by accident. ``conch-hostctl`` and ``conch-worker``
-are live (Swarm Phase 2). Still-dormant entrypoints must exist, parse
-arguments, and refuse to run with a pointer to the plan — exiting nonzero
-so scripts and supervisors can't mistake a dormant mode for a working one.
+``conch-edge`` (Swarm Phase 1) and ``conch-controller`` (the fleet
+awakening) are live but hard-gated on their config flags — without
+``edge_daemon=true`` / ``fleet_controller=true`` each refuses with a clear
+pointer and a nonzero exit, so shell-only users cannot start a daemon by
+accident and supervisors can't mistake a disabled mode for a working one.
+``conch-hostctl`` and ``conch-worker`` are live (Swarm Phase 2).
 """
 
 import contextlib
 import io
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from conch import __version__
 from conch.entrypoints import (
-    DORMANT_EXIT_CODE,
+    CONTROLLER_DISABLED_EXIT_CODE,
     EDGE_DISABLED_EXIT_CODE,
     controller_main,
     edge_main,
@@ -25,39 +26,25 @@ from conch.entrypoints import (
     worker_main,
 )
 
-DORMANT_MAINS = {
+ALL_MAINS = {
     "conch-controller": controller_main,
+    "conch-edge": edge_main,
+    "conch-hostctl": hostctl_main,
+    "conch-worker": worker_main,
 }
 
-ALL_MAINS = dict(DORMANT_MAINS)
-ALL_MAINS["conch-edge"] = edge_main
-ALL_MAINS["conch-hostctl"] = hostctl_main
-ALL_MAINS["conch-worker"] = worker_main
+
+def _clean_env(tmp: str) -> dict:
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in ("CONCH_EDGE_DAEMON", "CONCH_FLEET_CONTROLLER")
+    }
+    env["XDG_CONFIG_HOME"] = str(Path(tmp) / "config")
+    env["XDG_STATE_HOME"] = str(Path(tmp) / "state")
+    return env
 
 
-class TestDormantEntrypoints(unittest.TestCase):
-    def test_dormant_mains_exit_nonzero_with_plan_pointer(self):
-        for prog, main in DORMANT_MAINS.items():
-            with self.subTest(prog=prog):
-                stderr = io.StringIO()
-                with contextlib.redirect_stderr(stderr):
-                    code = main([])
-                self.assertEqual(code, DORMANT_EXIT_CODE)
-                self.assertNotEqual(code, 0)
-                message = stderr.getvalue()
-                self.assertIn(prog, message)
-                self.assertIn("not yet enabled", message)
-                self.assertIn("PLAN.md", message)
-
-    def test_dormant_message_never_goes_to_stdout(self):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), \
-                contextlib.redirect_stderr(stderr):
-            controller_main([])
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertTrue(stderr.getvalue())
-
+class TestEntrypointBasics(unittest.TestCase):
     def test_version_flag_works_now(self):
         for prog, main in ALL_MAINS.items():
             with self.subTest(prog=prog):
@@ -75,12 +62,6 @@ class TestDormantEntrypoints(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 controller_main(["--definitely-not-a-flag"])
         self.assertEqual(ctx.exception.code, 2)
-
-    def test_config_override_accepted(self):
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            code = controller_main(["--config", "/tmp/some.conf"])
-        self.assertEqual(code, DORMANT_EXIT_CODE)
 
     def test_hostctl_without_subcommand_shows_help_and_fails(self):
         stderr = io.StringIO()
@@ -103,15 +84,8 @@ class TestEdgeEntrypoint(unittest.TestCase):
 
     def test_refuses_without_edge_daemon_enabled(self):
         stderr = io.StringIO()
-        clean_env = {
-            key: value for key, value in os.environ.items()
-            if key != "CONCH_EDGE_DAEMON"
-        }
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
-            clean_env["XDG_CONFIG_HOME"] = str(Path(tmp) / "config")
-            with patch.dict(os.environ, clean_env, clear=True):
+            with patch.dict(os.environ, _clean_env(tmp), clear=True):
                 with contextlib.redirect_stderr(stderr):
                     code = edge_main([])
         self.assertEqual(code, EDGE_DISABLED_EXIT_CODE)
@@ -127,6 +101,42 @@ class TestEdgeEntrypoint(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
         text = stdout.getvalue()
         self.assertIn("mission kernel", text)
+        self.assertNotIn("dormant", text)
+
+
+class TestControllerEntrypoint(unittest.TestCase):
+    """conch-controller is live but hard-gated on fleet_controller=true."""
+
+    def test_refuses_without_fleet_controller_enabled(self):
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, _clean_env(tmp), clear=True):
+                with contextlib.redirect_stderr(stderr):
+                    code = controller_main([])
+        self.assertEqual(code, CONTROLLER_DISABLED_EXIT_CODE)
+        message = stderr.getvalue()
+        self.assertIn("fleet_controller", message)
+        self.assertIn("fully", message)
+
+    def test_disabled_message_never_goes_to_stdout(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, _clean_env(tmp), clear=True):
+                with contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    controller_main([])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertTrue(stderr.getvalue())
+
+    def test_help_describes_the_live_controller(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                controller_main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("task plane", text)
         self.assertNotIn("dormant", text)
 
 

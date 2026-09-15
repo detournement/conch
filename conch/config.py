@@ -100,6 +100,117 @@ def get_config_path() -> str:
     return str(config_dir / "config")
 
 
+def get_env_file_path() -> str:
+    """Path to the conch-owned API key file (may not exist yet).
+
+    ``~/.config/conch/env`` holds ``KEY=value`` lines (0600) that
+    :func:`load_config` mirrors into the process environment — the
+    canonical home for provider keys written by first-run onboarding.
+    Because conch itself loads it, daemons and launchd/systemd services
+    see the keys without shell-profile exports; a variable already in
+    the real environment always wins.
+    """
+    config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch"
+    return str(config_dir / "env")
+
+
+def load_env_file() -> None:
+    """Mirror the env file into ``os.environ`` (existing values win)."""
+    try:
+        text = Path(get_env_file_path()).read_text()
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _write_private_file(path: Path, text: str) -> None:
+    """Write *text* to *path* with 0600 perms (0700 parent), atomically
+    enough for single-user config: keys never transit a world-readable
+    state."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+
+
+def set_config_values(updates: Dict[str, str], header: str = "") -> str:
+    """Set ``key = value`` lines in the primary config file, in place.
+
+    Existing assignments to the same key are replaced (first occurrence
+    updated, duplicates dropped); new keys are appended. The file is
+    created 0600 when missing — with *header* as its leading comment —
+    and existing content, comments, and ordering are otherwise
+    preserved. Returns the config path.
+    """
+    path = Path(get_config_path())
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = [header.rstrip()] if header else []
+    remaining = dict(updates)
+    output = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in remaining:
+                output.append(f"{key} = {remaining.pop(key)}")
+                continue
+            if key in updates:
+                continue  # duplicate assignment of an updated key
+        output.append(line)
+    for key, value in remaining.items():
+        output.append(f"{key} = {value}")
+    _write_private_file(path, "\n".join(output).rstrip("\n") + "\n")
+    return str(path)
+
+
+def set_env_values(updates: Dict[str, str]) -> str:
+    """Set ``KEY=value`` lines in the 0600 env file (see
+    :func:`get_env_file_path`) and mirror them into ``os.environ`` so
+    the running process sees them immediately. Returns the env path.
+
+    Values are secrets: callers must never echo them, and this function
+    never logs them.
+    """
+    path = Path(get_env_file_path())
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = [
+            "# Conch API keys — loaded into the environment by conch itself.",
+            "# Keep this file 0600; real environment variables take precedence.",
+        ]
+    remaining = dict(updates)
+    output = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in remaining:
+                output.append(f"{key}={remaining.pop(key)}")
+                continue
+            if key in updates:
+                continue  # duplicate assignment of an updated key
+        output.append(line)
+    for key, value in remaining.items():
+        output.append(f"{key}={value}")
+    _write_private_file(path, "\n".join(output).rstrip("\n") + "\n")
+    for key, value in updates.items():
+        os.environ[key] = value
+    return str(path)
+
+
 def resolve_editor(config: Optional[Dict[str, str]] = None) -> str:
     """Editor precedence: config ``editor``, then $VISUAL, then $EDITOR,
     then nano when installed, else vi.
@@ -178,7 +289,12 @@ def load_config() -> Dict[str, str]:
 
     Precedence (last wins): defaults < ~/.config/conch/config < ~/.conchrc
     < per-project .conchrc (nearest file between cwd and the git root).
+
+    The conch-owned key file (~/.config/conch/env) is mirrored into the
+    environment first, so ``api_key_env`` lookups see onboarding-written
+    keys everywhere — shell, one-shots, daemons — without profile edits.
     """
+    load_env_file()
     config = dict(DEFAULT_CONFIG)
     explicit: Dict[str, str] = {}
     config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch"

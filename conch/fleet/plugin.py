@@ -11,7 +11,9 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 from ..plugins import (
+    Component,
     SlashCommand,
+    register_component,
     register_mission_tool_provider,
     register_session_tool_provider,
     register_slash_command,
@@ -89,6 +91,64 @@ def _run_fleet(arg: str, config: dict):
 
     handle_fleet_command(arg, config)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Component: /install fleet (component seam).
+# ---------------------------------------------------------------------------
+
+def _component_status(config: dict) -> str:
+    from ..config import get_bool
+
+    if not get_bool(config, "fleet_controller"):
+        return "disabled — /install fleet to enable trusted SSH workers"
+    return "enabled — /fleet status shows the plane"
+
+
+def _component_setup(config: dict) -> None:
+    from ..config import get_bool, set_config_values
+
+    print(
+        "\n  \033[1mFleet\033[0m — trusted SSH hosts running bounded,"
+        " replaceable\n  workers: enroll a host once, then dispatch tasks"
+        " with /fleet run\n  or the fleet_delegate tool."
+    )
+
+    def _confirm(prompt: str) -> bool:
+        try:
+            answer = input(f"  {prompt} [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return answer in ("", "y", "yes")
+
+    if not get_bool(config, "fleet_controller"):
+        if not _confirm("Enable fleet_controller?"):
+            print("  \033[2mLeft disabled.\033[0m\n")
+            return
+        path = set_config_values({"fleet_controller": "true"})
+        config["fleet_controller"] = "true"
+        print(f"  \033[1;32m✓ fleet_controller = true\033[0m"
+              f" \033[2m({path})\033[0m")
+    if _confirm("Install the supervised conch-controller daemon"
+                " (recommended)?"):
+        from .controller import controller_install_cmd
+
+        code = controller_install_cmd(config)
+        if code != 0:
+            print(f"\n  \033[31mController install exited {code}\033[0m"
+                  " \033[2m— run `conch-controller install` directly for"
+                  " details.\033[0m")
+    print("\n  \033[1;32m✓ Fleet ready.\033[0m \033[2mNext: /fleet enroll"
+          " <name> <user@host> to add a trusted worker, then /fleet run."
+          "\033[0m\n")
+
+
+register_component(Component(
+    "fleet", "Fleet",
+    "trusted SSH workers: signed builds, bounded tasks, task plane",
+    _component_status, _component_setup,
+))
 
 
 register_session_tool_provider("fleet_delegate", FleetSessionToolProvider())

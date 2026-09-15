@@ -1078,6 +1078,7 @@ def append_model_switch_note(
     model: str,
     config: dict,
     registry_name: str = "",
+    cause: str = "",
 ) -> Optional[str]:
     """Record a committed mid-conversation model switch in the history.
 
@@ -1090,6 +1091,13 @@ def append_model_switch_note(
     wire normalization already makes mid-history system notes safe
     (converted to context for providers that require a single leading
     system message).
+
+    *cause* marks automatic switches: the fallback chain passes what
+    failed (e.g. ``custom/gone-model failed``) and the note leads with
+    "Model switched automatically (fallback after ...)" instead of the
+    deliberate-switch lead. Only COMMITTED fallbacks note: candidates are
+    trialed on a config copy and same-provider transient retries never
+    switch, so neither reaches this function.
 
     Appends nothing at conversation start (no prior non-system turns:
     initial model selection isn't a switch) and skips an exact duplicate
@@ -1114,8 +1122,13 @@ def append_model_switch_note(
     elif provider == "custom":
         base_url = get_custom_base_url(config)
     served_at = f" at {base_url}" if base_url else ""
+    lead = (
+        f"Model switched automatically (fallback after {cause})"
+        if cause
+        else "Model switched"
+    )
     note = (
-        f"Model switched: this conversation is now served by {model} "
+        f"{lead}: this conversation is now served by {model} "
         f"({label}){served_at}. Prior turns may reference a different "
         "active model; statements about the previously active model no "
         "longer describe the current one."
@@ -1920,6 +1933,22 @@ def chat_turn(
                         config["model"] = fb_model
                         if fb_overrides:
                             config.update(fb_overrides)
+                        # This is the COMMIT point: the mutated config now
+                        # serves every subsequent turn (failed candidates
+                        # only ever touched the fb_config copy), so record
+                        # the switch boundary in the persisted history.
+                        append_model_switch_note(
+                            messages,
+                            provider=fb_provider,
+                            model=config.get("chat_model", fb_model),
+                            config=config,
+                            registry_name=(
+                                fb_model
+                                if fb_model.startswith("llamaidx/")
+                                else ""
+                            ),
+                            cause=f"{failed_provider}/{failed_model} failed",
+                        )
                         stream_fn = STREAM_FNS.get(provider) if on_token else None
                         raw_fn = RAW_FNS.get(provider)
                         send_messages = fb_messages

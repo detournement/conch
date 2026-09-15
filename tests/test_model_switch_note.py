@@ -33,7 +33,7 @@ def _notes(messages):
     return [
         m for m in messages
         if m.get("role") == "system"
-        and str(m.get("content", "")).startswith("Model switched:")
+        and str(m.get("content", "")).startswith("Model switched")
     ]
 
 
@@ -342,6 +342,135 @@ class ToolPathSwitchNoteTests(unittest.TestCase):
             messages,
         )
         self.assertIsNone(note)
+        self.assertEqual(_notes(messages), [])
+
+
+class _FlakyLlamaCppBox(FakeLlamaCppBox):
+    """Fails the first chat completion with a transient 500, then recovers
+    — exercising the same-provider retry, which never commits a switch."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.failures_left = 1
+
+    def handle(self, method, path, body):
+        if (
+            method == "POST"
+            and path == "/v1/chat/completions"
+            and self.failures_left > 0
+        ):
+            # Fail only real completions: the adapter's validation probe
+            # (conch_tool_probe) must pass or its cached verdict would
+            # block the retry before it reaches the wire.
+            tools = (body or {}).get("tools") or []
+            is_probe = any(
+                (t.get("function") or {}).get("name") == "conch_tool_probe"
+                for t in tools
+            )
+            if not is_probe:
+                self.failures_left -= 1
+                return 500, {"error": {"message": "temporarily overloaded"}}
+        return super().handle(method, path, body)
+
+
+class FallbackSwitchNoteTests(unittest.TestCase):
+    """The automatic mid-turn fallback path notes only COMMITTED switches:
+    candidates are trialed on a config copy and the live config mutates
+    solely in the success branch, while same-provider transient retries
+    never switch at all."""
+
+    def setUp(self):
+        clear_local_model_caches()
+
+    def test_committed_fallback_appends_note_once_with_cause(self):
+        from conch.providers import raw_custom
+        from conch.runtime import chat_turn
+
+        registry = FakeRegistry().start()
+        self.addCleanup(registry.stop)
+        rescue = FakeLlamaCppBox(models=["rescue-32b"]).start()
+        self.addCleanup(rescue.stop)
+        rescue.chat_reply = "rescued by the registry box"
+        registry.providers = [
+            registry.provider_entry(
+                name="rescuebox", flavor="llamacpp",
+                base_url=rescue.base_url,
+                models=[registry.model_entry("rescue-32b")],
+            )
+        ]
+        config = {
+            "provider": "custom",
+            # Nothing listens here: the primary box is gone.
+            "custom_base_url": "http://127.0.0.1:9/v1",
+            "custom_model": "gone-model",
+            "chat_model": "gone-model",
+            "model": "gone-model",
+            "llamaidx_url": registry.base_url,
+        }
+        messages = [{"role": "user", "content": "hi"}]
+        with patch("conch.runtime.time.sleep"), \
+             patch("sys.stderr", io.StringIO()), \
+             patch("sys.stdin", io.StringIO("")):
+            reply, _ = chat_turn(
+                config=config,
+                provider="custom",
+                raw_fn=raw_custom,
+                messages=messages,
+                tools=None,
+                tool_map={},
+                builtin_clients={},
+                max_tool_rounds=2,
+            )
+        self.assertIn("rescued by the registry box", reply)
+        self.assertEqual(config["chat_model"], "rescue-32b")  # committed
+        notes = _notes(messages)
+        self.assertEqual(len(notes), 1)
+        note = notes[0]["content"]
+        self.assertTrue(
+            note.startswith(
+                "Model switched automatically (fallback after"
+                " custom/gone-model failed):"
+            ),
+            note,
+        )
+        self.assertIn("now served by rescue-32b", note)
+        self.assertIn("(llamaidx/rescuebox/rescue-32b, custom adapter)", note)
+        self.assertIn(f"at {rescue.base_url}/v1", note)
+        self.assertIn("no longer describe the current one", note)
+
+    def test_transient_retry_without_commit_appends_nothing(self):
+        from conch.providers import raw_custom
+        from conch.runtime import chat_turn
+
+        box = _FlakyLlamaCppBox(models=["stay-model"]).start()
+        self.addCleanup(box.stop)
+        box.chat_reply = "recovered on the same model"
+        config = {
+            "provider": "custom",
+            "custom_base_url": box.base_url + "/v1",
+            "custom_model": "stay-model",
+            "chat_model": "stay-model",
+            "model": "stay-model",
+        }
+        messages = [{"role": "user", "content": "hi"}]
+        with patch("conch.runtime.time.sleep"), \
+             patch("sys.stderr", io.StringIO()), \
+             patch("sys.stdin", io.StringIO("")):
+            reply, _ = chat_turn(
+                config=config,
+                provider="custom",
+                raw_fn=raw_custom,
+                messages=messages,
+                tools=None,
+                tool_map={},
+                builtin_clients={},
+                max_tool_rounds=2,
+            )
+        # The retry recovered on the SAME provider/model: nothing committed,
+        # nothing noted.
+        self.assertIn("recovered on the same model", reply)
+        self.assertEqual(config["provider"], "custom")
+        self.assertEqual(config["chat_model"], "stay-model")
         self.assertEqual(_notes(messages), [])
 
 

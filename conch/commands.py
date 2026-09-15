@@ -85,6 +85,7 @@ SLASH_COMMANDS = [
     ("/models", "List available models"),
     ("/model <name>", "Switch model"),
     ("/llamaidx", "Fleet status from the llama-idx registry (up/degraded/down boxes)"),
+    ("/registry [set <url>|off]", "Show, wire, or remove the llama-idx registry (llamaidx_url)"),
     ("/provider <name>", "Switch provider (cerebras, openai, anthropic, bedrock, openrouter, ollama, custom)"),
     ("/remember <text>", "Save a persistent memory"),
     ("/memories", "List memories"),
@@ -1052,6 +1053,115 @@ def _switch_to_llamaidx_model(
     return (overrides["provider"], entry["model_id"], RAW_FNS[overrides["provider"]])
 
 
+_REGISTRY_USAGE = (
+    "\n  \033[2mUsage: /registry            Status of the configured registry\n"
+    "         /registry set <url>  Validate the endpoint, then save llamaidx_url\n"
+    "         /registry off        Remove the registry (also: clear)\033[0m\n"
+)
+
+
+def _handle_registry_command(arg: str, config: dict) -> None:
+    """/registry — wire a llama-idx registry from inside conch.
+
+    Status probes the configured URL live (uncached, with distinct
+    reasons for unreachable / non-JSON / unsupported schema / policy).
+    ``set`` validates the endpoint the same way BEFORE persisting
+    ``llamaidx_url`` through config.set_config_values — the same
+    conch-written path onboarding and /install use — and ``off`` clears
+    the key through it. Scheme-less URLs normalize to http://.
+    """
+    from .llamaidx import (
+        clear_llamaidx_cache,
+        get_llamaidx_url,
+        probe_llamaidx_registry,
+        registry_probe_summary,
+    )
+
+    parts = (arg or "").strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if not sub:
+        url = get_llamaidx_url(config)
+        if not url:
+            print(
+                "\n  \033[2mNo llama-idx registry configured.\033[0m\n"
+                "  \033[2m/registry set <url> wires one (config key:"
+                " llamaidx_url); /models then lists its tool-verified"
+                " models as llamaidx/<provider>/<model>.\033[0m\n"
+            )
+            return
+        ok, reason, status = probe_llamaidx_registry(url, config)
+        print(f"\n  \033[1;36mRegistry:\033[0m \033[1m{url}\033[0m")
+        if ok:
+            print(
+                f"  \033[1;32mreachable\033[0m"
+                f" \033[2m— {registry_probe_summary(status)}\033[0m"
+            )
+        else:
+            print(f"  \033[31m{reason}\033[0m")
+        print(
+            "\n  \033[2m/models lists entries as"
+            " llamaidx/<provider>/<model>; /model llamaidx/... switches;"
+            " /llamaidx shows the whole fleet. Config key:"
+            " llamaidx_url.\033[0m\n"
+        )
+        return
+
+    if sub == "set":
+        if not rest:
+            print(_REGISTRY_USAGE)
+            return
+        url = get_llamaidx_url({"llamaidx_url": rest})
+        ok, reason, status = probe_llamaidx_registry(url, config)
+        if not ok:
+            print(f"\n  \033[31mNot saved: {reason}\033[0m")
+            print(
+                f"  \033[2mChecked {url}/v1/inference — llamaidx_url is"
+                " unchanged.\033[0m\n"
+            )
+            return
+        from .config import set_config_values
+
+        path = set_config_values({"llamaidx_url": url})
+        config["llamaidx_url"] = url
+        clear_llamaidx_cache()
+        print(
+            f"\n  \033[1;32m✓ llamaidx_url = {url}\033[0m"
+            f" \033[2m({path})\033[0m"
+        )
+        print(f"  \033[2m{registry_probe_summary(status)}\033[0m")
+        print(
+            "  \033[2m/models now lists them as"
+            " llamaidx/<provider>/<model>; /model llamaidx/..."
+            " switches.\033[0m\n"
+        )
+        return
+
+    if sub in ("off", "clear", "unset"):
+        current = get_llamaidx_url(config)
+        if not current:
+            print(
+                "\n  \033[2mNo llama-idx registry configured — nothing to"
+                " remove.\033[0m\n"
+            )
+            return
+        from .config import set_config_values
+
+        path = set_config_values({"llamaidx_url": ""})
+        config["llamaidx_url"] = ""
+        clear_llamaidx_cache()
+        print(
+            f"\n  \033[1;32m✓ Registry removed\033[0m \033[2m(was"
+            f" {current}; llamaidx_url cleared in {path})\033[0m\n"
+            "  \033[2mllamaidx/... entries no longer appear in"
+            " /models.\033[0m\n"
+        )
+        return
+
+    print(_REGISTRY_USAGE)
+
+
 def handle_slash_command(
     cmd: str,
     config: dict,
@@ -1085,6 +1195,7 @@ def handle_slash_command(
             "  \033[1m/models\033[0m              List available models\n"
             "  \033[1m/model <name>\033[0m        Switch model\n"
             "  \033[1m/llamaidx\033[0m            Fleet status from the llama-idx registry\n"
+            "  \033[1m/registry [set <url>|off]\033[0m  Show, wire, or remove the llama-idx registry\n"
             "  \033[1m/provider <name>\033[0m     Switch provider (cerebras, openai, anthropic, bedrock, openrouter, ollama)\n"
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List memories\n"
@@ -1596,6 +1707,10 @@ def handle_slash_command(
             "\n  \033[2mSelect with /model llamaidx/<provider>/<model>;"
             " /models lists the selectable entries.\033[0m\n"
         )
+        return None
+
+    if command == "/registry":
+        _handle_registry_command(arg, config)
         return None
 
     if command == "/model":

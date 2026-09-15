@@ -224,6 +224,84 @@ def _parse_catalog(config: dict, payload: dict) -> List[dict]:
     return providers
 
 
+def probe_llamaidx_registry(
+    url: str,
+    config: Optional[dict] = None,
+    *,
+    timeout: float = LLAMAIDX_DISCOVERY_TIMEOUT,
+) -> tuple:
+    """Validate *url* as a llama-idx registry before committing it.
+
+    One uncached ``GET {url}/v1/inference?status=all`` that distinguishes,
+    for the human or agent wiring a registry, exactly what the fetch_*
+    helpers deliberately blur: policy-blocked, unreachable, non-JSON, and
+    unsupported schema majors all get their own reason. Returns
+    ``(ok, reason, status)`` where *status* is the parsed
+    fetch_llamaidx_status shape on success and None otherwise.
+    """
+    config = dict(config or {})
+    if "://" not in url:
+        url = "http://" + url
+    url = url.rstrip("/")
+    if _registry_blocked_by_policy(config, url):
+        return (
+            False,
+            "local_only is enabled and the registry URL is not a"
+            " local/tailnet address",
+            None,
+        )
+    request = urllib.request.Request(
+        f"{url}/v1/inference?status=all",
+        headers=_llamaidx_headers(config),
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode())
+    except json.JSONDecodeError:
+        return (
+            False,
+            "endpoint did not return JSON (not a llama-idx registry?)",
+            None,
+        )
+    except Exception as exc:
+        return False, f"unreachable: {exc}", None
+    if not isinstance(payload, dict) or not _schema_supported(payload):
+        version = (
+            payload.get("registry_version") if isinstance(payload, dict) else None
+        )
+        return (
+            False,
+            f"unsupported registry_version {version!r} (this conch speaks"
+            f" major {_SUPPORTED_SCHEMA_MAJOR}.x)",
+            None,
+        )
+    return True, "", _parse_status(config, payload)
+
+
+def registry_probe_summary(status: dict) -> str:
+    """One line of provider/model counts from a probe_llamaidx_registry
+    result, shared by /registry and the conch_config registry actions."""
+    providers = status.get("providers") or []
+    counts = {"up": 0, "degraded": 0, "down": 0}
+    for provider in providers:
+        counts[provider["status"]] += 1
+    selectable = sum(
+        1
+        for provider in providers
+        if provider["status"] in ("up", "degraded")
+        for model in provider["models"]
+        if model.get("tools") is True
+    )
+    version = status.get("registry_version") or "unknown"
+    return (
+        f"registry_version {version}; {len(providers)} provider(s) —"
+        f" {counts['up']} up, {counts['degraded']} degraded,"
+        f" {counts['down']} down; {selectable} tool-verified model(s)"
+        " selectable"
+    )
+
+
 def fetch_llamaidx_status(
     config: Optional[dict] = None,
     *,

@@ -144,13 +144,27 @@ that cannot positively report native tool support expose no selectable
 models. If a local service is unavailable, its models are not shown and
 requests are blocked without contaminating conversation history.
 
-#### llama-idx registry discovery
+#### Using a llama-idx registry
 
 When the fleet is more than one box, per-box configuration stops scaling:
 [llama-idx](https://github.com/detournement/llama-idx) is the
 owned-and-operated registry that every llama.cpp/Ollama/OpenAI-compatible
 server self-registers with (one curl), and conch discovers them all from
-one endpoint:
+one endpoint. Wire it from inside conch:
+
+```
+/registry set 192.168.1.226:8642   # validate, then save (http:// assumed)
+/registry                          # status: URL, reachability, version, counts
+/registry off                      # remove it (also: clear)
+```
+
+`/registry set` fetches the endpoint's `/v1/inference` first and refuses
+to save anything that is unreachable, isn't a llama-idx registry, or
+speaks an unsupported `registry_version` major — on success it reports
+the providers and tool-verified models found and persists the URL. The
+same three operations are available to the model through the
+`conch_config` tool (`get_registry` / `set_registry` / `clear_registry`),
+with identical validation. Hand-editors: the persisted key is
 
 ```
 # ~/.config/conch/config

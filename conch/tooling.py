@@ -2493,6 +2493,8 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(SKILL_MANAGE_TOOL)
     if "conch_introspect" in clients:
         builtin.append(CONCH_INTROSPECT_TOOL)
+    if "llamaidx_registry" in clients:
+        builtin.append(LLAMAIDX_REGISTRY_TOOL)
     builtin_names = {
         tool_def["function"]["name"] for tool_def in builtin
     }
@@ -2593,6 +2595,69 @@ class ConchConfigClient:
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
 
+    def _set_llamaidx_model(self, value: str) -> dict:
+        """Queue a switch to a registry-discovered model.
+
+        Mirrors the /model llamaidx/... path: the registry supplied
+        flavor + base_url + model id, routing goes through the existing
+        ollama/custom adapters, and conch's own probe-on-select runs here
+        against the box before anything is queued — the registry's
+        tools verdict gated the listing but can be stale.
+        """
+        from .llamaidx import (
+            get_llamaidx_url,
+            list_llamaidx_models,
+            llamaidx_selection_overrides,
+            resolve_llamaidx_model,
+        )
+        from .providers import validate_model_for_provider
+
+        if not get_llamaidx_url(self._config):
+            return self._text(
+                "No llama-idx registry is configured (llamaidx_url is unset), "
+                "so llamaidx/... names cannot be resolved."
+            )
+        entry = resolve_llamaidx_model(value, self._config, force_refresh=True)
+        if entry is None:
+            available = [
+                e["name"] for e in list_llamaidx_models(self._config) or []
+            ]
+            shown = ", ".join(available[:6]) + (", ..." if len(available) > 6 else "")
+            hint = (
+                f" Registered tool-verified models: {shown}."
+                if available
+                else " The registry is unreachable or lists no tool-verified models."
+            )
+            return self._text(f"'{value}' is not in the registry catalog.{hint}")
+        overrides = llamaidx_selection_overrides(entry)
+        trial = dict(self._config)
+        trial.update(overrides)
+        ok, reason = validate_model_for_provider(
+            overrides["provider"], entry["model_id"], trial
+        )
+        if ok is not True:
+            return self._text(
+                f"Cannot switch to {value}: {reason or 'validation failed'}. "
+                "The registry lists it as tool-verified, but conch's own "
+                "probe disagrees or the provider is unreachable — trust the "
+                "probe."
+            )
+        self.pending_actions.append(
+            ("set_model", overrides["provider"], entry["model_id"], overrides)
+        )
+        degraded = (
+            " The provider is currently degraded (loading/recovering)."
+            if entry["degraded"]
+            else ""
+        )
+        return self._text(
+            f"Model switch to {overrides['provider']}/{entry['model_id']} via "
+            f"{entry['name']} at {entry['base_url']} (free, self-hosted) is "
+            f"queued.{degraded} IMPORTANT: this response is still generated "
+            f"by {self._provider}/{self._model}. The switch takes effect "
+            "starting with the NEXT user message."
+        )
+
     def call_tool(self, name: str, arguments: dict) -> dict:
         from .providers import (
             KNOWN_MODELS,
@@ -2675,11 +2740,42 @@ class ConchConfigClient:
                         lines.append(f"  {m}  free{current}")
                     else:
                         lines.append(f"  {m}  ${price[0]:.2f}/${price[1]:.2f} per 1M tok (in/out){current}")
+            from .llamaidx import get_llamaidx_url, list_llamaidx_models
+
+            if get_llamaidx_url(self._config):
+                entries = list_llamaidx_models(self._config)
+                if entries is None:
+                    lines.append(
+                        "\nllamaidx (registry unreachable at "
+                        f"{get_llamaidx_url(self._config)}): no models"
+                    )
+                elif not entries:
+                    lines.append(
+                        "\nllamaidx (registry reachable): no tool-verified"
+                        " models registered"
+                    )
+                else:
+                    lines.append("\nllamaidx (self-hosted fleet registry, free):")
+                    for entry in entries[:48]:
+                        is_current = (
+                            entry["model_id"] == self._model
+                            and self._provider in ("ollama", "custom")
+                        )
+                        current = " <-- current" if is_current else ""
+                        ctx = f"  ctx={entry['ctx']}" if entry.get("ctx") else ""
+                        degraded = (
+                            "  (provider degraded)" if entry["degraded"] else ""
+                        )
+                        lines.append(
+                            f"  {entry['name']}{ctx}{degraded}{current}"
+                        )
             return self._text("\n".join(lines))
 
         if action == "set_model":
             if not value:
                 return self._text("Error: provide a model name in 'value'")
+            if value.startswith("llamaidx/"):
+                return self._set_llamaidx_model(value)
             target_provider = None
             for prov, models in KNOWN_MODELS.items():
                 if prov not in ("ollama", "custom") and value in models:
@@ -3364,3 +3460,151 @@ class ApiLayerClient:
             return self._text(result)
 
         return self._text(f"Unknown action: {action}")
+
+
+# ---------------------------------------------------------------------------
+# llamaidx_registry — the self-hosted fleet registry as a chat data source
+# ---------------------------------------------------------------------------
+
+LLAMAIDX_REGISTRY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "llamaidx_registry",
+        "description": (
+            "Query the llama-idx registry, the live data source for the "
+            "user's self-hosted inference fleet (llama.cpp, Ollama, and "
+            "OpenAI-compatible servers). Use fleet_status when the user "
+            "asks what is running, which boxes/GPUs are up, degraded, or "
+            "down, or why a server is unavailable — it includes down "
+            "providers with their last error and last-seen time, plus "
+            "per-model context size, quantization, loaded state, and "
+            "modalities. Use list_models for the registry models conch can "
+            "actually switch to; select one with conch_config "
+            "action=set_model value=llamaidx/<provider>/<model>. Read-only: "
+            "answers come from the registry's stored state and never wake "
+            "or probe the boxes themselves."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["fleet_status", "list_models"],
+                    "description": (
+                        "fleet_status: every registered provider with "
+                        "health, labels, and models (including down boxes "
+                        "and models without tool support). list_models: "
+                        "only the selectable tool-verified entries."
+                    ),
+                },
+                "provider": {
+                    "type": "string",
+                    "description": (
+                        "Optional exact provider name to narrow "
+                        "fleet_status to one box (e.g. 'burt')."
+                    ),
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+class LlamaidxRegistryClient:
+    """Read-only chat surface over the llama-idx registry.
+
+    Reporting only, never routing: model selection still goes through
+    conch_config/set_model (or /model) with conch's probe-on-select, and
+    this client only ever talks to the registry — not to the provider
+    boxes it describes. Output is bounded by render_fleet_status. Auth is
+    only ever reported as the NAME of an env var, never a value.
+    """
+
+    name = "llamaidx_registry"
+
+    def __init__(self, config: dict):
+        self._config = config
+
+    def _text(self, msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        from .llamaidx import (
+            fetch_llamaidx_status,
+            get_llamaidx_url,
+            list_llamaidx_models,
+            render_fleet_status,
+        )
+
+        arguments = arguments or {}
+        action = str(arguments.get("action") or "").strip()
+        url = get_llamaidx_url(self._config)
+        if not url:
+            return self._text(
+                "No llama-idx registry is configured (llamaidx_url is unset)."
+            )
+
+        if action == "fleet_status":
+            # force_refresh: fleet questions ("is burt up?") deserve the
+            # registry's current state, not a cached snapshot.
+            status = fetch_llamaidx_status(self._config, force_refresh=True)
+            if status is None:
+                return self._text(
+                    f"The llama-idx registry at {url} is unreachable, serves "
+                    "an unsupported schema version, or is blocked by "
+                    "local_only. Fleet status is unknown — do not guess at "
+                    "provider health."
+                )
+            provider_filter = str(arguments.get("provider") or "").strip()
+            if provider_filter:
+                matching = [
+                    p for p in status["providers"] if p["name"] == provider_filter
+                ]
+                if not matching:
+                    known = ", ".join(
+                        sorted(p["name"] for p in status["providers"])
+                    ) or "none"
+                    return self._text(
+                        f"No provider named '{provider_filter}' in the "
+                        f"registry. Registered providers: {known}."
+                    )
+                status = dict(status, providers=matching)
+            return self._text(render_fleet_status(status))
+
+        if action == "list_models":
+            entries = list_llamaidx_models(self._config, force_refresh=True)
+            if entries is None:
+                return self._text(
+                    f"The llama-idx registry at {url} is unreachable, serves "
+                    "an unsupported schema version, or is blocked by "
+                    "local_only. No registry models are selectable right now."
+                )
+            if not entries:
+                return self._text(
+                    "The registry is reachable but lists no tool-verified "
+                    "models on up/degraded providers, so nothing is "
+                    "selectable. Use fleet_status to see why (down boxes, "
+                    "models that failed the tool probe)."
+                )
+            lines = ["Selectable registry models (tool-verified, on up/degraded providers):"]
+            for entry in entries[:48]:
+                bits = []
+                if entry.get("ctx"):
+                    bits.append(f"ctx={entry['ctx']}")
+                bits.append("loaded" if entry.get("loaded") else "not loaded")
+                if entry["degraded"]:
+                    bits.append("provider degraded")
+                lines.append(f"  - {entry['name']}  ({', '.join(bits)})")
+            if len(entries) > 48:
+                lines.append(f"  (+{len(entries) - 48} more)")
+            lines.append(
+                "Switch with conch_config action=set_model "
+                "value=llamaidx/<provider>/<model> (conch re-probes tool "
+                "support before committing)."
+            )
+            return self._text("\n".join(lines))
+
+        return self._text(
+            f"Unknown action '{action}'. Use fleet_status or list_models."
+        )

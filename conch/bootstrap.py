@@ -25,6 +25,7 @@ from .tooling import (
     ConchIntrospectClient,
     DelegateTaskClient,
     InteractiveTerminalClient,
+    LlamaidxRegistryClient,
     LocalShellClient,
     LocalShellPolicy,
     ManageToolsClient,
@@ -303,6 +304,11 @@ def make_builtin_clients(
         from .fleet.delegate import FleetDelegateClient
 
         clients["fleet_delegate"] = FleetDelegateClient(config)
+    if str(config.get("llamaidx_url") or "").strip():
+        # The llama-idx registry as a chat-queryable data source (fleet
+        # status + selectable models). Read-only against the registry;
+        # unset llamaidx_url = tool absent, zero new traffic.
+        clients["llamaidx_registry"] = LlamaidxRegistryClient(config)
     import os
 
     api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")

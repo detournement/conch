@@ -1250,6 +1250,11 @@ def chat_loop(new_conversation=False):
             for _action in _cfg_client.pending_actions:
                 if _action[0] == "set_model":
                     _new_prov, _new_mod = _action[1], _action[2]
+                    # Registry-selected models (llamaidx/...) carry the
+                    # adapter overrides (base_url, api_key_env name, model
+                    # ids) resolved at selection time; they win over the
+                    # provider defaults below.
+                    _overrides = _action[3] if len(_action) > 3 else None
                     _new_fn = RAW_FNS.get(_new_prov)
                     if _new_fn:
                         old_provider = provider
@@ -1262,6 +1267,8 @@ def chat_loop(new_conversation=False):
                         config["model"] = _new_mod
                         if _new_prov == "custom":
                             config["custom_model"] = _new_mod
+                        if _overrides:
+                            config.update(_overrides)
                         if provider != old_provider:
                             from .runtime import normalize_messages_on_switch
                             normalize_messages_on_switch(messages, provider)

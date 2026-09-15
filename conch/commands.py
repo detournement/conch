@@ -85,6 +85,7 @@ SLASH_COMMANDS = [
     ("/help", "Show all commands"),
     ("/models", "List available models"),
     ("/model <name>", "Switch model"),
+    ("/llamaidx", "Fleet status from the llama-idx registry (up/degraded/down boxes)"),
     ("/provider <name>", "Switch provider (cerebras, openai, anthropic, bedrock, openrouter, ollama, custom)"),
     ("/remember <text>", "Save a persistent memory"),
     ("/memories", "List memories"),
@@ -1390,6 +1391,7 @@ def handle_slash_command(
             "\n\033[1;36mSlash commands:\033[0m\n"
             "  \033[1m/models\033[0m              List available models\n"
             "  \033[1m/model <name>\033[0m        Switch model\n"
+            "  \033[1m/llamaidx\033[0m            Fleet status from the llama-idx registry\n"
             "  \033[1m/provider <name>\033[0m     Switch provider (cerebras, openai, anthropic, bedrock, openrouter, ollama)\n"
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List memories\n"
@@ -1882,6 +1884,36 @@ def handle_slash_command(
                     )
                     print(f"    {prefix} {entry['name']}{ctx}{marker}")
         print()
+        return None
+
+    if command == "/llamaidx":
+        from .llamaidx import (
+            fetch_llamaidx_status,
+            get_llamaidx_url,
+            render_fleet_status,
+        )
+
+        registry_url = get_llamaidx_url(config)
+        if not registry_url:
+            print(
+                "\n  \033[2mNo llama-idx registry configured — set"
+                " llamaidx_url in ~/.config/conch/config\033[0m\n"
+            )
+            return None
+        status = fetch_llamaidx_status(config, force_refresh=True)
+        if status is None:
+            print(
+                f"\n  \033[31mRegistry unreachable at {registry_url}"
+                " (or unsupported schema / blocked by local_only)\033[0m\n"
+            )
+            return None
+        print()
+        for line in render_fleet_status(status, color=True).splitlines():
+            print(f"  {line}")
+        print(
+            "\n  \033[2mSelect with /model llamaidx/<provider>/<model>;"
+            " /models lists the selectable entries.\033[0m\n"
+        )
         return None
 
     if command == "/model":

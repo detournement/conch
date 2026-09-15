@@ -304,6 +304,39 @@ def _default_session_factory(config: dict) -> Callable:
 
                 session.builtin_clients["capitol_control"] = control.capitol
                 tools.append(CAPITOL_CONTROL_TOOL)
+            # Fleet authority is spec-derived the same way: the session's
+            # interactive fleet_delegate (if any) is dropped, and an
+            # envelope-scoped client — clamped to the mission's fleet
+            # block — replaces it only when the spec grants one.
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name") != "fleet_delegate"
+            ]
+            session.builtin_clients.pop("fleet_delegate", None)
+            spec = mission.get("spec") or {}
+            fleet_spec = spec.get("fleet") or {}
+            if fleet_spec:
+                from ..config import get_bool
+
+                if get_bool(config, "fleet_controller"):
+                    from ..fleet.authority import mission_fleet_authority
+                    from ..fleet.delegate import (
+                        FLEET_DELEGATE_TOOL,
+                        FleetDelegateClient,
+                    )
+
+                    session.builtin_clients["fleet_delegate"] = (
+                        FleetDelegateClient(
+                            config,
+                            caller=mission_fleet_authority(fleet_spec),
+                            principal=str(
+                                spec.get("principal") or "user"
+                            ),
+                            allowed_workers=fleet_spec.get("workers"),
+                            allowed_skills=fleet_spec.get("skills"),
+                        )
+                    )
+                    tools.append(FLEET_DELEGATE_TOOL)
             return session.run_turn(
                 messages, tools=tools,
                 max_tool_rounds=caps["max_tool_rounds"],

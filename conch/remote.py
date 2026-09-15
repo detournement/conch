@@ -240,7 +240,7 @@ REMOTE_SYSTEM_PROMPT = (
 REMOTE_EXCLUDED_TOOLS = {
     "delegate_task", "conch_config", "manage_tools", "skill_manage",
     "todo_list", "api_layer", "conch_introspect", "interactive_terminal",
-    "ssh_remote",
+    "ssh_remote", "fleet_delegate",
 }
 
 

@@ -295,6 +295,14 @@ def make_builtin_clients(
         from .capitol.tool import CapitolSessionClient
 
         clients["capitol_control"] = CapitolSessionClient(config)
+    if get_bool(config, "fleet_controller"):
+        # The model-callable fleet delegation surface (local sessions
+        # only: remote turns exclude it, workers deny-list it, delegated
+        # sub-turns don't inherit it implicitly). Import stays lazy so
+        # non-fleet installs never load conch.fleet.
+        from .fleet.delegate import FleetDelegateClient
+
+        clients["fleet_delegate"] = FleetDelegateClient(config)
     import os
 
     api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")

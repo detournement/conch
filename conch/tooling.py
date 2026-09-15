@@ -2154,7 +2154,7 @@ class DelegateTaskClient:
     # allowed tools is the operator's explicit offer (the fleet
     # analogue: a worker only sees a tool its task envelope names).
     IMPLICITLY_EXCLUDED_TOOLS = frozenset({
-        "personal_items", "capitol_control",
+        "personal_items", "capitol_control", "fleet_delegate",
     })
 
     DEFAULT_ROUNDS = 10
@@ -2483,6 +2483,12 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(CAPITOL_SESSION_TOOL)
     if "delegate_task" in clients:
         builtin.append(DELEGATE_TASK_TOOL)
+    if "fleet_delegate" in clients:
+        # Lazy import: only fleet_controller-configured sessions ever
+        # construct the client (bootstrap), so only they pay for this.
+        from .fleet.delegate import FLEET_DELEGATE_TOOL
+
+        builtin.append(FLEET_DELEGATE_TOOL)
     if "skill_manage" in clients:
         builtin.append(SKILL_MANAGE_TOOL)
     if "conch_introspect" in clients:

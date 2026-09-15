@@ -710,7 +710,7 @@ def normalize_spec(spec: Dict[str, Any],
         "run_once", "misfire_policy", "catch_up_limit",
         "session_wall_seconds", "session_max_tool_rounds",
         "session_token_budget", "principal", "notify", "capitol",
-        "review", "allow_model_completion",
+        "review", "allow_model_completion", "fleet",
     }
     unknown = set(spec) - known
     if unknown:
@@ -816,6 +816,63 @@ def normalize_spec(spec: Dict[str, Any],
                 "capitol.workflows allowlist"
             )
 
+    fleet_raw = spec.get("fleet") or {}
+    if not isinstance(fleet_raw, dict):
+        raise KernelError("mission spec fleet must be a dict")
+    fleet_known = {"workers", "skills", "tools", "actions", "data",
+                   "token_budget"}
+    fleet_unknown = set(fleet_raw) - fleet_known
+    if fleet_unknown:
+        raise KernelError(
+            f"mission spec fleet has unknown field(s) "
+            f"{sorted(fleet_unknown)} — failing closed"
+        )
+    fleet: Dict[str, Any] = {}
+    if fleet_raw:
+        # The fleet block is the mission's delegation envelope: which
+        # workers/skills it may address and the authority ceiling its
+        # fleet_delegate calls are clamped to. Membership validation
+        # (action classes, data levels) uses the swarm taxonomy so a spec
+        # cannot smuggle unknown classes past the clamp.
+        from ..swarm.protocol import ActionClass as _ActionClass
+        from ..swarm.protocol import DataClassification as _DataClass
+
+        for key in ("workers", "skills", "tools", "actions"):
+            value = fleet_raw.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, (list, tuple)) or any(
+                not isinstance(item, str) or not item.strip()
+                for item in value
+            ):
+                raise KernelError(
+                    f"fleet.{key} must be a list of non-empty strings"
+                )
+            fleet[key] = [item.strip() for item in value]
+        bad_actions = set(fleet.get("actions") or []) - _ActionClass.ALL
+        if bad_actions:
+            raise KernelError(
+                f"fleet.actions contains unknown class(es) "
+                f"{sorted(bad_actions)}"
+            )
+        if "data" in fleet_raw:
+            data_value = str(fleet_raw["data"])
+            if data_value not in _DataClass.ALL:
+                raise KernelError(
+                    f"fleet.data must be one of {sorted(_DataClass.ALL)},"
+                    f" got {data_value!r}"
+                )
+            fleet["data"] = data_value
+        if "token_budget" in fleet_raw:
+            budget = fleet_raw["token_budget"]
+            if isinstance(budget, bool) or not isinstance(budget, int):
+                raise KernelError("fleet.token_budget must be an integer")
+            if budget < 0:
+                raise KernelError(
+                    "fleet.token_budget must not be negative"
+                )
+            fleet["token_budget"] = budget
+
     review_raw = spec.get("review") or {}
     if not isinstance(review_raw, dict):
         raise KernelError("mission spec review must be a dict")
@@ -848,6 +905,7 @@ def normalize_spec(spec: Dict[str, Any],
     normalized: Dict[str, Any] = {
         "goal": goal,
         "capitol": capitol,
+        "fleet": fleet,
         "review": review,
         "success_criteria": _str_list("success_criteria"),
         "constraints": _str_list("constraints"),

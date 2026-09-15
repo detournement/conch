@@ -80,8 +80,12 @@ class CapitolCommandTests(unittest.TestCase):
     # -- registration -----------------------------------------------------
 
     def test_registered_in_slash_commands(self):
+        from conch.commands import all_slash_commands
+
         self.assertIn("/capitol", slash_command_names())
-        entry = next(e for e in SLASH_COMMANDS if e[0].startswith("/capitol"))
+        entry = next(
+            e for e in all_slash_commands() if e[0].startswith("/capitol")
+        )
         self.assertIn("A2Actrl", entry[1])
 
     def test_help_lists_subcommand_groups(self):

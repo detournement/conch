@@ -2905,14 +2905,14 @@ class ConchIntrospectClient:
 
     def _capabilities(self) -> str:
         from . import __version__
-        from .commands import SLASH_COMMANDS, load_user_commands
+        from .commands import all_slash_commands, load_user_commands
         from .providers import RAW_FNS
         from .skills import load_skills
 
         lines = [f"Conch v{__version__} — capability report (generated live)"]
 
         lines.append("\n## Slash commands (typed by the user, handled by conch)")
-        for spec, description in SLASH_COMMANDS:
+        for spec, description in all_slash_commands():
             lines.append(f"- {spec}: {description}")
         user_commands = load_user_commands()
         if user_commands:
@@ -3060,8 +3060,9 @@ class ConchIntrospectClient:
                 pass
         # Sized so every core conch/*.py module line (alphabetical map:
         # through runtime.py and beyond) survives the cut; notes.py's
-        # arrival pushed runtime.py out of the old 2800.
-        overview = build_map_for_root(root, budget_chars=3200)
+        # arrival pushed runtime.py out of the old 2800, and the fleet
+        # awakening plus plugins.py pushed it out of 3200.
+        overview = build_map_for_root(root, budget_chars=4400)
         if overview:
             lines.append(overview)
         return "\n".join(lines)

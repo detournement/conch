@@ -990,14 +990,49 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return (input_tokens * rate[0] + output_tokens * rate[1]) / 1_000_000
 
 
+def _attach_server_timings(target: dict, data: dict) -> None:
+    """Record server-reported generation time onto a usage dict.
+
+    llama.cpp (and OpenAI-compatible servers that mirror it) return a
+    ``timings`` object: ``predicted_ms`` is the generation phase in
+    milliseconds, with ``predicted_n``/``predicted_per_second`` as an
+    alternative derivation. When present, the turn's tok/s is exact
+    rather than a wall-clock estimate.
+    """
+    timings = data.get("timings") or {}
+    if not isinstance(timings, dict):
+        return
+    seconds = 0.0
+    try:
+        seconds = float(timings.get("predicted_ms") or 0) / 1000.0
+        if seconds <= 0:
+            n = float(timings.get("predicted_n") or 0)
+            per_second = float(timings.get("predicted_per_second") or 0)
+            if n > 0 and per_second > 0:
+                seconds = n / per_second
+    except (TypeError, ValueError):
+        return
+    if seconds > 0:
+        target["gen_seconds"] = seconds
+
+
 def _normalize_usage(data: dict, provider: str) -> dict:
-    """Extract a uniform usage dict from any provider's raw API response."""
+    """Extract a uniform usage dict from any provider's raw API response.
+
+    Besides token counts, this carries ``gen_seconds`` — the model's own
+    generation time — whenever the backend reports one (Ollama's
+    ``eval_duration``, llama.cpp's ``timings``). Turns whose calls all
+    have it show an exact tok/s; anything else falls back to a labeled
+    wall-clock estimate.
+    """
     if provider in ("cerebras", "openai", "bedrock", "openrouter"):
         usage = data.get("usage", {})
-        return {
+        result = {
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
         }
+        _attach_server_timings(result, data)
+        return result
     if provider == "anthropic":
         usage = data.get("usage", {})
         return {
@@ -1005,10 +1040,17 @@ def _normalize_usage(data: dict, provider: str) -> dict:
             "output_tokens": usage.get("output_tokens", 0),
         }
     if provider == "ollama":
-        return {
+        result = {
             "input_tokens": data.get("prompt_eval_count", 0),
             "output_tokens": data.get("eval_count", 0),
         }
+        try:
+            eval_ns = float(data.get("eval_duration") or 0)
+        except (TypeError, ValueError):
+            eval_ns = 0.0
+        if eval_ns > 0:
+            result["gen_seconds"] = eval_ns / 1e9
+        return result
     return {"input_tokens": 0, "output_tokens": 0}
 
 
@@ -2286,6 +2328,10 @@ def _stream_openai_compat(
                     u = chunk["usage"]
                     usage["input_tokens"] = u.get("prompt_tokens", 0)
                     usage["output_tokens"] = u.get("completion_tokens", 0)
+                if chunk.get("timings"):
+                    # llama.cpp sends timings on the final stream chunk:
+                    # exact generation seconds for the tok/s display.
+                    _attach_server_timings(usage, chunk)
     except urllib.error.HTTPError as exc:
         return error_response(format_http_api_error(exc))
     except Exception as exc:

@@ -21,6 +21,9 @@ DEFAULT_CONFIG: Dict[str, str] = {
     "local_only": "auto",
     # Public-IP geolocation is opt-in; startup otherwise makes no such call.
     "detect_location": "false",
+    # Per-message token stats line (tokens, cost, tok/s) in interactive
+    # chat. On by default; /tks flips it for a session.
+    "show_token_stats": "true",
 }
 
 ENV_CONFIG_KEYS = {

@@ -89,7 +89,7 @@ _CHAT_BASE = (
 
     "Slash commands (handled by Conch, NOT by you -- guide the user to type these):\n"
     "  Model/provider: /models, /model <name>, /provider <name>\n"
-    "  Conversations: /new, /convos, /switch <id>, /delete <id>, /clear, /browse\n"
+    "  Conversations: /new, /convos, /switch <id>, /delete <id>, /clear\n"
     "  Search: /search <query> (or /s, /find, /grep)\n"
     "  Memory: /remember <text>, /memories, /forget <id>\n"
     "  Tools: /tools, /enable <group>, /disable <group>, /reload\n"

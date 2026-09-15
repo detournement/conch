@@ -984,7 +984,6 @@ target directly, pass Docker's `--init`.
 | `/reload` | Reload MCP tools |
 | `/resettools` | Reset tool-calling when a local model drifts into writing tool calls as text |
 | `/search <query>` | Search conversations, memories, and config |
-| `/browse` | Interactive conversation browser |
 | `/<custom>` | Any markdown file in `~/.config/conch/commands/` |
 
 ## Use cases

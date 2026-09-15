@@ -9,7 +9,6 @@ import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .browser import browse_conversations
 from . import composio as composio_mod
 from .providers import (
     DEFAULT_API_KEY_ENVS,
@@ -94,7 +93,6 @@ SLASH_COMMANDS = [
     ("/skills", "List saved skills"),
     ("/skill <name> [task]", "Run a skill's procedure on a task"),
     ("/search <query>", "Search conversations, memories, and config"),
-    ("/browse", "Interactive conversation browser"),
     ("/new", "Start a new conversation"),
     ("/convos", "List past conversations"),
     ("/switch <id>", "Switch conversation"),
@@ -1399,7 +1397,6 @@ def handle_slash_command(
             "  \033[1m/skills\033[0m              List saved skills\n"
             "  \033[1m/skill <name> [task]\033[0m Run a skill's procedure on a task\n"
             "  \033[1m/search <query>\033[0m      Search conversations, memories, and config\n"
-            "  \033[1m/browse\033[0m              Interactive conversation browser\n"
             "  \033[1m/new\033[0m                 Start a new conversation\n"
             "  \033[1m/convos\033[0m              List past conversations\n"
             "  \033[1m/switch <id>\033[0m         Switch conversation\n"
@@ -1581,15 +1578,6 @@ def handle_slash_command(
                     )
                 print(f"    {role_color}{m['role']}\033[0m: {snippet}")
             print()
-        return None
-
-    if command in ("/browse", "/b") and conv_mgr is not None:
-        current_id = current_conv.id if current_conv else ""
-        result = browse_conversations(conv_mgr, current_id=current_id)
-        if result == "new":
-            return "new_conversation"
-        if result and result != current_id:
-            return ("switch_conversation", result)
         return None
 
     if command == "/clear":

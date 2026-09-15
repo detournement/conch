@@ -10,7 +10,7 @@ Conch is an LLM-assisted shell with two interfaces:
 ### One line (macOS & Linux)
 
 ```bash
-curl -fsSL https://llama.app/install | sh
+curl -fsSL https://conch.usecapitol.ai/install | sh
 ```
 
 Installs the latest conch into an isolated environment (uv → pipx →

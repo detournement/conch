@@ -868,10 +868,22 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
     objects and link tool results via tool_name.
     """
     if provider == "anthropic":
+        # The raw/stream anthropic functions fold system-role messages into
+        # the API's top-level system param (last one wins), so a mid-history
+        # system note (e.g. a model-switch note) would silently REPLACE the
+        # real system prompt. Keep only the leading system message as
+        # system-role; turn later ones into ordinary context.
         cleaned = []
         for msg in messages:
             role = msg.get("role", "user")
             if role == "tool":
+                continue
+            if role == "system" and cleaned:
+                cleaned.append({
+                    "role": "user",
+                    "content": "[conversation context]\n"
+                               + str(msg.get("content") or ""),
+                })
                 continue
             if role == "assistant" and msg.get("tool_calls") and not str(msg.get("content", "")).strip():
                 continue
@@ -1057,6 +1069,62 @@ def normalize_messages_on_switch(messages: list, new_provider: str):
 
     messages.clear()
     messages.extend(cleaned)
+
+
+def append_model_switch_note(
+    messages: Optional[list],
+    *,
+    provider: str,
+    model: str,
+    config: dict,
+    registry_name: str = "",
+) -> Optional[str]:
+    """Record a committed mid-conversation model switch in the history.
+
+    Field failure this fences off: after a switch, the new model kept
+    trusting stale pre-switch turns (e.g. an earlier claim that only some
+    other model was available) and misdescribed itself. One compact
+    system-role note at the switch boundary tells it which model now
+    serves the conversation and that older statements about the active
+    model are stale. Persisted like any other message; the per-provider
+    wire normalization already makes mid-history system notes safe
+    (converted to context for providers that require a single leading
+    system message).
+
+    Appends nothing at conversation start (no prior non-system turns:
+    initial model selection isn't a switch) and skips an exact duplicate
+    of the immediately preceding note (re-selecting the current model is
+    not a boundary worth recording twice). Returns the note text, or
+    None when nothing was appended.
+    """
+    if not messages or not any(
+        m.get("role") != "system" for m in messages
+    ):
+        return None
+    from .providers import get_custom_base_url, get_ollama_base_url
+
+    if registry_name:
+        adapter = "ollama adapter" if provider == "ollama" else "custom adapter"
+        label = f"{registry_name}, {adapter}"
+    else:
+        label = provider
+    base_url = ""
+    if provider == "ollama":
+        base_url = get_ollama_base_url(config)
+    elif provider == "custom":
+        base_url = get_custom_base_url(config)
+    served_at = f" at {base_url}" if base_url else ""
+    note = (
+        f"Model switched: this conversation is now served by {model} "
+        f"({label}){served_at}. Prior turns may reference a different "
+        "active model; statements about the previously active model no "
+        "longer describe the current one."
+    )
+    last = messages[-1]
+    if last.get("role") == "system" and last.get("content") == note:
+        return None
+    messages.append({"role": "system", "content": note})
+    return note
 
 
 # ---------------------------------------------------------------------------

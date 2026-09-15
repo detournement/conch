@@ -968,7 +968,7 @@ def _handle_items_command(command: str, arg: str, config: dict, sched):
 
 
 def _switch_to_llamaidx_model(
-    name: str, config: dict, provider: str
+    name: str, config: dict, provider: str, messages: Optional[list] = None
 ) -> Optional[tuple]:
     """Switch to a registry-discovered model (``llamaidx/provider/model``).
 
@@ -1032,9 +1032,22 @@ def _switch_to_llamaidx_model(
         )
         return None
     config.update(overrides)
+    from .runtime import append_model_switch_note
+
+    append_model_switch_note(
+        messages,
+        provider=overrides["provider"],
+        model=entry["model_id"],
+        config=config,
+        registry_name=entry["name"],
+    )
+    adapter = (
+        "ollama adapter" if overrides["provider"] == "ollama"
+        else "custom adapter"
+    )
     print(
-        f"\n  \033[1;32mSwitched to {overrides['provider']}/{entry['model_id']}"
-        f"\033[0m \033[2m(via {entry['name']} at {entry['base_url']})\033[0m\n"
+        f"\n  \033[1;32mSwitched to {entry['name']}\033[0m"
+        f" \033[2m({adapter}, {entry['base_url']})\033[0m\n"
     )
     return (overrides["provider"], entry["model_id"], RAW_FNS[overrides["provider"]])
 
@@ -1600,7 +1613,9 @@ def handle_slash_command(
             print("\n  \033[2mUsage: /model <verified-name>\033[0m\n")
             return None
         if new_model.startswith("llamaidx/"):
-            return _switch_to_llamaidx_model(new_model, config, provider)
+            return _switch_to_llamaidx_model(
+                new_model, config, provider, messages
+            )
         new_provider = None
         for provider_name, models in KNOWN_MODELS.items():
             if provider_name != "ollama" and new_model in models:
@@ -1663,6 +1678,11 @@ def handle_slash_command(
         config["model"] = new_model
         if new_provider == "custom":
             config["custom_model"] = new_model
+        from .runtime import append_model_switch_note
+
+        append_model_switch_note(
+            messages, provider=new_provider, model=new_model, config=config
+        )
         print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
         return (new_provider, new_model, new_fn)
 
@@ -1712,6 +1732,11 @@ def handle_slash_command(
         config["model"] = new_model
         if new_provider == "custom":
             config["custom_model"] = new_model
+        from .runtime import append_model_switch_note
+
+        append_model_switch_note(
+            messages, provider=new_provider, model=new_model, config=config
+        )
         print(f"\n  \033[1;32mSwitched to {new_provider}/{new_model}\033[0m\n")
         return (new_provider, new_model, RAW_FNS[new_provider])
 

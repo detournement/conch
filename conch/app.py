@@ -1253,8 +1253,10 @@ def chat_loop(new_conversation=False):
                     # Registry-selected models (llamaidx/...) carry the
                     # adapter overrides (base_url, api_key_env name, model
                     # ids) resolved at selection time; they win over the
-                    # provider defaults below.
+                    # provider defaults below. The registry name rides along
+                    # for the switch note in the history.
                     _overrides = _action[3] if len(_action) > 3 else None
+                    _registry_name = _action[4] if len(_action) > 4 else ""
                     _new_fn = RAW_FNS.get(_new_prov)
                     if _new_fn:
                         old_provider = provider
@@ -1278,6 +1280,14 @@ def chat_loop(new_conversation=False):
                         system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
                         if messages and messages[0].get("role") == "system":
                             messages[0]["content"] = system_prompt
+                        from .runtime import append_model_switch_note
+                        append_model_switch_note(
+                            messages,
+                            provider=provider,
+                            model=model_name,
+                            config=config,
+                            registry_name=_registry_name,
+                        )
                         _cfg_client.update(provider, model_name)
                         print(f"  \033[1;32m\u2713 Now using {provider}/{model_name}\033[0m")
                 elif _action[0] == "set_rounds":

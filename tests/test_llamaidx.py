@@ -1041,6 +1041,8 @@ class ConchConfigRegistryTests(unittest.TestCase):
         overrides = action[3]
         self.assertEqual(overrides["custom_base_url"], box.base_url + "/v1")
         self.assertEqual(overrides["custom_model"], "qwen3-32b")
+        # The registry identity rides along for the switch note.
+        self.assertEqual(action[4], "llamaidx/gpubox/qwen3-32b")
         # Queued, not applied: the live config is untouched until the
         # app loop drains pending_actions between turns.
         self.assertEqual(self.config["provider"], "anthropic")

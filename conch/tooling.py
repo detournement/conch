@@ -2641,16 +2641,26 @@ class ConchConfigClient:
                 "probe."
             )
         self.pending_actions.append(
-            ("set_model", overrides["provider"], entry["model_id"], overrides)
+            (
+                "set_model",
+                overrides["provider"],
+                entry["model_id"],
+                overrides,
+                entry["name"],
+            )
         )
         degraded = (
             " The provider is currently degraded (loading/recovering)."
             if entry["degraded"]
             else ""
         )
+        adapter = (
+            "ollama adapter" if overrides["provider"] == "ollama"
+            else "custom adapter"
+        )
         return self._text(
-            f"Model switch to {overrides['provider']}/{entry['model_id']} via "
-            f"{entry['name']} at {entry['base_url']} (free, self-hosted) is "
+            f"Model switch to {entry['name']} ({adapter}, "
+            f"{entry['base_url']}; free, self-hosted) is "
             f"queued.{degraded} IMPORTANT: this response is still generated "
             f"by {self._provider}/{self._model}. The switch takes effect "
             "starting with the NEXT user message."

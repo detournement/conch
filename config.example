@@ -217,6 +217,22 @@ api_key_env=ANTHROPIC_API_KEY
 # give co-located workers the same group and cap the group's concurrency.
 #fleet_resource_group_caps=ollama-box-1:1,ollama-box-2:2
 
+# The fleet awakening: enable the conch-controller daemon, the /fleet
+# command family, and the fleet_delegate tool (local sessions only).
+# The controller owns its own kernel scope (~/.local/state/conch/fleet —
+# separate database, lock, epoch, and control socket from conch-edge, so
+# both daemons coexist). Run it supervised: `conch-controller install`.
+# Worker authority defaults stay READ-only/narrow; raise one worker's
+# ceiling with `/fleet grant <worker> --actions ... --tools ...|full
+# --data <class>` (grants are ledgered kernel events). Hard exclusions
+# never lift for workers: conch_config, manage_tools, skill_manage,
+# interactive_terminal, ssh_remote, fleet_delegate.
+#fleet_controller=false
+# Heartbeat sweep cadence (seconds between fleet-wide status sweeps) and
+# per-RPC transport timeout:
+#fleet_heartbeat_sweep_seconds=30
+#fleet_rpc_timeout=60
+
 # --- Remote loop (Matrix / Slack / SMS / email) --------------------------------
 # Opt-in remote operation: scheduled output is delivered over notify_channel,
 # and inbound replies are polled and routed into conversations. SAFETY:

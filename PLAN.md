@@ -239,11 +239,65 @@ live host:
 - systemd-profile start verification: the capability-directive fix landed
   after the field run — the re-run should see the unit reach
   active (running) and exercise stop/restart plus the systemd rollback
-  swap.
+  swap. (The field host's systemd re-run is pending on the operator's
+  side; the worker currently runs under the process profile.)
 - A rollback exercise on the live host (`rollback` was not exercised —
   only one revision existed during the first run).
 - GPU residency scheduling against an actual `nvidia-smi` host and a
   shared Ollama endpoint under real concurrent load (unchanged).
+- A controller-driven live dispatch (`/fleet run <worker> "..."` through
+  a running `conch-controller`) against the field host — the harness
+  covers the full path over the fake transport; the live smoke needs
+  key-based BatchMode SSH from the controller machine.
+
+**The fleet awakening (September 2026): landed — conch-controller is
+live.** The Phase 2 substrate now has a driver: `conch-controller` is a
+supervised daemon (gated on `fleet_controller=true`, with
+`install|uninstall|status` on the same launchd/systemd machinery as
+conch-edge) owning its own fleet kernel scope at
+`~/.local/state/conch/fleet/` — a separate database, `daemon.lock`, and
+fencing epoch from the edge daemon's mission kernel, so both coexist on
+one machine. Each tick drives the TaskPlane end to end: scheduling queued
+dispatches onto eligible workers over WorkerTransport, event/receipt
+polling with fence checks, failure-class retries with backoff,
+cancellation propagation, heartbeat sweeps on cadence, worker skill
+inventory recording, and artifact pull (files a task leaves in its
+workspace `out/` publish as content-addressed artifacts, auto-pulled to
+the controller's local store). On top of it:
+
+- **`/fleet` command family** — `workers` (registry + live probe),
+  `run <worker|auto> "<prompt>"` with `--skill/--tools/--actions/--model/
+  --budget/--data/--wall`, `task`/`tasks`/`cancel`, `artifacts <id> pull`,
+  `drain|enable`, `grant`, `enroll`, `status` — over the controller socket
+  when it runs, direct-driving the fleet kernel one-shot when it doesn't
+  (the mission-command two-transport pattern).
+- **Owner grants + the authority clamp** (`conch/fleet/authority.py`):
+  worker ceilings default READ-only/narrow; `/fleet grant` raises them via
+  ledgered `worker_updated` events (replay == live); every envelope clamps
+  to `min(requested, worker ceiling, caller authority)` with explicit
+  excess refused by name; hard exclusions (`conch_config`,
+  `manage_tools`, `skill_manage`, `interactive_terminal`, `ssh_remote`,
+  `fleet_delegate`) never lift; the scheduler's eligibility filter is
+  ceiling-aware.
+- **Skill-addressed dispatch**: envelopes carry skill names; workers
+  report installed skills through `worker.status` (capability, never
+  authority); the skill's tool scope becomes the envelope's requested
+  tools and the worker loads its own copy of the skill's prompt,
+  re-intersecting tools at execution; dispatch to a worker missing the
+  skill is refused with a clear error (v1 does not ship skill files).
+- **`fleet_delegate`** — the model-callable brokered delegation for local
+  sessions only (interactive + missions; excluded from remote/channel
+  sessions, workers, and implicit local-subagent inheritance), returning
+  worker summaries + artifact references as tool output.
+- **Mission fleet block**: mission specs accept
+  `fleet: {workers, skills, tools, actions, data, token_budget}`; mission
+  sessions get an envelope-scoped fleet_delegate clamped to it.
+- **Tests**: controller-socket E2E over real worker subprocesses (fake
+  SSH transport), artifact round-trip, drain semantics, kill/restart
+  mid-dispatch with epoch fencing (no double execution), skill-addressed
+  dispatch + refusals, the full clamp/grant matrix, grant-ledger
+  replay == live, and a fleet_delegate round-trip inside a real
+  chat_turn.
 
 **Swarm Phase 3 — full Capitol integration (September 2026): landed.**
 Conch drives Capitol as a governed, subordinate process-execution fabric —

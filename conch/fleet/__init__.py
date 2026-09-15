@@ -11,6 +11,10 @@ alone pulls in nothing beyond this docstring):
 - ``transport``  — WorkerTransport: JSON RPC over SSH stdio
 - ``enroll``     — trusted host enrollment flow
 - ``plane``      — the distributed task plane (scheduling, leases, retries)
+- ``controller`` — the supervised conch-controller daemon (the awakening)
+- ``client``     — /fleet + fleet_delegate attach (socket or direct-drive)
+- ``authority``  — owner grants, worker ceilings, the envelope clamp
+- ``delegate``   — the model-callable fleet_delegate tool
 
 Workers are replaceable compute, never state authorities: mission truth,
 credentials, approvals, budgets, and external-action ledgers stay on the

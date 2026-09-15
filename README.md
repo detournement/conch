@@ -746,6 +746,81 @@ the interactive CLI never depends on it. See `PLAN.md` (Swarm Phase 2) for
 the current status and the items that still need a live Linux/SSH host for
 final verification.
 
+### The fleet awakening: conch-controller, /fleet, grants, fleet_delegate
+
+Set `fleet_controller = true` and the substrate above comes alive — the
+`conch-controller` daemon drives the task plane end to end, the `/fleet`
+command family is the cockpit, and `fleet_delegate` lets local agent
+sessions hand bounded tasks to remote workers mid-conversation.
+
+**`conch-controller`** is a supervised daemon exactly like `conch-edge`:
+its own kernel scope at `~/.local/state/conch/fleet/` (worker registry,
+dispatches, dispatch events, the grant ledger — separate database, lock,
+and fencing epoch from the edge daemon's mission kernel, so both coexist
+on one machine), a 0600 control socket (`fleet.sock`), and
+`conch-controller install|uninstall|status` rendering the same
+launchd/systemd machinery. Each tick schedules queued dispatches onto
+eligible workers over SSH stdio, polls events and fenced receipts,
+retries by failure class with backoff, sweeps heartbeats (silent worker →
+UNREACHABLE + requeue), propagates cancellations, records worker skill
+inventories, and pulls completed tasks' content-addressed artifacts into
+the local store. Kill it mid-dispatch and a restarted controller adopts a
+higher epoch, finishes supervising the same attempt from the worker's
+idempotent receipts, and the superseded process can never write again.
+
+**`/fleet`** works against the running controller, or direct-drives the
+fleet kernel one-shot when no daemon is up (the same two-transport client
+the mission commands use):
+
+```
+/fleet workers                    # registry + live reachability probe
+/fleet enroll burt-1 burt@host    # interactive first-enroll (host key,
+                                  # hostctl bootstrap, BatchMode probe)
+/fleet run burt-1 "report uname -a and disk free"
+/fleet run auto "..." --skill capitol --model qwen3:8b --budget 50000
+/fleet task <id> | tasks | cancel <id>
+/fleet artifacts <id> pull        # digest-verified artifact pull
+/fleet drain burt-1 | enable burt-1
+/fleet grant burt-1 --actions communicate --tools save_memory,full ...
+/fleet status
+```
+
+**Owner grants and the authority clamp.** Every worker starts narrow:
+action classes `{read, compute, write_local}`, the small default tool set
+(`local_shell`, `public_api`, `todo_list`, brokered `delegate_task`), and
+its admin-assigned data ceiling. `/fleet grant` raises one worker's
+ceiling — grants are admin labels riding ledgered `worker_updated` kernel
+events (hash-chained; replay == live). Every dispatch clamps to
+`min(requested, worker ceiling, caller authority)`: explicitly requested
+excess is refused with the exact names, omitted dimensions default
+narrow. The hard exclusions never lift, whatever the grants say:
+`conch_config`, `manage_tools`, `skill_manage`, `interactive_terminal`,
+`ssh_remote`, and `fleet_delegate` (recursive fleet delegation — a
+worker's `delegate_task` is the controller-brokered form). The scheduler
+is ceiling-aware too: an envelope a worker's grants would refuse never
+places there.
+
+**Skill-addressed dispatch.** `--skill <name>` makes the remote agent act
+as that skill: the envelope carries the skill name, the skill's declared
+tool scope becomes the requested tool set, and the worker loads its own
+installed copy of the skill (prompt + tool re-intersection) at execution.
+Skill availability is capability reporting — `worker.status` lists
+installed skills (built-ins ship inside the signed artifact; user skills
+live in the worker account's `~/.config/conch/skills/`), the controller
+records the inventory, and dispatch to a worker missing the skill is
+refused with a clear error (v1 never ships skill files to hosts).
+
+**`fleet_delegate`** is the model-callable form for local sessions
+(interactive and missions — never remote/channel sessions, never workers,
+never inherited by local subagents implicitly): the model delegates a
+bounded task, the controller brokers it through the TaskPlane with the
+authority-subset rule enforced in code, and the worker's summary plus
+artifact references return as tool output. Missions opt in through the
+spec's `fleet` block — allowed `workers`/`skills`, a `tools`/`actions`/
+`data`/`token_budget` authority ceiling — and their fleet calls are
+serialized across shared-endpoint resource groups like every other
+dispatch.
+
 ### Cost tracking
 See token usage and estimated cost per turn and per session. `/cost` for session totals.
 

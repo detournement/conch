@@ -2236,6 +2236,11 @@ def _stream_openai_compat(
 ) -> dict:
     """Shared streaming implementation for OpenAI-compatible APIs."""
     body["stream"] = True
+    # Without this, OpenAI-compatible servers (llama.cpp included) send
+    # no usage chunk at all and the per-turn token stats line has
+    # nothing to show. Servers that predate stream_options ignore
+    # unknown request keys.
+    body.setdefault("stream_options", {"include_usage": True})
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),

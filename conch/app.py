@@ -117,11 +117,14 @@ def format_turn_stats_line(turn_usage: dict, cost_str: str, gauge: str,
         return ""
     in_tok = turn_usage.get("input_tokens", 0)
     out_tok = turn_usage.get("output_tokens", 0)
+    # Estimator-derived counts (backend sent no usage) carry a ~ so an
+    # exact-looking number never comes from a chars-per-token guess.
+    tilde = "~" if turn_usage.get("tokens_estimated") else ""
     speed = format_token_speed(turn_usage)
     speed_part = f"  {speed}" if speed else ""
     return (
-        f"  \033[2m{in_tok:,} in / {out_tok:,} out  {cost_str}{speed_part}"
-        f"  {gauge}\033[2m  ({used_model})\033[0m"
+        f"  \033[2m{tilde}{in_tok:,} in / {tilde}{out_tok:,} out"
+        f"  {cost_str}{speed_part}  {gauge}\033[2m  ({used_model})\033[0m"
     )
 
 
@@ -1246,6 +1249,27 @@ def chat_loop(new_conversation=False):
             in_tok = turn_usage.get("input_tokens", 0)
             out_tok = turn_usage.get("output_tokens", 0)
             used_model = turn_usage.get("model", model_name)
+            if not (in_tok or out_tok) and reply:
+                # The backend reported no usage (an OpenAI-compatible
+                # server ignoring stream_options): fall back to the
+                # calibrated estimator so the stats line still appears,
+                # ~-labeled throughout (counts and tok/s alike).
+                from .runtime import calibration_key, estimate_tokens
+
+                _est_key = calibration_key(provider, config)
+                out_tok = estimate_tokens(
+                    [{"role": "assistant", "content": reply}], key=_est_key
+                )
+                in_tok = max(
+                    estimate_tokens(messages, key=_est_key) - out_tok, 0
+                )
+                turn_usage = dict(
+                    turn_usage,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    tokens_estimated=True,
+                    speed_estimated=True,
+                )
             if in_tok or out_tok:
                 from .providers import estimate_cost
                 from .runtime import (

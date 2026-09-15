@@ -1306,3 +1306,27 @@ conch listed `llamaidx/gpubox/qwen3-32b`, selected it (its probe hit
 the fake box), and routed a chat turn to it through the custom adapter.
 R3 remains: push heartbeat, deregistration tombstones, fleet tie-in
 (`labels.host` join to worker resource_groups).
+
+### The registry as a data source (September 2026, same week)
+
+Discovery answered "what can I switch to"; this increment answers "what
+is my fleet doing". `fetch_llamaidx_status` reads the registry's
+`?status=all` view — down boxes with last_error/last_seen, degraded
+boxes, per-model ctx/quant/loaded/tools/modalities, labels — parsed
+fail-closed and rendered bounded (24 providers / 12 models / 6000
+chars) by one shared renderer. Three consumers: the `llamaidx_registry`
+builtin tool (fleet_status + list_models; present only when
+`llamaidx_url` is set; read-only, never touches the boxes), the
+`/llamaidx` command (the human's fleet view — the only place down boxes
+appear, by design), and `conch_config` (list_models grows an llamaidx
+section; `set_model llamaidx/provider/model` resolves through the
+registry, runs probe-on-select against the box, and queues adapter
+overrides the app loop applies between turns). Both registry views now
+fail closed on unknown `registry_version` majors. Reporting and routing
+stay separate: selection/fallback still consume only the tool-verified
+catalog. 20 new gates in tests/test_llamaidx.py (status view incl.
+down/untooled visibility, ?status=all request assertion, schema gate,
+local_only on reporting, bounded rendering, env-name-only auth
+rendering, tool injection gating, conch_config select/refuse/queue,
+/llamaidx output). Live 2026-09-15: the real registry on burt served
+the A6000 box's qwen3-14b through fleet_status and list_models.

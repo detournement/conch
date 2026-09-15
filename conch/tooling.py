@@ -3158,8 +3158,11 @@ class ConchIntrospectClient:
                 pass
         # Sized so every core conch/*.py module line (alphabetical map:
         # through runtime.py and beyond) survives the cut; notes.py's
-        # arrival pushed runtime.py out of the old 2800.
-        overview = build_map_for_root(root, budget_chars=3200)
+        # arrival pushed runtime.py out of the old 2800, and llamaidx.py's
+        # status-view exports pushed it out of 3200. Headroom check: this
+        # plus the version/branch/commits header stays under
+        # INTROSPECT_OUTPUT_MAX (4500).
+        overview = build_map_for_root(root, budget_chars=3400)
         if overview:
             lines.append(overview)
         return "\n".join(lines)

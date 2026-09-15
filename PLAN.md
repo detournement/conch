@@ -241,8 +241,14 @@ live host:
   active (running) and exercise stop/restart plus the systemd rollback
   swap. (The field host's systemd re-run is pending on the operator's
   side; the worker currently runs under the process profile.)
-- A rollback exercise on the live host (`rollback` was not exercised —
-  only one revision existed during the first run).
+- A rollback exercise on the live host: exercised live 2026-09-15 — burt-1
+  was brought to the current build (new signed revision deployed, activated,
+  worker restarted over key-based BatchMode SSH), then with two revisions
+  present `rollback` swapped to the prior revision and roll-forward
+  re-activated the new one, receipts idempotent (duplicate replays) both
+  ways and the worker restarting on each swap under the process profile;
+  remaining host-side item is the systemd-profile re-run (enable-linger is
+  now done — the host reports Linger=yes).
 - GPU residency scheduling against an actual `nvidia-smi` host and a
   shared Ollama endpoint under real concurrent load (unchanged).
 - A controller-driven live dispatch (`/fleet run <worker> "..."` through

@@ -19,12 +19,10 @@ required idempotency keys and required-policy gates; ``CapitolAdmin``
 is never model-callable, and drivers/mission tools construct exact
 requests (deterministic policy authorizes). The ``A2Actrl`` reference
 client is the normative wire reference.
-"""
 
-from .errors import (  # noqa: F401
-    CapitolAuthError,
-    CapitolCapabilityError,
-    CapitolError,
-    CapitolProtocolError,
-)
-from .client import CapitolRuntime  # noqa: F401
+Submodules are imported lazily (fleet convention): importing
+``conch.capitol`` alone — as loading the plugin registrations does —
+pulls in nothing beyond this docstring. Import ``CapitolRuntime`` and
+the error types from :mod:`conch.capitol.client` /
+:mod:`conch.capitol.errors` directly.
+"""

@@ -214,11 +214,11 @@ class TestOriginBinding(CompileCommandCase):
 
 class TestRegistration(unittest.TestCase):
     def test_slash_registry(self):
-        from conch.commands import SLASH_COMMANDS, slash_command_names
+        from conch.commands import all_slash_commands, slash_command_names
 
         self.assertIn("/compile", slash_command_names())
         entry = next(
-            entry for entry in SLASH_COMMANDS
+            entry for entry in all_slash_commands()
             if entry[0].startswith("/compile")
         )
         self.assertIn("ProcessCompiler", entry[1])

@@ -290,53 +290,32 @@ def _default_session_factory(config: dict) -> Callable:
             session.builtin_clients["mission_control"] = control
             tools = list(getattr(session.chat_state, "tools", None) or [])
             tools.append(MISSION_CONTROL_TOOL)
-            # Mission authority is spec-derived: the session builtin
-            # capitol_control (interactive runtime surface) is dropped
-            # so only the envelope-scoped tool exists here — and only
-            # when the spec grants a capitol envelope at all.
-            tools = [
-                tool for tool in tools
-                if tool.get("function", {}).get("name") != "capitol_control"
-            ]
-            session.builtin_clients.pop("capitol_control", None)
-            if getattr(control, "capitol", None) is not None:
-                from ..capitol.supervisor import CAPITOL_CONTROL_TOOL
+            # Mission authority is spec-derived: each product's
+            # interactive builtin (capitol_control's runtime surface,
+            # the session fleet_delegate) is dropped, and the provider
+            # re-adds an envelope-scoped replacement only when the
+            # mission spec grants that authority at all. The kernel
+            # never imports the products — they register providers
+            # against conch.plugins.
+            from ..plugins import (
+                load_builtin_plugins,
+                mission_tool_providers,
+            )
 
-                session.builtin_clients["capitol_control"] = control.capitol
-                tools.append(CAPITOL_CONTROL_TOOL)
-            # Fleet authority is spec-derived the same way: the session's
-            # interactive fleet_delegate (if any) is dropped, and an
-            # envelope-scoped client — clamped to the mission's fleet
-            # block — replaces it only when the spec grants one.
-            tools = [
-                tool for tool in tools
-                if tool.get("function", {}).get("name") != "fleet_delegate"
-            ]
-            session.builtin_clients.pop("fleet_delegate", None)
-            spec = mission.get("spec") or {}
-            fleet_spec = spec.get("fleet") or {}
-            if fleet_spec:
-                from ..config import get_bool
-
-                if get_bool(config, "fleet_controller"):
-                    from ..fleet.authority import mission_fleet_authority
-                    from ..fleet.delegate import (
-                        FLEET_DELEGATE_TOOL,
-                        FleetDelegateClient,
-                    )
-
-                    session.builtin_clients["fleet_delegate"] = (
-                        FleetDelegateClient(
-                            config,
-                            caller=mission_fleet_authority(fleet_spec),
-                            principal=str(
-                                spec.get("principal") or "user"
-                            ),
-                            allowed_workers=fleet_spec.get("workers"),
-                            allowed_skills=fleet_spec.get("skills"),
-                        )
-                    )
-                    tools.append(FLEET_DELEGATE_TOOL)
+            load_builtin_plugins()
+            for tool_name, provider in mission_tool_providers():
+                tools = [
+                    tool for tool in tools
+                    if tool.get("function", {}).get("name") != tool_name
+                ]
+                session.builtin_clients.pop(tool_name, None)
+                built = provider.build_mission_tool(
+                    mission, config, control
+                )
+                if built is not None:
+                    tool_def, client = built
+                    session.builtin_clients[tool_name] = client
+                    tools.append(tool_def)
             return session.run_turn(
                 messages, tools=tools,
                 max_tool_rounds=caps["max_tool_rounds"],
@@ -728,16 +707,16 @@ class MissionEngine:
             return {"mission_id": mission_id, "outcome": "failed",
                     "error": f"budget exhausted: {exc}"}
         control = MissionControlClient(self.store, mission_id, session_id)
-        capitol_spec = spec.get("capitol") or {}
-        if capitol_spec.get("allow_start") or capitol_spec.get(
-            "allow_respond"
-        ):
-            # Import stays lazy: missions without Capitol authority never
-            # load the adapter (shell-first invariant).
-            from ..capitol.supervisor import CapitolControlClient
+        # Envelope-scoped product control surfaces attach through the
+        # mission-tool seam (capitol_control when the spec grants a
+        # capitol envelope). Providers keep their adapter imports lazy,
+        # so missions without that authority never load them.
+        from ..plugins import load_builtin_plugins, mission_tool_providers
 
-            control.capitol = CapitolControlClient(
-                self.store, mission, session_id, self.config
+        load_builtin_plugins()
+        for _tool_name, provider in mission_tool_providers():
+            provider.attach_mission_control(
+                control, self.store, mission, session_id, self.config
             )
         caps = {
             "max_tool_rounds": int(spec["session_max_tool_rounds"]),

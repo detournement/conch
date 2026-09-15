@@ -2475,20 +2475,18 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(TODO_LIST_TOOL)
     if "personal_items" in clients:
         builtin.append(PERSONAL_ITEMS_TOOL)
-    if "capitol_control" in clients:
-        # Lazy import: only Capitol-configured sessions ever construct
-        # the client (bootstrap), so only they pay for this module.
-        from .capitol.tool import CAPITOL_SESSION_TOOL
-
-        builtin.append(CAPITOL_SESSION_TOOL)
     if "delegate_task" in clients:
         builtin.append(DELEGATE_TASK_TOOL)
-    if "fleet_delegate" in clients:
-        # Lazy import: only fleet_controller-configured sessions ever
-        # construct the client (bootstrap), so only they pay for this.
-        from .fleet.delegate import FLEET_DELEGATE_TOOL
+    # Product tools (capitol_control, fleet_delegate, ...) advertise
+    # their schemas through the session-tool seam. Only sessions whose
+    # config gate passed carry the client (bootstrap), so only they pay
+    # for the schema import.
+    from .plugins import load_builtin_plugins, session_tool_providers
 
-        builtin.append(FLEET_DELEGATE_TOOL)
+    load_builtin_plugins()
+    for provider_name, provider in session_tool_providers():
+        if provider_name in clients:
+            builtin.append(provider.tool_def())
     if "skill_manage" in clients:
         builtin.append(SKILL_MANAGE_TOOL)
     if "conch_introspect" in clients:
@@ -3003,14 +3001,14 @@ class ConchIntrospectClient:
 
     def _capabilities(self) -> str:
         from . import __version__
-        from .commands import SLASH_COMMANDS, load_user_commands
+        from .commands import all_slash_commands, load_user_commands
         from .providers import RAW_FNS
         from .skills import load_skills
 
         lines = [f"Conch v{__version__} — capability report (generated live)"]
 
         lines.append("\n## Slash commands (typed by the user, handled by conch)")
-        for spec, description in SLASH_COMMANDS:
+        for spec, description in all_slash_commands():
             lines.append(f"- {spec}: {description}")
         user_commands = load_user_commands()
         if user_commands:
@@ -3159,10 +3157,10 @@ class ConchIntrospectClient:
         # Sized so every core conch/*.py module line (alphabetical map:
         # through runtime.py and beyond) survives the cut; notes.py's
         # arrival pushed runtime.py out of the old 2800, and llamaidx.py's
-        # status-view exports pushed it out of 3200. Headroom check: this
-        # plus the version/branch/commits header stays under
-        # INTROSPECT_OUTPUT_MAX (4500).
-        overview = build_map_for_root(root, budget_chars=3400)
+        # status-view exports plus plugins.py/onboarding pushed it out of
+        # 3200/3400. Headroom check: this plus the version/branch/commits
+        # header must stay under INTROSPECT_OUTPUT_MAX (4500).
+        overview = build_map_for_root(root, budget_chars=4000)
         if overview:
             lines.append(overview)
         return "\n".join(lines)

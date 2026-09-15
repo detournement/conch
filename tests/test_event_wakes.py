@@ -354,7 +354,8 @@ class TestSameTickScheduling(EventWakeCase):
                 woken = engine.wake_mission(mission_id, reason="capitol")
                 return {"woken": int(woken)}
 
-        daemon._capitol = WakingSupervisor()
+        for service in daemon._plugin_services():
+            service.supervisor = WakingSupervisor()
         self.clock.advance(2)  # only the capitol poll cadence, no timers due
         stats = daemon.tick()
         self.assertEqual(stats["fired"], 0)

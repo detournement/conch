@@ -696,7 +696,8 @@ class DaemonWiringTests(unittest.TestCase):
 
             def tick():
                 # force a Capitol pass every tick regardless of cadence
-                daemon._capitol_last_poll = 0.0
+                for service in daemon._plugin_services():
+                    service.last_poll = 0.0
                 with patch.dict(os.environ, {"CAPITOL_A2A_BEARER": BEARER}):
                     return daemon.tick()
 

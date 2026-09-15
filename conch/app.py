@@ -1348,6 +1348,13 @@ def main():
     if argv and argv[0] in ("--help", "-h"):
         print(_USAGE)
         return
+    # First-run onboarding: on a truly unconfigured interactive launch
+    # (real TTY, no config anywhere, no provider key), walk through
+    # provider + key setup before anything else loads config. Pipes,
+    # daemons, and configured installs never see it.
+    from .onboarding import maybe_run_first_run_wizard
+
+    maybe_run_first_run_wizard()
     new_conversation = False
     if argv and argv[0] in ("--new", "-n"):
         new_conversation = True

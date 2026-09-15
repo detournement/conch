@@ -144,6 +144,45 @@ def mission_tool_providers() -> List[Tuple[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Components: what /install lists, enables, and sets up.
+# ---------------------------------------------------------------------------
+
+class Component:
+    """One installable conch component (edge, fleet, works, ...).
+
+    v1 reality: every component ships inside the conch-shell
+    distribution behind config gates, so "install" means enable +
+    configure + set up its daemon or credentials. When the packages
+    split into separate distributions, the registered callables swap to
+    real per-package installs without the ``/install`` surface changing.
+
+    ``status(config)`` must be one cheap line with no product imports;
+    ``setup(config)`` is the interactive enable/configure/install flow
+    (lazy product imports inside; prompts allowed).
+    """
+
+    def __init__(self, name: str, title: str, summary: str,
+                 status: Callable[[dict], str],
+                 setup: Callable[[dict], None]):
+        self.name = name
+        self.title = title
+        self.summary = summary
+        self.status = status
+        self.setup = setup
+
+
+_components: "Dict[str, Component]" = {}
+
+
+def register_component(component: Component) -> None:
+    _components[component.name] = component
+
+
+def components() -> List[Component]:
+    return list(_components.values())
+
+
+# ---------------------------------------------------------------------------
 # Daemon services: supervision passes inside the edge-daemon tick.
 # ---------------------------------------------------------------------------
 

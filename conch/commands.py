@@ -109,6 +109,8 @@ SLASH_COMMANDS = [
     ("/cancel <id>", "Cancel a scheduled task"),
     ("/missions", "List durable missions (edge daemon)"),
     ("/mission <show|new|pause|resume|abort|input> ...", "Manage a mission"),
+    ("/install [component]",
+     "List conch components or set one up (edge, fleet, works)"),
     ("/todo [add|done|due|list|show|work|escalate ...]",
      "Personal todo list (bare /todo = today view)"),
     ("/list <space> [verb ...]",
@@ -466,6 +468,115 @@ def _handle_mission_command(command: str, arg: str, config: dict, sched):
         )
     except KernelError as exc:
         print(f"\n  \033[31mMission command failed: {exc}\033[0m\n")
+
+
+# ---------------------------------------------------------------------------
+# Component install (/install): list, enable, and set up the product
+# components. v1 reality: everything ships inside the conch-shell
+# distribution behind config gates, so installing means flipping the
+# gate, writing config, and running the existing daemon installers.
+# Fleet and works register their components through the plugin seam;
+# edge is wired here (the kernel is a foundation library, and its lazy
+# import below follows the mission-commands pattern).
+# ---------------------------------------------------------------------------
+
+_INSTALL_USAGE = (
+    "\n  \033[1;36m/install — conch components:\033[0m\n"
+    "    /install                     list components + status\n"
+    "    /install edge                durable missions: the personal edge"
+    " daemon\n"
+    "    /install fleet               trusted SSH workers (controller +"
+    " enrollment)\n"
+    "    /install works               governed Capitol workflows (A2A)\n"
+    "  \033[2mComponents ship inside conch today; installing enables and"
+    "\n  configures them. Daemons install supervised (launchd/systemd"
+    " user\n  units) — no sudo.\033[0m\n"
+)
+
+
+def _confirm(prompt: str, default_yes: bool = True) -> bool:
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    try:
+        answer = input(f"  {prompt} {suffix} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not answer:
+        return default_yes
+    return answer in ("y", "yes")
+
+
+def _edge_status(config: dict) -> str:
+    from .config import get_bool
+
+    if not get_bool(config, "edge_daemon"):
+        return "disabled — /install edge to enable durable missions"
+    return "enabled — conch-edge status shows the daemon"
+
+
+def _edge_setup(config: dict) -> None:
+    from .config import get_bool, set_config_values
+
+    print(
+        "\n  \033[1mEdge\033[0m — the personal edge daemon: durable"
+        " missions,\n  timers, approvals, and channel intake that survive"
+        " terminal exits\n  and reboots (supervised via launchd on macOS,"
+        " a systemd user\n  unit on Linux)."
+    )
+    if not get_bool(config, "edge_daemon"):
+        if not _confirm("Enable edge_daemon and install the supervised"
+                        " daemon?"):
+            print("  \033[2mLeft disabled.\033[0m\n")
+            return
+        path = set_config_values({"edge_daemon": "true"})
+        config["edge_daemon"] = "true"
+        print(f"  \033[1;32m✓ edge_daemon = true\033[0m \033[2m({path})"
+              "\033[0m")
+    elif not _confirm("edge_daemon is already enabled — run the daemon"
+                      " installer again?"):
+        return
+    from .entrypoints import edge_main
+
+    code = edge_main(["install"])
+    if code == 0:
+        print("\n  \033[1;32m✓ Edge daemon installed.\033[0m \033[2mTry"
+              " /missions, /todo, /notes — and conch-edge status.\033[0m\n")
+    else:
+        print(f"\n  \033[31mDaemon install exited {code}\033[0m \033[2m—"
+              " run `conch-edge install` directly for details.\033[0m\n")
+
+
+def _handle_install_command(arg: str, config: dict) -> None:
+    from .plugins import Component, components, load_builtin_plugins
+
+    load_builtin_plugins()
+    entries = [Component(
+        "edge", "Edge",
+        "durable mission daemon (missions, timers, approvals, channels)",
+        _edge_status, _edge_setup,
+    )] + components()
+    tokens = (arg or "").strip().split()
+    sub = tokens[0].lower() if tokens else "list"
+    if sub in ("list", "status", "help"):
+        from . import __version__
+
+        print("\n  \033[1;36mConch components\033[0m")
+        print(f"    \033[1m{'shell':<8}\033[0m v{__version__} — installed"
+              " (you're in it)")
+        for entry in entries:
+            print(f"    \033[1m{entry.name:<8}\033[0m"
+                  f" {entry.status(config)}")
+            print(f"      \033[2m{entry.summary}\033[0m")
+        print("\n  \033[2m/install <name> sets a component up."
+              " Components ship inside\n  conch today and land as separate"
+              " packages later — this surface\n  stays the same.\033[0m\n")
+        return
+    match = next((entry for entry in entries if entry.name == sub), None)
+    if match is None:
+        print(f"\n  \033[31mUnknown component {sub!r}.\033[0m")
+        print(_INSTALL_USAGE)
+        return
+    match.setup(config)
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1098,7 @@ def handle_slash_command(
             "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
             "  \033[1m/missions\033[0m            List durable missions (edge daemon)\n"
             "  \033[1m/mission show|new|pause|resume|abort|input\033[0m  Manage a mission\n"
+            "  \033[1m/install [component]\033[0m List or set up components (edge, fleet, works)\n"
             "  \033[1m/todo\033[0m                Today's personal todos (due, overdue, most urgent)\n"
             "  \033[1m/todo add <title> [due:...] [p1-5] [#tag] [-- body]\033[0m  Capture a todo\n"
             "  \033[1m/todo done|due|list|show|work|escalate ...\033[0m  Manage personal todos\n"
@@ -1273,6 +1385,10 @@ def handle_slash_command(
     if command in ("/missions", "/mission", "/approvals", "/approve",
                    "/deny"):
         _handle_mission_command(command, arg, config, sched)
+        return None
+
+    if command == "/install":
+        _handle_install_command(arg, config)
         return None
 
     if command in ("/todo", "/list"):

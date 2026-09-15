@@ -7,15 +7,20 @@ Conch is an LLM-assisted shell with two interfaces:
 
 ## Install
 
-### From PyPI
+### One line (macOS & Linux)
 
 ```bash
-pipx install conch-shell
-# or
-pip install conch-shell
+curl -fsSL https://conch-site-gamma.vercel.app/install | sh
 ```
 
-### From source
+Installs the latest conch into an isolated environment (uv → pipx →
+venv, whichever is available), puts `conch` on your PATH for zsh and
+bash, and never needs sudo. Re-running upgrades; `sh -s -- --uninstall`
+removes it. Windows is not supported (WSL2 works via the Linux path).
+On first launch conch walks you through picking a provider and storing
+an API key (`0600` in `~/.config/conch/env`).
+
+### From source (development)
 
 ```bash
 git clone https://github.com/detournement/conch.git
@@ -23,9 +28,17 @@ cd conch
 ./install.sh
 ```
 
-The installer configures your API keys and shell integration (`ask` / `conch` aliases).
+`install.sh` is the from-source developer installer (repo checkout,
+shell aliases); the one-liner above is the end-user path.
 
 ## Configuration
+
+On a first interactive launch with no configuration anywhere, `conch`
+runs a short setup wizard: pick a provider (Ollama is auto-detected at
+its local port), paste an API key (hidden input, stored `0600` in
+`~/.config/conch/env`, loaded by conch itself — daemons see it too),
+optionally verify it live, and start chatting. Set `CONCH_NO_WIZARD=1`
+to suppress it; non-interactive contexts never see it.
 
 Conch reads config from `~/.config/conch/config`, then `~/.conchrc`, then a
 per-project `.conchrc` (nearest file between the current directory and the
@@ -961,6 +974,7 @@ target directly, pass Docker's `--init`.
 | `/ssh exec <command>` | Run a captured, permission-gated command over the control connection |
 | `/ssh shell [command]` | Open an uncaptured remote TTY (including remote sudo) |
 | `/ssh disconnect` | Close the active SSH control connection |
+| `/install [component]` | List conch components or set one up (edge, fleet, works) |
 | `/missions` | List durable missions (edge daemon) |
 | `/mission show\|new\|pause\|resume\|abort\|input …` | Manage a mission |
 | `/todo` | Today's personal todos: due, overdue, top urgent |

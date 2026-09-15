@@ -10,13 +10,13 @@ Conch is an LLM-assisted shell with two interfaces:
 ### One line (macOS & Linux)
 
 ```bash
-curl -fsSL https://conch.usecapitol.ai/install | sh
+curl -fsSL -u conch:<password> https://conch.usecapitol.ai/install | sh
 ```
 
-Installs the latest conch into an isolated environment (uv → pipx →
-venv, whichever is available), puts `conch` on your PATH for zsh and
-bash, and never needs sudo. Re-running upgrades; `sh -s -- --uninstall`
-removes it. Windows is not supported (WSL2 works via the Linux path).
+`<password>` is the site password (the site is gated). Installs the
+latest conch into an isolated environment (uv → pipx → venv, whichever
+is available), puts `conch` on your PATH for zsh and bash, and never
+needs sudo. Re-running upgrades; `sh -s -- --uninstall` removes it. Windows is not supported (WSL2 works via the Linux path).
 On first launch conch walks you through picking a provider and storing
 an API key (`0600` in `~/.config/conch/env`).
 

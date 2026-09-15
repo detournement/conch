@@ -248,7 +248,15 @@ live host:
   re-activated the new one, receipts idempotent (duplicate replays) both
   ways and the worker restarting on each swap under the process profile;
   remaining host-side item is the systemd-profile re-run (enable-linger is
-  now done — the host reports Linger=yes).
+  now done — the host reports Linger=yes). The redeploy also surfaced a
+  keyless-worker gap: a process-profile worker started over a fresh
+  BatchMode SSH session missed ANTHROPIC_API_KEY, which lives in
+  `systemctl --user show-environment` on that host, so its first dispatch
+  failed ("worker produced no reply") until the environment was imported
+  by hand — fixed: process-profile worker-start now layers the
+  user-manager environment under its explicit variables (explicit config
+  wins, the manager env fills gaps, imported names only in the receipt),
+  matching what a systemd unit inherits natively.
 - GPU residency scheduling against an actual `nvidia-smi` host and a
   shared Ollama endpoint under real concurrent load (unchanged).
 - A controller-driven live dispatch (`/fleet run <worker> "..."` through

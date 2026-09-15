@@ -4,7 +4,8 @@ Covered here: checksum-verified self-install, capability probe on this
 host, the content-addressed artifact store (atomic, idempotent), the
 fail-closed signed deploy chain, idempotent deploy/activate/rollback
 receipts (repeated deployment is a no-op), the deployment lock, worker
-lifecycle under the process profile with a real supervised subprocess,
+lifecycle under the process profile with a real supervised subprocess
+(including user-manager environment layering under explicit variables),
 hardened systemd unit validation (textual everywhere, plus a real
 systemd-analyze verify on hosts that have it), and the bounded RPC relay.
 """
@@ -43,6 +44,19 @@ STUB_WORKER_MAIN = (
     "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
     "sys.stderr.write('stub worker started: %r\\n' % (sys.argv[1:],))\n"
     "sys.stderr.flush()\n"
+    "while True:\n"
+    "    time.sleep(0.2)\n"
+)
+
+#: A stub worker that records the environment it was spawned with (to a
+#: file, never stdout/stderr — values must not land in logs) then idles:
+#: proves what the process profile actually passed to the worker.
+ENV_DUMP_WORKER_MAIN = (
+    "import json, os, signal, sys, time\n"
+    "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+    "with open('env-dump.json.part', 'w') as fh:\n"
+    "    json.dump(dict(os.environ), fh)\n"
+    "os.replace('env-dump.json.part', 'env-dump.json')\n"
     "while True:\n"
     "    time.sleep(0.2)\n"
 )
@@ -699,6 +713,9 @@ class TestSystemdUnitText(SignedDeployCase):
 #: Fake systemctl for worker-start verification: state machine selected by
 #: CONCH_TEST_SYSTEMCTL_MODE (immediate | slow-start | crash-loop), state
 #: persisted in CONCH_TEST_SYSTEMCTL_DIR across invocations.
+#: `show-environment` replays the show_environment file from that state
+#: dir verbatim (empty output when absent), standing in for the user
+#: manager's environment block.
 FAKE_SYSTEMCTL = """\
 #!/usr/bin/env python3
 import os, sys
@@ -733,6 +750,13 @@ if "enable" in args:
 if "stop" in args:
     try:
         os.unlink(marker("enabled"))
+    except OSError:
+        pass
+    sys.exit(0)
+if "show-environment" in args:
+    try:
+        with open(marker("show_environment")) as fh:
+            sys.stdout.write(fh.read())
     except OSError:
         pass
     sys.exit(0)
@@ -958,6 +982,140 @@ class TestLingerSurfacing(FakeSystemdCase):
             env_extra=self._env("immediate", linger="no"),
         )
         self.assertIn("process worker dies", result["error"])
+
+
+class TestProcessProfileManagerEnv(FakeSystemdCase):
+    """Field finding (2026-09-15, burt-1 redeploy): a process-profile
+    worker started over a fresh BatchMode SSH session did not inherit
+    the systemd user-manager environment, so a credential living only in
+    `systemctl --user show-environment` (ANTHROPIC_API_KEY on the field
+    host) was missing and the first dispatch failed ("worker produced no
+    reply"). worker-start must layer the manager env UNDER explicit
+    variables — explicit config wins, the manager env fills gaps, the
+    receipt carries imported NAMES only, and hosts without systemd are
+    untouched."""
+
+    MANAGER_ONLY_VALUE = "manager-canary-77e1"
+    MANAGER_LOSES_VALUE = "manager-loses-b2c4"
+    EXPLICIT_VALUE = "explicit-wins-9d3a"
+
+    def setUp(self):
+        super().setUp()
+        artifact, manifest_path = _stub_artifact(
+            self.root / "envdump", main_py=ENV_DUMP_WORKER_MAIN
+        )
+        sig = sign_manifest(manifest_path, self.key)
+        digests = {}
+        for label, path in (("artifact", artifact),
+                            ("manifest", manifest_path),
+                            ("signature", sig)):
+            digest = sha256_file(path)
+            digests[label] = digest
+            hostctl_json(["artifact-put", "--digest", digest], self.home,
+                         path.read_bytes())
+        hostctl_json(
+            ["deploy", "--worker", "wenv", "--op-id", "d-env",
+             "--artifact-digest", digests["artifact"],
+             "--manifest-digest", digests["manifest"],
+             "--signature-digest", digests["signature"],
+             "--profile", "process"], self.home,
+        )
+        hostctl_json(
+            ["activate", "--worker", "wenv", "--op-id", "a-env",
+             "--digest", digests["artifact"]], self.home,
+        )
+
+    def _write_manager_env(self, text):
+        (self.fake_state / "show_environment").write_text(text)
+
+    def _start(self, env_extra):
+        result = hostctl_json(
+            ["worker-start", "--worker", "wenv", "--profile", "process",
+             "--python", sys.executable],
+            self.home, env_extra=env_extra,
+        )
+        self.addCleanup(
+            hostctl_json, ["worker-stop", "--worker", "wenv"], self.home
+        )
+        return result
+
+    def _worker_env(self):
+        dump = self.home / "workers" / "wenv" / "env-dump.json"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                return json.loads(dump.read_text())
+            except (OSError, ValueError):
+                time.sleep(0.05)
+        self.fail("worker never wrote its environment dump")
+
+    def test_manager_env_fills_gaps_and_explicit_config_wins(self):
+        self._write_manager_env(
+            f"CONCH_TEST_MANAGER_ONLY={self.MANAGER_ONLY_VALUE}\n"
+            f"CONCH_TEST_SHARED={self.MANAGER_LOSES_VALUE}\n"
+        )
+        env = dict(self._env("immediate"))
+        env["CONCH_TEST_SHARED"] = self.EXPLICIT_VALUE
+        self._start(env)
+        seen = self._worker_env()
+        self.assertEqual(
+            seen.get("CONCH_TEST_MANAGER_ONLY"), self.MANAGER_ONLY_VALUE,
+            "manager-env variable did not reach the spawned worker",
+        )
+        self.assertEqual(
+            seen.get("CONCH_TEST_SHARED"), self.EXPLICIT_VALUE,
+            "an explicit variable must beat a manager-env collision",
+        )
+
+    def test_receipt_reports_imported_names_never_values(self):
+        self._write_manager_env(
+            f"CONCH_TEST_MANAGER_ONLY={self.MANAGER_ONLY_VALUE}\n"
+            f"CONCH_TEST_SHARED={self.MANAGER_LOSES_VALUE}\n"
+        )
+        env = dict(self._env("immediate"))
+        env["CONCH_TEST_SHARED"] = self.EXPLICIT_VALUE
+        result = self._start(env)
+        self.assertEqual(
+            result["manager_env_imported"], ["CONCH_TEST_MANAGER_ONLY"],
+            "imported = manager vars that filled a gap; a collision the"
+            " explicit config won must not be listed",
+        )
+        blob = json.dumps(result)
+        for value in (self.MANAGER_ONLY_VALUE, self.MANAGER_LOSES_VALUE,
+                      self.EXPLICIT_VALUE):
+            self.assertNotIn(value, blob, "a value leaked into the receipt")
+
+    def test_without_systemd_spawn_behavior_is_unchanged(self):
+        """No systemctl on PATH → no layering, no receipt note — even
+        with a populated manager-env file waiting behind the fake."""
+        self._write_manager_env(
+            f"CONCH_TEST_MANAGER_ONLY={self.MANAGER_ONLY_VALUE}\n"
+        )
+        lonely = self.root / "emptybin"
+        lonely.mkdir()
+        result = self._start({"PATH": str(lonely)})
+        self.assertNotIn("manager_env_imported", result)
+        seen = self._worker_env()
+        self.assertNotIn("CONCH_TEST_MANAGER_ONLY", seen)
+
+    def test_malformed_show_environment_lines_are_skipped(self):
+        self._write_manager_env(
+            "Failed to connect to bus: No medium found\n"
+            "1BADNAME=nope\n"
+            "BAD-NAME=nope\n"
+            "MULTILINE=$'a\\nb'\n"
+            f"CONCH_TEST_MANAGER_ONLY={self.MANAGER_ONLY_VALUE}\n"
+        )
+        result = self._start(self._env("immediate"))
+        self.assertEqual(
+            result["manager_env_imported"], ["CONCH_TEST_MANAGER_ONLY"]
+        )
+        seen = self._worker_env()
+        self.assertEqual(
+            seen.get("CONCH_TEST_MANAGER_ONLY"), self.MANAGER_ONLY_VALUE
+        )
+        for name in ("1BADNAME", "BAD-NAME", "MULTILINE"):
+            self.assertNotIn(name, seen)
 
 
 @unittest.skipUnless(HAVE_SSH_KEYGEN, "ssh-keygen not on PATH")

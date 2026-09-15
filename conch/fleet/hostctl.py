@@ -90,6 +90,7 @@ RPC_SCHEMA_VERSION = 1
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class HostctlError(Exception):
@@ -1193,6 +1194,49 @@ WantedBy=default.target
 """
 
 
+def _user_manager_environment() -> dict:
+    """Variables exported by the systemd user manager, {} without one.
+
+    Field finding (2026-09-15, burt-1 redeploy): operator credentials —
+    ANTHROPIC_API_KEY on the field host — live in ``systemctl --user
+    show-environment`` (environment.d / set-environment), not in the
+    minimal environment of a fresh BatchMode SSH session. A
+    systemd-profile unit inherits the manager environment natively and
+    never had this problem; a process-profile worker spawned from that
+    SSH session started keyless, and its first dispatch failed ("worker
+    produced no reply") until the environment was imported by hand. The
+    process profile therefore layers this environment UNDER its own
+    explicit variables so both profiles see the same world: explicit
+    config wins, the manager env only fills gaps.
+
+    Parsing is fail-safe: only well-formed ``KEY=VALUE`` lines with a
+    valid variable name import; anything else (bus warnings, the
+    ``$'...'`` shell quoting newer systemd applies to values with
+    control characters) is skipped rather than mis-imported. On hosts
+    without systemd this returns {} and spawn behavior is unchanged.
+    Values must never be logged, echoed, or recorded — callers may
+    report the *names* of imported variables, nothing more.
+    """
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return {}
+    try:
+        out = _run([systemctl, "--user", "show-environment"], timeout=10)
+    except HostctlError:
+        return {}
+    if out.returncode != 0:
+        return {}
+    env = {}
+    for line in out.stdout.decode("utf-8", "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or not _ENV_NAME_RE.fullmatch(key):
+            continue
+        if value.startswith("$'"):
+            continue
+        env[key] = value
+    return env
+
+
 def _start_worker(host: Host, worker: str, record: dict, args) -> dict:
     profile = record.get("profile") or "process"
     current = record.get("current", "")
@@ -1212,13 +1256,23 @@ def _start_worker(host: Host, worker: str, record: dict, args) -> dict:
             getattr(args, "python", "") or record.get("python") or "python3"
         )
         record["python"] = interpreter
+        # A systemd-profile unit inherits the user manager's environment
+        # natively; give the process profile the same view (the burt-1
+        # keyless-worker finding — see _user_manager_environment).
+        # Explicit variables win; the manager env only fills gaps.
+        manager_env = _user_manager_environment()
+        spawn_env = dict(manager_env)
+        spawn_env.update(os.environ)
+        imported = sorted(
+            name for name in manager_env if name not in os.environ
+        )
         log_path = worker_dir / "logs" / "worker.log"
         with open(log_path, "ab") as log_handle:
             proc = subprocess.Popen(
                 [interpreter, str(release), "--home", str(worker_dir)],
                 stdin=subprocess.DEVNULL, stdout=log_handle,
                 stderr=log_handle, start_new_session=True,
-                cwd=str(worker_dir),
+                cwd=str(worker_dir), env=spawn_env,
             )
         _atomic_write_bytes(
             _pidfile(host, worker), f"{proc.pid}\n".encode("ascii")
@@ -1236,7 +1290,12 @@ def _start_worker(host: Host, worker: str, record: dict, args) -> dict:
                     + (f" — last log lines: {tail}" if tail else "")
                 )
             time.sleep(0.1)
-        return {"profile": profile, "pid": proc.pid}
+        detail = {"profile": profile, "pid": proc.pid}
+        if imported:
+            # Receipt-safe by design: the NAMES of the variables the
+            # manager env supplied, never their values.
+            detail["manager_env_imported"] = imported
+        return detail
     if profile == "systemd":
         systemctl = shutil.which("systemctl")
         if not systemctl:

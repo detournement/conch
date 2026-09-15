@@ -26,6 +26,8 @@ Documented exemptions, to move in the packaging stage:
 """
 
 import ast
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -149,6 +151,43 @@ class TestFoundationStaysKernelFreeAtImportTime(unittest.TestCase):
                 f"{path.name} imports conch.kernel at module scope:"
                 f" {found}",
             )
+
+
+class TestPluginLoadingStaysCheap(unittest.TestCase):
+    """Loading the plugin registrations must not load the products.
+
+    Registration is metadata: the only product modules that may enter
+    sys.modules are the two package docstrings and the plugin shims
+    themselves. The adapters (capitol client/runtime, fleet delegate,
+    the kernel) stay behind the config gates exactly as before the
+    seam inversion.
+    """
+
+    def test_plugin_shims_only(self):
+        script = (
+            "import sys\n"
+            "from conch.commands import slash_command_names\n"
+            "names = slash_command_names()\n"
+            "assert '/capitol' in names and '/fleet' in names, names\n"
+            "allowed = {'conch.capitol', 'conch.capitol.plugin',\n"
+            "           'conch.fleet', 'conch.fleet.plugin'}\n"
+            "leaked = sorted(\n"
+            "    name for name in sys.modules\n"
+            "    if name.startswith(\n"
+            "        ('conch.capitol', 'conch.fleet', 'conch.kernel')\n"
+            "    ) and name not in allowed\n"
+            ")\n"
+            "assert not leaked, f'loaded beyond the shims: {leaked}'\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(CONCH_ROOT.parent), capture_output=True, text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"stdout: {result.stdout}\nstderr: {result.stderr}",
+        )
 
 
 class TestPluginRegistryIsLeafward(unittest.TestCase):

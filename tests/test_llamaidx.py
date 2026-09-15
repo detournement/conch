@@ -17,10 +17,12 @@ from conch.config import load_config
 from conch.llamaidx import (
     clear_llamaidx_cache,
     fetch_llamaidx_catalog,
+    fetch_llamaidx_status,
     get_llamaidx_url,
     list_llamaidx_models,
     llamaidx_fallback_candidates,
     llamaidx_selection_overrides,
+    render_fleet_status,
     resolve_llamaidx_model,
 )
 from conch.providers import (
@@ -101,17 +103,24 @@ class _FakeServer:
 
 
 class FakeRegistry(_FakeServer):
-    """Serves GET /v1/inference with a scripted provider list."""
+    """Serves GET /v1/inference with a scripted provider list.
+
+    Deliberately leaky: it returns every scripted provider whatever the
+    query says (a real registry pre-filters), so the tests exercise
+    conch's own client-side re-filtering. The request log still records
+    the query string, so tests can assert which view conch asked for.
+    """
 
     def __init__(self):
         super().__init__()
         self.providers = []
+        self.registry_version = "0.1.0"
 
     def handle(self, method, path, body):
         if method == "GET" and path.startswith("/v1/inference"):
             return 200, {
                 "generated_at": "2026-09-15T00:00:00Z",
-                "registry_version": "0.1.0",
+                "registry_version": self.registry_version,
                 "providers": self.providers,
             }
         return None
@@ -694,6 +703,434 @@ class RuntimeFallbackTests(unittest.TestCase):
         self.assertEqual(config["provider"], "custom")
         self.assertEqual(config["custom_base_url"], rescue_box.base_url + "/v1")
         self.assertEqual(config["chat_model"], "rescue-32b")
+
+
+def _closed_port_url() -> str:
+    """A URL on which nothing listens (bind an ephemeral port, close it)."""
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return f"http://127.0.0.1:{port}"
+
+
+class DataSourceTests(unittest.TestCase):
+    """The ?status=all reporting view behind the llamaidx_registry tool and
+    /llamaidx: the whole fleet stays visible (down boxes with their last
+    error, models without tool support), unknown schema majors fail closed,
+    and local_only gates reporting exactly like discovery."""
+
+    def setUp(self):
+        clear_local_model_caches()
+        self.registry = FakeRegistry().start()
+        self.addCleanup(self.registry.stop)
+        self.config = {
+            "provider": "anthropic",
+            "llamaidx_url": self.registry.base_url,
+        }
+
+    def _fleet(self):
+        up = self.registry.provider_entry(
+            name="burt", flavor="llamacpp",
+            base_url="http://192.0.2.50:8080",
+            models=[
+                self.registry.model_entry("qwen3-14b", ctx=32768),
+                self.registry.model_entry("embed-only", tools=False),
+            ],
+        )
+        up["labels"] = {"gpu": "a6000", "host": "burt"}
+        degraded = self.registry.provider_entry(
+            name="warmup", flavor="ollama",
+            base_url="http://192.0.2.51:11434", status="degraded",
+            models=[self.registry.model_entry("qwen3:8b")],
+        )
+        down = self.registry.provider_entry(
+            name="coldbox", flavor="llamacpp",
+            base_url="http://192.0.2.52:8080", status="down",
+            models=[self.registry.model_entry("m")],
+        )
+        down["last_error"] = "connect timeout"
+        down["last_seen"] = "2026-09-14T22:00:00Z"
+        return [up, degraded, down]
+
+    def test_status_view_keeps_the_whole_fleet(self):
+        self.registry.providers = self._fleet()
+        status = fetch_llamaidx_status(self.config)
+        by_name = {p["name"]: p for p in status["providers"]}
+        self.assertEqual(set(by_name), {"burt", "warmup", "coldbox"})
+        self.assertEqual(by_name["coldbox"]["status"], "down")
+        self.assertEqual(by_name["coldbox"]["last_error"], "connect timeout")
+        self.assertEqual(by_name["burt"]["labels"]["gpu"], "a6000")
+        burt_models = {m["display_id"]: m for m in by_name["burt"]["models"]}
+        self.assertFalse(burt_models["embed-only"]["tools"])
+        # The routing view stays strict: no down box, no non-tool model.
+        names = [e["name"] for e in list_llamaidx_models(self.config)]
+        self.assertNotIn("llamaidx/coldbox/m", names)
+        self.assertNotIn("llamaidx/burt/embed-only", names)
+
+    def test_status_view_requests_the_all_view(self):
+        self.registry.providers = self._fleet()
+        fetch_llamaidx_status(self.config, force_refresh=True)
+        with self.registry.lock:
+            status_paths = [
+                p for m, p in self.registry.requests
+                if m == "GET" and "status=all" in p
+            ]
+        self.assertTrue(status_paths)
+
+    def test_unknown_schema_major_fails_closed_everywhere(self):
+        self.registry.providers = self._fleet()
+        self.registry.registry_version = "2.0.0"
+        self.assertIsNone(fetch_llamaidx_status(self.config, force_refresh=True))
+        self.assertIsNone(fetch_llamaidx_catalog(self.config, force_refresh=True))
+        self.assertIsNone(list_llamaidx_models(self.config, force_refresh=True))
+
+    def test_missing_schema_version_fails_closed(self):
+        self.registry.providers = self._fleet()
+        self.registry.registry_version = None
+        self.assertIsNone(fetch_llamaidx_status(self.config, force_refresh=True))
+
+    def test_status_view_respects_local_only(self):
+        self.registry.providers = [
+            self.registry.provider_entry(
+                name="lanbox", flavor="llamacpp",
+                base_url="http://192.0.2.50:8080",
+                models=[self.registry.model_entry("m1")],
+            ),
+            self.registry.provider_entry(
+                name="cloudbox", flavor="openai",
+                base_url="https://inference.example.com",
+                status="down",
+                models=[self.registry.model_entry("m2")],
+            ),
+        ]
+        config = {
+            "provider": "ollama",  # local_only auto-on
+            "llamaidx_url": self.registry.base_url,
+        }
+        status = fetch_llamaidx_status(config)
+        self.assertEqual(
+            [p["name"] for p in status["providers"]], ["lanbox"]
+        )
+
+    def test_render_is_bounded_and_marks_truncation(self):
+        providers = []
+        for i in range(30):
+            providers.append({
+                "name": f"box{i:02d}", "flavor": "llamacpp",
+                "base_url": f"http://192.0.2.{i}:8080", "status": "up",
+                "last_seen": "2026-09-15T00:00:00Z", "last_error": None,
+                "server_version": "", "labels": {"gpu": "a6000"},
+                "auth_required": False, "api_key_env": None,
+                "models": [
+                    {
+                        "model_id": f"model-{j}", "display_id": f"model-{j}",
+                        "ctx": 32768, "quant": "Q4_K_M", "loaded": True,
+                        "tools": True, "modalities": [],
+                    }
+                    for j in range(20)
+                ],
+            })
+        status = {
+            "generated_at": "2026-09-15T00:00:00Z",
+            "registry_version": "0.1.0",
+            "providers": providers,
+        }
+        text = render_fleet_status(status)
+        self.assertLessEqual(len(text), 6100)
+        self.assertIn("(truncated)", text)
+        colored = render_fleet_status(
+            {"generated_at": "", "registry_version": "0.1.0",
+             "providers": providers[:1]},
+            color=True,
+        )
+        self.assertIn("\033[", colored)
+
+    def test_render_never_prints_token_values(self):
+        status = {
+            "generated_at": "", "registry_version": "0.1.0",
+            "providers": [{
+                "name": "authbox", "flavor": "openai",
+                "base_url": "http://192.0.2.9:8080", "status": "up",
+                "last_seen": "", "last_error": None, "server_version": "",
+                "labels": {}, "auth_required": True,
+                "api_key_env": "AUTHBOX_KEY", "models": [],
+            }],
+        }
+        with patch.dict(os.environ, {"AUTHBOX_KEY": "sekret-value"}):
+            text = render_fleet_status(status)
+        self.assertIn("$AUTHBOX_KEY", text)
+        self.assertNotIn("sekret-value", text)
+
+
+class RegistryToolTests(unittest.TestCase):
+    """The llamaidx_registry builtin: gated on llamaidx_url, bounded
+    read-only answers about the fleet, and honest about unreachability."""
+
+    def setUp(self):
+        clear_local_model_caches()
+        self.registry = FakeRegistry().start()
+        self.addCleanup(self.registry.stop)
+        self.config = {
+            "provider": "anthropic",
+            "llamaidx_url": self.registry.base_url,
+        }
+        self.registry.providers = [
+            self.registry.provider_entry(
+                name="burt", flavor="llamacpp",
+                base_url="http://192.0.2.50:8080",
+                models=[
+                    self.registry.model_entry("qwen3-14b", ctx=32768),
+                    self.registry.model_entry("embed-only", tools=False),
+                ],
+            ),
+            self.registry.provider_entry(
+                name="coldbox", flavor="llamacpp",
+                base_url="http://192.0.2.52:8080", status="down",
+                models=[self.registry.model_entry("m")],
+            ),
+        ]
+        self.registry.providers[1]["last_error"] = "connect timeout"
+
+    def _call(self, arguments):
+        from conch.tooling import LlamaidxRegistryClient
+
+        client = LlamaidxRegistryClient(self.config)
+        return client.call_tool("llamaidx_registry", arguments)["content"][0]["text"]
+
+    def test_injection_is_gated_by_config(self):
+        from conch.bootstrap import make_builtin_clients
+        from conch.memory import MemoryStore
+        from conch.tooling import LlamaidxRegistryClient, inject_builtin_tools
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+                "XDG_STATE_HOME": str(Path(tmp) / "state"),
+                "XDG_DATA_HOME": str(Path(tmp) / "data"),
+            }
+            with patch.dict(os.environ, env):
+                without = make_builtin_clients(
+                    MemoryStore(), {"provider": "openai"}
+                )
+                self.assertNotIn("llamaidx_registry", without)
+                clients = make_builtin_clients(
+                    MemoryStore(), dict(self.config, provider="openai")
+                )
+                self.assertIsInstance(
+                    clients["llamaidx_registry"], LlamaidxRegistryClient
+                )
+                tools: list = []
+                tool_map: dict = {}
+                with patch(
+                    "conch.tooling.discover_user_tools",
+                    return_value=([], None),
+                ):
+                    inject_builtin_tools(tools, tool_map, clients)
+                names = {tool["function"]["name"] for tool in tools}
+                self.assertIn("llamaidx_registry", names)
+                self.assertIs(
+                    tool_map["llamaidx_registry"], clients["llamaidx_registry"]
+                )
+
+    def test_fleet_status_reports_down_and_why(self):
+        text = self._call({"action": "fleet_status"})
+        self.assertIn("burt", text)
+        self.assertIn("[down]", text)
+        self.assertIn("last error: connect timeout", text)
+        self.assertIn("tools verified", text)
+        self.assertIn("no tool support", text)
+
+    def test_fleet_status_provider_filter(self):
+        text = self._call({"action": "fleet_status", "provider": "coldbox"})
+        self.assertIn("coldbox", text)
+        self.assertNotIn("burt", text)
+        missing = self._call({"action": "fleet_status", "provider": "nope"})
+        self.assertIn("No provider named 'nope'", missing)
+        self.assertIn("burt", missing)
+
+    def test_list_models_action_lists_selectable_entries(self):
+        text = self._call({"action": "list_models"})
+        self.assertIn("llamaidx/burt/qwen3-14b", text)
+        self.assertIn("ctx=32768", text)
+        self.assertIn("conch_config action=set_model", text)
+        self.assertNotIn("embed-only", text)
+        self.assertNotIn("coldbox", text)
+
+    def test_unreachable_registry_is_reported_not_guessed(self):
+        self.config["llamaidx_url"] = _closed_port_url()
+        text = self._call({"action": "fleet_status"})
+        self.assertIn("unreachable", text)
+        self.assertIn("Fleet status is unknown", text)
+
+    def test_unconfigured_and_unknown_action(self):
+        from conch.tooling import LlamaidxRegistryClient
+
+        bare = LlamaidxRegistryClient({})
+        text = bare.call_tool("llamaidx_registry", {"action": "fleet_status"})
+        self.assertIn("llamaidx_url is unset", text["content"][0]["text"])
+        self.assertIn("Unknown action", self._call({"action": "bogus"}))
+
+
+class ConchConfigRegistryTests(unittest.TestCase):
+    """The in-chat conch_config surface sees and selects registry models:
+    list_models grows an llamaidx section; set_model llamaidx/... resolves
+    through the registry, runs conch's own probe-on-select, and queues the
+    adapter overrides without touching the live config."""
+
+    def setUp(self):
+        clear_local_model_caches()
+        self.registry = FakeRegistry().start()
+        self.addCleanup(self.registry.stop)
+        self.config = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "chat_model": "claude-sonnet-5",
+            "llamaidx_url": self.registry.base_url,
+        }
+
+    def _client(self):
+        from conch.tooling import ConchConfigClient
+
+        client = ConchConfigClient()
+        client.bind("anthropic", "claude-sonnet-5", {}, self.config)
+        return client
+
+    def _call(self, client, arguments):
+        return client.call_tool("conch_config", arguments)["content"][0]["text"]
+
+    def test_list_models_includes_registry_section(self):
+        self.registry.providers = [
+            self.registry.provider_entry(
+                name="gpubox", flavor="llamacpp",
+                base_url="http://192.0.2.50:8080", status="degraded",
+                models=[self.registry.model_entry("qwen3-32b", ctx=40960)],
+            )
+        ]
+        text = self._call(self._client(), {"action": "list_models"})
+        self.assertIn("llamaidx (self-hosted fleet registry, free):", text)
+        self.assertIn("llamaidx/gpubox/qwen3-32b", text)
+        self.assertIn("ctx=40960", text)
+        self.assertIn("(provider degraded)", text)
+
+    def test_set_model_llamaidx_queues_overrides_after_probe(self):
+        box = FakeLlamaCppBox(models=["qwen3-32b"]).start()
+        self.addCleanup(box.stop)
+        self.registry.providers = [
+            self.registry.provider_entry(
+                name="gpubox", flavor="llamacpp", base_url=box.base_url,
+                models=[self.registry.model_entry("qwen3-32b")],
+            )
+        ]
+        client = self._client()
+        text = self._call(
+            client,
+            {"action": "set_model", "value": "llamaidx/gpubox/qwen3-32b"},
+        )
+        self.assertIn("queued", text)
+        self.assertIn("NEXT user message", text)
+        # Probe-on-select ran against the box itself.
+        self.assertGreaterEqual(
+            box.request_count("POST", "/v1/chat/completions"), 1
+        )
+        self.assertEqual(len(client.pending_actions), 1)
+        action = client.pending_actions[0]
+        self.assertEqual(action[:3], ("set_model", "custom", "qwen3-32b"))
+        overrides = action[3]
+        self.assertEqual(overrides["custom_base_url"], box.base_url + "/v1")
+        self.assertEqual(overrides["custom_model"], "qwen3-32b")
+        # Queued, not applied: the live config is untouched until the
+        # app loop drains pending_actions between turns.
+        self.assertEqual(self.config["provider"], "anthropic")
+
+    def test_set_model_llamaidx_refuses_when_probe_fails(self):
+        box = FakeLlamaCppBox(models=["qwen3-32b"], tool_capable=False).start()
+        self.addCleanup(box.stop)
+        self.registry.providers = [
+            self.registry.provider_entry(
+                name="gpubox", flavor="llamacpp", base_url=box.base_url,
+                models=[self.registry.model_entry("qwen3-32b")],  # stale yes
+            )
+        ]
+        client = self._client()
+        text = self._call(
+            client,
+            {"action": "set_model", "value": "llamaidx/gpubox/qwen3-32b"},
+        )
+        self.assertIn("trust the probe", text)
+        self.assertEqual(client.pending_actions, [])
+
+    def test_set_model_llamaidx_unknown_name(self):
+        self.registry.providers = [
+            self.registry.provider_entry(
+                name="gpubox", flavor="llamacpp",
+                base_url="http://192.0.2.50:8080",
+                models=[self.registry.model_entry("qwen3-32b")],
+            )
+        ]
+        client = self._client()
+        text = self._call(
+            client, {"action": "set_model", "value": "llamaidx/gpubox/nope"}
+        )
+        self.assertIn("not in the registry catalog", text)
+        self.assertIn("llamaidx/gpubox/qwen3-32b", text)
+        self.assertEqual(client.pending_actions, [])
+
+
+class LlamaidxCommandTests(unittest.TestCase):
+    """/llamaidx renders the whole fleet for the human, down boxes and all."""
+
+    def setUp(self):
+        clear_local_model_caches()
+
+    def test_command_prints_fleet_status(self):
+        registry = FakeRegistry().start()
+        self.addCleanup(registry.stop)
+        registry.providers = [
+            registry.provider_entry(
+                name="burt", flavor="llamacpp",
+                base_url="http://192.0.2.50:8080",
+                models=[registry.model_entry("qwen3-14b")],
+            ),
+            registry.provider_entry(
+                name="coldbox", flavor="ollama",
+                base_url="http://192.0.2.52:11434", status="down",
+            ),
+        ]
+        registry.providers[1]["last_error"] = "connect timeout"
+        config = {"provider": "anthropic", "llamaidx_url": registry.base_url}
+        with _quiet() as out:
+            handle_slash_command(
+                "/llamaidx", config, "anthropic", "claude-sonnet-5",
+                lambda v: None,
+            )
+        rendered = out.getvalue()
+        self.assertIn("burt", rendered)
+        self.assertIn("[down]", rendered)
+        self.assertIn("connect timeout", rendered)
+        self.assertIn("/model llamaidx/", rendered)
+
+    def test_command_without_registry_configured(self):
+        with _quiet() as out:
+            handle_slash_command(
+                "/llamaidx", {"provider": "anthropic"}, "anthropic",
+                "claude-sonnet-5", lambda v: None,
+            )
+        self.assertIn("No llama-idx registry configured", out.getvalue())
+
+    def test_command_reports_unreachable_registry(self):
+        config = {
+            "provider": "anthropic",
+            "llamaidx_url": _closed_port_url(),
+        }
+        with _quiet() as out:
+            handle_slash_command(
+                "/llamaidx", config, "anthropic", "claude-sonnet-5",
+                lambda v: None,
+            )
+        self.assertIn("Registry unreachable", out.getvalue())
 
 
 if __name__ == "__main__":

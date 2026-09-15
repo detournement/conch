@@ -166,6 +166,24 @@ llamaidx_url=http://registry.example:8642
   of the env var holding the read token. Unset `llamaidx_url` = feature
   off, zero new traffic.
 
+The registry is a **data source**, not just discovery plumbing. With
+`llamaidx_url` set:
+
+- `/llamaidx` prints the whole fleet from the registry's `?status=all`
+  view: up, degraded, **and down** boxes — with last error, last-seen
+  time, labels (`gpu=a6000, host=burt`), and per-model context size,
+  quantization, and loaded state. Down boxes never appear in `/models`;
+  this is where you see them and why.
+- The `llamaidx_registry` builtin tool gives the model the same
+  read-only view in chat: ask "is burt up?", "which box has the biggest
+  context model loaded?", or "why is the fleet degraded?" and the answer
+  comes from the registry's stored state (bounded output, never wakes or
+  probes the boxes). The tool only exists when a registry is configured.
+- The `conch_config` tool lists `llamaidx/provider/model` entries and can
+  switch to one in chat; conch's probe-on-select still runs against the
+  box before the switch is queued. Both views fail closed on unknown
+  `registry_version` majors, exactly like an unreachable registry.
+
 #### Auditing the cloud catalogs
 
 The cloud model catalogs are hardcoded and go stale as providers rename and

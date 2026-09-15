@@ -53,6 +53,16 @@ api_key_env=ANTHROPIC_API_KEY
 # Fallback chains draw registry boxes before any cloud hop. local_only
 # applies to the registry URL and every discovered provider base_url.
 # Unset = feature off, zero new traffic.
+#
+# The registry is also a queryable data source. With llamaidx_url set:
+#   - /llamaidx prints the whole fleet (?status=all): down boxes with
+#     their last error and last-seen time, degraded boxes, per-model
+#     context/quant/loaded state.
+#   - the llamaidx_registry builtin tool gives the model the same
+#     read-only view in chat ("is burt up?", "what GPUs are running?"),
+#     and conch_config can list and select llamaidx/provider/model
+#     entries (probe-on-select still runs before committing).
+# Reporting is read-only against the registry and never wakes the boxes.
 #llamaidx_url=http://registry.example:8642
 # Registries running read_auth=true: NAME of the env var with the read
 # token (never the token itself).

@@ -143,6 +143,59 @@ class TestStatsLineGating(unittest.TestCase):
         self.assertNotIn("tok/s", line)
 
 
+class TestCustomStreamUsage(unittest.TestCase):
+    """provider=custom streaming must ask for and capture usage.
+
+    Regression: without stream_options.include_usage, llama.cpp sends no
+    usage chunk, the turn reports 0/0 tokens, and the stats line never
+    appears (the original "i don't see tks" report)."""
+
+    def test_stream_requests_usage_and_captures_timings(self):
+        from tests.test_custom_provider import CONFIG, _custom_server
+        from conch.providers import clear_local_model_caches, stream_custom
+
+        clear_local_model_caches()
+        recorded = {}
+        lines = [
+            b'data: {"choices": [{"delta": {"content": "hi"}}]}\n',
+            b'data: {"choices": [], "usage": {"prompt_tokens": 53,'
+            b' "completion_tokens": 10},'
+            b' "timings": {"predicted_ms": 500.0}}\n',
+            b"data: [DONE]\n",
+        ]
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_custom_server(stream_lines=lines, recorded=recorded),
+        ):
+            result = stream_custom(CONFIG, [], None, lambda *_: None)
+        self.assertEqual(
+            recorded["body"].get("stream_options"),
+            {"include_usage": True},
+        )
+        self.assertEqual(result["_usage"]["input_tokens"], 53)
+        self.assertEqual(result["_usage"]["output_tokens"], 10)
+        self.assertAlmostEqual(result["_usage"]["gen_seconds"], 0.5)
+
+
+class TestEstimatedFallbackLine(unittest.TestCase):
+    def test_estimated_counts_carry_tilde(self):
+        # Backend sent no usage: estimator-derived counts and wall-clock
+        # speed are both ~-labeled so nothing estimated looks exact.
+        line = format_turn_stats_line(
+            {"input_tokens": 100, "output_tokens": 50,
+             "tokens_estimated": True, "speed_estimated": True,
+             "wall_seconds": 2.0},
+            "free", "", "m1", {},
+        )
+        self.assertIn("~100 in / ~50 out", line)
+        self.assertIn("~25.0 tok/s", line)
+
+    def test_exact_counts_stay_unlabeled(self):
+        line = format_turn_stats_line(TURN, "free", "", "m1", {})
+        self.assertIn("1,200 in / 300 out", line)
+        self.assertNotIn("~", line)
+
+
 class TestTksToggle(unittest.TestCase):
     def _run(self, arg, config):
         with patch("sys.stdout", io.StringIO()) as out:

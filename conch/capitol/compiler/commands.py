@@ -22,6 +22,7 @@ wherever missions run).
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import time
 from typing import Any, Dict, List, Optional
@@ -32,6 +33,8 @@ from ..packs.templates import clean_text
 USAGE = """
   \033[1;36m/compile — the ProcessCompiler (goal → reviewed card → governed process)\033[0m
     /compile "<goal>"              compile a goal into an Architecture Card
+    /compile from-mission <id> ["goal"]   draft a card from a mission's journal (Capture→Card)
+    /compile from-session [<conv-id>] ["goal"]   draft a card from a saved conversation
     /compile list                  list compilations
     /compile show <id> [vN|--diff] render a card (or diff the last two versions)
     /compile approve <id>          approve the current card version (authorizes materialization)
@@ -82,17 +85,12 @@ def _line(compilation: Dict[str, Any]) -> str:
     )
 
 
-def _cmd_compile(goal: str, config: dict):
-    from .session import run_compile_session
-
-    _print(f"\n  \033[2mcompiling: {clean_text(goal, 120)}\033[0m")
-    _print("  \033[2mdiscovering the org and running the bounded design"
-           " session …\033[0m")
-    card = run_compile_session(config, goal)
+def _finish_compile(card: Dict[str, Any], *,
+                    capture: Optional[Dict[str, Any]] = None):
     store = _store()
     try:
         compilation = store.create_compilation(
-            card, actor=os.environ.get("USER", "user"),
+            card, actor=os.environ.get("USER", "user"), capture=capture,
         )
     finally:
         store.close()
@@ -108,6 +106,58 @@ def _cmd_compile(goal: str, config: dict):
         f"{compilation['compilation_id'][:16]} — then approve/reject/"
         "revise\033[0m\n"
     )
+
+
+def _cmd_compile(goal: str, config: dict):
+    from .session import run_compile_session
+
+    _print(f"\n  \033[2mcompiling: {clean_text(goal, 120)}\033[0m")
+    _print("  \033[2mdiscovering the org and running the bounded design"
+           " session …\033[0m")
+    card = run_compile_session(config, goal)
+    _finish_compile(card)
+
+
+def _cmd_from_mission(tokens: List[str], config: dict):
+    from .capture import capture_from_mission, compile_from_capture
+
+    if not tokens:
+        _print("\n  \033[2mUsage: /compile from-mission <mission-id> "
+               "[\"goal\"]\033[0m\n")
+        return
+    store = _store()
+    try:
+        context = capture_from_mission(store, tokens[0])
+    finally:
+        store.close()
+    goal = " ".join(tokens[1:]).strip().strip("\"'")
+    _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
+           "card …\033[0m")
+    card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
+
+
+def _cmd_from_session(tokens: List[str], config: dict):
+    from .capture import (
+        capture_from_conversation,
+        compile_from_capture,
+        resolve_conversation,
+    )
+
+    conv_ref = ""
+    goal_tokens = list(tokens)
+    # Conversation ids are short hex (uuid4().hex[:8]); a leading token
+    # of 4–8 hex chars selects the conversation, everything else is the
+    # goal. Quote the goal if its first word happens to be pure hex.
+    if goal_tokens and re.fullmatch(r"[0-9a-f]{4,8}", goal_tokens[0]):
+        conv_ref = goal_tokens.pop(0)
+    conversation = resolve_conversation(conv_ref)
+    context = capture_from_conversation(conversation)
+    goal = " ".join(goal_tokens).strip().strip("\"'")
+    _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
+           "card …\033[0m")
+    card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
 
 
 def _cmd_list(store):
@@ -293,6 +343,13 @@ def _cmd_status(store, tokens: List[str]):
     if compilation is None:
         return
     _print("\n  " + _line(compilation))
+    capture = store.compilation_capture(compilation["compilation_id"])
+    if capture:
+        from .capture import capture_provenance_line
+
+        line = capture_provenance_line(capture)
+        if line:
+            _print(f"    \033[2m{line}\033[0m")
     if compilation.get("approved_version"):
         _print(
             f"    \033[2mapproved: card v{compilation['approved_version']}"
@@ -355,11 +412,18 @@ def run_compile_command(arg: str, config: dict, *,
         return
     sub = tokens[0].lower()
     known = {"list", "show", "approve", "reject", "revise",
-             "materialize", "rollback", "status"}
+             "materialize", "rollback", "status",
+             "from-mission", "from-session"}
     try:
         if sub not in known:
             # The whole argument is the goal ("/compile \"<goal>\"").
             _cmd_compile(arg.strip("\"'"), config)
+            return
+        if sub == "from-mission":
+            _cmd_from_mission(tokens[1:], config)
+            return
+        if sub == "from-session":
+            _cmd_from_session(tokens[1:], config)
             return
         store = _store()
         try:

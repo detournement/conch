@@ -40,6 +40,7 @@ from conch.providers import (  # noqa: E402
     DEFAULT_API_KEY_ENVS,
     DEFAULT_CHAT_MODEL_BY_PROVIDER,
     KNOWN_MODELS,
+    anthropic_forced_tool_choice_supported,
     build_openai_chat_request_body,
     get_bedrock_base_url,
 )
@@ -137,7 +138,12 @@ def _probe_body(provider: str, model: str) -> "tuple[str, dict, dict]":
             },
             {
                 "model": model,
-                "max_tokens": 64,
+                # Adaptive-thinking models (Opus 5.5 family) may spend
+                # tokens thinking before the tool call; 64 is enough for
+                # forced-choice models but starves them.
+                "max_tokens": (
+                    64 if anthropic_forced_tool_choice_supported(model) else 512
+                ),
                 "messages": [{"role": "user", "content": PROBE_USER_MSG}],
                 "tools": [
                     {
@@ -146,7 +152,14 @@ def _probe_body(provider: str, model: str) -> "tuple[str, dict, dict]":
                         "input_schema": PROBE_TOOL_SCHEMA["parameters"],
                     }
                 ],
-                "tool_choice": {"type": "tool", "name": PROBE_TOOL},
+                # Opus 5.5 / Fable 5.1 reject forced tool_choice ("tool" and
+                # "any" both 400, verified live 2026-09-23); "auto" plus the
+                # strict tool_use extraction below keeps the probe honest.
+                "tool_choice": (
+                    {"type": "tool", "name": PROBE_TOOL}
+                    if anthropic_forced_tool_choice_supported(model)
+                    else {"type": "auto"}
+                ),
             },
         )
     urls = {

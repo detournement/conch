@@ -321,7 +321,8 @@ class TestFromSessionCommand(CaptureCase):
         ):
             with contextlib.redirect_stdout(buffer):
                 run_compile_command(
-                    'from-session abc12345 "automate the deploy"', {},
+                    'from-session abc12345 "automate the deploy"',
+                    {"capture_enabled": "true"},
                 )
         output = buffer.getvalue()
         self.assertIn("Compiled", output)
@@ -337,9 +338,221 @@ class TestFromSessionCommand(CaptureCase):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             run_compile_command(
-                "from-session abc12345", {}, origin="slack",
+                "from-session abc12345", {"capture_enabled": "true"},
+                origin="slack",
             )
         self.assertIn("interactive-only", buffer.getvalue())
+
+    def test_capture_verbs_gated_on_component(self):
+        for verb in ("from-session", "from-mission x",
+                     "from-email", "from-history 50 \"g\""):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                run_compile_command(verb, {})
+            self.assertIn("/install capture", buffer.getvalue(),
+                          f"{verb} not gated")
+
+
+class TestCaptureComponent(CaptureCase):
+    def test_registered_with_honest_status(self):
+        from conch.plugins import components, load_builtin_plugins
+
+        load_builtin_plugins()
+        by_name = {c.name: c for c in components()}
+        self.assertIn("capture", by_name)
+        component = by_name["capture"]
+        self.assertIn("/install capture", component.status({}))
+        enabled = component.status({
+            "capture_enabled": "true",
+            "capture_email_folder": "Conch/Capture",
+        })
+        self.assertIn("enabled", enabled)
+        self.assertIn("sessions", enabled)
+        self.assertIn("Conch/Capture", enabled)
+
+    def test_setup_enables_the_gate(self):
+        from conch.capitol.plugin import _capture_setup
+
+        config = {}
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _capture_setup(config)  # no email config → no prompts
+        self.assertEqual(config.get("capture_enabled"), "true")
+        self.assertIn("Capture enabled", buffer.getvalue())
+        # the config file in the isolated XDG home carries the flag
+        from conch.config import load_config
+
+        self.assertEqual(load_config().get("capture_enabled"), "true")
+
+
+def _raw_mail(sender, subject, body,
+              date="Mon, 22 Sep 2026 10:00:00 +0000"):
+    return (
+        f"From: {sender}\r\nDate: {date}\r\nSubject: {subject}\r\n"
+        f"\r\n{body}\r\n"
+    ).encode()
+
+
+class FakeImap:
+    """The exact imaplib surface capture_from_email touches."""
+
+    def __init__(self, messages):
+        self.messages = dict(messages)  # uid -> raw bytes
+        self.selected = None
+        self.readonly = None
+
+    def select(self, folder, readonly=False):
+        self.selected = folder
+        self.readonly = readonly
+        return "OK", [b"1"]
+
+    def uid(self, op, *args):
+        if op == "search":
+            spec = args[1]
+            low = int(spec.split()[1].split(":")[0])
+            uids = sorted(u for u in self.messages if u >= low)
+            return "OK", [
+                " ".join(str(u) for u in uids).encode() or b""
+            ]
+        if op == "fetch":
+            raw = self.messages.get(int(args[0]))
+            if raw is None:
+                return "NO", [None]
+            return "OK", [(b"1 (RFC822)", raw)]
+        raise AssertionError(f"unexpected op {op}")
+
+    def logout(self):
+        return "BYE", []
+
+
+class TestEmailCapture(CaptureCase):
+    CONFIG = {
+        "capture_email_folder": "Conch/Capture",
+        "email_imap_host": "imap.example.com",
+        "email_address": "me@example.com",
+        "email_allowed_senders": "ada@example.com",
+    }
+
+    def setUp(self):
+        super().setUp()
+        env = patch.dict(os.environ, {"EMAIL_PASSWORD": "x"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def capture(self, messages, config=None):
+        from conch.capitol.compiler.capture_email import (
+            capture_from_email,
+        )
+
+        fake = FakeImap(messages)
+        context, commit = capture_from_email(
+            dict(config or self.CONFIG),
+            imap_factory=lambda _config: fake,
+        )
+        return context, commit, fake
+
+    def test_unconfigured_reasons_are_named(self):
+        from conch.capitol.compiler.capture_email import (
+            email_capture_unconfigured_reason,
+        )
+
+        self.assertIn("capture_email_folder",
+                      email_capture_unconfigured_reason({}))
+        partial = dict(self.CONFIG, email_allowed_senders="")
+        self.assertIn("allowlist",
+                      email_capture_unconfigured_reason(partial))
+
+    def test_capture_allowlist_and_readonly(self):
+        context, _commit, fake = self.capture({
+            5: _raw_mail("ada@example.com", "Weekly invoice run",
+                         "Step 1: export ledger\nStep 2: mail it"),
+            6: _raw_mail("mallory@evil.example", "buy pills", "spam"),
+        })
+        self.assertTrue(fake.readonly)
+        self.assertIn("Weekly invoice run", context["block"])
+        self.assertNotIn("spam", context["block"])
+        self.assertEqual(context["provenance"]["messages"], 1)
+        self.assertEqual(context["provenance"]["skipped"], 1)
+        self.assertIn("invoice", context["default_goal"].lower())
+
+    def test_cursor_commits_only_on_success(self):
+        from conch.capitol.errors import CapitolError
+
+        messages = {
+            5: _raw_mail("ada@example.com", "Run A", "body a"),
+        }
+        context, commit, _fake = self.capture(messages)
+        # no commit yet → the same window re-reads
+        context2, commit2, _fake = self.capture(messages)
+        self.assertEqual(context2["provenance"]["uid_range"],
+                         context["provenance"]["uid_range"])
+        commit2()
+        # committed → nothing new
+        with self.assertRaises(CapitolError) as caught:
+            self.capture(messages)
+        self.assertIn("no new allowlisted mail", str(caught.exception))
+        # new mail after the cursor is picked up
+        messages[9] = _raw_mail("ada@example.com", "Run B", "body b")
+        context3, _commit, _fake = self.capture(messages)
+        self.assertIn("Run B", context3["block"])
+        self.assertNotIn("Run A", context3["block"])
+
+    def test_credential_in_body_rejects_whole(self):
+        with self.assertRaises(CredentialRejected):
+            self.capture({
+                5: _raw_mail("ada@example.com", "keys",
+                             f"the token is {FAKE_TOKEN}"),
+            })
+
+
+class TestHistoryCapture(CaptureCase):
+    def write_history(self, lines, name=".zsh_history"):
+        path = os.path.join(self._tmp.name, name)
+        with open(path, "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+        return path
+
+    def test_zsh_parse_collapse_and_drop(self):
+        from conch.capitol.compiler.capture import capture_from_history
+
+        path = self.write_history([
+            ": 1758500000:0;git pull",
+            ": 1758500001:0;git pull",
+            ": 1758500002:0;make deploy",
+            f": 1758500003:0;export GH_TOKEN={FAKE_TOKEN}",
+            ": 1758500004:0;kubectl rollout status deploy/api",
+        ])
+        context = capture_from_history(50, path=path)
+        block = context["block"]
+        self.assertEqual(block.count("git pull"), 1)  # collapsed
+        self.assertIn("make deploy", block)
+        self.assertIn("kubectl rollout", block)
+        self.assertNotIn(FAKE_TOKEN, block)
+        self.assertEqual(context["provenance"]["dropped"], 1)
+        self.assertIn("1 dropped", block)
+        self.assertEqual(context["default_goal"], "")
+
+    def test_plain_bash_format_and_missing_file(self):
+        from conch.capitol.compiler.capture import capture_from_history
+        from conch.capitol.errors import CapitolError
+
+        path = self.write_history(
+            ["git status", "docker build -t api ."],
+            name=".bash_history",
+        )
+        context = capture_from_history(50, path=path)
+        self.assertIn("docker build", context["block"])
+        with self.assertRaises(CapitolError):
+            capture_from_history(50, path="/nonexistent/hist")
+
+    def test_command_requires_explicit_goal(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            run_compile_command(
+                "from-history 50", {"capture_enabled": "true"},
+            )
+        self.assertIn("goal must be explicit",
+                      buffer.getvalue().replace("\n", " "))
 
 
 if __name__ == "__main__":

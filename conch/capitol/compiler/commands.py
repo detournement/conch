@@ -33,8 +33,10 @@ from ..packs.templates import clean_text
 USAGE = """
   \033[1;36m/compile — the ProcessCompiler (goal → reviewed card → governed process)\033[0m
     /compile "<goal>"              compile a goal into an Architecture Card
-    /compile from-mission <id> ["goal"]   draft a card from a mission's journal (Capture→Card)
-    /compile from-session [<conv-id>] ["goal"]   draft a card from a saved conversation
+    /compile from-mission <id> ["goal"]   draft a card from a mission's journal (capture)
+    /compile from-session [<conv-id>] ["goal"]   draft a card from a saved conversation (capture)
+    /compile from-email [--rescan] ["goal"]   draft a card from the capture mailbox (capture)
+    /compile from-history [N] "goal"      draft a card from recent shell history (capture)
     /compile list                  list compilations
     /compile show <id> [vN|--diff] render a card (or diff the last two versions)
     /compile approve <id>          approve the current card version (authorizes materialization)
@@ -131,6 +133,49 @@ def _cmd_from_mission(tokens: List[str], config: dict):
     finally:
         store.close()
     goal = " ".join(tokens[1:]).strip().strip("\"'")
+    _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
+           "card …\033[0m")
+    card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
+
+
+def _cmd_from_email(tokens: List[str], config: dict):
+    from .capture import compile_from_capture
+    from .capture_email import capture_from_email, reset_cursor
+
+    tokens = list(tokens)
+    if tokens and tokens[0] == "--rescan":
+        tokens.pop(0)
+        folder = str(config.get("capture_email_folder") or "").strip()
+        if folder:
+            reset_cursor(folder)
+            _print(f"\n  \033[2mcursor reset for {folder!r} — "
+                   "re-reading the folder.\033[0m")
+    context, commit = capture_from_email(config)
+    goal = " ".join(tokens).strip().strip("\"'")
+    _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
+           "card …\033[0m")
+    card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
+    # Advance the UID cursor only now that the compilation is stored —
+    # a failed synthesis re-reads the same window on retry.
+    commit()
+
+
+def _cmd_from_history(tokens: List[str], config: dict):
+    from .capture import capture_from_history, compile_from_capture
+
+    tokens = list(tokens)
+    limit = 200
+    if tokens and tokens[0].isdigit():
+        limit = int(tokens.pop(0))
+    goal = " ".join(tokens).strip().strip("\"'")
+    if not goal:
+        _print("\n  \033[2mUsage: /compile from-history [N] \"<goal>\""
+               " — raw history is heterogeneous, so the goal must be"
+               " explicit.\033[0m\n")
+        return
+    context = capture_from_history(limit)
     _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
            "card …\033[0m")
     card, provenance = compile_from_capture(config, context, goal=goal)
@@ -411,19 +456,39 @@ def run_compile_command(arg: str, config: dict, *,
         _print(f"\n  \033[31mInvalid arguments: {exc}\033[0m\n")
         return
     sub = tokens[0].lower()
+    capture_verbs = {"from-mission", "from-session", "from-email",
+                     "from-history"}
     known = {"list", "show", "approve", "reject", "revise",
-             "materialize", "rollback", "status",
-             "from-mission", "from-session"}
+             "materialize", "rollback", "status"} | capture_verbs
     try:
         if sub not in known:
             # The whole argument is the goal ("/compile \"<goal>\"").
             _cmd_compile(arg.strip("\"'"), config)
             return
+        if sub in capture_verbs:
+            # Capture is a discrete installed component: nothing
+            # capture-related runs until /install capture enables it.
+            from ...config import get_bool
+
+            if not get_bool(config, "capture_enabled", False):
+                _print(
+                    "\n  \033[33mCapture is not installed.\033[0m "
+                    "\033[2m/install capture enables capture→card "
+                    "drafting (sessions, missions, email, shell "
+                    "history).\033[0m\n"
+                )
+                return
         if sub == "from-mission":
             _cmd_from_mission(tokens[1:], config)
             return
         if sub == "from-session":
             _cmd_from_session(tokens[1:], config)
+            return
+        if sub == "from-email":
+            _cmd_from_email(tokens[1:], config)
+            return
+        if sub == "from-history":
+            _cmd_from_history(tokens[1:], config)
             return
         store = _store()
         try:

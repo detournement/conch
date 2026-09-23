@@ -249,6 +249,115 @@ def compile_from_capture(config: dict, context: Dict[str, Any], *,
     return card, provenance
 
 
+# ---------------------------------------------------------------------------
+# Shell-history source (system capture, alongside missions/sessions)
+# ---------------------------------------------------------------------------
+
+_ZSH_ENTRY = None  # compiled lazily
+
+
+def _history_lines(path) -> List[str]:
+    """Commands from a zsh (extended or plain) or bash history file, in
+    order. Zsh extended entries (``: <ts>:<dur>;cmd``) may span lines;
+    a new entry starts with the timestamp prefix."""
+    import re
+
+    global _ZSH_ENTRY
+    if _ZSH_ENTRY is None:
+        _ZSH_ENTRY = re.compile(r"^: \d+:\d+;")
+    try:
+        raw = path.read_text(errors="replace")
+    except OSError as exc:
+        raise CapitolError(f"history capture: cannot read {path}: {exc}")
+    commands: List[str] = []
+    for line in raw.splitlines():
+        if _ZSH_ENTRY.match(line):
+            commands.append(line.split(";", 1)[1])
+        elif commands and line.endswith("\\"):
+            commands[-1] += " " + line.rstrip("\\").strip()
+        elif line.strip() and not line.startswith("#"):
+            commands.append(line)
+    return [command.strip() for command in commands if command.strip()]
+
+
+def capture_from_history(limit: int = 200, *,
+                         path: Optional[str] = None) -> Dict[str, Any]:
+    """Capture context from the user's shell history (the second system
+    source next to journaled sessions/missions).
+
+    History routinely contains credential-bearing one-liners, so the
+    discipline here deliberately differs from journal capture:
+    credential-shaped LINES are dropped and counted — disclosed in the
+    block and the provenance, never silently sanitized inside a line —
+    and the assembled block is then guarded whole as a second net. A
+    journal or capture mailbox is curated input where a credential is an
+    anomaly (reject whole); raw history is not, and rejecting it whole
+    would make the source useless in practice.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    if path:
+        source = _Path(path).expanduser()
+        if not source.exists():
+            raise CapitolError(f"history capture: {source} not found")
+    else:
+        home = _Path(_os.path.expanduser("~"))
+        candidates = [home / ".zsh_history", home / ".bash_history"]
+        source = next((p for p in candidates if p.exists()), None)
+        if source is None:
+            raise CapitolError(
+                "history capture: no ~/.zsh_history or ~/.bash_history"
+            )
+    limit = max(10, min(int(limit or 200), 1000))
+    commands = _history_lines(source)
+    # collapse immediate repeats, keep the tail
+    collapsed: List[str] = []
+    for command in commands:
+        if not collapsed or collapsed[-1] != command:
+            collapsed.append(command)
+    window = collapsed[-limit:]
+    kept: List[str] = []
+    dropped = 0
+    for command in window:
+        if credential_findings(command):
+            dropped += 1
+            continue
+        kept.append(_clip(command, 200))
+    if not kept:
+        raise CapitolError(
+            "history capture: nothing capturable in the window"
+            + (f" ({dropped} credential-shaped line(s) dropped)"
+               if dropped else "")
+        )
+    lines = [
+        f"Shell history capture — {source.name}, last {len(window)} "
+        f"command(s)"
+        + (f", {dropped} dropped (credential-shaped, disclosed here "
+           "by count only)" if dropped else "") + ":",
+    ] + [f"  {command}" for command in kept]
+    block = "\n".join(lines)
+    if len(block) > CAPTURE_BLOCK_CAP:
+        block = block[: CAPTURE_BLOCK_CAP - 15] + "\n... [clipped]"
+    block = guard_capture_text(block)
+    return {
+        "kind": "history",
+        "source_id": source.name,
+        "label": f"shell history ({source.name}, "
+                 f"{len(kept)} command(s))",
+        # No derivable goal: raw history is heterogeneous, so the goal
+        # must be explicit — compile_from_capture enforces it.
+        "default_goal": "",
+        "block": block,
+        "provenance": {
+            "kind": "history",
+            "source": source.name,
+            "commands": len(kept),
+            "dropped": dropped,
+        },
+    }
+
+
 def capture_provenance_line(capture: Optional[Dict[str, Any]]) -> str:
     """One rendered status line for /compile status (empty when the
     compilation was not capture-sourced)."""
@@ -263,6 +372,15 @@ def capture_provenance_line(capture: Optional[Dict[str, Any]]) -> str:
     if kind == "session":
         return (f"captured from session {source} "
                 f"({capture.get('message_count', 0)} messages)")
+    if kind == "email":
+        span = capture.get("uid_range") or [0, 0]
+        return (f"captured from email folder {source!r} "
+                f"({capture.get('messages', 0)} message(s), "
+                f"UIDs {span[0]}–{span[1]})")
+    if kind == "history":
+        return (f"captured from shell history {source} "
+                f"({capture.get('commands', 0)} command(s), "
+                f"{capture.get('dropped', 0)} dropped)")
     if kind == "scribe":
         return f"captured from Scribe guide {source}"
     return f"captured from {kind} {source}"

@@ -14,14 +14,17 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from conch.swarm.protocol import (
+    FailureClass,
     ProtocolError,
     RpcRequest,
     RpcResponse,
     TaskEnvelope,
     new_id,
 )
+from conch.fleet.worker import RUNNING, WAITING_CHILD, WorkerSupervisor
 
 from tests.fleet_fakes import (
     FakeSSHWorkerTransport,
@@ -405,6 +408,83 @@ class TestEventSpoolAndAck(WorkerCase):
 
 
 class TestBrokeredDelegationParking(WorkerCase):
+    def test_resume_before_reaper_is_retried_and_idempotent(self):
+        """The delegation event may beat the reaper's WAITING_CHILD state.
+
+        A premature resume must not be acknowledged as a duplicate. Once
+        accepted, however, redelivery must remain effectively-once even if a
+        later delegation has replaced the current resume-state file.
+        """
+        supervisor = WorkerSupervisor(self.home, config={"name": "worker"})
+        self.addCleanup(supervisor.close)
+        envelope = make_envelope(tools=("delegate_task",))
+        offer = supervisor.handle_request(RpcRequest(
+            rpc_id=new_id("rpc"), op="task.offer",
+            args={"envelope": envelope.to_dict(), "attempt": 1,
+                  "fence": 1, "controller_epoch": 1},
+        ))
+        self.assertTrue(offer.ok)
+        supervisor._set_state(envelope.task_id, RUNNING, pid=0)
+        resume_path = supervisor._resume_path(envelope.task_id, 1)
+        resume_path.write_text(json.dumps({
+            "messages": [],
+            "tool_call_id": "delegation-1",
+            "arguments": {"task": "research the thing"},
+        }))
+
+        def resume(result_text="the child found 42"):
+            return supervisor.handle_request(RpcRequest(
+                rpc_id=new_id("rpc"), op="task.resume",
+                args={"task_id": envelope.task_id, "attempt": 1,
+                      "fence": 1, "tool_call_id": "delegation-1",
+                      "result_text": result_text},
+            ))
+
+        premature = resume()
+        self.assertFalse(premature.ok)
+        self.assertEqual(premature.error_class, FailureClass.TRANSIENT)
+        self.assertEqual(
+            supervisor._row(envelope.task_id)["state"], RUNNING
+        )
+
+        supervisor._set_state(envelope.task_id, WAITING_CHILD, pid=0)
+        spawn_count = 0
+
+        def fake_spawn(task_id, row, resume=False):
+            nonlocal spawn_count
+            self.assertTrue(resume)
+            spawn_count += 1
+            supervisor._set_state(task_id, RUNNING, pid=0)
+
+        with patch.object(supervisor, "_spawn", side_effect=fake_spawn):
+            accepted = resume()
+            duplicate = resume()
+            self.assertTrue(accepted.ok)
+            self.assertFalse(accepted.result["duplicate"])
+            self.assertTrue(duplicate.ok)
+            self.assertTrue(duplicate.result["duplicate"])
+            self.assertEqual(spawn_count, 1)
+
+            # A second delegation may park before a lost response to the
+            # first resume is retried. The acceptance journal, not the one
+            # mutable resume file, proves the old resume already happened.
+            supervisor._set_state(
+                envelope.task_id, WAITING_CHILD, pid=0
+            )
+            resume_path.write_text(json.dumps({
+                "messages": [],
+                "tool_call_id": "delegation-2",
+                "arguments": {"task": "another thing"},
+            }))
+            delayed_duplicate = resume()
+            self.assertTrue(delayed_duplicate.ok)
+            self.assertTrue(delayed_duplicate.result["duplicate"])
+            self.assertEqual(spawn_count, 1)
+
+            conflict = resume("a conflicting child result")
+            self.assertFalse(conflict.ok)
+            self.assertEqual(conflict.error_class, FailureClass.POLICY)
+
     def test_delegate_parks_waiting_child_then_resumes(self):
         self.home.mkdir(parents=True, exist_ok=True)
         # First segment: model calls delegate_task. After resume: it sees

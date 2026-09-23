@@ -301,6 +301,22 @@ def make_builtin_clients(
         client = provider.build_session_client(config)
         if client is not None:
             clients[name] = client
+    backend_kind = str(config.get("exec_backend") or "").strip().lower()
+    if backend_kind and backend_kind != "local":
+        # Startup default for the sandbox exec backend (/sandbox flips it
+        # per session). Construction only validates config (docker on
+        # PATH, API key env present); the sandbox itself starts lazily on
+        # the first command. Fail soft: a broken backend config degrades
+        # to local execution with a visible warning, never a dead shell.
+        from .execbackend import SandboxError, build_exec_backend
+
+        try:
+            backend = build_exec_backend(backend_kind, config)
+        except SandboxError as exc:
+            print(f"  \033[33m\u26a0 exec_backend disabled: {exc}\033[0m")
+            backend = None
+        if backend is not None:
+            local_shell.set_exec_backend(backend)
     if str(config.get("llamaidx_url") or "").strip():
         # The llama-idx registry as a chat-queryable data source (fleet
         # status + selectable models). Read-only against the registry;

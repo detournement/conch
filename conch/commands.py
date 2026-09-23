@@ -106,6 +106,8 @@ SLASH_COMMANDS = [
     ("/ssh <action>", "Connect, execute, open a shell, show status, or disconnect"),
     ("/verbose", "Toggle showing tool args and results"),
     ("/tks [on|off]", "Toggle the per-message token stats line (tokens, cost, tok/s)"),
+    ("/sandbox [docker [image]|e2b|off]",
+     "Run approved shell commands in a sandbox instead of locally"),
     ("/schedule <interval> <prompt>", "Schedule a recurring task"),
     ("/tasks", "List scheduled tasks"),
     ("/cancel <id>", "Cancel a scheduled task"),
@@ -1219,6 +1221,7 @@ def handle_slash_command(
             "  \033[1m/ssh status|disconnect\033[0m  Inspect or close the active connection\n"
             "  \033[1m/verbose\033[0m             Toggle showing tool args + output\n"
             "  \033[1m/tks [on|off]\033[0m        Toggle the per-message token stats line (tok/s)\n"
+            "  \033[1m/sandbox [docker|e2b|off]\033[0m Run approved commands in a sandbox, not locally\n"
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
             "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
@@ -1379,6 +1382,53 @@ def handle_slash_command(
         print(f"\n  Token stats after each message: {state}"
               "  \033[2m(this session; persist with show_token_stats"
               " in the config file)\033[0m\n")
+        return None
+
+    if command == "/sandbox":
+        shell_client = (tool_map or {}).get("local_shell")
+        if shell_client is None or not hasattr(shell_client, "set_exec_backend"):
+            print("\n  \033[33mNo local shell client in this session.\033[0m\n")
+            return None
+        parts = arg.split()
+        choice = parts[0].lower() if parts else ""
+        if not choice:
+            backend = shell_client.exec_backend()
+            if backend is None:
+                print("\n  Exec backend: \033[1mlocal\033[0m"
+                      "  \033[2m(/sandbox docker [image] | e2b to sandbox;"
+                      " persist with exec_backend in config)\033[0m\n")
+            else:
+                print(f"\n  Exec backend: \033[1m{backend.describe()}\033[0m"
+                      "  \033[2m(/sandbox off to return to local)\033[0m\n")
+            return None
+        if choice in ("off", "local"):
+            shell_client.set_exec_backend(None)
+            print("\n  Exec backend: \033[1mlocal\033[0m"
+                  "  \033[2m(sandbox closed)\033[0m\n")
+            return None
+        from .execbackend import SandboxError, build_exec_backend
+
+        kwargs = {}
+        if choice == "docker" and len(parts) > 1:
+            kwargs["image"] = parts[1]
+        try:
+            import os as _os
+            backend = build_exec_backend(
+                choice, config, cwd=_os.getcwd(), **kwargs
+            )
+        except SandboxError as exc:
+            print(f"\n  \033[31m\u2717 {exc}\033[0m\n")
+            return None
+        except TypeError:
+            print(f"\n  \033[31m\u2717 {choice} does not take an image"
+                  " argument\033[0m\n")
+            return None
+        shell_client.set_exec_backend(backend)
+        print(f"\n  Exec backend: \033[1m{backend.describe()}\033[0m\n"
+              "  \033[2mApproved commands now run in the sandbox; the"
+              " permission prompts are unchanged. Host environment"
+              " variables are never forwarded. /sandbox off returns to"
+              " local.\033[0m\n")
         return None
 
     if command in ("/search", "/s", "/find", "/grep") and conv_mgr is not None:

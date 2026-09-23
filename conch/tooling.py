@@ -668,6 +668,11 @@ class LocalShellClient:
         self._result_budget = self.DEFAULT_RESULT_BUDGET
         self._permissions = permissions
         self._cwd: Optional[str] = None
+        # Optional execution backend (conch/execbackend.py): when set,
+        # approved commands run in the sandbox instead of the local
+        # machine. Approval/permission logic above is deliberately
+        # backend-blind — the sandbox changes where, never whether.
+        self._exec_backend = None
 
     def bind_permissions(self, permissions: Optional[PermissionState]):
         """Adopt a session's permission state (None = process default)."""
@@ -817,8 +822,45 @@ class LocalShellClient:
             output = truncate_middle(output, self._result_budget)
         return self._text(output)
 
+    def set_exec_backend(self, backend) -> None:
+        """Route approved commands through a sandbox backend (None = local).
+        Closes the previous backend's sandbox when swapping."""
+        old, self._exec_backend = self._exec_backend, backend
+        if old is not None and old is not backend:
+            try:
+                old.close()
+            except Exception:
+                pass
+
+    def exec_backend(self):
+        return self._exec_backend
+
     def _run_command(self, cmd: str, timeout: int) -> dict:
-        return self._run_process(cmd, timeout, shell=True)
+        backend = self._exec_backend
+        if backend is None:
+            return self._run_process(cmd, timeout, shell=True)
+        from .execbackend import SandboxError
+        try:
+            argv = backend.wrap_argv(cmd)
+        except SandboxError as exc:
+            return self._text(f"Sandbox unavailable: {exc}")
+        if argv is not None:
+            # docker path: exec argv streams through the normal PTY
+            # capture, so live output and budgets behave exactly as local.
+            return self._run_process(argv, timeout, shell=False)
+        try:
+            output, returncode = backend.run(cmd, timeout)
+        except SandboxError as exc:
+            return self._text(f"Sandbox error: {exc}")
+        output = (output or "").strip()
+        if not output:
+            output = f"(no output, exit code {returncode})"
+        elif returncode != 0:
+            output += f"\n(exit code {returncode})"
+        if len(output) > self._result_budget:
+            from .runtime import truncate_middle
+            output = truncate_middle(output, self._result_budget)
+        return self._text(output)
 
     def _run_argv(self, argv: List[str], timeout: int) -> dict:
         return self._run_process(list(argv), timeout, shell=False)
@@ -831,7 +873,11 @@ class LocalShellClient:
 
         from .render import clear_active_spinners
         clear_active_spinners()
-        print(f"\n  \033[1;33m\u26a0 Run locally:\033[0m \033[1m{cmd}\033[0m", flush=True)
+        if self._exec_backend is not None:
+            where = f"Run in {self._exec_backend.kind} sandbox:"
+        else:
+            where = "Run locally:"
+        print(f"\n  \033[1;33m\u26a0 {where}\033[0m \033[1m{cmd}\033[0m", flush=True)
 
         destructive = is_destructive_command(cmd)
         mode = self.permissions().get_permission_mode()

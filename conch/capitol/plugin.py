@@ -251,6 +251,74 @@ register_component(Component(
     _component_status, _component_setup,
 ))
 
+
+# ---------------------------------------------------------------------------
+# Component: /install capture (capture → cards/plans/workflows).
+# ---------------------------------------------------------------------------
+
+def _capture_enabled(config: dict) -> bool:
+    from ..config import get_bool
+
+    return get_bool(config, "capture_enabled", False)
+
+
+def _capture_status(config: dict) -> str:
+    if not _capture_enabled(config):
+        return ("disabled — /install capture enables capture→card"
+                " drafting")
+    sources = ["sessions", "missions", "shell history"]
+    if str(config.get("capture_email_folder") or "").strip():
+        sources.append(
+            f"email ({config['capture_email_folder']})"
+        )
+    return "enabled — sources: " + ", ".join(sources)
+
+
+def _capture_setup(config: dict) -> None:
+    from ..config import set_config_values
+
+    print(
+        "\n  \033[1mCapture\033[0m — turn work that already happened"
+        " into governed processes:\n  journaled sessions and missions"
+        " (and optionally a designated email\n  folder or your shell"
+        " history) become draft Architecture Cards for\n  /compile"
+        " review; approved cards materialize into workflows. Capture\n"
+        "  never approves or provisions anything itself."
+    )
+    updates = {"capture_enabled": "true"}
+    if str(config.get("email_imap_host") or "").strip():
+        current = str(config.get("capture_email_folder") or "").strip()
+        prompt = ("IMAP capture folder (Enter to "
+                  + (f"keep {current!r}" if current else "skip email"
+                     " capture") + "): ")
+        try:
+            folder = input(f"  {prompt}").strip()
+        except (EOFError, KeyboardInterrupt):
+            folder = ""
+            print()
+        if folder:
+            updates["capture_email_folder"] = folder
+    path = set_config_values(updates)
+    config.update(updates)
+    print(
+        f"\n  \033[1;32m✓ Capture enabled.\033[0m \033[2m({path})\033[0m"
+        " \033[2mTry /compile from-session, /compile from-mission <id>,"
+        " /compile from-history N \"goal\""
+        + (", or /compile from-email"
+           if updates.get("capture_email_folder")
+           or str(config.get("capture_email_folder") or "").strip()
+           else "")
+        + ".\033[0m\n"
+    )
+
+
+register_component(Component(
+    "capture", "Capture",
+    "capture→card drafting: sessions, missions, email, and shell"
+    " history become /compile drafts",
+    _capture_status, _capture_setup,
+))
+
 register_session_tool_provider(
     "capitol_control", CapitolSessionToolProvider()
 )

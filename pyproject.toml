@@ -39,7 +39,7 @@ conch-edge = "conch.entrypoints:edge_main"
 conch-worker = "conch.entrypoints:worker_main"
 conch-hostctl = "conch.entrypoints:hostctl_main"
 # Browser-capture satellite: the native messaging host Chrome launches
-# (satellites/browser-capture). Gated on capture_enabled+capture_browser.
+# (conch/satellites/browser_capture). Gated on capture_enabled+capture_browser.
 conch-capture-host = "conch.entrypoints:capture_host_main"
 
 [project.urls]
@@ -54,6 +54,13 @@ where = ["."]
 include = ["conch*"]
 
 [tool.setuptools.package-data]
+# Browser-capture satellite: the MV3 extension's static files ship as
+# package data so pip/uv/pipx installs carry them (/install capture
+# browser copies them to a stable user-data dir for load-unpacked).
+"conch.satellites.browser_capture" = [
+    "extension/*",
+    "README.md",
+]
 # Flow packs shipped with conch (declarative Capitol use cases; the
 # manifests are data the pack engine validates and executes).
 "conch.capitol.packs" = [

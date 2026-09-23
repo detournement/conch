@@ -579,10 +579,14 @@ rendered by `/compile status`:
   was offered), the OAuth access token rides by env reference
   (`scribe_token_env`), and an unset `scribe_mcp_url` means the source
   is absent.
-- **Browser capture.** `/install capture browser` sets up the satellite
-  Chrome extension (`satellites/browser-capture/`, in the repo, not the
-  wheel) and its native messaging host (`conch-capture-host`, stdio —
-  no listening ports). The extension records DOM interaction on
+- **Browser capture** *(Chrome on macOS first; Linux paths supported,
+  Firefox a follow-up)*. `/install capture browser` sets up the
+  satellite Chrome extension (`conch/satellites/browser_capture/`,
+  shipped as package data and copied to a stable
+  `~/.local/share/conch/browser-capture/extension` for load-unpacked)
+  and its native messaging host (`conch-capture-host`, stdio — no
+  listening ports, launched via a generated `/bin/sh` shim that
+  survives uv/pipx/venv reinstalls and paths with spaces). The extension records DOM interaction on
   **explicitly allowlisted origins only** (no `<all_urls>`; nothing is
   captured until you add an origin in its options page): navigation
   paths, semantic click targets (role/label, never coordinates), form
@@ -597,8 +601,8 @@ rendered by `/compile status`:
   drafts a card from them, and the recurrence mining below sees
   normalized browser steps too. All local; no cloud anywhere. Gated on
   `capture_enabled` + `capture_browser`. Firefox: follow-up. See
-  `satellites/browser-capture/README.md` for the full privacy contract
-  and a manual test checklist.
+  `conch/satellites/browser_capture/README.md` for the full privacy
+  contract and a manual test checklist.
 - **Recurrence mining.** `/compile suggestions` is computed, never
   model-ranked: normalized step sequences (options and paths collapsed;
   browser events as `web:<host>:<action>` shapes when browser capture

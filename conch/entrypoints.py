@@ -217,10 +217,12 @@ def capture_host_main(argv: Optional[List[str]] = None) -> int:
 
     if argv and argv[0] == "install":
         try:
+            extension_path = browser_capture.install_extension_files()
             outcome = browser_capture.install_native_host()
         except browser_capture.BrowserEventRejected as exc:
             print(f"conch-capture-host: {exc}", file=sys.stderr)
             return 1
+        print(f"extension {extension_path}")
         for browser, path in sorted(outcome["written"].items()):
             print(f"written  {browser:<9} {path}")
         for browser in outcome["skipped"]:

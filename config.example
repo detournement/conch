@@ -469,7 +469,7 @@ api_key_env=ANTHROPIC_API_KEY
 #scribe_mcp_url=https://mcp.scribe.com/mcp
 #scribe_token_env=SCRIBE_MCP_TOKEN
 # Browser capture satellite (/install capture browser): the Chrome MV3
-# extension in satellites/browser-capture + the conch-capture-host
+# extension in conch/satellites/browser_capture + the conch-capture-host
 # native messaging host. Captures DOM interaction (semantic clicks,
 # navigation paths, form-submit field NAMES, copy events without
 # content) on origins explicitly allowlisted in the extension options —

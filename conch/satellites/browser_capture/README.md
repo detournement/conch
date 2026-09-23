@@ -6,8 +6,14 @@ browser work into capture events for the local Conch kernel — so
 times — compile it?" and `/compile from-browser` can draft a card from
 what you actually did.
 
-This directory ships **in the repo, not in the wheel**: plain JS, no
-node_modules, no bundler, no build step. Load it unpacked.
+The extension is plain JS — no node_modules, no bundler, no build step —
+and ships **inside the conch-shell distribution** as package data
+(`conch/satellites/browser_capture/extension`). `/install capture
+browser` copies it to a stable per-user location
+(`~/.local/share/conch/browser-capture/extension`, honoring
+`XDG_DATA_HOME`) so the browser's load-unpacked reference survives pip
+upgrades and venv reinstalls; re-run the install step after upgrading
+conch to refresh the copy.
 
 ## What is captured — and what is never captured
 
@@ -59,19 +65,24 @@ The action badge shows the live state: **ON** (capturing), **OFF**
 (no origins, host down, or capture disabled), **II** (paused). Click
 the toolbar icon to pause/resume.
 
-## Setup
+## Setup (Chrome on macOS is the proven path; Linux paths ship too)
 
-1. In the conch shell: `/install capture browser` — writes the
+1. In the conch shell: `/install capture browser` — copies the
+   extension to the stable per-user directory, writes the
    NativeMessagingHosts manifest for installed Chromium-family browsers
-   (Chrome, Chromium, Brave, Edge on macOS and Linux) and enables the
-   config gates. Firefox is a documented follow-up.
-2. `chrome://extensions` → Developer mode → **Load unpacked** → pick
-   this `extension/` directory. The id must read
+   (Chrome required; Brave/Chromium/Edge covered on macOS and Linux),
+   generates the `/bin/sh` host launcher (space-safe, reinstall-proof),
+   and enables the config gates. Firefox is a documented follow-up.
+2. The one gesture conch cannot do for you — Chrome never allows
+   silent extension installs: `chrome://extensions` → Developer mode →
+   **Load unpacked** → pick the printed path
+   (`~/.local/share/conch/browser-capture/extension`). The id must read
    `hgmjnpkpdnaeekckabogikdcpdfeeghh` (pinned by the manifest `key`; the
    matching private key was generated and discarded — the public key
    only pins the unpacked id and cannot sign anything).
-3. Open the extension options, add an origin (e.g. `https://github.com`),
-   grant the permission prompt.
+3. Open the extension options, add an origin (e.g. `https://github.com`)
+   and approve the per-origin permission prompt — the second
+   user-consent gesture, also never silent.
 4. Verify: `/install` in conch shows the capture line with the last
    handshake, or run `conch-capture-host status`.
 

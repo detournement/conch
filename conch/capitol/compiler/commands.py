@@ -37,6 +37,8 @@ USAGE = """
     /compile from-session [<conv-id>] ["goal"]   draft a card from a saved conversation (capture)
     /compile from-email [--rescan] ["goal"]   draft a card from the capture mailbox (capture)
     /compile from-history [N] "goal"      draft a card from recent shell history (capture)
+    /compile suggestions [--days D] [--min N]   recurring work shapes worth compiling
+    /compile from-suggestion <#> ["goal"]  draft a card from a mined recurrence
     /compile list                  list compilations
     /compile show <id> [vN|--diff] render a card (or diff the last two versions)
     /compile approve <id>          approve the current card version (authorizes materialization)
@@ -176,6 +178,193 @@ def _cmd_from_history(tokens: List[str], config: dict):
                " explicit.\033[0m\n")
         return
     context = capture_from_history(limit)
+    _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
+           "card …\033[0m")
+    card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
+
+
+# /compile suggestions: deterministic recurrence mining (capture
+# feature 2). The cache lets from-suggestion pick by number within the
+# process; suggestions themselves are recomputed reproducibly.
+_SUGGESTION_CACHE: Dict[str, Any] = {}
+
+_SCAN_CONVERSATIONS = 200
+_SCAN_MISSIONS = 100
+_MISSION_EVENT_CAP = 400
+
+
+def _gather_pattern_sources(config: dict) -> List[Dict[str, Any]]:
+    import time as _time
+
+    from ...conversations import ConversationManager
+    from ...kernel.patterns import (
+        paired_steps_from_messages,
+        parse_window_days,
+        steps_from_mission_events,
+    )
+
+    window_days = parse_window_days(config)
+    horizon = _time.time() - window_days * 86400
+    sources: List[Dict[str, Any]] = []
+    manager = ConversationManager()
+    try:
+        rows = manager.list_all()[:_SCAN_CONVERSATIONS]
+        for row in rows:
+            updated = str(row.get("updated_at") or "")
+            try:
+                import datetime
+
+                stamp = datetime.datetime.fromisoformat(
+                    updated
+                ).timestamp()
+            except (TypeError, ValueError):
+                stamp = 0.0
+            if stamp and stamp < horizon:
+                continue
+            conversation = manager.load(str(row.get("id") or ""))
+            if conversation is None:
+                continue
+            pairs = paired_steps_from_messages(conversation.messages)
+            if len(pairs) >= 3:
+                sources.append({
+                    "id": conversation.id, "kind": "session",
+                    "steps": [pair[0] for pair in pairs],
+                    "raw": [pair[1] for pair in pairs],
+                })
+    finally:
+        manager.close()
+    store = _store()
+    try:
+        for mission in store.list_missions()[:_SCAN_MISSIONS]:
+            mid = mission["mission_id"]
+            events = store.events_since(
+                mid, 0, kinds=("action_recorded",),
+                limit=_MISSION_EVENT_CAP,
+            )
+            steps = steps_from_mission_events(events)
+            if len(steps) >= 3:
+                sources.append({
+                    "id": mid, "kind": "mission",
+                    "steps": steps, "raw": list(steps),
+                })
+    finally:
+        store.close()
+    return sources
+
+
+def _cmd_suggestions(tokens: List[str], config: dict):
+    from ...kernel.patterns import (
+        mine_sequences,
+        parse_min_count,
+        parse_window_days,
+    )
+
+    tokens = list(tokens)
+    overrides = dict(config)
+    while tokens:
+        if tokens[0] == "--days" and len(tokens) > 1:
+            overrides["compile_suggest_window_days"] = tokens[1]
+            tokens = tokens[2:]
+        elif tokens[0] == "--min" and len(tokens) > 1:
+            overrides["compile_suggest_min_count"] = tokens[1]
+            tokens = tokens[2:]
+        else:
+            tokens = tokens[1:]
+    sources = _gather_pattern_sources(overrides)
+    suggestions = mine_sequences(
+        sources, min_count=parse_min_count(overrides),
+    )
+    _SUGGESTION_CACHE.clear()
+    _SUGGESTION_CACHE.update({
+        "suggestions": suggestions,
+        "sources": {source["id"]: source for source in sources},
+    })
+    window_days = parse_window_days(overrides)
+    if not suggestions:
+        _print(
+            f"\n  \033[2mNo recurring shapes found in the last "
+            f"{window_days} day(s) (min count "
+            f"{parse_min_count(overrides)}). Tune with /compile "
+            "suggestions --days D --min N.\033[0m\n"
+        )
+        return
+    _print(f"\n  \033[1;36mRecurring shapes (last {window_days} "
+           f"day(s)):\033[0m")
+    for index, suggestion in enumerate(suggestions, start=1):
+        _print(f"    \033[1m#{index}\033[0m {suggestion['why']}")
+        _print("      \033[2m" + " → ".join(suggestion["steps"])
+               + f"  [{suggestion['signature']}]\033[0m")
+    _print(
+        "  \033[2mcompile one: /compile from-suggestion <#> "
+        "[\"goal\"]\033[0m\n"
+    )
+
+
+def _cmd_from_suggestion(tokens: List[str], config: dict):
+    from ...kernel.patterns import occurrences_in_steps
+    from .capture import compile_from_capture
+
+    suggestions = _SUGGESTION_CACHE.get("suggestions") or []
+    if not tokens or not tokens[0].lstrip("#").isdigit():
+        _print("\n  \033[2mUsage: /compile from-suggestion <#> "
+               "[\"goal\"] (run /compile suggestions first)\033[0m\n")
+        return
+    index = int(tokens[0].lstrip("#"))
+    if not suggestions or index < 1 or index > len(suggestions):
+        _print("\n  \033[31mNo suggestion #{0} — run /compile "
+               "suggestions first.\033[0m\n".format(index))
+        return
+    suggestion = suggestions[index - 1]
+    sources = _SUGGESTION_CACHE.get("sources") or {}
+    lines = [
+        f"Recurring pattern [{suggestion['signature']}]: "
+        + " → ".join(suggestion["steps"]),
+        suggestion["why"],
+        "Sample occurrences (raw commands, evidence only):",
+    ]
+    shown = 0
+    for source_id in suggestion["sources"]:
+        source = sources.get(source_id)
+        if source is None or shown >= 3:
+            continue
+        starts = occurrences_in_steps(
+            source["steps"], suggestion["steps"]
+        )
+        if not starts:
+            continue
+        start = starts[0]
+        lines.append(f"  from {source['kind']} {source_id}:")
+        for raw in source["raw"][start:start + len(
+                suggestion["steps"])]:
+            lines.append(f"    {raw}")
+        shown += 1
+    from .capture import CAPTURE_BLOCK_CAP, guard_capture_text
+
+    block = "\n".join(lines)
+    if len(block) > CAPTURE_BLOCK_CAP:
+        block = block[: CAPTURE_BLOCK_CAP - 15] + "\n... [clipped]"
+    block = guard_capture_text(block)
+    context = {
+        "kind": "pattern",
+        "source_id": suggestion["signature"],
+        "label": f"recurring pattern {suggestion['signature']} "
+                 f"({suggestion['count']} occurrence(s))",
+        "default_goal": (
+            f"Automate the recurring {len(suggestion['steps'])}-step "
+            f"procedure {suggestion['steps'][0]} → "
+            f"{suggestion['steps'][-1]}"
+        ),
+        "block": block,
+        "provenance": {
+            "kind": "pattern",
+            "source": suggestion["signature"],
+            "count": suggestion["count"],
+            "sessions": len(suggestion["sources"]),
+            "steps": suggestion["steps"],
+        },
+    }
+    goal = " ".join(tokens[1:]).strip().strip("\"'")
     _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
            "card …\033[0m")
     card, provenance = compile_from_capture(config, context, goal=goal)
@@ -457,7 +646,7 @@ def run_compile_command(arg: str, config: dict, *,
         return
     sub = tokens[0].lower()
     capture_verbs = {"from-mission", "from-session", "from-email",
-                     "from-history"}
+                     "from-history", "suggestions", "from-suggestion"}
     known = {"list", "show", "approve", "reject", "revise",
              "materialize", "rollback", "status"} | capture_verbs
     try:
@@ -489,6 +678,12 @@ def run_compile_command(arg: str, config: dict, *,
             return
         if sub == "from-history":
             _cmd_from_history(tokens[1:], config)
+            return
+        if sub == "suggestions":
+            _cmd_suggestions(tokens[1:], config)
+            return
+        if sub == "from-suggestion":
+            _cmd_from_suggestion(tokens[1:], config)
             return
         store = _store()
         try:

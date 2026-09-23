@@ -381,6 +381,10 @@ def capture_provenance_line(capture: Optional[Dict[str, Any]]) -> str:
         return (f"captured from shell history {source} "
                 f"({capture.get('commands', 0)} command(s), "
                 f"{capture.get('dropped', 0)} dropped)")
+    if kind == "pattern":
+        return (f"captured from recurring pattern {source} "
+                f"({capture.get('count', 0)} occurrence(s) across "
+                f"{capture.get('sessions', 0)} source(s))")
     if kind == "scribe":
         return f"captured from Scribe guide {source}"
     return f"captured from {kind} {source}"

@@ -468,6 +468,19 @@ api_key_env=ANTHROPIC_API_KEY
 # Unset URL = the source is absent (zero traffic).
 #scribe_mcp_url=https://mcp.scribe.com/mcp
 #scribe_token_env=SCRIBE_MCP_TOKEN
+# Browser capture satellite (/install capture browser): the Chrome MV3
+# extension in satellites/browser-capture + the conch-capture-host
+# native messaging host. Captures DOM interaction (semantic clicks,
+# navigation paths, form-submit field NAMES, copy events without
+# content) on origins explicitly allowlisted in the extension options —
+# nothing else, nothing until you add one. Events are secretguard-
+# scrubbed by the host and journaled locally (source="browser") for
+# /compile from-browser and the recurrence mining. Off by default;
+# requires capture_enabled too.
+#capture_browser=false
+# Override the pinned extension id (only needed if you repackage the
+# extension yourself; the shipped manifest key pins the default id).
+#capture_browser_extension_id=hgmjnpkpdnaeekckabogikdcpdfeeghh
 
 # eBay pilot (/ebay <photo...> [-- notes]): sandbox photo→listing driver.
 # Identity + seller prerequisites for ebay.draft_request.v1 (ask the org

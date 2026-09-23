@@ -585,6 +585,23 @@ def _handle_install_command(arg: str, config: dict) -> None:
         print(f"\n  \033[31mUnknown component {sub!r}.\033[0m")
         print(_INSTALL_USAGE)
         return
+    rest = tokens[1:]
+    # Components may take sub-steps (/install capture browser): a setup
+    # accepting a second parameter receives the remaining tokens.
+    import inspect
+
+    try:
+        takes_args = len(
+            inspect.signature(match.setup).parameters
+        ) >= 2
+    except (TypeError, ValueError):
+        takes_args = False
+    if takes_args:
+        match.setup(config, rest)
+        return
+    if rest:
+        print(f"\n  \033[2m(ignoring extra arguments:"
+              f" {' '.join(rest)})\033[0m")
     match.setup(config)
 
 

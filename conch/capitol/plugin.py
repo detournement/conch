@@ -271,11 +271,97 @@ def _capture_status(config: dict) -> str:
         sources.append(
             f"email ({config['capture_email_folder']})"
         )
-    return "enabled — sources: " + ", ".join(sources)
+    from ..config import get_bool
+
+    if get_bool(config, "capture_browser", False):
+        from ..kernel.browser_capture import handshake_line
+
+        sources.append(f"browser ({handshake_line()})")
+    line = "enabled — sources: " + ", ".join(sources)
+    if not get_bool(config, "capture_browser", False):
+        line += "; browser off (/install capture browser)"
+    return line
 
 
-def _capture_setup(config: dict) -> None:
+def _capture_browser_setup(config: dict) -> None:
+    """``/install capture browser``: write the native-host manifests,
+    enable the gates, print the load-unpacked instructions, and show
+    the extension → host → kernel handshake status."""
     from ..config import set_config_values
+    from ..kernel.browser_capture import (
+        EXTENSION_ID,
+        BrowserEventRejected,
+        extension_dir,
+        handshake_line,
+        install_native_host,
+    )
+
+    print(
+        "\n  \033[1mBrowser capture\033[0m — the satellite extension"
+        " records DOM interaction\n  (semantic clicks, navigation, form"
+        " submits by field NAME only, copy\n  events without content) on"
+        " origins you explicitly allowlist, and\n  nothing else. Events"
+        " travel over browser-sanctioned native messaging\n  (stdio — no"
+        " listening ports), are secretguard-scrubbed by the host,\n  and"
+        " land only in your local kernel journal."
+    )
+    try:
+        outcome = install_native_host(
+            str(config.get("capture_browser_extension_id") or "")
+        )
+    except BrowserEventRejected as exc:
+        print(f"\n  \033[31m{exc}\033[0m\n")
+        return
+    updates = {"capture_enabled": "true", "capture_browser": "true"}
+    path = set_config_values(updates)
+    config.update(updates)
+    if outcome["written"]:
+        print("\n  \033[1;32m✓ Native host manifest written\033[0m"
+              f" \033[2m(host: {outcome['command']})\033[0m")
+        for browser, manifest in sorted(outcome["written"].items()):
+            print(f"    {browser:<9} {manifest}")
+    else:
+        print("\n  \033[33mNo Chromium-family browser profile found\033[0m"
+              " \033[2m(Chrome/Chromium/Brave/Edge) — install one and"
+              " re-run /install capture browser.\033[0m")
+    if outcome["skipped"]:
+        print(f"    \033[2mskipped (not installed):"
+              f" {', '.join(outcome['skipped'])}\033[0m")
+    directory = extension_dir()
+    location = (
+        str(directory) if directory else
+        "<conch checkout>/satellites/browser-capture/extension"
+        " (the extension ships in the repo, not the wheel — clone"
+        " https://the conch repo to get it)"
+    )
+    print(
+        "\n  \033[1mLoad the extension (once per browser):\033[0m\n"
+        "    1. Open chrome://extensions and enable Developer mode.\n"
+        "    2. Click \"Load unpacked\" and pick:\n"
+        f"       {location}\n"
+        f"    3. The extension id must read {EXTENSION_ID}\n"
+        "       (it is pinned by the manifest key).\n"
+        "    4. Open the extension's Options page and add the origins"
+        " you\n       want captured — nothing is captured until you do.\n"
+        f"\n  \033[2mconfig: {path} (capture_browser=true; Firefox is a"
+        " follow-up)\033[0m"
+    )
+    print(f"  \033[2mverify: /install shows the capture line —"
+          f" currently: {handshake_line()}\033[0m\n")
+
+
+def _capture_setup(config: dict, args=()) -> None:
+    from ..config import set_config_values
+
+    args = [str(token).lower() for token in (args or ())]
+    if args and args[0] == "browser":
+        _capture_browser_setup(config)
+        return
+    if args:
+        print(f"\n  \033[31mUnknown capture step {args[0]!r}\033[0m"
+              " \033[2m(/install capture, /install capture browser)"
+              "\033[0m\n")
+        return
 
     print(
         "\n  \033[1mCapture\033[0m — turn work that already happened"
@@ -309,6 +395,8 @@ def _capture_setup(config: dict) -> None:
            or str(config.get("capture_email_folder") or "").strip()
            else "")
         + ".\033[0m\n"
+        "  \033[2mBrowser capture (the satellite extension) is a"
+        " separate opt-in step:\n  /install capture browser.\033[0m\n"
     )
 
 

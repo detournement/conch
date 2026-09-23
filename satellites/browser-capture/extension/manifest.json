@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Conch Browser Capture",
+  "version": "0.1.0",
+  "description": "Capture satellite for the local Conch shell: records semantic DOM interaction (clicks, navigation, form submits by field name only, copy events without content) on origins you explicitly allowlist, and delivers it to your local Conch kernel over native messaging. No cloud, no listening ports, nothing captured until you add an origin.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmwJNnApGMM0GCZQ2ERuoPMleEKsMX3FunI7jWtuIkoGwFBeeBLdciKV7/hZzqV6NzB6zontAuYjiPqoq00GmSBOnai7m//YXlqSSJsXgIqpagRPZsnxkvpAiPRnBrJuDLeKYSAOGBCSfWL2T5V/UsFJRBK7SmeJa8zebA5pvjQyC4lASMnPLYWW7P/nlurW5SWNI0deGYgOLSKlN4FCUItHXW3jC/03dRqIZTkwQH9dbu2iLnMYVB3Ckl4haU7HVM+QiF7yoF+2ekp6dXB3I/qJFYheGdBR46sDCELOS18EK68cgXvy6+SqyAiHVhNKTpcazK1sVqeW325iKLOHg2wIDAQAB",
+  "minimum_chrome_version": "116",
+  "permissions": ["nativeMessaging", "storage", "scripting"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Conch capture — click to pause/resume"
+  }
+}

@@ -38,6 +38,7 @@ USAGE = """
     /compile from-email [--rescan] ["goal"]   draft a card from the capture mailbox (capture)
     /compile from-history [N] "goal"      draft a card from recent shell history (capture)
     /compile from-scribe "<guide>" ["goal"]   draft a card from Scribe workflow context (MCP)
+    /compile from-browser [origin] ["goal"]   draft a card from captured browser events (capture)
     /compile suggestions [--days D] [--min N]   recurring work shapes worth compiling
     /compile from-suggestion <#> ["goal"]  draft a card from a mined recurrence
     /compile list                  list compilations
@@ -185,6 +186,36 @@ def _cmd_from_history(tokens: List[str], config: dict):
     _finish_compile(card, capture=provenance)
 
 
+def _cmd_from_browser(tokens: List[str], config: dict):
+    from ...config import get_bool
+    from .capture import compile_from_capture
+    from .capture_browser import capture_from_browser
+
+    if not get_bool(config, "capture_browser", False):
+        _print(
+            "\n  \033[33mBrowser capture is not installed.\033[0m "
+            "\033[2m/install capture browser sets up the extension and"
+            " the native messaging host.\033[0m\n"
+        )
+        return
+    tokens = list(tokens)
+    origin = ""
+    # A leading token with a dot or scheme is the origin filter;
+    # everything after is the goal.
+    if tokens and ("." in tokens[0] or "://" in tokens[0]):
+        origin = tokens.pop(0).strip("\"'")
+    goal = " ".join(tokens).strip().strip("\"'")
+    store = _store()
+    try:
+        context = capture_from_browser(store, origin)
+    finally:
+        store.close()
+    _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
+           "card …\033[0m")
+    card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
+
+
 # /compile suggestions: deterministic recurrence mining (capture
 # feature 2). The cache lets from-suggestion pick by number within the
 # process; suggestions themselves are recomputed reproducibly.
@@ -193,6 +224,7 @@ _SUGGESTION_CACHE: Dict[str, Any] = {}
 _SCAN_CONVERSATIONS = 200
 _SCAN_MISSIONS = 100
 _MISSION_EVENT_CAP = 400
+_SCAN_BROWSER_EVENTS = 2000
 
 
 def _gather_pattern_sources(config: dict) -> List[Dict[str, Any]]:
@@ -249,9 +281,51 @@ def _gather_pattern_sources(config: dict) -> List[Dict[str, Any]]:
                     "id": mid, "kind": "mission",
                     "steps": steps, "raw": list(steps),
                 })
+        sources.extend(_browser_pattern_sources(store, config, horizon))
     finally:
         store.close()
     return sources
+
+
+def _browser_pattern_sources(store, config: dict,
+                             horizon: float) -> List[Dict[str, Any]]:
+    """Journaled browser events as mining sources: one source per
+    (origin host, UTC day), so recurring same-site procedures surface
+    across days exactly like recurring shell sequences across sessions.
+    Nothing is read unless browser capture is installed."""
+    import datetime as _datetime
+
+    from ...config import get_bool
+    from ...kernel.patterns import normalize_browser_step
+    from .capture_browser import render_browser_event
+
+    if not get_bool(config, "capture_browser", False):
+        return []
+    grouped: Dict[str, Dict[str, List[Any]]] = {}
+    for row in store.list_inbox(
+        source="browser", limit=_SCAN_BROWSER_EVENTS, since=horizon,
+    ):
+        payload = row.get("payload") or {}
+        step = normalize_browser_step(payload)
+        if not step:
+            continue
+        host = str(payload.get("origin", "")).split("://", 1)[-1]
+        host = host.split("/", 1)[0].split(":", 1)[0]
+        day = _datetime.datetime.fromtimestamp(
+            float(row.get("received_at") or 0),
+            _datetime.timezone.utc,
+        ).strftime("%Y-%m-%d")
+        entry = grouped.setdefault(
+            f"browser:{host}:{day}", {"steps": [], "raw": []},
+        )
+        entry["steps"].append(step)
+        entry["raw"].append(render_browser_event(payload))
+    return [
+        {"id": source_id, "kind": "browser",
+         "steps": entry["steps"], "raw": entry["raw"]}
+        for source_id, entry in sorted(grouped.items())
+        if len(entry["steps"]) >= 3
+    ]
 
 
 def _cmd_suggestions(tokens: List[str], config: dict):
@@ -664,8 +738,8 @@ def run_compile_command(arg: str, config: dict, *,
         return
     sub = tokens[0].lower()
     capture_verbs = {"from-mission", "from-session", "from-email",
-                     "from-history", "from-scribe", "suggestions",
-                     "from-suggestion"}
+                     "from-history", "from-scribe", "from-browser",
+                     "suggestions", "from-suggestion"}
     known = {"list", "show", "approve", "reject", "revise",
              "materialize", "rollback", "status"} | capture_verbs
     try:
@@ -700,6 +774,9 @@ def run_compile_command(arg: str, config: dict, *,
             return
         if sub == "from-scribe":
             _cmd_from_scribe(tokens[1:], config)
+            return
+        if sub == "from-browser":
+            _cmd_from_browser(tokens[1:], config)
             return
         if sub == "suggestions":
             _cmd_suggestions(tokens[1:], config)

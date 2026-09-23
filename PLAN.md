@@ -1307,6 +1307,56 @@ the fake box), and routed a chat turn to it through the custom adapter.
 R3 remains: push heartbeat, deregistration tombstones, fleet tie-in
 (`labels.host` join to worker resource_groups).
 
+## Capture monitoring — roadmap and the browser satellite (September 2026)
+
+The computer-usage-monitoring feasibility work settled into three
+phases, consent-first at every step (explicit opt-in surfaces, local
+kernel only, no cloud, secretguard on every ingest path):
+
+- **Phase 1 — journal-adjacent capture (done, merged).** The capture
+  component (`/install capture`, `capture_enabled` gate): sessions,
+  missions, shell history, a designated email folder, and Scribe import
+  feed `/compile from-*` drafts; deterministic recurrence mining
+  (`/compile suggestions`) computes "you've done this N times" over
+  normalized step sequences. No new observation — only work conch
+  already journaled or the user explicitly designated.
+- **Phase 2 — browser-capture satellite (done, this increment).** The
+  Scribe-equivalent for the user's own browser: an MV3 Chrome extension
+  (`satellites/browser-capture/`, plain JS, repo-only, excluded from
+  the wheel) captures semantic DOM interaction — navigation paths,
+  click role/label (never coordinates), form-submit field NAMES only,
+  copy events without content — on origins the user explicitly
+  allowlists (no `<all_urls>`; per-origin `chrome.permissions` grants;
+  password/secret fields excluded at the source; badge + pause
+  control). Transport is Chrome native messaging to
+  `conch-capture-host` (stdio, 4-byte-length JSON framing — no
+  listening ports): the host validates fail-closed (protocol version,
+  pinned caller extension id, per-kind schema whitelist, http(s)
+  origin), runs the authoritative secretguard scrub reject-whole, and
+  journals accepted events via the existing `event.post` op with
+  `source="browser"` (daemon socket → direct kernel store → bounded
+  oldest-dropped spool, never blocking the browser). Ingestion feeds
+  the same pipeline: `store.list_inbox` reads them back,
+  `normalize_browser_step` gives mining `web:<host>:<action>` shapes,
+  `/compile from-browser [origin]` follows the from-* conventions, and
+  `/install capture browser` writes the NativeMessagingHosts manifests
+  (Chrome/Chromium/Brave/Edge, macOS+Linux) and verifies the
+  extension → host → kernel handshake. All behind `capture_enabled` +
+  `capture_browser`. Firefox manifest: follow-up.
+- **Phase 3 — OS-level usage monitoring (not started, deliberately
+  last).** Window-focus/app-usage signals via platform accessibility
+  APIs, the heaviest consent surface; only worth building if Phase 2's
+  origin-scoped model proves the capture→mining→card loop earns its
+  keep. Same shape when it comes: explicit per-app allowlist, a
+  satellite process feeding `event.post`, secretguard at the boundary.
+
+- [x] Browser-capture satellite: extension + native host + `event.post`
+      ingestion + `from-browser` + mining integration + `/install
+      capture browser` setup/handshake (September 2026).
+- [ ] Firefox native-messaging manifest + extension port.
+- [ ] Phase 3 scoping: OS-level focus/app-usage satellite, only after
+      browser-capture proves recurrence value.
+
 ### The registry as a data source (September 2026, same week)
 
 Discovery answered "what can I switch to"; this increment answers "what

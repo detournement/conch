@@ -388,4 +388,9 @@ def capture_provenance_line(capture: Optional[Dict[str, Any]]) -> str:
     if kind == "scribe":
         return (f"captured from Scribe ({capture.get('server', '?')}) "
                 f"query {source!r}")
+    if kind == "browser":
+        origins = capture.get("origins") or []
+        return (f"captured from browser {source} "
+                f"({capture.get('events', 0)} event(s) across "
+                f"{len(origins)} origin(s))")
     return f"captured from {kind} {source}"

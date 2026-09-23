@@ -38,6 +38,9 @@ conch-controller = "conch.entrypoints:controller_main"
 conch-edge = "conch.entrypoints:edge_main"
 conch-worker = "conch.entrypoints:worker_main"
 conch-hostctl = "conch.entrypoints:hostctl_main"
+# Browser-capture satellite: the native messaging host Chrome launches
+# (satellites/browser-capture). Gated on capture_enabled+capture_browser.
+conch-capture-host = "conch.entrypoints:capture_host_main"
 
 [project.urls]
 Homepage = "https://github.com/detournement/conch"

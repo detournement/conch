@@ -579,13 +579,34 @@ rendered by `/compile status`:
   was offered), the OAuth access token rides by env reference
   (`scribe_token_env`), and an unset `scribe_mcp_url` means the source
   is absent.
+- **Browser capture.** `/install capture browser` sets up the satellite
+  Chrome extension (`satellites/browser-capture/`, in the repo, not the
+  wheel) and its native messaging host (`conch-capture-host`, stdio —
+  no listening ports). The extension records DOM interaction on
+  **explicitly allowlisted origins only** (no `<all_urls>`; nothing is
+  captured until you add an origin in its options page): navigation
+  paths, semantic click targets (role/label, never coordinates), form
+  submits by field **name** only (password/secret fields excluded at
+  the source), and copy events without the copied content. The host
+  validates fail-closed (protocol version, caller extension id, event
+  schema, origin), runs the authoritative secretguard scrub
+  (reject-whole), and journals accepted events via `event.post` with
+  `source="browser"` provenance — daemon socket first, direct kernel
+  write when it's down, bounded oldest-dropped spool last, never
+  blocking the browser. `/compile from-browser [origin] ["goal"]`
+  drafts a card from them, and the recurrence mining below sees
+  normalized browser steps too. All local; no cloud anywhere. Gated on
+  `capture_enabled` + `capture_browser`. Firefox: follow-up. See
+  `satellites/browser-capture/README.md` for the full privacy contract
+  and a manual test checklist.
 - **Recurrence mining.** `/compile suggestions` is computed, never
-  model-ranked: normalized step sequences (options and paths collapsed)
-  reduce to n-gram signatures, recurring shapes rank count-first with
-  stable tiebreaks, and each suggestion explains itself — "same 4-step
-  git pull → … shape, 14 occurrences across 5 sessions". `/compile
-  from-suggestion <#>` drafts the card with the raw commands as sample
-  evidence. Thresholds: `compile_suggest_min_count` /
+  model-ranked: normalized step sequences (options and paths collapsed;
+  browser events as `web:<host>:<action>` shapes when browser capture
+  is on) reduce to n-gram signatures, recurring shapes rank count-first
+  with stable tiebreaks, and each suggestion explains itself — "same
+  4-step git pull → … shape, 14 occurrences across 5 sessions".
+  `/compile from-suggestion <#>` drafts the card with the raw commands
+  as sample evidence. Thresholds: `compile_suggest_min_count` /
   `compile_suggest_window_days`.
 
 Captured text is evidence, never instructions: the trace rides into the
@@ -1076,7 +1097,7 @@ target directly, pass Docker's `--init`.
 | `/ssh shell [command]` | Open an uncaptured remote TTY (including remote sudo) |
 | `/ssh disconnect` | Close the active SSH control connection |
 | `/install [component]` | List conch components or set one up (edge, fleet, works, capture) |
-| `/compile from-mission\|from-session\|from-email\|from-history\|from-scribe …` | Draft an Architecture Card from captured work (capture component) |
+| `/compile from-mission\|from-session\|from-email\|from-history\|from-scribe\|from-browser …` | Draft an Architecture Card from captured work (capture component) |
 | `/compile suggestions` / `from-suggestion <#>` | Mine recurring work shapes; compile one into a card |
 | `/missions` | List durable missions (edge daemon) |
 | `/mission show\|new\|pause\|resume\|abort\|input …` | Manage a mission |

@@ -2477,6 +2477,36 @@ class MissionStore:
             }
         return self._mutate(fn)
 
+    def list_inbox(self, source: str = "", limit: int = 500,
+                   since: float = 0.0) -> List[Dict[str, Any]]:
+        """Inbox rows in chronological order, payload parsed — the read
+        surface capture sources (browser events especially) mine from.
+        Filters: exact *source*, ``received_at >= since``."""
+        sql = ("SELECT inbox_id, source, idempotency_key, mission_id,"
+               " payload, status, received_at FROM inbox")
+        clauses = []
+        params: List[Any] = []
+        if source:
+            clauses.append("source=?")
+            params.append(source)
+        if since:
+            clauses.append("received_at>=?")
+            params.append(float(since))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY inbox_id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = self._read_conn().execute(sql, params).fetchall()
+        entries = []
+        for row in reversed(rows):
+            entry = dict(row)
+            try:
+                entry["payload"] = _json.loads(entry["payload"])
+            except (TypeError, ValueError):
+                entry["payload"] = {}
+            entries.append(entry)
+        return entries
+
     def mark_inbox_processed(self, idempotency_key: str, ok: bool = True,
                              detail: str = "") -> None:
         def fn(conn):

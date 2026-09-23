@@ -184,6 +184,62 @@ def edge_main(argv: Optional[List[str]] = None) -> int:
     return run_edge_daemon(config, once=args.once)
 
 
+def capture_host_main(argv: Optional[List[str]] = None) -> int:
+    """``conch-capture-host``: the browser-capture native messaging host.
+
+    Chrome launches it with the caller extension origin in argv (plus
+    ``--parent-window=N`` on some platforms), so argument handling is
+    deliberately loose: the recognized subcommands are ``install`` and
+    ``status``; anything else runs the stdio host loop with the first
+    ``chrome-extension://`` argument as the caller to verify fail-closed.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("--version", "-V"):
+        print(f"conch-capture-host {__version__}")
+        return 0
+    if argv and argv[0] in ("--help", "-h", "help"):
+        print(
+            "conch-capture-host — Conch browser-capture native messaging"
+            " host.\n\n"
+            "  conch-capture-host install   write the NativeMessagingHosts"
+            " manifest\n"
+            "                               for installed Chromium-family"
+            " browsers\n"
+            "  conch-capture-host status    handshake / delivery status\n"
+            "  conch-capture-host           run the stdio host (Chrome"
+            " launches this)\n\n"
+            "Gated on capture_enabled + capture_browser (set by /install"
+            " capture browser)."
+        )
+        return 0
+    from .config import load_config
+    from .kernel import browser_capture
+
+    if argv and argv[0] == "install":
+        try:
+            outcome = browser_capture.install_native_host()
+        except browser_capture.BrowserEventRejected as exc:
+            print(f"conch-capture-host: {exc}", file=sys.stderr)
+            return 1
+        for browser, path in sorted(outcome["written"].items()):
+            print(f"written  {browser:<9} {path}")
+        for browser in outcome["skipped"]:
+            print(f"skipped  {browser:<9} (not installed)")
+        return 0 if outcome["written"] else 1
+    if argv and argv[0] == "status":
+        import json as _json
+
+        status = dict(browser_capture.read_status())
+        status["handshake"] = browser_capture.handshake_line(status)
+        print(_json.dumps(status, indent=2, sort_keys=True))
+        return 0
+    caller = next(
+        (arg for arg in argv if arg.startswith("chrome-extension://")),
+        "",
+    )
+    return browser_capture.run_host(load_config(), caller=caller)
+
+
 def worker_main(argv: Optional[List[str]] = None) -> int:
     """The bounded fleet worker supervisor (live as of Swarm Phase 2)."""
     from .fleet.worker import main as fleet_worker_main

@@ -102,6 +102,58 @@ def steps_from_mission_events(events: List[dict]) -> List[str]:
     return steps
 
 
+_LABEL_NOISE = re.compile(r"\d+|[0-9a-f]{7,}")
+
+
+def _label_slug(value: str, cap: int = 24) -> str:
+    """A label's stable shape: lowercased, ids/numbers collapsed to
+    ``·``, whitespace to ``-``, clipped."""
+    text = _LABEL_NOISE.sub("·", str(value or "").lower())
+    slug = "-".join(text.split())
+    return slug[:cap]
+
+
+def normalize_browser_step(payload: Dict[str, Any]) -> str:
+    """One browser event payload's stable step shape (mining input).
+
+    ``web:<host>:click:<role>:<label-slug>``, ``web:<host>:nav:<first
+    path segment>``, ``web:<host>:submit:<form-slug>``, or
+    ``web:<host>:copy`` — the same semantic action on the same origin
+    always yields the same step, so recurring browser procedures mine
+    exactly like recurring shell procedures.
+    """
+    kind = str(payload.get("kind") or "")
+    origin = str(payload.get("origin") or "")
+    host = origin.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    if not host or kind not in ("nav", "click", "submit", "copy"):
+        return ""
+    detail = payload.get("detail") or {}
+    if kind == "nav":
+        path = str(detail.get("path") or "/")
+        segment = path.strip("/").split("/", 1)[0]
+        return f"web:{host}:nav:{_label_slug(segment) or '/'}"
+    if kind == "click":
+        role = _label_slug(detail.get("role"), 16) or "element"
+        label = _label_slug(detail.get("label"))
+        return f"web:{host}:click:{role}" + (f":{label}" if label else "")
+    if kind == "submit":
+        form = _label_slug(detail.get("form")) or "form"
+        return f"web:{host}:submit:{form}"
+    return f"web:{host}:copy"
+
+
+def steps_from_browser_events(payloads: List[Dict[str, Any]]
+                              ) -> List[str]:
+    """Ordered normalized steps from browser event payloads (the inbox
+    rows ``source="browser"`` events land as)."""
+    steps = []
+    for payload in payloads or []:
+        step = normalize_browser_step(payload)
+        if step:
+            steps.append(step)
+    return steps
+
+
 def _signature(gram: tuple) -> str:
     return hashlib.sha256(
         "\x1f".join(gram).encode("utf-8")

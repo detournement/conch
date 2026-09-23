@@ -158,7 +158,9 @@ class Component:
 
     ``status(config)`` must be one cheap line with no product imports;
     ``setup(config)`` is the interactive enable/configure/install flow
-    (lazy product imports inside; prompts allowed).
+    (lazy product imports inside; prompts allowed). A setup accepting a
+    second parameter receives the remaining ``/install`` tokens, so a
+    component can offer sub-steps (``/install capture browser``).
     """
 
     def __init__(self, name: str, title: str, summary: str,

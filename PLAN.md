@@ -1322,8 +1322,10 @@ kernel only, no cloud, secretguard on every ingest path):
   already journaled or the user explicitly designated.
 - **Phase 2 — browser-capture satellite (done, this increment).** The
   Scribe-equivalent for the user's own browser: an MV3 Chrome extension
-  (`satellites/browser-capture/`, plain JS, repo-only, excluded from
-  the wheel) captures semantic DOM interaction — navigation paths,
+  (`conch/satellites/browser_capture/`, plain JS, shipped as package
+  data so pip/uv/pipx installs carry it; setup copies it to a stable
+  user-data dir for load-unpacked) captures semantic DOM interaction —
+  navigation paths,
   click role/label (never coordinates), form-submit field NAMES only,
   copy events without content — on origins the user explicitly
   allowlists (no `<all_urls>`; per-origin `chrome.permissions` grants;

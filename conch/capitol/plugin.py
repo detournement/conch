@@ -291,8 +291,8 @@ def _capture_browser_setup(config: dict) -> None:
     from ..kernel.browser_capture import (
         EXTENSION_ID,
         BrowserEventRejected,
-        extension_dir,
         handshake_line,
+        install_extension_files,
         install_native_host,
     )
 
@@ -306,6 +306,7 @@ def _capture_browser_setup(config: dict) -> None:
         " land only in your local kernel journal."
     )
     try:
+        extension_path = install_extension_files()
         outcome = install_native_host(
             str(config.get("capture_browser_extension_id") or "")
         )
@@ -327,18 +328,16 @@ def _capture_browser_setup(config: dict) -> None:
     if outcome["skipped"]:
         print(f"    \033[2mskipped (not installed):"
               f" {', '.join(outcome['skipped'])}\033[0m")
-    directory = extension_dir()
-    location = (
-        str(directory) if directory else
-        "<conch checkout>/satellites/browser-capture/extension"
-        " (the extension ships in the repo, not the wheel — clone"
-        " https://the conch repo to get it)"
-    )
+    print(f"\n  \033[1;32m✓ Extension files installed\033[0m"
+          f" \033[2m(stable copy — survives conch upgrades; re-run this"
+          " step after upgrading to refresh it)\033[0m\n"
+          f"    {extension_path}")
     print(
-        "\n  \033[1mLoad the extension (once per browser):\033[0m\n"
+        "\n  \033[1mOne manual step left — load the extension (once per"
+        " browser):\033[0m\n"
         "    1. Open chrome://extensions and enable Developer mode.\n"
         "    2. Click \"Load unpacked\" and pick:\n"
-        f"       {location}\n"
+        f"       {extension_path}\n"
         f"    3. The extension id must read {EXTENSION_ID}\n"
         "       (it is pinned by the manifest key).\n"
         "    4. Open the extension's Options page and add the origins"

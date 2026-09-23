@@ -35,6 +35,8 @@ from conch.kernel.browser_capture import (
     drain_spool,
     event_key,
     install_native_host,
+    launcher_path,
+    native_host_dirs,
     read_message,
     read_status,
     run_host,
@@ -42,6 +44,7 @@ from conch.kernel.browser_capture import (
     spool_append,
     spool_path,
     validate_event,
+    write_host_launcher,
     write_message,
 )
 from conch.secretguard import CredentialRejected
@@ -445,53 +448,84 @@ class TestKernelDelivery(IsolatedCase):
         )
 
 
+def _make_chrome_profile_dir() -> Path:
+    """The Chrome profile dir install_native_host keys on, per platform
+    (macOS is the release path; the Linux branch keeps CI honest)."""
+    import sys as _sys
+
+    home = Path(os.environ["HOME"])
+    if _sys.platform == "darwin":
+        chrome_dir = (home / "Library" / "Application Support"
+                      / "Google" / "Chrome")
+    else:
+        chrome_dir = (Path(os.environ["XDG_CONFIG_HOME"])
+                      / "google-chrome")
+    chrome_dir.mkdir(parents=True)
+    return chrome_dir
+
+
 class TestManifestInstall(IsolatedCase):
     def test_writes_for_installed_browsers_only(self):
-        home = Path(os.environ["HOME"])
-        import sys as _sys
-
-        if _sys.platform == "darwin":
-            chrome_dir = (home / "Library" / "Application Support"
-                          / "Google" / "Chrome")
-        else:
-            chrome_dir = (Path(os.environ["XDG_CONFIG_HOME"])
-                          / "google-chrome")
-        chrome_dir.mkdir(parents=True)
-        with patch(
-            "conch.kernel.browser_capture.host_command_path",
-            return_value="/opt/conch/bin/conch-capture-host",
-        ):
-            outcome = install_native_host()
+        _make_chrome_profile_dir()
+        outcome = install_native_host()
         self.assertEqual(list(outcome["written"]), ["Chrome"])
         self.assertIn("Brave", outcome["skipped"])
-        manifest = json.loads(
-            Path(outcome["written"]["Chrome"]).read_text()
-        )
+        manifest_path = Path(outcome["written"]["Chrome"])
+        manifest = json.loads(manifest_path.read_text())
         self.assertEqual(manifest["name"], NATIVE_HOST_NAME)
         self.assertEqual(manifest["type"], "stdio")
         self.assertEqual(
             manifest["allowed_origins"],
             [f"chrome-extension://{EXTENSION_ID}/"],
         )
-        self.assertEqual(manifest["path"],
-                         "/opt/conch/bin/conch-capture-host")
+        # manifest file name and permissions Chrome expects
+        self.assertEqual(manifest_path.name, f"{NATIVE_HOST_NAME}.json")
+        # the path points at the generated stable launcher, executable
+        launcher = Path(manifest["path"])
+        self.assertEqual(launcher, launcher_path())
+        self.assertTrue(launcher.is_file())
+        self.assertTrue(os.access(launcher, os.X_OK))
 
-    def test_extension_id_override(self):
-        home = Path(os.environ["HOME"])
+    def test_macos_manifest_lands_in_chrome_native_hosts_dir(self):
         import sys as _sys
 
-        if _sys.platform == "darwin":
-            chrome_dir = (home / "Library" / "Application Support"
-                          / "Google" / "Chrome")
-        else:
-            chrome_dir = (Path(os.environ["XDG_CONFIG_HOME"])
-                          / "google-chrome")
-        chrome_dir.mkdir(parents=True)
-        with patch(
-            "conch.kernel.browser_capture.host_command_path",
-            return_value="/opt/conch/bin/conch-capture-host",
-        ):
-            outcome = install_native_host("b" * 32)
+        if _sys.platform != "darwin":
+            self.skipTest("macOS release-path check")
+        _make_chrome_profile_dir()
+        outcome = install_native_host()
+        expected = (Path(os.environ["HOME"]) / "Library"
+                    / "Application Support" / "Google" / "Chrome"
+                    / "NativeMessagingHosts"
+                    / f"{NATIVE_HOST_NAME}.json")
+        self.assertEqual(Path(outcome["written"]["Chrome"]), expected)
+
+    def test_linux_paths_with_temp_home(self):
+        """Linux manifest locations, exercised on any platform by
+        driving native_host_dirs' XDG branch directly."""
+        with patch("sys.platform", "linux"):
+            dirs = native_host_dirs()
+        config_home = Path(os.environ["XDG_CONFIG_HOME"])
+        self.assertEqual(
+            dirs["Chrome"],
+            config_home / "google-chrome" / "NativeMessagingHosts",
+        )
+        self.assertEqual(
+            dirs["Brave"],
+            config_home / "BraveSoftware" / "Brave-Browser"
+            / "NativeMessagingHosts",
+        )
+        self.assertEqual(
+            dirs["Chromium"],
+            config_home / "chromium" / "NativeMessagingHosts",
+        )
+        self.assertEqual(
+            dirs["Edge"],
+            config_home / "microsoft-edge" / "NativeMessagingHosts",
+        )
+
+    def test_extension_id_override(self):
+        _make_chrome_profile_dir()
+        outcome = install_native_host("b" * 32)
         manifest = json.loads(
             Path(outcome["written"]["Chrome"]).read_text()
         )
@@ -499,6 +533,42 @@ class TestManifestInstall(IsolatedCase):
             manifest["allowed_origins"],
             [f"chrome-extension://{'b' * 32}/"],
         )
+
+
+class TestHostLauncher(IsolatedCase):
+    def test_launcher_survives_spaces_and_runs_the_host(self):
+        """The generated /bin/sh launcher — what every native-host
+        manifest points at — must exec the real host even when the
+        data dir AND the interpreter prefix contain spaces."""
+        import subprocess
+        import sys as _sys
+
+        spaced = Path(self._tmp.name) / "Application Data With Spaces"
+        launcher = write_host_launcher(
+            spaced / "browser-capture" / "conch-capture-host"
+        )
+        self.assertTrue(os.access(launcher, os.X_OK))
+        content = launcher.read_text()
+        self.assertTrue(content.startswith("#!/bin/sh\n"))
+        self.assertIn(f"exec '{_sys.executable}'", content)
+        # end to end through the launcher exactly as Chrome would exec
+        # it: framed hello on stdin, framed hello reply on stdout.
+        env = dict(os.environ)
+        result = subprocess.run(
+            [str(launcher), f"chrome-extension://{EXTENSION_ID}/"],
+            input=frame(hello_message()), capture_output=True,
+            env=env, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        reply = read_message(io.BytesIO(result.stdout))
+        self.assertEqual(reply["type"], "hello")
+        self.assertTrue(reply["ok"])
+
+    def test_launcher_quotes_single_quotes(self):
+        from conch.kernel.browser_capture import _sh_quote
+
+        self.assertEqual(_sh_quote("a b"), "'a b'")
+        self.assertEqual(_sh_quote("o'brien"), "'o'\\''brien'")
 
 
 if __name__ == "__main__":

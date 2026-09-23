@@ -7,6 +7,100 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [0.7.0] - 2026-09-23
+
+### Added
+
+- **Installable product seams.** A plugin registry now supplies product tools,
+  slash commands, components, and session wiring without coupling the core
+  shell to Capitol or fleet adapters; static import-boundary tests enforce the
+  split. First-run interactive launches can configure a provider and a
+  permission-tight API-key file, while `/install` reports and sets up the
+  shipped shell, edge, fleet, works, and capture components.
+- **Owned-model discovery through llama-idx.** `/registry` and the
+  `conch_config` tool validate and persist one llama-idx endpoint, add its
+  tool-verified models to selection and local-first fallback, and route each
+  model through the existing Ollama or OpenAI-compatible adapter.
+  `/llamaidx` and the read-only `llamaidx_registry` tool expose the registry as
+  a bounded fleet-status data source, including degraded and down providers.
+- **Capture to compile.** The reviewed Architecture Card pipeline can now
+  draft from bounded mission journals, saved conversations, shell history,
+  allowlisted read-only email, Scribe MCP guides, and browser events.
+  `/install capture` keeps the surface off until enabled; provenance is
+  journaled, captured text is inert evidence, and every draft still requires
+  the normal review and approval path. `/compile suggestions` mines recurring
+  normalized work shapes with deterministic ranking and stable tie-breaks,
+  then `/compile from-suggestion` carries the source evidence into a draft.
+- **Local browser-capture satellite.** The wheel ships an MV3 Chrome extension
+  and native-messaging host. `/install capture browser` makes a stable
+  load-unpacked copy and a reinstall-safe launcher; explicit origin
+  allowlists, semantic rather than coordinate capture, field-name-only form
+  events, source-side secret exclusion, host validation, and bounded spooling
+  keep the capture path local and fail closed.
+- **Sandboxed execution.** `/sandbox docker` and `/sandbox e2b` route approved
+  shell commands to ephemeral Docker or E2B environments without changing the
+  existing permission and destructive-command gates. Host environment
+  variables are not forwarded, Docker mount policy is explicit, and E2B does
+  not receive local files.
+- **Git checkpoints and undo.** Changed worktrees receive bounded turn-level
+  snapshot refs through a temporary index, leaving the branch, real index,
+  stash, and history untouched. `/checkpoint` lists, diffs, and restores
+  snapshots; `/undo` restores the latest one after confirmation. Ignored and
+  secret-shaped paths are excluded.
+- **Visible token accounting.** A default-on per-message line shows input and
+  output tokens, cost, context use, model, and measured or honestly marked
+  estimated throughput; `/tks` toggles it. Custom OpenAI-compatible streams
+  request usage data so local llama.cpp-style providers report consistently.
+- **Current model catalogs.** Live-audited catalogs add Claude Opus 5.5 and
+  GPT-6 Sol/Luna with their verified Chat Completions constraints, context
+  windows, and pricing. The catalog continues to exclude models whose tool
+  use requires an API Conch does not implement.
+- **Governed processes and fleet operations.** The generic FlowPack engine,
+  `/capitol` runtime and pack commands, shipped Capitol/pack-author skills,
+  ProcessCompiler review/materialize/drill/rollback flow, durable mission
+  controller, owner-granted worker ceilings, artifact publishing,
+  `fleet_delegate`, and `/fleet` operations turn the earlier kernel and SSH
+  worker foundation into user-facing operating surfaces.
+- **Everyday shell and remote workflows.** Multiline paste and editor
+  composition, `python -m conch`, `/new` and `conch --new`, `/todo`, `/list`,
+  editor-backed `/notes`, Matrix conversation transport, and ntfy push support
+  were added. Conversation writes are atomic, corrupt files are salvaged or
+  quarantined, and model/fallback switches are recorded in history.
+
+### Changed
+
+- `conch-edge` uses supervised install and startup checks, channel intake is
+  daemon-owned under a lease, mission events wake work immediately, scheduled
+  critic reviews detect stalls deterministically, and mission learnings can be
+  consolidated into credential-guarded shared memory.
+- The public installer and documentation use the website `/install` route for
+  an isolated, no-sudo install or upgrade, and installed/runtime diagnostics
+  report the single-sourced package version.
+
+### Safety and behavior
+
+- Capture sources, shared memory, and retrieval reject credential material;
+  email additionally requires an explicit folder and sender allowlist, and
+  shell-history import drops credential-shaped lines with a disclosed count.
+- Capture cannot approve or materialize its own output. Sandboxes change where
+  a command runs, not whether it is allowed. Checkpoint restores require local
+  confirmation and cannot restore excluded secrets.
+- Product components remain gated until configured. Unknown registry/schema
+  versions, unsupported catalog models, invalid browser callers/events, and
+  uncertain external effects fail closed or reconcile by query instead of
+  being retried blindly.
+
+### Known limitations
+
+- Scribe import requires a live Scribe MCP endpoint and OAuth credential; E2B
+  execution requires a live account and API key. Their contract paths are
+  covered by deterministic fakes when live credentials are unavailable.
+- Browser capture is proven first on Chrome for macOS. Linux host paths are
+  supported, Firefox is not yet supported, and Conch has no native Windows
+  installer or runtime support (WSL2 follows the Linux path).
+- Responses API and computer-use support were research only and are not part
+  of this release.
+
 ## [0.6.0] - 2026-09-12
 
 ### Added
@@ -90,4 +184,5 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.7.0]: https://github.com/detournement/conch/compare/v0.6.0...edge
 [0.6.0]: https://github.com/detournement/conch/releases/tag/v0.6.0

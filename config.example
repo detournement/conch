@@ -68,6 +68,30 @@ api_key_env=ANTHROPIC_API_KEY
 # token (never the token itself).
 #llamaidx_token_env=LLAMAIDX_TOKEN
 
+# --- Sandboxed execution (exec backend) ---------------------------------------
+# Run approved shell commands in a sandbox instead of (or alongside) the
+# local machine. The permission model is unchanged — prompts, safe_auto,
+# and destructive-command gates decide WHETHER a command runs; the
+# backend only changes WHERE. Flip per session with
+# /sandbox docker [image] | e2b | off; set a startup default here.
+# The host environment is NEVER forwarded into a sandbox.
+# Unset (or local) = feature off, zero new code paths.
+#exec_backend=local
+#
+# docker: one ephemeral local container per session (removed on exit).
+# The cwd can be mounted at /workspace so builds see the project:
+# rw (default) / ro / none (fully isolated scratch box).
+#sandbox_docker_image=python:3.12-slim
+#sandbox_docker_mount=rw
+#
+# e2b: an E2B cloud sandbox (e2b.dev) over a stdlib-only client. The
+# sandbox is a CLEAN remote environment — it does not see local files
+# (clone your repo inside it). NAME of the env var with the API key
+# (never the key itself); template and TTL are optional.
+#e2b_api_key_env=E2B_API_KEY
+#e2b_template=base
+#e2b_timeout_seconds=600
+
 # --- OpenRouter ---------------------------------------------------------------
 # Frontier models not on the other providers, via openrouter.ai:
 #   moonshotai/kimi-k3           (2.8T MoE, 1M context, $3/$15 per MTok)
@@ -84,6 +108,15 @@ api_key_env=ANTHROPIC_API_KEY
 # Auto-execute shell commands without confirmation (a startup notice is shown
 # when this is enabled here). Off by default.
 #agent_mode=false
+
+# Turn-level git checkpoints (on by default): inside a git repo, every
+# turn that changes the worktree snapshots it to refs/conch/checkpoints/*
+# — your branch, index, stash, and history are never touched, gitignored
+# and secret-shaped paths (.env, *.pem, id_rsa*, ...) are never captured,
+# and /undo / /checkpoint restore write a snapshot back as uncommitted
+# changes. /checkpoint on|off flips it per session.
+#git_checkpoints=true
+#git_checkpoint_limit=20
 
 # Shell approval policy: prompt_all (default), safe_auto (read-only commands
 # auto-approve), or yolo (everything auto-executes). Destructive commands

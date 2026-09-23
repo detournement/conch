@@ -24,6 +24,10 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # Per-message token stats line (tokens, cost, tok/s) in interactive
     # chat. On by default; /tks flips it for a session.
     "show_token_stats": "true",
+    # Turn-level git checkpoints when cwd is a git repo: mutating turns
+    # snapshot the worktree to refs/conch/checkpoints/* (user branch and
+    # index untouched). /checkpoint and /undo manage them.
+    "git_checkpoints": "true",
 }
 
 ENV_CONFIG_KEYS = {

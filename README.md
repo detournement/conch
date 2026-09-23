@@ -94,6 +94,10 @@ you explicitly configure or approve.
 | `ask_prompt:<provider>/<model-glob>` | — | Same for ask mode |
 | `permission_mode` | `prompt_all` | Shell approval policy: `prompt_all`, `safe_auto`, or `yolo` |
 | `show_token_stats` | `true` | Per-message token stats line (tokens, cost, tok/s, context gauge); `/tks` toggles per session |
+| `exec_backend` | `local` | Where approved shell commands run: `local`, `docker`, or `e2b`; `/sandbox` flips per session |
+| `sandbox_docker_image` / `sandbox_docker_mount` | `python:3.12-slim` / `rw` | Docker sandbox image and cwd mount mode (`rw`, `ro`, `none`) |
+| `e2b_api_key_env` / `e2b_template` / `e2b_timeout_seconds` | `E2B_API_KEY` / `base` / `600` | E2B sandbox auth (env-var name), template, and TTL |
+| `git_checkpoints` / `git_checkpoint_limit` | `true` / `20` | Turn-level worktree snapshots under `refs/conch/checkpoints` in git repos; `/undo` restores |
 | `allow_prefixes` | — | Comma-separated command prefixes that never prompt, e.g. `git status, ls` |
 | `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds (clamped to 1–86400) |
 | `hook_pre_tool_use` | — | Shell script gating every tool call (JSON on stdin; non-zero exit blocks) |
@@ -253,6 +257,39 @@ Connect external tools via the [Model Context Protocol](https://modelcontextprot
 
 ### Local shell execution
 The LLM can run shell commands on your machine. In normal mode, each command shows a prompt: **y**/Enter to run, **n** to decline (with optional feedback), **e** to edit the command first, **a** to always-allow commands with the same prefix for the session (`git status`, `docker ps`, …). Toggle `/agent` (or `/yolo`) for auto-execution. Command output streams live to your terminal. This captured path has no interactive stdin or controlling TTY, so a password prompt cannot be read accidentally.
+
+### Sandboxed execution (exec backends)
+Approved shell commands can run in a sandbox instead of (or alongside) the
+local machine: `/sandbox docker [image]` runs the session's commands in an
+ephemeral local container (cwd mounted at `/workspace`, `rw` by default —
+`sandbox_docker_mount=ro|none` for isolation; removed on exit), and
+`/sandbox e2b` runs them in an [E2B](https://e2b.dev) cloud sandbox over a
+stdlib-only client (REST control plane + the envd Connect-RPC stream; API
+key by env reference via `e2b_api_key_env`, never stored). `/sandbox off`
+returns to local; `exec_backend=docker|e2b` sets a startup default. The
+permission model is deliberately unchanged — prompts, `safe_auto`, and
+destructive-command gates still decide *whether* a command runs; the
+backend only changes *where*. The host environment is never forwarded
+into a sandbox, and the E2B sandbox does not see local files (it is a
+clean remote environment — clone your repo inside it). Dispatching
+sandboxed work to fleet workers is a planned follow-up.
+
+### Git checkpoints
+Inside a git repo, conch uses local git as its safety net when writing
+code: after every turn that changes the worktree, a snapshot commit is
+recorded under `refs/conch/checkpoints/*` through a temporary index —
+your branch, real index, stash, and history are never touched, and
+`.gitignore` plus secret-shaped paths (`.env`, `*.pem`, `id_rsa*`,
+`credentials*`, …) are never captured, so a restore can never
+materialize a skipped secret. `/checkpoint` lists snapshots,
+`/checkpoint diff <#>` shows one, `/checkpoint restore <#>` (or `/undo`
+for the latest) writes a snapshot back as ordinary uncommitted changes
+after a y/N confirmation. The ref namespace is pruned to
+`git_checkpoint_limit` (default 20); disable with `git_checkpoints=false`
+or `/checkpoint off` for a session. The system prompt also nudges the
+model toward deliberate git use in repos (status/diff around edits,
+feature branches for multi-file changes) — the checkpoint layer is the
+deterministic backstop when it doesn't.
 
 ### Passwords and direct terminal handoff
 Use `/terminal <command>` (or the model-facing `interactive_terminal` tool) whenever `sudo`, `getpass`, SSH, a key passphrase, or another program may request private input:
@@ -1076,6 +1113,9 @@ target directly, pass Docker's `--init`.
 | `/status` | Show provider, model, context window/usage, and config |
 | `/verbose` | Toggle showing tool args and results |
 | `/tks [on\|off]` | Toggle the per-message token stats line (tokens, cost, tok/s) |
+| `/sandbox [docker [image]\|e2b\|off]` | Run approved shell commands in a sandbox instead of locally |
+| `/checkpoint [list\|diff <#>\|restore <#>\|on\|off]` | Turn-level git checkpoints of the worktree |
+| `/undo` | Restore the worktree from the latest git checkpoint |
 | `/rounds <n>` | Set max tool call rounds |
 | `/queue` | Toggle typeahead input |
 | `/paste` | Paste lines literally; end with a lone `.` or Ctrl+D |

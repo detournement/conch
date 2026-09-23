@@ -33,9 +33,13 @@ class HttpMcpClient:
 
     name = "http"
 
-    def __init__(self, client_name: str, url: str):
+    def __init__(self, client_name: str, url: str,
+                 headers: Optional[dict] = None):
         self.name = client_name
         self.url = url.rstrip("/")
+        # Extra request headers (e.g. an Authorization bearer for hosted
+        # MCP servers); values are used by reference and never logged.
+        self.headers = dict(headers or {})
         self._next_request_id = 1
 
     def _rpc(self, method: str, params: Optional[dict] = None) -> dict:
@@ -49,14 +53,16 @@ class HttpMcpClient:
         payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             payload["params"] = params
+        request_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": "conch/1.0",
+        }
+        request_headers.update(self.headers)
         req = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                "User-Agent": "conch/1.0",
-            },
+            headers=request_headers,
             method="POST",
         )
         try:

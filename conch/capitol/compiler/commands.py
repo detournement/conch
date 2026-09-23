@@ -37,6 +37,7 @@ USAGE = """
     /compile from-session [<conv-id>] ["goal"]   draft a card from a saved conversation (capture)
     /compile from-email [--rescan] ["goal"]   draft a card from the capture mailbox (capture)
     /compile from-history [N] "goal"      draft a card from recent shell history (capture)
+    /compile from-scribe "<guide>" ["goal"]   draft a card from Scribe workflow context (MCP)
     /compile suggestions [--days D] [--min N]   recurring work shapes worth compiling
     /compile from-suggestion <#> ["goal"]  draft a card from a mined recurrence
     /compile list                  list compilations
@@ -371,6 +372,23 @@ def _cmd_from_suggestion(tokens: List[str], config: dict):
     _finish_compile(card, capture=provenance)
 
 
+def _cmd_from_scribe(tokens: List[str], config: dict):
+    from .capture import compile_from_capture
+    from .capture_scribe import capture_from_scribe
+
+    if not tokens:
+        _print("\n  \033[2mUsage: /compile from-scribe "
+               "\"<guide-or-search>\" [\"goal\"]\033[0m\n")
+        return
+    query = tokens[0].strip("\"'")
+    goal = " ".join(tokens[1:]).strip().strip("\"'")
+    context = capture_from_scribe(config, query)
+    _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
+           "card …\033[0m")
+    card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
+
+
 def _cmd_from_session(tokens: List[str], config: dict):
     from .capture import (
         capture_from_conversation,
@@ -646,7 +664,8 @@ def run_compile_command(arg: str, config: dict, *,
         return
     sub = tokens[0].lower()
     capture_verbs = {"from-mission", "from-session", "from-email",
-                     "from-history", "suggestions", "from-suggestion"}
+                     "from-history", "from-scribe", "suggestions",
+                     "from-suggestion"}
     known = {"list", "show", "approve", "reject", "revise",
              "materialize", "rollback", "status"} | capture_verbs
     try:
@@ -678,6 +697,9 @@ def run_compile_command(arg: str, config: dict, *,
             return
         if sub == "from-history":
             _cmd_from_history(tokens[1:], config)
+            return
+        if sub == "from-scribe":
+            _cmd_from_scribe(tokens[1:], config)
             return
         if sub == "suggestions":
             _cmd_suggestions(tokens[1:], config)

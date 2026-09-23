@@ -109,6 +109,15 @@ api_key_env=ANTHROPIC_API_KEY
 # when this is enabled here). Off by default.
 #agent_mode=false
 
+# Turn-level git checkpoints (on by default): inside a git repo, every
+# turn that changes the worktree snapshots it to refs/conch/checkpoints/*
+# — your branch, index, stash, and history are never touched, gitignored
+# and secret-shaped paths (.env, *.pem, id_rsa*, ...) are never captured,
+# and /undo / /checkpoint restore write a snapshot back as uncommitted
+# changes. /checkpoint on|off flips it per session.
+#git_checkpoints=true
+#git_checkpoint_limit=20
+
 # Shell approval policy: prompt_all (default), safe_auto (read-only commands
 # auto-approve), or yolo (everything auto-executes). Destructive commands
 # (rm, dd, git push --force, ...) always prompt, even in agent/yolo mode.

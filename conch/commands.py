@@ -108,6 +108,9 @@ SLASH_COMMANDS = [
     ("/tks [on|off]", "Toggle the per-message token stats line (tokens, cost, tok/s)"),
     ("/sandbox [docker [image]|e2b|off]",
      "Run approved shell commands in a sandbox instead of locally"),
+    ("/checkpoint [list|diff <#>|restore <#>|on|off]",
+     "Turn-level git checkpoints of the worktree (refs/conch/checkpoints)"),
+    ("/undo", "Restore the worktree from the latest git checkpoint"),
     ("/schedule <interval> <prompt>", "Schedule a recurring task"),
     ("/tasks", "List scheduled tasks"),
     ("/cancel <id>", "Cancel a scheduled task"),
@@ -1222,6 +1225,8 @@ def handle_slash_command(
             "  \033[1m/verbose\033[0m             Toggle showing tool args + output\n"
             "  \033[1m/tks [on|off]\033[0m        Toggle the per-message token stats line (tok/s)\n"
             "  \033[1m/sandbox [docker|e2b|off]\033[0m Run approved commands in a sandbox, not locally\n"
+            "  \033[1m/checkpoint [verb]\033[0m    List/diff/restore turn-level git checkpoints\n"
+            "  \033[1m/undo\033[0m                Restore the worktree from the latest checkpoint\n"
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
             "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
@@ -1429,6 +1434,84 @@ def handle_slash_command(
               " permission prompts are unchanged. Host environment"
               " variables are never forwarded. /sandbox off returns to"
               " local.\033[0m\n")
+        return None
+
+    if command in ("/checkpoint", "/undo"):
+        from .gitcheckpoint import GitCheckpoints
+
+        ckpt = GitCheckpoints(config)
+        if ckpt.repo_root() is None:
+            print("\n  \033[2mNot inside a git repository — checkpoints"
+                  " need one (git init to start).\033[0m\n")
+            return None
+        parts = arg.split()
+        verb = parts[0].lower() if parts else ""
+        if command == "/undo":
+            verb, parts = "restore", ["restore", "latest"]
+
+        if verb in ("on", "off"):
+            config["git_checkpoints"] = "true" if verb == "on" else "false"
+            print(f"\n  Git checkpoints: \033[1m{verb}\033[0m"
+                  "  \033[2m(this session; persist with git_checkpoints"
+                  " in the config file)\033[0m\n")
+            return None
+
+        entries = ckpt.list()
+        if verb in ("", "list"):
+            if not entries:
+                print("\n  \033[2mNo checkpoints yet — one is saved after"
+                      " every turn that changes the worktree.\033[0m\n")
+                return None
+            print("\n  \033[1;36mGit checkpoints (oldest first):\033[0m\n")
+            for i, entry in enumerate(entries, 1):
+                print(f"  \033[1m{i}\033[0m  {entry['sha'][:10]}  "
+                      f"{entry['label']}")
+            print("\n  \033[2m/checkpoint diff <#> · /checkpoint restore <#>"
+                  " · /undo = restore latest\033[0m\n")
+            return None
+
+        def _pick(token: str):
+            if token == "latest":
+                return entries[-1] if entries else None
+            try:
+                idx = int(token)
+            except ValueError:
+                return None
+            return entries[idx - 1] if 1 <= idx <= len(entries) else None
+
+        if verb == "diff":
+            entry = _pick(parts[1]) if len(parts) > 1 else None
+            if entry is None:
+                print("\n  \033[2mUsage: /checkpoint diff <#>\033[0m\n")
+                return None
+            print(f"\n{ckpt.diff_stat(entry['sha'])}\n")
+            return None
+
+        if verb == "restore":
+            entry = _pick(parts[1]) if len(parts) > 1 else None
+            if entry is None:
+                print("\n  \033[2mUsage: /checkpoint restore <#>"
+                      " (see /checkpoint list)\033[0m\n")
+                return None
+            print(f"\n  Restore worktree from \033[1m{entry['sha'][:10]}\033[0m"
+                  f" ({entry['label']})?")
+            print("  \033[2mOverwrites files present in the snapshot;"
+                  " files created afterwards are left alone. Uncommitted —"
+                  " nothing touches your branch.\033[0m")
+            try:
+                answer = input("  \033[1;33mRestore? [y/N]\033[0m ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            if answer not in ("y", "yes"):
+                print("  \033[2m(cancelled)\033[0m\n")
+                return None
+            ok, msg = ckpt.restore(entry["sha"])
+            marker = "\033[1;32m✓\033[0m" if ok else "\033[31m✗\033[0m"
+            print(f"  {marker} {msg}\n")
+            return None
+
+        print("\n  \033[2mUsage: /checkpoint [list|diff <#>|restore <#>"
+              "|on|off]\033[0m\n")
         return None
 
     if command in ("/search", "/s", "/find", "/grep") and conv_mgr is not None:

@@ -97,6 +97,7 @@ you explicitly configure or approve.
 | `exec_backend` | `local` | Where approved shell commands run: `local`, `docker`, or `e2b`; `/sandbox` flips per session |
 | `sandbox_docker_image` / `sandbox_docker_mount` | `python:3.12-slim` / `rw` | Docker sandbox image and cwd mount mode (`rw`, `ro`, `none`) |
 | `e2b_api_key_env` / `e2b_template` / `e2b_timeout_seconds` | `E2B_API_KEY` / `base` / `600` | E2B sandbox auth (env-var name), template, and TTL |
+| `git_checkpoints` / `git_checkpoint_limit` | `true` / `20` | Turn-level worktree snapshots under `refs/conch/checkpoints` in git repos; `/undo` restores |
 | `allow_prefixes` | — | Comma-separated command prefixes that never prompt, e.g. `git status, ls` |
 | `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds (clamped to 1–86400) |
 | `hook_pre_tool_use` | — | Shell script gating every tool call (JSON on stdin; non-zero exit blocks) |
@@ -272,6 +273,23 @@ backend only changes *where*. The host environment is never forwarded
 into a sandbox, and the E2B sandbox does not see local files (it is a
 clean remote environment — clone your repo inside it). Dispatching
 sandboxed work to fleet workers is a planned follow-up.
+
+### Git checkpoints
+Inside a git repo, conch uses local git as its safety net when writing
+code: after every turn that changes the worktree, a snapshot commit is
+recorded under `refs/conch/checkpoints/*` through a temporary index —
+your branch, real index, stash, and history are never touched, and
+`.gitignore` plus secret-shaped paths (`.env`, `*.pem`, `id_rsa*`,
+`credentials*`, …) are never captured, so a restore can never
+materialize a skipped secret. `/checkpoint` lists snapshots,
+`/checkpoint diff <#>` shows one, `/checkpoint restore <#>` (or `/undo`
+for the latest) writes a snapshot back as ordinary uncommitted changes
+after a y/N confirmation. The ref namespace is pruned to
+`git_checkpoint_limit` (default 20); disable with `git_checkpoints=false`
+or `/checkpoint off` for a session. The system prompt also nudges the
+model toward deliberate git use in repos (status/diff around edits,
+feature branches for multi-file changes) — the checkpoint layer is the
+deterministic backstop when it doesn't.
 
 ### Passwords and direct terminal handoff
 Use `/terminal <command>` (or the model-facing `interactive_terminal` tool) whenever `sudo`, `getpass`, SSH, a key passphrase, or another program may request private input:
@@ -1045,6 +1063,8 @@ target directly, pass Docker's `--init`.
 | `/verbose` | Toggle showing tool args and results |
 | `/tks [on\|off]` | Toggle the per-message token stats line (tokens, cost, tok/s) |
 | `/sandbox [docker [image]\|e2b\|off]` | Run approved shell commands in a sandbox instead of locally |
+| `/checkpoint [list\|diff <#>\|restore <#>\|on\|off]` | Turn-level git checkpoints of the worktree |
+| `/undo` | Restore the worktree from the latest git checkpoint |
 | `/rounds <n>` | Set max tool call rounds |
 | `/queue` | Toggle typeahead input |
 | `/paste` | Paste lines literally; end with a lone `.` or Ctrl+D |

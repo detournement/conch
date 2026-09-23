@@ -161,6 +161,18 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
         repo_map = get_repo_map()
         if repo_map:
             prompt += "\n\n" + repo_map
+            # Repo detected → git-aware coding discipline. The nudge is
+            # prompt-level; the deterministic backstop is the turn-level
+            # checkpoint layer (gitcheckpoint.py), which snapshots every
+            # mutating turn regardless of what the model does.
+            prompt += (
+                "\n\nThis is a git repository: use git deliberately when "
+                "writing code. Check git status/diff before and after "
+                "edits, prefer a feature branch for multi-file changes, "
+                "and commit logical units with descriptive messages when "
+                "the user asks for commits. Conch snapshots the worktree "
+                "after every turn that changes files (/undo restores)."
+            )
     # Available skills (plan 4.1): compact list so the model knows what it
     # can load with skill_manage.
     from .skills import build_skills_context
@@ -803,6 +815,14 @@ def chat_loop(new_conversation=False):
     _typeahead_partial = ""
     _handoff_depth = 0
 
+    # Turn-level git checkpoints (plan: maximally use local git when
+    # writing code). Active only inside a git repo with git_checkpoints
+    # on; every mutating turn snapshots to refs/conch/checkpoints/* so
+    # /undo and /checkpoint restore work without touching user history.
+    from .gitcheckpoint import GitCheckpoints
+
+    _git_ckpt = GitCheckpoints(config)
+
     def _pause_typeahead():
         nonlocal _typeahead_partial
         partial = _typeahead.stop_for_handoff()
@@ -1193,6 +1213,10 @@ def chat_loop(new_conversation=False):
             if _use_streaming:
                 print("\n\033[1;36massistant:\033[0m")
 
+            # Cheap pre-turn worktree fingerprint; a changed fingerprint
+            # after the turn means the turn wrote something → checkpoint.
+            _ckpt_fp = _git_ckpt.fingerprint() if _git_ckpt.enabled() else None
+
             try:
                 reply, turn_usage = session.run_turn(
                     messages,
@@ -1298,6 +1322,17 @@ def chat_loop(new_conversation=False):
                     print(
                         f"  \033[33m⚠ Context {ctx_used / ctx_window * 100:.0f}% full — "
                         f"older history will be compacted soon (/clear or /new to reset)\033[0m"
+                    )
+
+            # Git checkpoint when the turn mutated the worktree.
+            if _ckpt_fp is not None and _git_ckpt.fingerprint() != _ckpt_fp:
+                _label = user_input.strip().splitlines()[0][:80]
+                _snap = _git_ckpt.snapshot(_label)
+                if _snap:
+                    _n = len(_git_ckpt.list())
+                    print(
+                        f"  \033[2mcheckpoint #{_n} saved ({_snap['stat']})"
+                        f" — /undo reverts, /checkpoint lists\033[0m"
                     )
 
             # Process any config changes made by the LLM via conch_config tool

@@ -474,6 +474,7 @@ def run_compile_session(
     prior_card: Optional[Dict[str, Any]] = None,
     guidance: str = "",
     prefix: str = "",
+    capture_context: str = "",
     session_factory: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Run one bounded compilation session; returns the validated card.
@@ -505,6 +506,12 @@ def run_compile_session(
         discovery_digest(discovery),
         f"Created-asset identity prefix: {prefix}",
     ]
+    if str(capture_context or "").strip():
+        # Capture→Card: the trace is evidence for the design. It rides
+        # in its own labeled block; the preamble (set by the capture
+        # module) states the inertness rule — trace text is data, never
+        # instructions to the session.
+        user_parts.append(str(capture_context).strip())
     if prior_card is not None:
         user_parts.append(
             "This is a REVISION. The prior card version follows; produce "

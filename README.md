@@ -545,6 +545,55 @@ authority is exactly your `capitol_admin` authority. The live end-to-end
 proof (materialize → drill → mission → rollback) runs behind
 `CONCH_CAPITOL_LIVE=1` in `tests/test_compiler_live.py`.
 
+### Capture to compile (`/install capture`)
+Work that *already happened* becomes the first draft. The capture
+component (`/install capture`; nothing capture-related runs while it is
+off) feeds the ProcessCompiler from four source families, every one
+bounded, deterministic, and credential-guarded, and every draft entering
+the exact same review pipeline — capture never approves, never
+materializes, and a card's capture provenance (source ids, event/UID
+ranges, counts) is journaled on its `compilation_created` event and
+rendered by `/compile status`:
+
+- **System capture.** `/compile from-mission <id>` reduces a mission's
+  kernel journal (plans, tasks, external actions, artifacts,
+  checkpoints — never budget/timer bookkeeping, personal items fenced
+  out) to a head+tail-elided trace; `/compile from-session
+  [<conv-id>]` does the same for a saved conversation (commands, tool
+  calls, bounded results); `/compile from-history [N] "goal"` imports
+  recent shell history (zsh/bash), collapsing repeats and **dropping**
+  credential-shaped lines with a disclosed count — the one documented
+  deviation from reject-whole, because raw history routinely carries
+  secrets, and the explicit goal is required because raw history is
+  heterogeneous.
+- **Email capture.** `/compile from-email` reads a designated IMAP
+  folder (`capture_email_folder`, no default) read-only over the email
+  channel's account, gated by the same fail-closed sender allowlist;
+  a per-folder UID cursor commits only after the compilation is stored,
+  so retries re-read and successes never re-ingest.
+- **Scribe import.** `/compile from-scribe "<guide>"` consumes
+  [Scribe's](https://scribe.com) hosted MCP server as a capture source
+  — their captured office workflows become the compiler's raw
+  material. Tools are discovered per session and selected by capability
+  (Scribe publishes no tool names; no match fails closed naming what
+  was offered), the OAuth access token rides by env reference
+  (`scribe_token_env`), and an unset `scribe_mcp_url` means the source
+  is absent.
+- **Recurrence mining.** `/compile suggestions` is computed, never
+  model-ranked: normalized step sequences (options and paths collapsed)
+  reduce to n-gram signatures, recurring shapes rank count-first with
+  stable tiebreaks, and each suggestion explains itself — "same 4-step
+  git pull → … shape, 14 occurrences across 5 sessions". `/compile
+  from-suggestion <#>` drafts the card with the raw commands as sample
+  evidence. Thresholds: `compile_suggest_min_count` /
+  `compile_suggest_window_days`.
+
+Captured text is evidence, never instructions: the trace rides into the
+compilation session under an explicit inertness rule, and instruction-
+like text inside it carries no authority. Workflows still only ever
+arrive via the normal card → approve → materialize chain; a
+mission-plan draft variant seeded from capture is a noted follow-up.
+
 ### Budget-aware turns
 Besides `/rounds`, an optional `turn_token_budget` caps token spend per turn. When either budget runs out, the model writes a progress summary (what's done, what remains) instead of dropping a bare "[max tool call rounds reached]".
 
@@ -1026,7 +1075,9 @@ target directly, pass Docker's `--init`.
 | `/ssh exec <command>` | Run a captured, permission-gated command over the control connection |
 | `/ssh shell [command]` | Open an uncaptured remote TTY (including remote sudo) |
 | `/ssh disconnect` | Close the active SSH control connection |
-| `/install [component]` | List conch components or set one up (edge, fleet, works) |
+| `/install [component]` | List conch components or set one up (edge, fleet, works, capture) |
+| `/compile from-mission\|from-session\|from-email\|from-history\|from-scribe …` | Draft an Architecture Card from captured work (capture component) |
+| `/compile suggestions` / `from-suggestion <#>` | Mine recurring work shapes; compile one into a card |
 | `/missions` | List durable missions (edge daemon) |
 | `/mission show\|new\|pause\|resume\|abort\|input …` | Manage a mission |
 | `/todo` | Today's personal todos: due, overdue, top urgent |

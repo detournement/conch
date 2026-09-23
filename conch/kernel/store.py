@@ -3437,22 +3437,47 @@ class MissionStore:
 
     def create_compilation(self, card: Dict[str, Any], *,
                            actor: str = "user",
-                           compilation_id: Optional[str] = None
+                           compilation_id: Optional[str] = None,
+                           capture: Optional[Dict[str, Any]] = None
                            ) -> Dict[str, Any]:
         digest = self._guard_card(card)
         cid = compilation_id or kernel_id("cmp")
         goal = str(card.get("goal") or "").strip()
+        # Capture provenance (Capture→Card): a small ids-and-ranges dict
+        # recorded in the journal event only — the projection ignores it
+        # (replay == live is unaffected), and status surfaces read it
+        # back from the compilation's first event. Guarded like every
+        # other journal write.
+        if capture is not None:
+            findings = credential_findings(_canonical(capture))
+            if findings:
+                raise CredentialRejected(sorted(set(findings)))
 
         def fn(conn):
-            self._append(conn, cid, "compilation_created", {
+            data = {
                 "compilation_id": cid,
                 "status": CompilationStatus.COMPILED,
                 "goal": goal, "card": card, "digest": digest,
                 "author": str(actor or "user"), "version": 1,
-            })
+            }
+            if capture is not None:
+                data["capture"] = capture
+            self._append(conn, cid, "compilation_created", data)
             return cid
         self._mutate(fn)
         return self.get_compilation(cid)  # committed above; never None
+
+    def compilation_capture(self, compilation_id: str
+                            ) -> Optional[Dict[str, Any]]:
+        """The capture provenance recorded at creation (None when the
+        compilation was goal-compiled, not capture-sourced)."""
+        events = self.events_since(
+            compilation_id, 0, kinds=("compilation_created",), limit=1,
+        )
+        if not events:
+            return None
+        capture = events[0]["data"].get("capture")
+        return capture if isinstance(capture, dict) else None
 
     def _compilation_row(self, conn: sqlite3.Connection,
                          compilation_id: str):

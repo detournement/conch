@@ -442,6 +442,33 @@ api_key_env=ANTHROPIC_API_KEY
 #compile_token_budget=200000
 #compile_drill_timeout=600
 
+# --- Capture (capture → cards/plans/workflows) ----------------------------------
+# /install capture enables capture→card drafting: journaled sessions and
+# missions (/compile from-session, from-mission), recent shell history
+# (from-history), a designated email folder (from-email), imported Scribe
+# workflow context (from-scribe), and deterministic recurrence mining
+# (/compile suggestions → from-suggestion). Capture only drafts — every
+# card goes through the normal review/approve/materialize chain, and all
+# captured text is credential-guarded. Nothing here runs while
+# capture_enabled is off.
+#capture_enabled=false
+# Email source: reads the named IMAP folder READ-ONLY over the email
+# channel's account (email_address / email_imap_host / EMAIL_PASSWORD),
+# gated by the same fail-closed email_allowed_senders allowlist; a
+# per-folder UID cursor makes re-runs ingest only new mail. No default
+# folder — unset means the email source is absent.
+#capture_email_folder=Conch/Capture
+#capture_email_max_messages=25
+# Recurrence mining thresholds (/compile suggestions).
+#compile_suggest_min_count=3
+#compile_suggest_window_days=30
+# Scribe importer: Scribe's MCP server as a capture source. The hosted
+# endpoint authenticates with OAuth — export a pre-obtained access token
+# in the env var named by scribe_token_env (conch never stores it).
+# Unset URL = the source is absent (zero traffic).
+#scribe_mcp_url=https://mcp.scribe.com/mcp
+#scribe_token_env=SCRIBE_MCP_TOKEN
+
 # eBay pilot (/ebay <photo...> [-- notes]): sandbox photo→listing driver.
 # Identity + seller prerequisites for ebay.draft_request.v1 (ask the org
 # operator; the sandbox seller-policy IDs come from the provisioned org).

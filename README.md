@@ -125,9 +125,9 @@ are rejected.
 
 | Provider | Models | Cost |
 |----------|--------|------|
-| Cerebras | gpt-oss-120b, gemma-4-31b, zai-glm-4.7 (catalog unverified in the 2026-09-14 audit: no key available — re-audit before relying on it) | Paid / free tier |
-| OpenAI | gpt-5.6-sol/terra/luna, gpt-5.5, gpt-5.4 family, gpt-5-mini/nano, gpt-4.1 family, gpt-4o, gpt-4o-mini, o3, o3-mini, o4-mini, o1 (all verified tool-capable 2026-09-14; o1-mini is not supported, and gpt-5.3-codex, gpt-5.4-pro, o3-pro, o1-pro are v1/responses-only so conch cannot use them) | Paid |
-| Anthropic | claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5, claude-sonnet-4-5-20250929 (all verified tool-capable 2026-09-14) | Paid |
+| Cerebras | gpt-oss-120b, gemma-4-31b, zai-glm-4.7 (catalog unverified in the 2026-09-23 audit: no key available — re-audit before relying on it) | Paid / free tier |
+| OpenAI | gpt-6-sol, gpt-6-luna, gpt-5.6-sol/terra/luna, gpt-5.5, gpt-5.4 family, gpt-5-mini/nano, gpt-4.1 family, gpt-4o, gpt-4o-mini, o3, o3-mini, o4-mini, o1 (all verified tool-capable 2026-09-23; conch sends `reasoning_effort="none"` automatically where GPT-6/5.6 chat-completions tool calls require it. o1-mini is not supported, and gpt-6-astra, gpt-5.3-codex, gpt-5.4-pro, o3-pro, o1-pro are v1/responses-only for tools so conch cannot use them) | Paid |
+| Anthropic | claude-opus-5-5, claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5, claude-sonnet-4-5-20250929 (all verified tool-capable 2026-09-23; claude-opus-5-5 rejects forced tool_choice, which conch and its audit handle with `auto` + strict verification) | Paid |
 | Bedrock (AWS) | moonshotai.kimi-k2.5, moonshot.kimi-k2-thinking via Bedrock's OpenAI-compatible endpoint; auth is a long-term Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK` (region via `bedrock_region`, default us-east-2) | Paid (AWS) |
 | OpenRouter | moonshotai/kimi-k3 (2.8T MoE, 1M context, $3/$15 per MTok), z-ai/glm-5.2 (~750B MoE, 1M context, $0.98/$3.08 per MTok), deepseek/deepseek-v4-pro and deepseek/deepseek-v4-flash (1M context); key in `OPENROUTER_API_KEY` | Paid |
 | Ollama | Discovered live from your server's `/api/tags`, filtered to models that advertise the `tools` capability | Free (local) |

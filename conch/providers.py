@@ -60,11 +60,20 @@ KNOWN_MODELS = {
     # Quarantined 2026-09-14 (exist, but are v1/responses-only and reject
     # tool calls on chat completions, which is the only API conch speaks):
     #   gpt-5.3-codex, gpt-5.4-pro, o3-pro, o1-pro
+    # Quarantined 2026-09-23 for the same reason:
+    #   gpt-6-astra — tool calling requires v1/responses, and it does not
+    #   support reasoning_effort="none", so the chat-completions escape
+    #   hatch the other GPT-6 models have is unavailable.
     # Re-add them only if/when conch grows a v1/responses adapter.
     "openai": [
-        # gpt-5.6-{sol,terra,luna} tool-call on chat completions only with
-        # reasoning_effort="none" (sent automatically by
-        # build_openai_chat_request_body).
+        # gpt-6-{sol,luna} and gpt-5.6-{sol,terra,luna} tool-call on chat
+        # completions only with reasoning_effort="none" (sent automatically
+        # by build_openai_chat_request_body; see
+        # _openai_tools_require_effort_none). gpt-6 verified live
+        # 2026-09-23: with effort "none" the forced probe passes; without
+        # it the API returns 400 pointing at v1/responses.
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -89,7 +98,19 @@ KNOWN_MODELS = {
     # claude-haiku-4-5 is kept although the list endpoint only shows the
     # dated ID (claude-haiku-4-5-20251001): the alias resolves and passed
     # the tool probe.
+    #
+    # claude-opus-5-5 (released 2026-09-22) rejects FORCED tool_choice —
+    # both {"type": "tool"} and {"type": "any"} return HTTP 400
+    # ('tool_choice: type "tool" and "any" are not supported for this
+    # model'); {"type": "auto"} works and the model calls the offered tool
+    # reliably (verified live 2026-09-23). See
+    # anthropic_forced_tool_choice_supported(), honored by ask mode and
+    # tools/audit_models.py. Note: Anthropic's "preserved thinking" applies
+    # to Opus 5.5 (and Fable 5.1) for API accounts created on or after
+    # 2026-08-31 — editing prior assistant context can be rejected on such
+    # accounts, which affects history-rewriting flows like compaction.
     "anthropic": [
+        "claude-opus-5-5",
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
@@ -111,44 +132,47 @@ KNOWN_MODELS = {
 # the live existence + forced-tool-call audit (tools/audit_models.py), or
 # "unverified YYYY-MM-DD (<reason>)" when the audit could not run. A catalog
 # entry without an annotation here fails the test suite.
-_CEREBRAS_UNVERIFIED = "unverified 2026-09-14 (no CEREBRAS_API_KEY on audit machine)"
+_CEREBRAS_UNVERIFIED = "unverified 2026-09-23 (no CEREBRAS_API_KEY on audit machine)"
 MODEL_VERIFIED = {
     "gpt-oss-120b": _CEREBRAS_UNVERIFIED,
     "gemma-4-31b": _CEREBRAS_UNVERIFIED,
     "zai-glm-4.7": _CEREBRAS_UNVERIFIED,
-    "moonshotai.kimi-k2.5": "2026-09-14",
-    "moonshot.kimi-k2-thinking": "2026-09-14",
-    "zai.glm-5": "2026-09-14",
-    "moonshotai/kimi-k3": "2026-09-14",
-    "z-ai/glm-5.2": "2026-09-14",
-    "deepseek/deepseek-v4-pro": "2026-09-14",
-    "deepseek/deepseek-v4-flash": "2026-09-14",
-    "gpt-5.6-sol": "2026-09-14",
-    "gpt-5.6-terra": "2026-09-14",
-    "gpt-5.6-luna": "2026-09-14",
-    "gpt-5.5": "2026-09-14",
-    "gpt-5.4": "2026-09-14",
-    "gpt-5.4-mini": "2026-09-14",
-    "gpt-5.4-nano": "2026-09-14",
-    "gpt-5-mini": "2026-09-14",
-    "gpt-5-nano": "2026-09-14",
-    "gpt-4.1": "2026-09-14",
-    "gpt-4.1-mini": "2026-09-14",
-    "gpt-4.1-nano": "2026-09-14",
-    "gpt-4o": "2026-09-14",
-    "gpt-4o-mini": "2026-09-14",
-    "o4-mini": "2026-09-14",
-    "o3": "2026-09-14",
-    "o3-mini": "2026-09-14",
-    "o1": "2026-09-14",
-    "claude-opus-5": "2026-09-14",
-    "claude-sonnet-5": "2026-09-14",
-    "claude-opus-4-8": "2026-09-14",
-    "claude-opus-4-7": "2026-09-14",
-    "claude-sonnet-4-6": "2026-09-14",
-    "claude-opus-4-6": "2026-09-14",
-    "claude-haiku-4-5": "2026-09-14",
-    "claude-sonnet-4-5-20250929": "2026-09-14",
+    "moonshotai.kimi-k2.5": "2026-09-23",
+    "moonshot.kimi-k2-thinking": "2026-09-23",
+    "zai.glm-5": "2026-09-23",
+    "moonshotai/kimi-k3": "2026-09-23",
+    "z-ai/glm-5.2": "2026-09-23",
+    "deepseek/deepseek-v4-pro": "2026-09-23",
+    "deepseek/deepseek-v4-flash": "2026-09-23",
+    "gpt-6-sol": "2026-09-23",
+    "gpt-6-luna": "2026-09-23",
+    "gpt-5.6-sol": "2026-09-23",
+    "gpt-5.6-terra": "2026-09-23",
+    "gpt-5.6-luna": "2026-09-23",
+    "gpt-5.5": "2026-09-23",
+    "gpt-5.4": "2026-09-23",
+    "gpt-5.4-mini": "2026-09-23",
+    "gpt-5.4-nano": "2026-09-23",
+    "gpt-5-mini": "2026-09-23",
+    "gpt-5-nano": "2026-09-23",
+    "gpt-4.1": "2026-09-23",
+    "gpt-4.1-mini": "2026-09-23",
+    "gpt-4.1-nano": "2026-09-23",
+    "gpt-4o": "2026-09-23",
+    "gpt-4o-mini": "2026-09-23",
+    "o4-mini": "2026-09-23",
+    "o3": "2026-09-23",
+    "o3-mini": "2026-09-23",
+    "o1": "2026-09-23",
+    "claude-opus-5-5": "2026-09-23",
+    "claude-opus-5": "2026-09-23",
+    "claude-sonnet-5": "2026-09-23",
+    "claude-opus-4-8": "2026-09-23",
+    "claude-opus-4-7": "2026-09-23",
+    "claude-sonnet-4-6": "2026-09-23",
+    "claude-opus-4-6": "2026-09-23",
+    "claude-haiku-4-5": "2026-09-23",
+    "claude-sonnet-4-5-20250929": "2026-09-23",
 }
 
 DEFAULT_API_KEY_ENVS = {
@@ -206,6 +230,8 @@ MODEL_CONTEXT_WINDOWS = {
     "deepseek/deepseek-v4-pro": 1048576,
     "deepseek/deepseek-v4-flash": 1048576,
     # openai
+    "gpt-6-sol": 1050000,
+    "gpt-6-luna": 1050000,
     "gpt-5.6-sol": 1050000,
     "gpt-5.6-terra": 1050000,
     "gpt-5.6-luna": 1050000,
@@ -225,6 +251,7 @@ MODEL_CONTEXT_WINDOWS = {
     "o3-mini": 200000,
     "o1": 200000,
     # anthropic (1M is the default window from Sonnet 4.6 / Opus 4.6 onward)
+    "claude-opus-5-5": 1000000,
     "claude-opus-5": 1000000,
     "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
@@ -874,6 +901,9 @@ MODEL_PRICING = {
     "z-ai/glm-5.2":                (0.98, 3.08),
     "deepseek/deepseek-v4-pro":    (0.435, 0.87),
     "deepseek/deepseek-v4-flash":  (0.14, 0.28),
+    # GPT-6 rates per developers.openai.com/api/docs/pricing (2026-09-23).
+    "gpt-6-sol":                   (2.00, 10.00),
+    "gpt-6-luna":                  (0.10, 0.50),
     "gpt-5.6-sol":                 (5.00, 30.00),
     "gpt-5.6-terra":               (2.00, 12.00),
     "gpt-5.6-luna":                (0.20, 1.20),
@@ -892,6 +922,8 @@ MODEL_PRICING = {
     "o3":                          (2.00, 8.00),
     "o3-mini":                     (1.10, 4.40),
     "o1":                          (15.00, 60.00),
+    # Opus 5.5 per platform.claude.com pricing (2026-09-23).
+    "claude-opus-5-5":             (4.00, 20.00),
     "claude-opus-5":               (5.00, 25.00),
     "claude-sonnet-5":             (2.00, 10.00),
     "claude-sonnet-4-6":           (3.00, 15.00),
@@ -975,13 +1007,39 @@ def build_openai_chat_request_body(
         body["temperature"] = temperature
     if tools:
         body["tools"] = _sanitize_tools_for_openai(tools)
-        # gpt-5.6-{sol,terra,luna} reject function tools on chat completions
-        # at any reasoning_effort other than "none" (the API points to
-        # v1/responses otherwise). Verified live 2026-09-14: with
-        # reasoning_effort="none" the forced-tool probe passes on all three.
-        if model.lower().startswith("gpt-5.6"):
+        if _openai_tools_require_effort_none(model):
             body["reasoning_effort"] = "none"
     return body
+
+
+def _openai_tools_require_effort_none(model: str) -> bool:
+    """Models that reject function tools on chat completions unless
+    reasoning_effort is "none" (the API's 400 points at v1/responses
+    otherwise).
+
+    gpt-5.6-{sol,terra,luna} verified live 2026-09-14; gpt-6-{sol,luna}
+    verified live 2026-09-23 (with "none" the forced probe passes; without
+    it: "Function tools with reasoning_effort are not supported ... use
+    /v1/responses or set reasoning_effort to 'none'"). gpt-6-astra is NOT
+    handled here: it does not support effort "none" at all, so it stays
+    out of the catalog until a v1/responses adapter exists.
+    """
+    name = model.lower().strip()
+    return name.startswith("gpt-5.6") or name.startswith(("gpt-6-sol", "gpt-6-luna"))
+
+
+def anthropic_forced_tool_choice_supported(model: str) -> bool:
+    """Whether the model accepts forced tool_choice ({"type": "tool"/"any"}).
+
+    claude-opus-5-5 returns HTTP 400 for both forced forms ('tool_choice:
+    type "tool" and "any" are not supported for this model'; verified live
+    2026-09-23) — Anthropic documents the same for claude-fable-5-1. For
+    these models callers must use {"type": "auto"} and validate that the
+    tool_use block actually came back (ask mode and tools/audit_models.py
+    both do).
+    """
+    name = model.lower().strip()
+    return not name.startswith(("claude-opus-5-5", "claude-fable-5-1"))
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:

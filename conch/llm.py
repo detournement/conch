@@ -308,11 +308,14 @@ def call_anthropic(config: dict, messages: list) -> str:
     if not api_key:
         print("conch: ANTHROPIC_API_KEY not set", file=sys.stderr)
         sys.exit(1)
+    from .providers import anthropic_forced_tool_choice_supported
+
     url = "https://api.anthropic.com/v1/messages"
     system = next((m["content"] for m in messages if m["role"] == "system"), "")
     user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
+    model = config.get("model", "claude-sonnet-5")
     body = {
-        "model": config.get("model", "claude-sonnet-5"),
+        "model": model,
         "max_tokens": 2048,
         "system": system,
         "messages": [{"role": "user", "content": user_content}],
@@ -321,7 +324,14 @@ def call_anthropic(config: dict, messages: list) -> str:
             "description": SHELL_COMMAND_TOOL["function"]["description"],
             "input_schema": COMMAND_SCHEMA,
         }],
-        "tool_choice": {"type": "tool", "name": "shell_command"},
+        # Opus 5.5 / Fable 5.1 reject forced tool_choice; "auto" still
+        # produces the tool call reliably, and the extraction below returns
+        # "" (a clean ask-mode failure) if the model answered with text.
+        "tool_choice": (
+            {"type": "tool", "name": "shell_command"}
+            if anthropic_forced_tool_choice_supported(model)
+            else {"type": "auto"}
+        ),
     }
     req = urllib.request.Request(
         url,

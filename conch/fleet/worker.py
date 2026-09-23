@@ -100,6 +100,14 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS task_resumes (
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    accepted_at REAL NOT NULL,
+    PRIMARY KEY(task_id, attempt, tool_call_id)
+);
 """
 
 
@@ -508,6 +516,54 @@ class WorkerSupervisor:
             self._db.commit()
         return {"acked_seq": max(upto, row["acked_seq"])}
 
+    @staticmethod
+    def _resume_result_digest(result_text: str) -> str:
+        return hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+
+    def _resume_acceptance(self, task_id: str, attempt: int,
+                           tool_call_id: str) -> Optional[Dict[str, Any]]:
+        row = self._db.execute(
+            "SELECT result_sha256, accepted_at FROM task_resumes"
+            " WHERE task_id=? AND attempt=? AND tool_call_id=?",
+            (task_id, int(attempt), tool_call_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "result_sha256": str(row[0]),
+            "accepted_at": float(row[1]),
+        }
+
+    def _record_resume_acceptance(self, task_id: str, attempt: int,
+                                  tool_call_id: str,
+                                  result_text: str) -> None:
+        self._db.execute(
+            "INSERT INTO task_resumes(task_id, attempt, tool_call_id,"
+            " result_sha256, accepted_at) VALUES (?,?,?,?,?)",
+            (
+                task_id, int(attempt), tool_call_id,
+                self._resume_result_digest(result_text), _now(),
+            ),
+        )
+        self._db.commit()
+
+    def _read_resume_state(self, task_id: str,
+                           attempt: int) -> Dict[str, Any]:
+        resume_path = self._resume_path(task_id, attempt)
+        try:
+            resume = json.loads(resume_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise _RpcFailure(
+                f"task {task_id} has no readable resume state",
+                FailureClass.BUG,
+            )
+        if not isinstance(resume, dict):
+            raise _RpcFailure(
+                f"task {task_id} has invalid resume state",
+                FailureClass.BUG,
+            )
+        return resume
+
     def _op_resume(self, args: Dict[str, Any]) -> Dict[str, Any]:
         task_id = str(args["task_id"])
         row = self._row(task_id)
@@ -516,33 +572,81 @@ class WorkerSupervisor:
                 f"no task {task_id!r}", FailureClass.POLICY
             )
         self._check_fence(row, args)
+        tool_call_id = str(args.get("tool_call_id", ""))
+        result_text = str(args.get("result_text", ""))
+        accepted = self._resume_acceptance(
+            task_id, row["attempt"], tool_call_id
+        )
+        if accepted is not None:
+            if accepted["result_sha256"] != self._resume_result_digest(
+                result_text
+            ):
+                raise _RpcFailure(
+                    f"resume {tool_call_id!r} for task {task_id} was"
+                    " already accepted with a different result — refusing",
+                    FailureClass.POLICY,
+                )
+            # If the supervisor died after journaling acceptance but before
+            # spawning the resumed child, finish that handoff on redelivery.
+            if row["state"] == WAITING_CHILD:
+                resume = self._read_resume_state(
+                    task_id, row["attempt"]
+                )
+                child_result = resume.get("child_result") or {}
+                if (
+                    str(resume.get("tool_call_id") or "") == tool_call_id
+                    and str(child_result.get("result_text") or "")
+                    == result_text
+                ):
+                    self._spawn(task_id, row, resume=True)
+                    row = self._row(task_id)
+            return {
+                "state": row["state"], "duplicate": True,
+                "accepted": True,
+            }
         if row["state"] in TERMINAL_STATES:
             return {"state": row["state"], "duplicate": True,
-                    "receipt": row["receipt"]}
+                    "accepted": True, "receipt": row["receipt"]}
         if row["state"] == RUNNING:
-            return {"state": RUNNING, "duplicate": True}
+            # The delegation event is written by the child just before it
+            # exits. The event can therefore reach the controller before the
+            # reaper changes this row to WAITING_CHILD. A RUNNING row with no
+            # acceptance receipt is not a duplicate resume: acknowledging it
+            # would make the controller move on while the worker parks forever.
+            raise _RpcFailure(
+                f"task {task_id} is still parking its delegation"
+                " — retry resume",
+                FailureClass.TRANSIENT, retry_after=0.2,
+            )
         if row["state"] != WAITING_CHILD:
             raise _RpcFailure(
                 f"task {task_id} is {row['state']}, not waiting_child",
                 FailureClass.POLICY,
             )
-        resume_path = self._resume_path(task_id, row["attempt"])
-        try:
-            resume = json.loads(resume_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        resume = self._read_resume_state(task_id, row["attempt"])
+        expected_call_id = str(resume.get("tool_call_id") or "")
+        if not tool_call_id or tool_call_id != expected_call_id:
             raise _RpcFailure(
-                f"task {task_id} has no readable resume state",
-                FailureClass.BUG,
+                f"resume tool call {tool_call_id!r} does not match"
+                f" task {task_id}'s parked delegation"
+                f" {expected_call_id!r} — refusing",
+                FailureClass.POLICY,
             )
         resume["child_result"] = {
-            "tool_call_id": str(args.get("tool_call_id", "")),
-            "result_text": str(args.get("result_text", "")),
+            "tool_call_id": tool_call_id,
+            "result_text": result_text,
         }
-        resume_path.write_text(
+        self._resume_path(task_id, row["attempt"]).write_text(
             json.dumps(resume, sort_keys=True), encoding="utf-8"
         )
+        # Journal acceptance before spawning. A lost RPC response can then be
+        # redelivered without starting a second child, including after a later
+        # delegation has replaced the single current resume-state file.
+        self._record_resume_acceptance(
+            task_id, row["attempt"], tool_call_id, result_text
+        )
         self._spawn(task_id, row, resume=True)
-        return {"state": RUNNING, "duplicate": False}
+        return {"state": RUNNING, "duplicate": False, "accepted": True}
 
     # -- artifact transfer (content-addressed, digest-verified) ----------------
 

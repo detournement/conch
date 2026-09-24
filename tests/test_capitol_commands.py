@@ -186,6 +186,22 @@ class CapitolCommandTests(unittest.TestCase):
             document()["workflow_id"], version_number=2,
         )
 
+    def test_procedure_endpoint_gap_fails_closed_without_traceback(self):
+        from conch.capitol.errors import CapitolProtocolError
+
+        client = unittest.mock.Mock()
+        client.search.side_effect = CapitolProtocolError(
+            "unsupported Procedure search schema (failing closed)"
+        )
+        with patch(
+            "conch.capitol.procedures.CapitolProcedureClient.from_config",
+            return_value=client,
+        ):
+            out = _run('procedure search "warehouse"', self.config)
+        self.assertIn("failing closed", out)
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn(BEARER, out)
+
     # -- start / watch -------------------------------------------------------
 
     def test_start_discovers_inputs_key_and_prints_replay_key(self):

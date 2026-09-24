@@ -1,10 +1,9 @@
 # Conch
 
-**Turn the work you do into automation you can trust.**
+**An AI shell that learns your work and automates it — with your approval at every step.**
 
-Conch is a local-first AI shell and agent control plane. It runs approved
-commands, captures repeatable work, compiles it into reviewed workflows, and
-operates durable missions across your machines, channels, and Capitol.
+Local-first. Everything it does is captured, reviewed, and auditable: from
+one-off commands to durable missions running across your machines.
 
 **Capture → compile → operate.**
 

@@ -1,9 +1,12 @@
-# conch
+# Conch
 
-**Conch is an LLM-assisted shell:** ask for a command, open a tool-using chat,
-edit code behind approval gates, or keep durable work running after the terminal
-closes. Optional components add trusted SSH workers, governed Capitol
-workflows, and a local-first capture-to-compile pipeline.
+**Turn the work you do into automation you can trust.**
+
+Conch is a local-first AI shell and agent control plane. It runs approved
+commands, captures repeatable work, compiles it into reviewed workflows, and
+operates durable missions across your machines, channels, and Capitol.
+
+**Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
 [Current release: v0.7.0][release] ·

@@ -159,6 +159,33 @@ class CapitolCommandTests(unittest.TestCase):
         out = _run("evals run-x", self.config)
         self.assertIn('"suite_passed": true', out)
 
+    def test_procedure_search_and_exact_show_use_read_client(self):
+        from tests.test_capitol_procedures import document, result_item
+
+        client = unittest.mock.Mock()
+        client.search.return_value = {
+            "schema_version": "capitol.procedure_collection.v1",
+            "results": [result_item()],
+            "limit": 10, "offset": 0, "total": 1,
+        }
+        client.get.return_value = document()
+        with patch(
+            "conch.capitol.procedures.CapitolProcedureClient.from_config",
+            return_value=client,
+        ):
+            out = _run('procedure search "governed thing"', self.config)
+            self.assertIn("Governed Thing", out)
+            self.assertIn("reviewed", out)
+            out = _run(
+                f"procedure show {document()['workflow_id']} --version 2",
+                self.config,
+            )
+        self.assertIn("untrusted Procedure prose", out)
+        self.assertIn(document()["content_digest"], out)
+        client.get.assert_called_once_with(
+            document()["workflow_id"], version_number=2,
+        )
+
     # -- start / watch -------------------------------------------------------
 
     def test_start_discovers_inputs_key_and_prints_replay_key(self):

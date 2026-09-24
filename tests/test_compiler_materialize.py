@@ -14,11 +14,13 @@ non-local base URLs are refused in v1.
 """
 
 import json
+import copy
 import tempfile
 import unittest
 from pathlib import Path
 
 from conch.capitol.compiler.card import normalize_card
+from conch.capitol.compiler.graph import build_workflow_payload
 from conch.capitol.compiler.materialize import (
     ensure_local_stack,
     materialize_compilation,
@@ -36,6 +38,7 @@ from tests.compiler_fixtures import (
     SCHEDULE_IDENTITY,
     WORKFLOW_IDENTITY,
     FakeAdmin,
+    FakeProcedureClient,
     FakeRunDriver,
     candidate_card,
     fake_catalog,
@@ -62,8 +65,10 @@ class MaterializeCase(unittest.TestCase):
         return cid
 
     def materialize(self, cid, admin):
+        self.procedure_client = FakeProcedureClient(admin)
         return materialize_compilation(
             self.store, self.config, cid, admin=admin,
+            procedure_client=self.procedure_client,
             catalog=self.catalog, packs_dir=self.packs_dir,
             log=lambda line: None,
         )
@@ -89,6 +94,19 @@ class TestMaterializationOrder(MaterializeCase):
         compilation = self.store.get_compilation(cid)
         self.assertEqual(
             compilation["status"], CompilationStatus.MATERIALIZED
+        )
+        self.assertEqual(
+            compilation["materialization"]["documentation"]["status"],
+            "linked",
+        )
+        self.assertEqual(len(compilation["procedures"]["links"]), 1)
+        self.assertTrue(
+            Path(compilation["materialization"]["lock_path"]).is_file()
+        )
+        self.assertTrue(
+            compilation["materialization"]["lock_digest"].startswith(
+                "sha256:"
+            )
         )
         # the pack + drill fixtures landed on disk and load fail-closed
         pack_dir = self.packs_dir / PACK_NAME
@@ -145,6 +163,53 @@ class TestMaterializationOrder(MaterializeCase):
             self.store.get_compilation(cid)["status"],
             CompilationStatus.MATERIALIZED,
         )
+        self.assertEqual(
+            len(self.store.get_compilation(cid)["procedures"]["links"]), 1,
+            "identical reconciliation appends no second link event",
+        )
+
+    def test_legacy_receipt_reconciles_read_only_when_exactly_provable(self):
+        cid = self.compile_and_approve()
+        workflow = self.card["assets"]["create"]["workflows"][0]
+        payload = build_workflow_payload(
+            self.catalog,
+            workflow,
+            collection_ids={"col-ledger": "col-ledger"},
+        )
+        admin = FakeAdmin()
+        client = FakeProcedureClient(admin)
+        client.seed(workflow["workflow_id"], payload)
+        self.store.record_compilation_materialization(
+            cid,
+            {"steps": [{
+                "step": f"workflow:{workflow['identity']}",
+                "receipt": {
+                    "workflow_id": workflow["workflow_id"],
+                    "version_pin": client.version_id(
+                        workflow["workflow_id"]
+                    ),
+                    "version_number": 1,
+                    # Legacy receipts had no payload_digest.
+                },
+                "rollback_ref": {
+                    "kind": "delete_workflow",
+                    "workflow_id": workflow["workflow_id"],
+                },
+                "adopted": False,
+            }]},
+            complete=True,
+        )
+        state = materialize_compilation(
+            self.store, self.config, cid, admin=admin,
+            procedure_client=client, catalog=self.catalog,
+            packs_dir=self.packs_dir, log=lambda line: None,
+        )
+        self.assertNotIn("persist_workflow", admin.effects)
+        receipt = state["steps"][0]["receipt"]
+        self.assertTrue(receipt["payload_digest"].startswith("sha256:"))
+        self.assertEqual(
+            len(self.store.get_compilation(cid)["procedures"]["links"]), 1,
+        )
 
 
 class TestPartialFailureAndRollback(MaterializeCase):
@@ -191,6 +256,7 @@ class TestPartialFailureAndRollback(MaterializeCase):
         driver = FakeRunDriver()
         verify_compilation(
             self.store, self.config, cid, driver=driver,
+            procedure_client=self.procedure_client,
             packs_dir=self.packs_dir, log=lambda line: None,
         )
         compilation = self.store.get_compilation(cid)
@@ -232,6 +298,88 @@ class TestPartialFailureAndRollback(MaterializeCase):
         ))
         self.assertNotIn("delete_agent", admin.effects)
 
+    def test_exact_procedure_workflow_adoption_is_never_deleted(self):
+        admin = FakeAdmin()
+        procedure_client = FakeProcedureClient(admin)
+        workflow_id = "wf-procedure-adopt"
+        payload = {
+            "id": workflow_id,
+            "name": "Existing Procedure Workflow",
+            "nodes": [{
+                "id": "input-node",
+                "data": {"struct": {"node_id": "json_input_node"}},
+            }],
+            "edges": [],
+        }
+        procedure_client.seed(workflow_id, payload)
+        version = procedure_client.get_workflow_version(
+            workflow_id, procedure_client.version_id(workflow_id),
+        )
+        document = procedure_client.get(
+            workflow_id,
+            workflow_version_id=version["id"],
+        )
+        raw = copy.deepcopy(candidate_card())
+        raw["schema"] = "conch.architecture_card.v2"
+        raw["assets"] = {
+            "reuse": [{
+                "kind": "workflow", "id": workflow_id,
+                "name": "Existing Procedure Workflow",
+                "reason": "adopt the exact existing version",
+            }],
+            "create": {
+                "workflows": [], "agent": None, "schedules": [],
+                "collections": [],
+            },
+        }
+        raw["drill"]["fixtures"][0]["workflow"] = workflow_id
+        raw["mission"]["capitol"]["workflows"] = [workflow_id]
+        raw["procedure_sources"] = [{
+            "relationship": "adopt",
+            "org_id": admin.org_id,
+            "procedure_document_id": document["id"],
+            "workflow_id": workflow_id,
+            "workflow_version_id": version["id"],
+            "workflow_version_number": version["version_number"],
+            "workflow_payload_digest": version["payload_digest"],
+            "procedure_content_digest": document["content_digest"],
+            "compiler_version": document["compiler_version"],
+        }]
+        discovery = fake_discovery()
+        discovery["org_id"] = admin.org_id
+        discovery["workflows"].append({
+            "id": workflow_id,
+            "name": "Existing Procedure Workflow",
+            "workflow_version_id": version["id"],
+            "version_number": version["version_number"],
+            "workflow_payload_digest": version["payload_digest"],
+            "input_override_key": "input-node.value",
+        })
+        card = normalize_card(raw, discovery)
+        cid = self.store.create_compilation(card)["compilation_id"]
+        self.store.decide_compilation(cid, "approve", decided_by="tester")
+        state = materialize_compilation(
+            self.store, self.config, cid, admin=admin,
+            procedure_client=procedure_client,
+            catalog=self.catalog, packs_dir=self.packs_dir,
+            log=lambda line: None,
+        )
+        adopted = next(
+            step for step in state["steps"]
+            if step["step"].startswith("workflow-adopt:")
+        )
+        self.assertTrue(adopted["adopted"])
+        self.assertNotIn("persist_workflow", admin.effects)
+        outcome = rollback_compilation(
+            self.store, self.config, cid, admin=admin,
+            log=lambda line: None,
+        )
+        self.assertTrue(any(
+            "workflow-adopt:" in entry for entry in outcome["skipped"]
+        ))
+        self.assertIn(workflow_id, admin.workflow_payloads)
+        self.assertNotIn("delete_workflow", admin.effects)
+
     def test_rollback_without_receipts_refused(self):
         cid = self.compile_and_approve()
         with self.assertRaisesRegex(CapitolError, "no recorded"):
@@ -252,6 +400,7 @@ class TestDrillGate(MaterializeCase):
         driver = FakeRunDriver()
         outcome = verify_compilation(
             self.store, self.config, cid, driver=driver,
+            procedure_client=self.procedure_client,
             packs_dir=self.packs_dir, log=lambda line: None,
         )
         self.assertEqual(outcome["status"], CompilationStatus.OPERATING)
@@ -282,6 +431,7 @@ class TestDrillGate(MaterializeCase):
         with self.assertRaisesRegex(CapitolError, "drill FAILED"):
             verify_compilation(
                 self.store, self.config, cid, driver=driver,
+                procedure_client=self.procedure_client,
                 packs_dir=self.packs_dir, log=lambda line: None,
             )
         compilation = self.store.get_compilation(cid)
@@ -297,6 +447,7 @@ class TestDrillGate(MaterializeCase):
         with self.assertRaisesRegex(CapitolError, "marker"):
             verify_compilation(
                 self.store, self.config, cid, driver=driver,
+                procedure_client=self.procedure_client,
                 packs_dir=self.packs_dir, log=lambda line: None,
             )
 
@@ -311,6 +462,49 @@ class TestDrillGate(MaterializeCase):
         with self.assertRaises(PackError):
             verify_compilation(
                 self.store, self.config, cid, driver=FakeRunDriver(),
+                procedure_client=self.procedure_client,
+                packs_dir=self.packs_dir, log=lambda line: None,
+            )
+
+    def test_documentation_pending_may_drill_in_shadow(self):
+        cid = self.compile_and_approve()
+        admin = FakeAdmin()
+        self.procedure_client = FakeProcedureClient(admin, missing=True)
+        materialize_compilation(
+            self.store, self.config, cid, admin=admin,
+            procedure_client=self.procedure_client,
+            catalog=self.catalog, packs_dir=self.packs_dir,
+            log=lambda line: None,
+        )
+        compilation = self.store.get_compilation(cid)
+        self.assertEqual(
+            compilation["materialization"]["documentation"]["status"],
+            "documentation_pending",
+        )
+        outcome = verify_compilation(
+            self.store, self.config, cid, driver=FakeRunDriver(),
+            procedure_client=self.procedure_client,
+            packs_dir=self.packs_dir, log=lambda line: None,
+        )
+        self.assertEqual(outcome["status"], CompilationStatus.OPERATING)
+
+    def test_stale_latest_workflow_version_fails_closed(self):
+        cid = self.materialize_ok()
+        self.procedure_client.latest = False
+        with self.assertRaisesRegex(CapitolError, "latest version"):
+            verify_compilation(
+                self.store, self.config, cid, driver=FakeRunDriver(),
+                procedure_client=self.procedure_client,
+                packs_dir=self.packs_dir, log=lambda line: None,
+            )
+
+    def test_procedure_digest_drift_fails_closed(self):
+        cid = self.materialize_ok()
+        self.procedure_client.markdown_suffix = "\nChanged projection."
+        with self.assertRaisesRegex(CapitolError, "Procedure drift"):
+            verify_compilation(
+                self.store, self.config, cid, driver=FakeRunDriver(),
+                procedure_client=self.procedure_client,
                 packs_dir=self.packs_dir, log=lambda line: None,
             )
 

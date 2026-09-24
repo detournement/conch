@@ -117,8 +117,9 @@ class TestToolDefinition(ToolCase):
         ops = set(fn["parameters"]["properties"]["op"]["enum"])
         self.assertEqual(ops, {
             "discover", "workflows", "describe", "suggest", "versions",
-            "stats", "runs", "start", "status", "watch", "respond",
-            "outputs", "evals", "upload", "download",
+            "stats", "runs", "procedure_search", "procedure_show", "start",
+            "status", "watch", "respond", "outputs", "evals", "upload",
+            "download",
         })
         # Admin ops are never advertised on the schema.
         self.assertFalse(ops & set(ADMIN_REFUSALS))
@@ -208,6 +209,31 @@ class TestReads(ToolCase):
     def test_missing_argument_is_reported(self):
         self.assertIn("needs workflow_id",
                       self.call({"op": "describe"}))
+
+    def test_procedure_reads_are_bounded_runtime_ops(self):
+        from tests.test_capitol_procedures import document, result_item
+
+        procedure_client = unittest.mock.Mock()
+        procedure_client.search.return_value = {
+            "results": [result_item()],
+        }
+        procedure_client.get.return_value = document()
+        with patch.object(
+            self.client, "_procedure_client",
+            return_value=procedure_client,
+        ):
+            text = self.call({
+                "op": "procedure_search", "query": "governed",
+            })
+            self.assertIn("Procedure result", text)
+            self.assertIn("documentation only", text)
+            text = self.call({
+                "op": "procedure_show",
+                "workflow_id": document()["workflow_id"],
+                "version_number": 2,
+            })
+        self.assertIn("bounded untrusted prose", text)
+        self.assertIn(document()["content_digest"], text)
 
     def test_auth_error_parks_with_sources(self):
         with patch.dict(os.environ, {"CAPITOL_A2A_BEARER": "cap_a2a_WRONG"}):

@@ -39,16 +39,17 @@ USAGE = """
     /compile from-history [N] "goal"      draft a card from recent shell history (capture)
     /compile from-scribe "<guide>" ["goal"]   draft a card from Scribe workflow context (MCP)
     /compile from-browser [origin] ["goal"]   draft a card from captured browser events (capture)
+    /compile from-procedure <workflow-id> --version N ["goal"]   draft from an exact Capitol Procedure/workflow version
     /compile suggestions [--days D] [--min N]   recurring work shapes worth compiling
     /compile from-suggestion <#> ["goal"]  draft a card from a mined recurrence
     /compile list                  list compilations
-    /compile show <id> [vN|--diff] render a card (or diff the last two versions)
+    /compile show <id> [vN|--diff] [--procedures] render a card and linkage
     /compile approve <id>          approve the current card version (authorizes materialization)
     /compile reject <id> [reason]  reject the current card version
     /compile revise <id> "<guidance>"   recompile into a new card version
     /compile materialize <id>      provision the approved card, run the drill, bind the mission
     /compile rollback <id>         revert everything materialized so far
-    /compile status <id>           status, receipts, drill evidence, mission
+    /compile status <id> [--procedures] status, receipts, Procedure linkage
   \033[2mCards are kernel events (replay == live). Approval is origin-bound and local-only in v1;
   materialization requires capitol_admin=true and the local serving stack.\033[0m
 """
@@ -213,6 +214,66 @@ def _cmd_from_browser(tokens: List[str], config: dict):
     _print(f"\n  \033[2mcapturing {context['label']} → drafting the "
            "card …\033[0m")
     card, provenance = compile_from_capture(config, context, goal=goal)
+    _finish_compile(card, capture=provenance)
+
+
+def _cmd_from_procedure(tokens: List[str], config: dict):
+    from .capture import compile_from_capture
+    from .capture_procedure import capture_from_procedure
+    from .session import build_discovery
+
+    positional: List[str] = []
+    version = 0
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--version":
+            if index + 1 >= len(tokens):
+                raise CapitolError("--version needs a positive integer")
+            try:
+                version = int(tokens[index + 1])
+            except ValueError:
+                raise CapitolError(
+                    "--version needs a positive integer"
+                ) from None
+            index += 2
+            continue
+        if token.startswith("--"):
+            raise CapitolError(
+                f"unknown from-procedure option {token!r}"
+            )
+        positional.append(token)
+        index += 1
+    if not positional or version < 1:
+        _print(
+            "\n  \033[2mUsage: /compile from-procedure <workflow-id> "
+            "--version N [\"goal\"]\033[0m\n"
+        )
+        return
+    workflow_id = positional[0]
+    goal = " ".join(positional[1:]).strip().strip("\"'")
+    context = capture_from_procedure(
+        config, workflow_id, version, goal=goal,
+    )
+    discovery = build_discovery(config)
+    exact = context["discovery_workflow"]
+    workflows = [
+        row for row in discovery.get("workflows") or []
+        if str(row.get("id") or "") != workflow_id
+    ]
+    workflows.append(exact)
+    discovery["workflows"] = workflows
+    _print(
+        f"\n  \033[2mcapturing {context['label']} → drafting the "
+        "card through the normal review path …\033[0m"
+    )
+    card, provenance = compile_from_capture(
+        config,
+        context,
+        goal=goal,
+        discovery=discovery,
+        procedure_sources=[context["source_ref"]],
+    )
     _finish_compile(card, capture=provenance)
 
 
@@ -502,13 +563,18 @@ def _cmd_show(store, tokens: List[str]):
     from .card import diff_cards, render_card_markdown
 
     if not tokens:
-        _print("\n  \033[2mUsage: /compile show <id> [vN|--diff]\033[0m\n")
+        _print(
+            "\n  \033[2mUsage: /compile show <id> [vN|--diff] "
+            "[--procedures]\033[0m\n"
+        )
         return
     compilation = _resolve(store, tokens[0])
     if compilation is None:
         return
     cid = compilation["compilation_id"]
     rest = tokens[1:]
+    show_procedures = "--procedures" in rest
+    rest = [token for token in rest if token != "--procedures"]
     if rest and rest[0] == "--diff":
         latest = int(compilation["card_version"])
         if latest < 2:
@@ -537,6 +603,8 @@ def _cmd_show(store, tokens: List[str]):
         card_version=row["card_version"],
     ).splitlines():
         _print("  " + line)
+    if show_procedures:
+        _print_procedures(compilation, verbose=True)
     _print()
 
 
@@ -661,9 +729,53 @@ def _cmd_rollback(store, tokens: List[str], config: dict):
     )
 
 
+def _print_procedures(
+    compilation: Dict[str, Any],
+    *,
+    verbose: bool = False,
+) -> None:
+    procedures = compilation.get("procedures") or {}
+    links = procedures.get("links") or []
+    materialization = compilation.get("materialization") or {}
+    documentation = materialization.get("documentation") or {}
+    pending = documentation.get("pending") or []
+    if not links and not pending:
+        _print("    \033[2mProcedures: unresolved / not reconciled\033[0m")
+        return
+    _print(
+        f"    \033[2mProcedures: {len(links)} linked, "
+        f"{len(pending)} documentation_pending\033[0m"
+    )
+    if not verbose:
+        return
+    for link in links:
+        _print(
+            f"      \033[2m{link['workflow_id']} v"
+            f"{link['workflow_version_number']} "
+            f"({link['workflow_version_id']}) → "
+            f"{link['procedure_document_id']} "
+            f"{link['procedure_content_digest'][:23]}… "
+            f"[{link['verification']}]\033[0m"
+        )
+    for row in pending:
+        _print(
+            f"      \033[33m{row.get('workflow_id')} v"
+            f"{row.get('workflow_version_number')} "
+            "documentation_pending\033[0m"
+        )
+    if materialization.get("lock_digest"):
+        _print(
+            f"      \033[2mlock {materialization['lock_digest']} at "
+            f"{materialization.get('lock_path', '')}\033[0m"
+        )
+
+
 def _cmd_status(store, tokens: List[str]):
     if not tokens:
-        _print("\n  \033[2mUsage: /compile status <id>\033[0m\n")
+        _print(
+            "\n  \033[2mUsage: /compile status <id> "
+            "[--procedures]\033[0m\n"
+        )
         return
     compilation = _resolve(store, tokens[0])
     if compilation is None:
@@ -713,6 +825,9 @@ def _cmd_status(store, tokens: List[str]):
     if compilation.get("mission_id"):
         _print(f"    \033[2msupervising mission: "
                f"{compilation['mission_id']}\033[0m")
+    _print_procedures(
+        compilation, verbose="--procedures" in tokens[1:],
+    )
     _print()
 
 
@@ -739,7 +854,7 @@ def run_compile_command(arg: str, config: dict, *,
     sub = tokens[0].lower()
     capture_verbs = {"from-mission", "from-session", "from-email",
                      "from-history", "from-scribe", "from-browser",
-                     "suggestions", "from-suggestion"}
+                     "from-procedure", "suggestions", "from-suggestion"}
     known = {"list", "show", "approve", "reject", "revise",
              "materialize", "rollback", "status"} | capture_verbs
     try:
@@ -777,6 +892,9 @@ def run_compile_command(arg: str, config: dict, *,
             return
         if sub == "from-browser":
             _cmd_from_browser(tokens[1:], config)
+            return
+        if sub == "from-procedure":
+            _cmd_from_procedure(tokens[1:], config)
             return
         if sub == "suggestions":
             _cmd_suggestions(tokens[1:], config)

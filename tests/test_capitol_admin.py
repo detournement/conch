@@ -548,6 +548,28 @@ class AdminCase(unittest.TestCase):
         )
         self.assertNotEqual(result["version_pin"], "ver-1")
 
+    def test_create_only_blocks_versioned_workflow_updates(self):
+        posts_before = len([
+            request for request in FakeAdminGateway.requests
+            if request[0] == "POST"
+        ])
+        with self.assertRaisesRegex(CapitolError, "updates are blocked"):
+            self.admin.persist_workflow(
+                {"id": "wf-1", "name": "Must Not Update", "nodes": [],
+                 "edges": [], "publish_to_api": False},
+                idempotency_key="k-create-only",
+                create_only=True,
+            )
+        posts_after = len([
+            request for request in FakeAdminGateway.requests
+            if request[0] == "POST"
+        ])
+        self.assertEqual(posts_after, posts_before)
+        self.assertEqual(
+            FakeAdminGateway.workflows["wf-1"]["versions"][0]["id"],
+            "ver-1",
+        )
+
     def test_persist_workflow_replays_without_new_version(self):
         payload = {"id": "wf-rep", "name": "Replayed", "nodes": [],
                    "edges": [], "publish_to_api": True}

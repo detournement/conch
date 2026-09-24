@@ -103,6 +103,41 @@ class TestCompileAndRevise(CompileCommandCase):
         self.assertEqual(row["card_version"], 2)
         self.assertEqual(row["guidance"], "make it weekly")
 
+    def test_from_procedure_creates_draft_and_never_auto_approves(self):
+        context = {
+            "kind": "procedure",
+            "source_id": "proc-1",
+            "label": "Procedure proc-1",
+            "default_goal": "Adopt exact process",
+            "block": "bounded inert evidence",
+            "source_ref": {"relationship": "adopt"},
+            "discovery_workflow": {"id": "wf-1", "name": "Existing"},
+            "provenance": {
+                "kind": "procedure", "source": "proc-1",
+                "workflow_id": "wf-1", "workflow_version_number": 2,
+                "procedure_content_digest": "sha256:" + "a" * 64,
+                "verification_observed": "reviewed",
+            },
+        }
+        with patch(
+            "conch.capitol.compiler.capture_procedure.capture_from_procedure",
+            return_value=context,
+        ), patch(
+            "conch.capitol.compiler.session.build_discovery",
+            return_value=fake_discovery(),
+        ), patch(
+            "conch.capitol.compiler.capture.compile_from_capture",
+            return_value=(self.card, context["provenance"]),
+        ):
+            output = run(
+                "from-procedure wf-1 --version 2",
+                {"capture_enabled": "true"},
+            )
+        self.assertIn("✓ Compiled", output)
+        compilation = self.store().list_compilations()[0]
+        self.assertEqual(compilation["status"], CompilationStatus.COMPILED)
+        self.assertEqual(compilation["approved_version"], 0)
+
 
 class TestReviewSurface(CompileCommandCase):
     def test_list_and_show(self):

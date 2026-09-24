@@ -37,7 +37,13 @@ from .graph import (
     workflow_uuid,
 )
 
-CARD_SCHEMA = "conch.architecture_card.v1"
+CARD_SCHEMA_V1 = "conch.architecture_card.v1"
+CARD_SCHEMA_V2 = "conch.architecture_card.v2"
+# Ordinary goal/capture compilations continue to emit v1. Procedure-seeded
+# compilations opt into v2 because immutable workflow/Procedure pins belong
+# in the approved authorization artifact.
+CARD_SCHEMA = CARD_SCHEMA_V1
+CARD_SCHEMAS = frozenset({CARD_SCHEMA_V1, CARD_SCHEMA_V2})
 
 #: Created-asset identity prefix (disposable, greppable, rollback-safe).
 DEFAULT_ASSET_PREFIX = "conch-compile"
@@ -64,11 +70,12 @@ class CardError(CapitolError):
     """An architecture card failed validation (fail closed)."""
 
 
-_TOP_KEYS = {
+_TOP_KEYS_V1 = {
     "schema", "goal", "success_criteria", "narrative", "assets", "pack",
     "caps", "approval_classes", "hitl", "eval_criteria", "drill",
     "rollout", "rollback", "estimates", "open_questions", "mission",
 }
+_TOP_KEYS_V2 = _TOP_KEYS_V1 | {"procedure_sources"}
 _REQUIRED_TOP = ("schema", "goal", "narrative", "assets", "pack",
                  "drill", "rollback", "mission")
 _ASSET_KEYS = {"reuse", "create"}
@@ -89,6 +96,14 @@ _FIXTURE_KEYS = {"workflow", "input", "expect", "workflow_id",
 _EXPECT_KEYS = {"status", "output_contains"}
 _ROLLOUT_KEYS = {"rung", "notes"}
 _ESTIMATE_KEYS = {"cost", "latency", "notes"}
+_PROCEDURE_SOURCE_KEYS = {
+    "relationship", "org_id", "procedure_document_id", "workflow_id",
+    "workflow_version_id", "workflow_version_number",
+    "workflow_payload_digest", "procedure_content_digest",
+    "compiler_version",
+}
+_PROCEDURE_RELATIONSHIPS = frozenset({"evidence", "adopt", "adapt"})
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _CRON_RE = re.compile(
     r"^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s*$"
@@ -158,8 +173,8 @@ def _normalized_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def empty_discovery() -> Dict[str, Any]:
-    return {"workflows": [], "agents": [], "collections": [], "packs": [],
-            "node_catalog": [], "conch": [], "notes": []}
+    return {"org_id": "", "workflows": [], "agents": [], "collections": [],
+            "packs": [], "node_catalog": [], "conch": [], "notes": []}
 
 
 def discovery_names(discovery: Dict[str, Any], kind: str) -> Dict[str, str]:
@@ -242,6 +257,129 @@ def _validate_reuse(card: Dict[str, Any]) -> List[Dict[str, Any]]:
     return clean
 
 
+def _require_digest(where: str, value: Any) -> str:
+    digest = str(value or "").strip()
+    if not _SHA256_RE.fullmatch(digest):
+        raise CardError(
+            f"{where} must be a lowercase sha256:<64 hex> digest"
+        )
+    return digest
+
+
+def _validate_procedure_sources(
+    card: Dict[str, Any],
+    discovery: Dict[str, Any],
+    reused: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows = card.get("procedure_sources")
+    if not isinstance(rows, list) or not rows:
+        raise CardError(
+            "card.procedure_sources must be a non-empty list for "
+            "conch.architecture_card.v2"
+        )
+    known_workflows = {
+        str(row.get("id") or ""): row
+        for row in discovery.get("workflows") or []
+        if str(row.get("id") or "")
+    }
+    reused_workflows = {
+        str(row.get("id") or "")
+        for row in reused
+        if row.get("kind") == "workflow"
+    }
+    local_org = str(discovery.get("org_id") or "")
+    clean: List[Dict[str, Any]] = []
+    seen_versions = set()
+    for index, row in enumerate(rows):
+        where = f"card.procedure_sources[{index}]"
+        _check_keys(where, row, _PROCEDURE_SOURCE_KEYS,
+                    tuple(sorted(_PROCEDURE_SOURCE_KEYS)))
+        relationship = str(row.get("relationship") or "")
+        if relationship not in _PROCEDURE_RELATIONSHIPS:
+            raise CardError(
+                f"{where}.relationship {relationship!r} is not one of "
+                + ", ".join(sorted(_PROCEDURE_RELATIONSHIPS))
+            )
+        org_id = str(row.get("org_id") or "").strip()
+        document_id = str(row.get("procedure_document_id") or "").strip()
+        workflow_id = str(row.get("workflow_id") or "").strip()
+        version_id = str(row.get("workflow_version_id") or "").strip()
+        compiler_version = str(row.get("compiler_version") or "").strip()
+        try:
+            version_number = int(row.get("workflow_version_number"))
+        except (TypeError, ValueError):
+            version_number = 0
+        if not all((org_id, document_id, workflow_id, version_id,
+                    compiler_version)) or version_number < 1:
+            raise CardError(
+                f"{where} requires non-empty immutable ids/compiler_version "
+                "and a positive workflow_version_number"
+            )
+        version_key = (org_id, workflow_id, version_id)
+        if version_key in seen_versions:
+            raise CardError(
+                f"{where} duplicates workflow version {version_id!r}"
+            )
+        seen_versions.add(version_key)
+        if relationship == "adopt":
+            if not local_org:
+                raise CardError(
+                    f"{where}: direct adoption requires a discovered local "
+                    "organization id"
+                )
+            if org_id != local_org:
+                raise CardError(
+                    f"{where}: cross-org Procedure sources may be evidence "
+                    "or adapt, never direct adopt"
+                )
+            if workflow_id not in known_workflows:
+                raise CardError(
+                    f"{where}: adopted workflow {workflow_id!r} was not "
+                    "present in discovery"
+                )
+            if workflow_id not in reused_workflows:
+                raise CardError(
+                    f"{where}: relationship='adopt' requires the exact "
+                    "workflow in assets.reuse"
+                )
+            discovered = known_workflows[workflow_id]
+            discovered_version = str(
+                discovered.get("workflow_version_id") or ""
+            )
+            discovered_number = discovered.get("version_number")
+            discovered_digest = str(
+                discovered.get("workflow_payload_digest") or ""
+            )
+            if (
+                discovered_version != version_id
+                or int(discovered_number or 0) != version_number
+                or discovered_digest
+                != str(row.get("workflow_payload_digest") or "")
+            ):
+                raise CardError(
+                    f"{where}: adopted Procedure source does not match the "
+                    "exact workflow version discovered (failing closed)"
+                )
+        clean.append({
+            "relationship": relationship,
+            "org_id": org_id,
+            "procedure_document_id": document_id,
+            "workflow_id": workflow_id,
+            "workflow_version_id": version_id,
+            "workflow_version_number": version_number,
+            "workflow_payload_digest": _require_digest(
+                f"{where}.workflow_payload_digest",
+                row.get("workflow_payload_digest"),
+            ),
+            "procedure_content_digest": _require_digest(
+                f"{where}.procedure_content_digest",
+                row.get("procedure_content_digest"),
+            ),
+            "compiler_version": compiler_version,
+        })
+    return clean
+
+
 def _enforce_reuse_first(kind: str, name: str, identity: str,
                          discovery: Dict[str, Any]) -> None:
     """The hard rule: never create what already exists. A created
@@ -265,12 +403,19 @@ def normalize_card(card: Dict[str, Any], discovery: Dict[str, Any], *,
     flow-pack manifest (validated by the fail-closed pack loader).
     """
     discovery = discovery or empty_discovery()
-    _check_keys("card", card, _TOP_KEYS, _REQUIRED_TOP)
-    if card.get("schema") != CARD_SCHEMA:
+    schema = str(card.get("schema") or "")
+    if schema not in CARD_SCHEMAS:
         raise CardError(
             f"unsupported card schema {card.get('schema')!r} "
-            f"(supported: {CARD_SCHEMA}) — failing closed"
+            f"(supported: {', '.join(sorted(CARD_SCHEMAS))}) — "
+            "failing closed"
         )
+    _check_keys(
+        "card", card,
+        _TOP_KEYS_V2 if schema == CARD_SCHEMA_V2 else _TOP_KEYS_V1,
+        _REQUIRED_TOP
+        + (("procedure_sources",) if schema == CARD_SCHEMA_V2 else ()),
+    )
     goal = str(card.get("goal") or "").strip()
     if not goal:
         raise CardError("card.goal must be a non-empty string")
@@ -279,7 +424,7 @@ def normalize_card(card: Dict[str, Any], discovery: Dict[str, Any], *,
         raise CardError("card.narrative must be a non-empty string")
 
     normalized: Dict[str, Any] = {
-        "schema": CARD_SCHEMA,
+        "schema": schema,
         "goal": goal,
         "narrative": narrative,
         "success_criteria": _str_list(
@@ -331,6 +476,12 @@ def normalize_card(card: Dict[str, Any], discovery: Dict[str, Any], *,
         "create": {"workflows": [], "agent": None, "schedules": [],
                    "collections": []},
     }
+    procedure_sources: List[Dict[str, Any]] = []
+    if schema == CARD_SCHEMA_V2:
+        procedure_sources = _validate_procedure_sources(
+            card, discovery, normalized_assets["reuse"],
+        )
+        normalized["procedure_sources"] = procedure_sources
 
     catalog_ids = [
         str(node) for node in (discovery.get("node_catalog") or [])
@@ -429,7 +580,13 @@ def normalize_card(card: Dict[str, Any], discovery: Dict[str, Any], *,
             ),
             "cron": cron,
             "timezone": str(row.get("timezone") or "UTC"),
-            "enabled": bool(row.get("enabled", False)),
+            # Capitol starts/schedules address a workflow id, not an exact
+            # version. Procedure-linked cards therefore remain disabled in
+            # shadow until the platform supports version-addressed starts.
+            "enabled": (
+                False if procedure_sources
+                else bool(row.get("enabled", False))
+            ),
             "input": row.get("input"),
         })
     normalized["assets"] = normalized_assets
@@ -460,6 +617,19 @@ def normalize_card(card: Dict[str, Any], discovery: Dict[str, Any], *,
         for workflow in normalized_assets["create"]["workflows"]:
             if workflow["workflow_id"] == workflow_id:
                 override_key = workflow["input_override_key"]
+        if not override_key:
+            matches = [
+                str(row.get("input_override_key") or "")
+                for row in discovery.get("workflows") or []
+                if str(row.get("id") or "") == workflow_id
+            ]
+            override_key = matches[0] if matches else ""
+        if not override_key:
+            raise CardError(
+                f"{where}: reused workflow {workflow_id!r} has no "
+                "discovered exact-version input_override_key; refusing "
+                "to guess a drill input"
+            )
         fixtures.append({
             "workflow": str(fixture["workflow"]),
             "workflow_id": workflow_id,
@@ -486,6 +656,7 @@ def normalize_card(card: Dict[str, Any], discovery: Dict[str, Any], *,
         pack_name, str(pack.get("description") or ""),
         normalized_assets["create"]["workflows"],
         normalized["drill"],
+        procedure_sources=procedure_sources,
     )
     from ..packs.manifest import PackError, load_pack_data
 
@@ -534,9 +705,14 @@ def normalize_card(card: Dict[str, Any], discovery: Dict[str, Any], *,
     return normalized
 
 
-def generate_pack_manifest(name: str, description: str,
-                           workflows: List[Dict[str, Any]],
-                           drill: Dict[str, Any]) -> Dict[str, Any]:
+def generate_pack_manifest(
+    name: str,
+    description: str,
+    workflows: List[Dict[str, Any]],
+    drill: Dict[str, Any],
+    *,
+    procedure_sources: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """The generated FlowPack manifest — deterministic scaffolding, no
     model bytes: workflow aliases bound by literal uuid5 ids, org/agent
     by config reference, and the ``workflow_drill`` acceptance pointing
@@ -544,6 +720,14 @@ def generate_pack_manifest(name: str, description: str,
     bindings: Dict[str, Any] = {}
     for workflow in workflows:
         bindings[workflow["identity"]] = {"id": workflow["workflow_id"]}
+    for source in procedure_sources or []:
+        if source.get("relationship") != "adopt":
+            continue
+        workflow_id = str(source["workflow_id"])
+        alias = "adopted-" + hashlib.sha256(
+            workflow_id.encode("utf-8")
+        ).hexdigest()[:12]
+        bindings[alias] = {"id": workflow_id}
     if not bindings:
         raise CardError(
             "a generated pack needs at least one created workflow"
@@ -649,6 +833,18 @@ def render_card_markdown(card: Dict[str, Any], *,
                 create.get("schedules"), create.get("collections"))):
         lines.append("- (nothing created)")
     lines.append("")
+    if card.get("procedure_sources"):
+        lines.append("## Procedure sources")
+        for source in card["procedure_sources"]:
+            lines.append(
+                f"- **{source['relationship']}** Procedure "
+                f"`{source['procedure_document_id']}` → workflow "
+                f"`{source['workflow_id']}` v"
+                f"{source['workflow_version_number']} "
+                f"(`{source['workflow_version_id']}`), content "
+                f"`{source['procedure_content_digest'][:23]}…`"
+            )
+        lines.append("")
     lines.append("## Pack")
     pack = card.get("pack") or {}
     lines.append(

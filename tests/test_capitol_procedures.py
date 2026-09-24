@@ -122,11 +122,9 @@ class FakeProcedureGateway(BaseHTTPRequestHandler):
         base = f"/api/v1/orgs/{ORG}"
         if self.path.startswith(f"{base}/procedures/search?"):
             payload = {
-                "schema_version": "capitol.procedure_collection.v1",
+                "schema_version": "capitol.procedure_search.v1",
                 "results": [result_item()],
                 "limit": 5,
-                "offset": 0,
-                "total": 1,
             }
         elif self.path.startswith(f"{base}/procedures?"):
             payload = {

@@ -26,6 +26,7 @@ from .errors import CapitolAuthError, CapitolError, CapitolProtocolError
 
 PROCEDURE_DOCUMENT_SCHEMA = "capitol.procedure_document.v1"
 PROCEDURE_COLLECTION_SCHEMA = "capitol.procedure_collection.v1"
+PROCEDURE_SEARCH_SCHEMA = "capitol.procedure_search.v1"
 WORKFLOW_VERSION_SCHEMA = "capitol.workflow_version.v1"
 
 MAX_QUERY_CHARS = 200
@@ -76,6 +77,11 @@ _COLLECTION_KEYS = {
     "limit",
     "offset",
     "total",
+}
+_SEARCH_KEYS = {
+    "schema_version",
+    "results",
+    "limit",
 }
 _RESULT_KEYS = {
     "schema_version",
@@ -316,6 +322,32 @@ def _collection(value: Any, *, rows_key: str) -> Dict[str, Any]:
     }
 
 
+def _search_collection(value: Any) -> Dict[str, Any]:
+    row = _strict_object(
+        value,
+        where="Procedure search",
+        keys=_SEARCH_KEYS,
+        required=_SEARCH_KEYS,
+    )
+    if row["schema_version"] != PROCEDURE_SEARCH_SCHEMA:
+        raise CapitolProtocolError(
+            "unsupported Procedure search schema "
+            f"{row['schema_version']!r} (supported: "
+            f"{PROCEDURE_SEARCH_SCHEMA}) — failing closed"
+        )
+    if not isinstance(row["results"], list):
+        raise CapitolProtocolError("Procedure search results must be a list")
+    if len(row["results"]) > MAX_RESULTS:
+        raise CapitolProtocolError("Procedure search exceeds result bound")
+    return {
+        "schema_version": PROCEDURE_SEARCH_SCHEMA,
+        "results": [
+            _result(item, index) for index, item in enumerate(row["results"])
+        ],
+        "limit": int(row["limit"]),
+    }
+
+
 def _workflow_version(value: Any) -> Dict[str, Any]:
     row = _strict_object(
         value,
@@ -461,12 +493,11 @@ class CapitolProcedureClient:
             )
         limit = max(1, min(int(limit), MAX_RESULTS))
         params = urllib.parse.urlencode({"q": query, "limit": limit})
-        return _collection(
+        return _search_collection(
             self._request(
                 f"/api/v1/orgs/{urllib.parse.quote(self.org_id, safe='')}"
                 f"/procedures/search?{params}"
-            ),
-            rows_key="results",
+            )
         )
 
     def list(self, *, limit: int = 10, offset: int = 0) -> Dict[str, Any]:

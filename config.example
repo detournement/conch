@@ -396,6 +396,12 @@ api_key_env=ANTHROPIC_API_KEY
 #repo_map=true
 
 # --- Capitol A2A ---------------------------------------------------------------
+# Works is an optional conch-works distribution. /install works installs it
+# into the current Conch Python environment from the private GitHub SSH source
+# by default; override with CONCH_WORKS_PACKAGE_SPEC, /install works --package,
+# or this non-secret package spec (for example, a local wheel).
+#works_package_spec=/path/to/conch_works-0.7.1-py3-none-any.whl
+#
 # Conch drives governed Capitol workflows over the A2A gateway. The bearer
 # token is NEVER stored here: capitol_bearer_env names the environment
 # variable it is read from; if that is unset, the A2Actrl registry

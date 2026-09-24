@@ -189,6 +189,26 @@ class TestPluginLoadingStaysCheap(unittest.TestCase):
             f"stdout: {result.stdout}\nstderr: {result.stderr}",
         )
 
+    def test_shell_only_mode_has_no_works_surfaces_or_imports(self):
+        script = (
+            "import os, sys\n"
+            "os.environ['CONCH_DISABLE_BUNDLED_WORKS'] = '1'\n"
+            "from conch.commands import slash_command_names\n"
+            "names = slash_command_names()\n"
+            "assert '/capitol' not in names and '/compile' not in names, names\n"
+            "assert not any(name.startswith('conch.capitol') "
+            "for name in sys.modules), sorted(sys.modules)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(CONCH_ROOT.parent), capture_output=True, text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"stdout: {result.stdout}\nstderr: {result.stderr}",
+        )
+
 
 class TestPluginRegistryIsLeafward(unittest.TestCase):
     """The seam registry itself must sit below everyone: no kernel or

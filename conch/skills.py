@@ -105,9 +105,29 @@ def load_skills() -> Dict[str, Dict[str, Any]]:
     user skills dir; a user skill wins by name (the pack-registry rule).
     """
     skills: Dict[str, Dict[str, Any]] = {}
-    builtin_root = builtin_skills_dir()
-    if builtin_root.is_dir():
-        for entry in sorted(builtin_root.iterdir()):
+    roots = [builtin_skills_dir()]
+    try:
+        from .plugins import (
+            load_builtin_plugins,
+            skill_directories,
+        )
+
+        load_builtin_plugins()
+        roots.extend(skill_directories())
+    except ImportError:
+        pass
+    seen_roots = set()
+    for builtin_root in roots:
+        try:
+            resolved = str(Path(builtin_root).resolve())
+        except OSError:
+            resolved = str(builtin_root)
+        if resolved in seen_roots:
+            continue
+        seen_roots.add(resolved)
+        if not Path(builtin_root).is_dir():
+            continue
+        for entry in sorted(Path(builtin_root).iterdir()):
             manifest = entry / "SKILL.md"
             if not entry.is_dir() or not manifest.is_file():
                 continue

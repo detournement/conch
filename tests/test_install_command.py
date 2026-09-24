@@ -46,13 +46,14 @@ class InstallCase(unittest.TestCase):
         for name in ("shell", "edge", "fleet", "works"):
             self.assertIn(name, out)
         self.assertIn("disabled", out)          # edge + fleet default off
-        self.assertIn("not configured", out)    # works default off
+        self.assertIn("installed-unconfigured", out)  # works source module
 
     def test_status_reflects_enabled_gates(self):
         out = self._run("list", config={
             "edge_daemon": "true", "fleet_controller": "true",
             "capitol_base_url": "https://cap.example",
             "capitol_org": "org-1",
+            "capitol_agent": "agent-1",
         })
         self.assertIn("enabled — conch-edge status", out)
         self.assertIn("enabled — /fleet status", out)
@@ -87,21 +88,29 @@ class InstallCase(unittest.TestCase):
         self.assertIn("fleet_controller = true", text)
         self.assertIn("/fleet enroll", out)
 
-    def test_install_works_writes_config_and_hides_bearer(self):
-        bearer = "cap-bearer-secret-42"
+    def test_install_works_stores_only_bearer_env_reference(self):
         out = self._run(
             "works",
-            inputs=["https://cap.example", "org-1", "agent-1"],
-            getpass_values=[bearer],
+            inputs=[
+                "https://workflow.example",
+                "https://platform.example",
+                "org-1",
+                "agent-1",
+                "MY_CAPITOL_BEARER",
+            ],
         )
         text = Path(config_mod.get_config_path()).read_text()
-        self.assertIn("capitol_base_url = https://cap.example", text)
+        self.assertIn(
+            "capitol_base_url = https://workflow.example", text,
+        )
+        self.assertIn(
+            "capitol_platform_url = https://platform.example", text,
+        )
         self.assertIn("capitol_org = org-1", text)
         self.assertIn("capitol_agent = agent-1", text)
-        self.assertNotIn(bearer, text)
-        self.assertNotIn(bearer, out)
-        env_text = Path(config_mod.get_env_file_path()).read_text()
-        self.assertIn(f"CAPITOL_A2A_BEARER={bearer}", env_text)
+        self.assertIn("capitol_bearer_env = MY_CAPITOL_BEARER", text)
+        self.assertFalse(Path(config_mod.get_env_file_path()).exists())
+        self.assertIn("bearer bytes were not stored", out)
 
     def test_dispatches_from_the_slash_registry(self):
         out = io.StringIO()

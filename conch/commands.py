@@ -494,12 +494,14 @@ _INSTALL_USAGE = (
     " daemon\n"
     "    /install fleet               trusted SSH workers (controller +"
     " enrollment)\n"
-    "    /install works               governed Capitol workflows (A2A)\n"
+    "    /install works [--package SPEC]   optional governed Capitol"
+    " workflows module\n"
     "    /install capture             capture→card drafting (sessions,"
     " missions, email, history)\n"
-    "  \033[2mComponents ship inside conch today; installing enables and"
-    "\n  configures them. Daemons install supervised (launchd/systemd"
-    " user\n  units) — no sudo.\033[0m\n"
+    "  \033[2mWorks is an optional distribution; the installer targets"
+    " this\n  Conch Python environment and uses existing private Git/gh"
+    " auth. Daemons\n  install supervised (launchd/systemd user units)"
+    " — no sudo.\033[0m\n"
 )
 
 
@@ -564,6 +566,24 @@ def _handle_install_command(arg: str, config: dict) -> None:
         "durable mission daemon (missions, timers, approvals, channels)",
         _edge_status, _edge_setup,
     )] + components()
+    if not any(entry.name == "works" for entry in entries):
+        from .optional_packages import setup_works, works_status
+
+        entries.append(Component(
+            "works", "Works",
+            "optional conch-works module: Capitol runtime, compiler, "
+            "Procedures, packs, and supervision",
+            works_status, setup_works,
+        ))
+    if not any(entry.name == "capture" for entry in entries):
+        from .optional_packages import capture_status, setup_capture
+
+        entries.append(Component(
+            "capture", "Capture",
+            "local evidence capture; Works adds Capture→Card compilation "
+            "and Capitol materialization",
+            capture_status, setup_capture,
+        ))
     tokens = (arg or "").strip().split()
     sub = tokens[0].lower() if tokens else "list"
     if sub in ("list", "status", "help"):
@@ -576,9 +596,9 @@ def _handle_install_command(arg: str, config: dict) -> None:
             print(f"    \033[1m{entry.name:<8}\033[0m"
                   f" {entry.status(config)}")
             print(f"      \033[2m{entry.summary}\033[0m")
-        print("\n  \033[2m/install <name> sets a component up."
-              " Components ship inside\n  conch today and land as separate"
-              " packages later — this surface\n  stays the same.\033[0m\n")
+        print("\n  \033[2m/install <name> sets a component up. Optional"
+              " product packages\n  report absent / installed-unconfigured"
+              " / configured / healthy here.\033[0m\n")
         return
     match = next((entry for entry in entries if entry.name == sub), None)
     if match is None:

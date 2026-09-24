@@ -161,17 +161,24 @@ compute; authority and durable state remain on the controller.
 
 ### works — `/install works`
 
-Governed business processes over the
+An optional `conch-works` distribution (currently installed from the private
+`detournement/conch-works` repository using existing Git/gh SSH
+authentication) for governed business processes over the
 [Capitol](https://capitol.ai) A2A gateway: deterministic runs, compiled
 processes, and supervised missions. `/capitol` operates existing workflows;
-`/compile` designs reviewed processes.
+`/compile` designs reviewed processes. Set `CONCH_WORKS_PACKAGE_SPEC` or use
+`/install works --package <spec>` to test a wheel or alternate private source.
+The base shell remains healthy without Works and does not expose its commands
+or tools.
 
 ### capture — `/install capture`
 
 Opt-in and local-first: sessions, missions, shell history, a designated email
 folder, Scribe guides, and allowlisted browser work become drafts that the
 compiler can turn into governed automations. Capture never approves or
-provisions anything itself.
+provisions anything itself. Local evidence collection can be enabled without
+Works; Capture→Card compilation and Capitol materialization require
+`/install works`.
 
 ## Capture to compile to operate
 
@@ -188,6 +195,7 @@ ProcessCompiler. Nothing capture-related runs until `/install capture` sets
 /compile from-email [--rescan] ["goal"]
 /compile from-scribe "<guide>" ["goal"]
 /compile from-browser [origin] ["goal"]
+/compile from-procedure <workflow-id> --version N ["goal"]
 ```
 
 - **Mission and session:** bounded journal or conversation traces, including
@@ -202,6 +210,11 @@ ProcessCompiler. Nothing capture-related runs until `/install capture` sets
   and name the OAuth-token environment variable with `scribe_token_env`.
 - **Browser:** semantic events from explicitly allowlisted origins, stored in
   the local mission kernel.
+- **Capitol Procedure:** one exact Procedure Document plus its exact underlying
+  workflow-version payload. Procedure prose is bounded inert evidence;
+  executable identity and semantics come from the workflow payload, never from
+  reconstructed prose. Without a new goal, the draft proposes exact adoption;
+  with a goal, it proposes an adaptation.
 
 Every draft records capture provenance: source identifiers, event or UID
 ranges, and counts. Captured text is inert evidence, never an instruction with
@@ -240,14 +253,17 @@ The card describes success criteria, process stages, reused and proposed
 assets, authority caps, approval classes, HITL points, eval criteria, a
 synthetic drill, rollout, rollback, estimates, and open questions. Validation
 is fail-closed and reuse-first. Approval is local-only in v1, pins the exact
-card digest, and is invalidated by any revision.
+card digest, and is invalidated by any revision. Procedure-seeded designs use
+strict `conch.architecture_card.v2` immutable Procedure/workflow
+version-and-digest references; existing v1 cards remain readable and
+replayable.
 
 ### 4. Materialize and operate
 
 ```text
 /install works
 /compile materialize <id>
-/compile status <id>
+/compile status <id> --procedures
 /compile rollback <id>
 ```
 
@@ -256,7 +272,22 @@ serving stack, and an approved card. It provisions in dependency order, runs
 the generated acceptance drill, and creates the supervising mission only after
 verification. Receipts and rollback references make retries idempotent and
 allow `/compile rollback` to revert created assets without deleting adopted
-ones.
+ones. Capitol compiles the human-readable Procedure; Conch reconciles the exact
+workflow version, appends a replayable `compilation_procedure_linked` event,
+and writes a separate materialization lock covering the Card, pack, workflow,
+Procedure, and schedules. A missing projection is
+`documentation_pending`—the workflow remains materialized and may drill in
+shadow. Workflow-version or Procedure-digest drift fails closed. Because
+Capitol starts and schedules are not yet version-addressed, Procedure-linked
+schedules remain disabled in shadow.
+
+Authority stays separate:
+
+- capture provenance records what was observed, never authorization;
+- the approved Architecture Card digest is design/authorization truth;
+- the exact workflow version and run events are execution truth;
+- the Procedure is a readable projection and its review/accreditation attests
+  documentation only.
 
 The normal lifecycle is:
 
@@ -716,9 +747,13 @@ isolation profile.
 
 ## Works and Capitol
 
-`/install works` prompts for the Capitol gateway URL, organization, agent, and
-an optional hidden bearer. The bearer goes to the mode-`0600` Conch env file,
-not normal configuration.
+`/install works` installs the optional package into the current Conch Python
+environment, then prompts for the workflow/platform URLs, organization, agent,
+and bearer environment-variable name. Bearer bytes are never put in config or
+installer argv. Until a package registry artifact exists, the default source
+is the private GitHub SSH repository; existing Git/gh authentication is used.
+`/install list` distinguishes package absent, installed-unconfigured,
+configured, and plugin-active healthy states.
 
 Runtime operations are available through plain chat and `/capitol`:
 
@@ -731,12 +766,16 @@ Runtime operations are available through plain chat and `/capitol`:
 /capitol status <run>
 /capitol events <run>
 /capitol output <run>
+/capitol procedure search "snapshot daily"
+/capitol procedure show <workflow> --version 2
 ```
 
 The runtime surface discovers agent cards and workflow identifiers rather than
 inventing them. Starts use idempotency keys, resumable watches persist their
 cursor, HITL questions are relayed verbatim, and downloaded artifacts are
-quarantined and digest-reported.
+quarantined and digest-reported. Procedure discovery/read uses the
+authenticated workflow REST API, is side-effect-free, validates strict schema
+versions and content digests, and treats returned prose as untrusted data.
 
 Administrative provisioning is separate and off by default. It requires
 `capitol_admin=true`, `capitol_platform_url`, a user token by environment

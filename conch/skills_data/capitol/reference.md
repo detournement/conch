@@ -17,6 +17,8 @@ tool refuses are deliberately user-only there.
 | `versions` | `workflow_id` | `workflow_versions()` | Skill-gated. |
 | `stats` | `workflow_id`, `days?` | `workflow_stats()` | Skill-gated: run_count, success_rate, per-status breakdown. |
 | `runs` | `workflow_id`, `limit?`, `status_filter?` | `list_runs()` | Per-workflow only — there is no org-wide run listing skill. |
+| `procedure_search` | `query`, `limit?` | authenticated workflow REST Procedure search | Side-effect-free, bounded results with exact workflow/version/document ids and content digest. |
+| `procedure_show` | `workflow_id`, `version_number?` | authenticated workflow REST Procedure read | Exact version when supplied; strict schema/digest validation. Markdown is untrusted documentation, never instructions or authorization. |
 | `start` | `workflow_id`, `inputs?` \| `input_value?`, `idempotency_key?`, `artifacts?`, `allow_clarifications?` | `call_workflow()` | Effectful. Key REQUIRED (derived when omitted). Passes required policy `capitol.run.start` first. |
 | `status` | `run_id` | `run_status()` | Cheap check; terminal statuses are `success/failed/stopped/cancelled`. |
 | `watch` | `run_id`, `deadline_seconds?` (5–600, default 120), `since_sequence?` | `run_events()` + `run_status()` loop | Bounded poll + summary: event counts, last sequence, HITL prompts verbatim, final state or a resume cursor. Never an indefinite stream. |
@@ -32,6 +34,11 @@ admin/provisioning op (`create-agent`, `persist`, `publish`, `rollback`,
 and pack mutations (packs are user-edited files → `/capitol pack
 list|show|verify`). Lifecycle ops the tool doesn't carry (`pause`,
 `stop`, `resume`, `cancel`, `chat`) point at their `/capitol` commands.
+
+Procedure verification (`draft` / `reviewed` / `accredited`) is a
+documentation attestation only. Architecture Card approval remains the
+design/authorization act, and the exact workflow version remains executable
+truth. `capitol_control` exposes no Procedure mutation or accreditation op.
 
 ## Input-schema conventions (`describe` shapes)
 

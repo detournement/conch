@@ -3286,8 +3286,7 @@ class ConchIntrospectClient:
                     ["git", "branch", "--show-current"], cwd=str(root),
                     capture_output=True, timeout=5,
                 ).stdout.decode().strip()
-                if branch:
-                    lines.append(f"branch: {branch}")
+                lines.append(f"branch: {branch or '(detached)'}")
                 log = subprocess.run(
                     ["git", "log", "--oneline", "-6"], cwd=str(root),
                     capture_output=True, timeout=5,

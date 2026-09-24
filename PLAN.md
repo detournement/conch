@@ -631,6 +631,47 @@ with `conch-compile-*` assets, drilled green, and left operating with
 the schedule DISABLED and the mission dry-run; the opt-in
 `tests/test_compiler_live.py` additionally proves the rollback arc.
 
+**Capitol Procedures + optional Works distribution (September 2026):
+implementation branch).** Procedures are integrated without introducing a
+second authority: captured evidence records observation; the approved
+Architecture Card digest authorizes design; exact workflow versions and run
+events are executable/execution truth; a Capitol Procedure is a
+human/agent-readable projection whose reviewed/accredited status attests the
+documentation only. Phase A adds side-effect-free list/search/read contracts,
+exact workflow-version reads, deterministic content/payload digests, and
+recompile invalidation of stale accreditation. Conch adds strict
+`/capitol procedure search|show`, bounded read-only `capitol_control`
+operations, `/compile from-procedure <workflow> --version N`, v1-compatible
+strict Card v2 Procedure refs, exact adoption/adaptation rules, workflow
+lineage metadata, replayable `compilation_procedure_linked` events,
+`documentation_pending`, immutable materialization locks, and fail-closed
+workflow/Procedure drift checks. Existing receipts reconcile only when exact
+payload/version matching is provable; adopted assets remain protected on
+rollback. Procedure-linked schedules remain disabled because current Capitol
+starts/schedules address workflow ids rather than immutable versions.
+
+The packaging phase turns the private history-filtered `conch-works` seed into
+an optional `conch-works` 0.7.x distribution depending on
+`conch-shell>=0.7,<0.8`. It uses a `conch.plugins` entry point and a separate
+`conch_works` top-level package so uninstall cannot remove or overlap shell
+files. The public monorepo remains the immediate canonical source while a
+deterministic export/check script prevents drift. Source checkouts retain the
+bundled compatibility plugin; installed shell-only environments do not
+activate Works. `/install works` installs into the current uv/pipx/venv
+environment from a package-spec override or private GitHub SSH, stores only
+credential environment-variable references, and reports absent,
+installed-unconfigured, configured, or healthy. The bundled compatibility tree
+must not be removed from the public edge artifact until shell-only,
+shell+Works, and uninstall E2E gates remain green.
+
+**Explicit follow-ups:** Capitol still needs version-addressed workflow starts
+and schedules before non-shadow promotion can be unambiguous; Procedure health
+is an operational overlay rather than immutable SOP content; Procedure
+accreditation remains explicit human/admin work and is not exposed as a Conch
+mutation; workflow updates remain blocked until `persist_prior_version`
+rollback is implemented and proven. Removing bundled `conch.capitol` from the
+shell distribution is a later packaging cutover, not part of this transition.
+
 ---
 
 ## Phase 0 — Correctness on local Ollama (do first)

@@ -418,6 +418,7 @@ CREATE TABLE IF NOT EXISTS compilations (
     decided_at REAL,
     decision_reason TEXT NOT NULL DEFAULT '',
     materialization TEXT NOT NULL DEFAULT '{}',
+    procedures TEXT NOT NULL DEFAULT '{"links":[]}',
     drill TEXT NOT NULL DEFAULT '{}',
     mission_id TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL,
@@ -535,7 +536,7 @@ REPLAYED_TABLES: Dict[str, Tuple[str, ...]] = {
         "compilation_id", "status", "goal", "card_version",
         "approved_version", "approved_digest", "decided_by",
         "decision_origin", "decided_at", "decision_reason",
-        "materialization", "drill", "mission_id", "version",
+        "materialization", "procedures", "drill", "mission_id", "version",
         "created_at", "updated_at",
     ),
     "compilation_cards": (
@@ -1058,9 +1059,10 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
             "INSERT INTO compilations(compilation_id, status, goal,"
             " card_version, approved_version, approved_digest, decided_by,"
             " decision_origin, decided_at, decision_reason,"
-            " materialization, drill, mission_id, version, created_at,"
+            " materialization, procedures, drill, mission_id, version, created_at,"
             " updated_at)"
-            " VALUES (?,?,?,1,0,'','','',NULL,'','{}','{}','',?,?,?)",
+            " VALUES (?,?,?,1,0,'','','',NULL,'','{}','{\"links\":[]}',"
+            " '{}','',?,?,?)",
             (data["compilation_id"], data["status"], data["goal"],
              data["version"], created_at, created_at),
         )
@@ -1122,6 +1124,23 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
             " updated_at=? WHERE compilation_id=?",
             (_canonical(data["materialization"]), data["version"],
              created_at, data["compilation_id"]),
+        )
+    elif kind == "compilation_procedure_linked":
+        row = conn.execute(
+            "SELECT procedures FROM compilations WHERE compilation_id=?",
+            (data["compilation_id"],),
+        ).fetchone()
+        try:
+            procedures = _json.loads(row[0] or "{}") if row else {}
+        except ValueError:
+            procedures = {}
+        links = list(procedures.get("links") or [])
+        links.append(data["link"])
+        conn.execute(
+            "UPDATE compilations SET procedures=?, version=?, updated_at=?"
+            " WHERE compilation_id=?",
+            (_canonical({"links": links}), data["version"], created_at,
+             data["compilation_id"]),
         )
     elif kind == "compilation_drill_recorded":
         conn.execute(
@@ -1272,6 +1291,9 @@ class MissionStore:
                 ("cursor", "INTEGER NOT NULL DEFAULT 0"),
                 ("detail", "TEXT NOT NULL DEFAULT '{}'"),
                 ("updated_at", "REAL NOT NULL DEFAULT 0"),
+            ),
+            "compilations": (
+                ("procedures", "TEXT NOT NULL DEFAULT '{\"links\":[]}'"),
             ),
         }
         for table, columns in additions.items():
@@ -3676,6 +3698,122 @@ class MissionStore:
                              })
         self._mutate(fn)
 
+    def record_compilation_procedure_link(
+        self,
+        compilation_id: str,
+        link: Dict[str, Any],
+    ) -> bool:
+        """Append one exact workflow-version → Procedure linkage.
+
+        Returns ``False`` when the identical linkage was already recorded.
+        Any same-workflow/version conflict fails closed instead of silently
+        replacing the attested projection.
+        """
+        required = {
+            "workflow_id", "workflow_version_id", "workflow_version_number",
+            "workflow_payload_digest", "procedure_document_id",
+            "procedure_content_digest", "compiler_version", "verification",
+            "card_version", "card_digest", "lineage", "linked_at",
+        }
+        if not isinstance(link, dict):
+            raise KernelError("procedure link must be a dict")
+        unknown = set(link) - required
+        missing = required - set(link)
+        if unknown or missing:
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(sorted(missing)))
+            if unknown:
+                detail.append("unknown " + ", ".join(sorted(unknown)))
+            raise KernelError(
+                "procedure link shape rejected: " + "; ".join(detail)
+            )
+        payload = _json.loads(_canonical(link))
+        for key in (
+            "workflow_id", "workflow_version_id", "workflow_payload_digest",
+            "procedure_document_id", "procedure_content_digest",
+            "compiler_version", "card_digest",
+        ):
+            if not str(payload.get(key) or "").strip():
+                raise KernelError(f"procedure link requires {key}")
+        try:
+            payload["workflow_version_number"] = int(
+                payload["workflow_version_number"]
+            )
+            payload["card_version"] = int(payload["card_version"])
+            payload["linked_at"] = float(payload["linked_at"])
+        except (TypeError, ValueError):
+            raise KernelError(
+                "procedure link version numbers and linked_at are invalid"
+            ) from None
+        if (
+            payload["workflow_version_number"] < 1
+            or payload["card_version"] < 1
+        ):
+            raise KernelError("procedure link versions must be positive")
+        findings = credential_findings(_canonical(payload))
+        if findings:
+            raise CredentialRejected(sorted(set(findings)))
+
+        def fn(conn):
+            row = self._compilation_row(conn, compilation_id)
+            status, version = row[1], int(row[3])
+            if status not in (
+                CompilationStatus.APPROVED,
+                CompilationStatus.MATERIALIZED,
+                CompilationStatus.VERIFIED,
+                CompilationStatus.OPERATING,
+            ):
+                raise KernelError(
+                    f"compilation {compilation_id} is {status}; Procedure "
+                    "links require an approved/materialized compilation"
+                )
+            projected = conn.execute(
+                "SELECT procedures FROM compilations WHERE compilation_id=?",
+                (compilation_id,),
+            ).fetchone()
+            try:
+                existing = _json.loads(
+                    projected[0] or '{"links":[]}'
+                ) if projected else {"links": []}
+            except ValueError:
+                existing = {"links": []}
+            for recorded in existing.get("links") or []:
+                same_identity = (
+                    str(recorded.get("workflow_id") or "")
+                    == payload["workflow_id"]
+                    or str(recorded.get("workflow_version_id") or "")
+                    == payload["workflow_version_id"]
+                    or str(recorded.get("procedure_document_id") or "")
+                    == payload["procedure_document_id"]
+                )
+                if not same_identity:
+                    continue
+                recorded_stable = dict(recorded)
+                payload_stable = dict(payload)
+                recorded_stable.pop("linked_at", None)
+                payload_stable.pop("linked_at", None)
+                if recorded_stable == payload_stable:
+                    return False
+                raise ConflictError(
+                    "conflicting Procedure linkage for workflow "
+                    f"{payload['workflow_id']} / version "
+                    f"{payload['workflow_version_id']} (failing closed)"
+                )
+            self._append(
+                conn,
+                compilation_id,
+                "compilation_procedure_linked",
+                {
+                    "compilation_id": compilation_id,
+                    "link": payload,
+                    "version": version + 1,
+                },
+            )
+            return True
+
+        return bool(self._mutate(fn))
+
     def record_compilation_drill(self, compilation_id: str,
                                  result: Dict[str, Any], *,
                                  passed: bool) -> None:
@@ -3719,7 +3857,7 @@ class MissionStore:
     @staticmethod
     def _compilation_dict(row) -> Dict[str, Any]:
         data = dict(row)
-        for key in ("materialization", "drill"):
+        for key in ("materialization", "procedures", "drill"):
             try:
                 data[key] = _json.loads(data[key] or "{}")
             except ValueError:

@@ -35,6 +35,7 @@ from conch.kernel.model import (
     EVENT_KINDS,
     ApprovalError,
     CompilationStatus,
+    ConflictError,
     KernelError,
     check_compilation_transition,
     kernel_id,
@@ -116,9 +117,86 @@ class TestCardValidation(unittest.TestCase):
             self.normalize()
 
     def test_wrong_schema_fails_closed(self):
-        self.card["schema"] = "conch.architecture_card.v2"
+        self.card["schema"] = "conch.architecture_card.v3"
         with self.assertRaisesRegex(CardError, "unsupported card schema"):
             self.normalize()
+
+    def test_v1_remains_digest_stable_and_readable(self):
+        normalized = self.normalize()
+        self.assertEqual(normalized["schema"], "conch.architecture_card.v1")
+        self.assertNotIn("procedure_sources", normalized)
+
+    def test_v2_adopts_exact_discovered_workflow(self):
+        source_workflow = {
+            "id": "wf-source",
+            "name": "Existing Exact Process",
+            "workflow_version_id": "ver-source-3",
+            "version_number": 3,
+            "workflow_payload_digest": "sha256:" + "a" * 64,
+            "input_override_key": "node-input.value",
+        }
+        discovery = fake_discovery()
+        discovery["org_id"] = "org-test"
+        discovery["workflows"].append(source_workflow)
+        card = candidate_card()
+        card["schema"] = "conch.architecture_card.v2"
+        card["assets"] = {
+            "reuse": [{
+                "kind": "workflow",
+                "id": "wf-source",
+                "name": "Existing Exact Process",
+                "reason": "adopt this exact workflow version",
+            }],
+            "create": {
+                "workflows": [], "agent": None, "schedules": [],
+                "collections": [],
+            },
+        }
+        card["drill"]["fixtures"][0]["workflow"] = "wf-source"
+        card["mission"]["capitol"]["workflows"] = ["wf-source"]
+        card["procedure_sources"] = [{
+            "relationship": "adopt",
+            "org_id": "org-test",
+            "procedure_document_id": "proc-source",
+            "workflow_id": "wf-source",
+            "workflow_version_id": "ver-source-3",
+            "workflow_version_number": 3,
+            "workflow_payload_digest": "sha256:" + "a" * 64,
+            "procedure_content_digest": "sha256:" + "b" * 64,
+            "compiler_version": "1.0.0",
+        }]
+        normalized = normalize_card(card, discovery)
+        self.assertEqual(
+            normalized["drill"]["fixtures"][0]["override_key"],
+            "node-input.value",
+        )
+        bindings = normalized["pack"]["manifest"]["capitol"]["workflows"]
+        self.assertEqual(
+            list(bindings.values()), [{"id": "wf-source"}],
+        )
+
+    def test_v2_cross_org_direct_adopt_is_refused(self):
+        card = candidate_card()
+        card["schema"] = "conch.architecture_card.v2"
+        card["procedure_sources"] = [{
+            "relationship": "adopt",
+            "org_id": "other-org",
+            "procedure_document_id": "proc-source",
+            "workflow_id": "wf-ingest",
+            "workflow_version_id": "ver-source",
+            "workflow_version_number": 1,
+            "workflow_payload_digest": "sha256:" + "a" * 64,
+            "procedure_content_digest": "sha256:" + "b" * 64,
+            "compiler_version": "1.0.0",
+        }]
+        card["assets"]["reuse"].append({
+            "kind": "workflow", "id": "wf-ingest",
+            "name": "together-funding-ingest", "reason": "source",
+        })
+        discovery = fake_discovery()
+        discovery["org_id"] = "org-test"
+        with self.assertRaisesRegex(CardError, "cross-org"):
+            normalize_card(card, discovery)
 
     def test_missing_required_sections(self):
         for key in ("goal", "narrative", "drill", "rollback", "mission"):
@@ -504,6 +582,47 @@ class TestCompilationAggregate(unittest.TestCase):
         self.assertEqual(
             kinds, ["compilation_created", "compilation_decided"]
         )
+
+    def test_procedure_link_is_idempotent_and_conflicts_fail_closed(self):
+        cid = self.create()["compilation_id"]
+        decision = self.store.decide_compilation(
+            cid, "approve", decided_by="me",
+        )
+        link = {
+            "workflow_id": "wf-1",
+            "workflow_version_id": "ver-1",
+            "workflow_version_number": 1,
+            "workflow_payload_digest": "sha256:" + "a" * 64,
+            "procedure_document_id": "proc-1",
+            "procedure_content_digest": "sha256:" + "b" * 64,
+            "compiler_version": "1.0.0",
+            "verification": "draft",
+            "card_version": 1,
+            "card_digest": decision["digest"],
+            "lineage": {"compilation_id": cid},
+            "linked_at": 1.0,
+        }
+        self.assertTrue(
+            self.store.record_compilation_procedure_link(cid, link)
+        )
+        replayed = dict(link, linked_at=2.0)
+        self.assertFalse(
+            self.store.record_compilation_procedure_link(cid, replayed)
+        )
+        with self.assertRaises(ConflictError):
+            self.store.record_compilation_procedure_link(
+                cid,
+                dict(
+                    link,
+                    procedure_content_digest="sha256:" + "c" * 64,
+                    linked_at=3.0,
+                ),
+            )
+        self.assertEqual(
+            len(self.store.get_compilation(cid)["procedures"]["links"]), 1,
+        )
+        ok, message = self.store.replay_matches_live()
+        self.assertTrue(ok, message)
 
     def test_card_secretguard_at_store_boundary(self):
         with self.assertRaises(CredentialRejected):

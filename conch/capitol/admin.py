@@ -568,8 +568,13 @@ class CapitolAdmin:
 
     # -- workflows: persist / publish / versions / rollback ---------------------------
 
-    def persist_workflow(self, payload: Dict[str, Any], *,
-                         idempotency_key: str) -> Dict[str, Any]:
+    def persist_workflow(
+        self,
+        payload: Dict[str, Any],
+        *,
+        idempotency_key: str,
+        create_only: bool = False,
+    ) -> Dict[str, Any]:
         """Create or update a workflow definition (one new version).
 
         ``payload`` is a full ``AdvancedWorkflowPayload`` dict carrying its
@@ -602,6 +607,12 @@ class CapitolAdmin:
                 # permission problem fails there.
                 if exc.http_status not in (403, 404):
                     raise
+            if existed and create_only:
+                raise CapitolError(
+                    f"workflow {workflow_id} already exists; compiled "
+                    "workflow updates are blocked until exact prior-version "
+                    "rollback is implemented (reuse/adopt it explicitly)"
+                )
             persisted = self._request(
                 self.workflow_url,
                 f"/api/v1/orgs/{self.org_id}/workflows",
@@ -819,6 +830,7 @@ class CapitolAdmin:
                 "workflow_id": workflow_id,
                 "schedule_id": schedule_id,
                 "cron_expression": str(cron_expression),
+                "enabled": bool(enabled),
                 "rollback_ref": {"kind": "delete_schedule",
                                  "workflow_id": workflow_id,
                                  "schedule_id": schedule_id},

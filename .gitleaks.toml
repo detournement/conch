@@ -24,6 +24,11 @@ regexes = [
 
 [allowlist]
 description = "Documentation placeholders and known false positives"
+paths = [
+    # Chrome MV3 public-key pin (not a credential). The historical commit
+    # stored the satellite at the repository root before packaging moved it.
+    '''(^|/)satellites/browser-capture/extension/manifest\.json$''',
+]
 regexes = [
     # README / mcp.example.json / config.example placeholders
     '''YOUR_COMPOSIO_API_KEY''',

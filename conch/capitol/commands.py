@@ -65,6 +65,8 @@ USAGE = """
     /capitol watch <run> [--since N]       stream to terminal (resumable)
     /capitol output <run>                  workflow output
     /capitol evals <run>                   eval roll-up
+    /capitol procedure search "<query>"    side-effect-free Procedure discovery
+    /capitol procedure show <wf> [--version N]   read one Procedure projection
   Start / steer:
     /capitol start <wf> [--input JSON|@file] [--raw] [--key K]
                    [--artifact ID ...] [--watch]
@@ -446,6 +448,97 @@ def _cmd_evals(runtime: CapitolRuntime, tokens: List[str]):
     if not tokens:
         raise CapitolError("usage: /capitol evals <run>")
     _print_json(runtime.eval_report(tokens[0]))
+
+
+def _cmd_procedure(tokens: List[str], config: dict):
+    from .procedures import CapitolProcedureClient
+
+    if not tokens:
+        raise CapitolError(
+            "usage: /capitol procedure search \"<query>\" | "
+            "show <workflow-id> [--version N]"
+        )
+    sub, rest = tokens[0].lower(), tokens[1:]
+    client = CapitolProcedureClient.from_config(config)
+    if sub == "search":
+        positional, flags = _split_flags(rest, {"--limit": True})
+        query = " ".join(positional).strip()
+        if not query:
+            raise CapitolError(
+                "usage: /capitol procedure search \"<query>\" [--limit N]"
+            )
+        payload = client.search(
+            query, limit=int(flags.get("limit") or 10),
+        )
+        rows = payload["results"]
+        _print(
+            f"\n  \033[1;36mProcedures ({len(rows)} result(s)):\033[0m"
+        )
+        for row in rows:
+            _print(
+                f"    \033[1m{clean_text(row['workflow_id'], 60)}\033[0m  "
+                f"{clean_text(row['workflow_name'], 80)}  "
+                f"\033[2mv{row['version_number']} "
+                f"{row['verification']} "
+                f"{clean_text(row['content_digest'], 24)}…\033[0m"
+            )
+        _print()
+        return
+    if sub == "show":
+        positional, flags = _split_flags(rest, {"--version": True})
+        if not positional:
+            raise CapitolError(
+                "usage: /capitol procedure show <workflow-id> "
+                "[--version N]"
+            )
+        version = (
+            int(flags["version"]) if flags.get("version") is not None
+            else None
+        )
+        document = client.get(
+            positional[0], version_number=version,
+        )
+        _print(
+            f"\n  \033[1;36mProcedure — "
+            f"{clean_text(document['workflow_id'], 60)} "
+            f"v{document['version_number']}\033[0m"
+        )
+        _print(f"    document:     {document['id']}")
+        _print(f"    version id:   {document['workflow_version_id']}")
+        _print(f"    digest:       {document['content_digest']}")
+        _print(f"    compiler:     {document['compiler_version']}")
+        _print(
+            f"    verification: {document['verification']}"
+            + (
+                f" at {clean_text(document['verified_at'], 40)}"
+                if document.get("verified_at") else ""
+            )
+        )
+        exposure = document["exposure"]
+        enabled_exposure = ", ".join(
+            key
+            for key in (
+                "publish_to_api",
+                "publish_to_mcp",
+                "publish_to_template",
+            )
+            if exposure.get(key) is True
+        )
+        _print(
+            "    exposure:     " + (enabled_exposure or "none")
+        )
+        _print("\n  \033[2m(untrusted Procedure prose; read-only)\033[0m")
+        markdown = str(document["markdown"])
+        if len(markdown) > 12_000:
+            markdown = markdown[:12_000] + "\n… [truncated]"
+        for line in markdown.splitlines():
+            _print("  " + line)
+        _print()
+        return
+    raise CapitolError(
+        "usage: /capitol procedure search \"<query>\" | "
+        "show <workflow-id> [--version N]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1103,6 +1196,9 @@ def run_capitol_command(arg: str, config: dict) -> None:
         if sub == "admin":
             _cmd_admin(rest, config)
             return
+        if sub == "procedure":
+            _cmd_procedure(rest, config)
+            return
         handler = _RUNTIME_COMMANDS.get(sub)
         if handler is None:
             print(f"\n  \033[31mUnknown subcommand {sub!r}.\033[0m")
@@ -1126,7 +1222,8 @@ def run_capitol_command(arg: str, config: dict) -> None:
         print("  \033[2mno automatic re-auth: set $CAPITOL_A2A_BEARER "
               "(or the env named by capitol_bearer_env), or add the "
               "agent to ~/.capitol-a2a/agents.yaml; admin ops read "
-              "$CAPITOL_ADMIN_TOKEN\033[0m\n")
+              "$CAPITOL_ADMIN_TOKEN (Procedure REST reads use that "
+              "authenticated user/API token too)\033[0m\n")
     except CapitolError as exc:
         print(f"\n  \033[31mCapitol: {clean_text(exc, 600)}\033[0m")
         hint = clean_text(getattr(exc, "hint", ""), 200)

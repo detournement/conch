@@ -645,6 +645,7 @@ EVENT_KINDS = frozenset({
     "compilation_decided",
     "compilation_transitioned",
     "compilation_materialization_recorded",
+    "compilation_procedure_linked",
     "compilation_drill_recorded",
 })
 
@@ -653,7 +654,8 @@ EVENT_KINDS = frozenset({
 COMPILATION_EVENT_KINDS = frozenset({
     "compilation_created", "compilation_card_recorded",
     "compilation_decided", "compilation_transitioned",
-    "compilation_materialization_recorded", "compilation_drill_recorded",
+    "compilation_materialization_recorded", "compilation_procedure_linked",
+    "compilation_drill_recorded",
 })
 
 #: The personal-items event family. Memory consolidation and every other

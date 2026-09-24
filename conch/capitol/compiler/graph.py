@@ -367,6 +367,7 @@ def build_workflow_payload(
     workflow: Dict[str, Any],
     *,
     collection_ids: Optional[Dict[str, str]] = None,
+    lineage: Optional[Dict[str, Any]] = None,
     set_param: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Assemble the full workflow payload for one created workflow.
@@ -496,6 +497,7 @@ def build_workflow_payload(
         "edges": edges,
         "metadata": {
             "conch": {
+                **json.loads(json.dumps(lineage or {}, sort_keys=True)),
                 "provisioner": "process_compiler",
                 "identity": identity,
             },

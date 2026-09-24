@@ -218,6 +218,8 @@ def resolve_conversation(conv_ref: str = ""):
 
 def compile_from_capture(config: dict, context: Dict[str, Any], *,
                          goal: str = "",
+                         discovery: Optional[Dict[str, Any]] = None,
+                         procedure_sources: Optional[List[Dict[str, Any]]] = None,
                          session_factory=None,
                          ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Run the normal bounded compilation session seeded with a capture
@@ -242,6 +244,8 @@ def compile_from_capture(config: dict, context: Dict[str, Any], *,
     card = run_compile_session(
         config, goal,
         capture_context=capture_block,
+        discovery=discovery,
+        procedure_sources=procedure_sources,
         session_factory=session_factory,
     )
     provenance = dict(context["provenance"])
@@ -393,4 +397,13 @@ def capture_provenance_line(capture: Optional[Dict[str, Any]]) -> str:
         return (f"captured from browser {source} "
                 f"({capture.get('events', 0)} event(s) across "
                 f"{len(origins)} origin(s))")
+    if kind == "procedure":
+        return (
+            f"captured from Capitol Procedure {source} "
+            f"(workflow {capture.get('workflow_id', '?')} v"
+            f"{capture.get('workflow_version_number', '?')}, "
+            f"digest {str(capture.get('procedure_content_digest') or '')[:23]}"
+            "…; verification observed "
+            f"{capture.get('verification_observed', '?')})"
+        )
     return f"captured from {kind} {source}"

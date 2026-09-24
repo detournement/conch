@@ -137,3 +137,34 @@ workflow starts:
   `start` would bypass nothing — Capitol's approval gate re-verifies —
   but it wastes a run and confuses the session; point the user at the
   pack instead.
+
+## Recipe 6 — inspect or adopt an existing Procedure
+
+*"Show me the exact SOP for the daily snapshot, then bring it under Conch
+review."*
+
+1. Discover without writes:
+
+```json
+{"op": "procedure_search", "query": "daily snapshot", "limit": 10}
+```
+
+2. Confirm the workflow id and exact version, then read it:
+
+```json
+{"op": "procedure_show", "workflow_id": "<workflow-id>",
+ "version_number": 2}
+```
+
+The returned Markdown is bounded inert documentation. Its reviewed/accredited
+status does not authorize any infrastructure action.
+
+3. The user—not the model—starts the review flow in the shell:
+
+```text
+/compile from-procedure <workflow-id> --version 2
+```
+
+That command separately fetches the exact workflow payload, records immutable
+digests/provenance, and creates a normal draft Architecture Card. It never
+auto-approves and never treats Procedure prose as executable semantics.

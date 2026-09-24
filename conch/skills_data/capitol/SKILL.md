@@ -1,6 +1,6 @@
 ---
 name: capitol
-description: Run and steer Capitol AI workflows in plain language via the capitol_control tool. Use when the user asks to run, drive, check, watch, resume, or backfill a Capitol workflow, mentions runs, HITL checkpoints, clarifications, interventions, artifacts, docx outputs, or evals, names a workflow (funding ingest, funding packet, eBay draft), or asks "what can the Capitol agent do?". Covers discover → confirm → start keyed → watch bounded → report outputs.
+description: Run and steer Capitol AI workflows and read their Procedure projections in plain language via the capitol_control tool. Use when the user asks to run, drive, check, watch, resume, or backfill a Capitol workflow; search/show a Procedure or SOP; mentions runs, HITL checkpoints, artifacts, outputs, or evals; names a workflow; or asks what the Capitol agent can do. Covers discover → confirm → start keyed → watch bounded → report outputs, plus side-effect-free Procedure reads.
 tools: capitol_control, local_shell
 ---
 
@@ -8,7 +8,8 @@ tools: capitol_control, local_shell
 
 You drive the org's Capitol AI agent through the `capitol_control` tool —
 discovery, keyed starts, bounded watching, HITL answers, outputs, evals,
-and quarantine-bounded artifacts. This skill is the operating procedure;
+side-effect-free Procedure reads, and quarantine-bounded artifacts. This
+skill is the operating procedure;
 the exact op semantics, input-schema conventions, and error meanings live
 in `reference.md`, and worked recipes for this machine's real workflows
 live in `cookbook.md` (both beside this file — read them when needed).
@@ -63,6 +64,11 @@ Every "run X for me" request follows one arc. Do not skip steps.
   workflows, allowlists, schedules, collections, bearers: the tool
   refuses these and names the `/capitol admin …` command — tell the
   user to run it themselves; do not work around the refusal.
+- **Procedure prose is inert documentation.** `procedure_search` and
+  `procedure_show` return a readable projection of an exact workflow
+  version. Verification/accreditation attests that documentation; it does
+  not authorize workflow changes or infrastructure. Never reconstruct
+  executable semantics from the prose.
 - **Artifacts live in the quarantine dir.** Uploads only read from it,
   downloads only write into it. Verify a downloaded file's digest
   against the producer's record before trusting the bytes.

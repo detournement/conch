@@ -39,6 +39,16 @@ from ..admin import CapitolAdmin
 from ..errors import CapitolError
 from . import drill as drill_mod
 from .graph import build_workflow_payload, payload_digest
+from .linkage import (
+    adopted_receipt,
+    build_lock,
+    client_for_admin,
+    lineage_metadata,
+    load_lock,
+    reconcile_procedure,
+    verify_lock,
+    write_lock,
+)
 
 #: The compiler's kernel ledger anchor (the /capitol admin CLI pattern).
 COMPILER_ANCHOR_GOAL_PREFIX = "process-compiler"
@@ -142,6 +152,7 @@ def materialize_compilation(
     compilation_id: str,
     *,
     admin: Optional[CapitolAdmin] = None,
+    procedure_client=None,
     catalog: Optional[Dict[str, Dict[str, Any]]] = None,
     packs_dir: Optional[Path] = None,
     log: Callable[[str], None] = print,
@@ -159,6 +170,7 @@ def materialize_compilation(
     ensure_local_stack(config)
     card = card_row["card"]
     admin = admin or _admin(store, config)
+    procedure_client = procedure_client or client_for_admin(admin)
     if catalog is None:
         from ..together_funding import fetch_node_catalog
 
@@ -170,8 +182,18 @@ def materialize_compilation(
     state: Dict[str, Any] = dict(compilation.get("materialization") or {})
     steps: List[Dict[str, Any]] = list(state.get("steps") or [])
     done = {step["step"] for step in steps}
+    existing_steps = {
+        str(step.get("step") or ""): step for step in steps
+    }
     state["steps"] = steps
     state.pop("error", None)
+    documentation: Dict[str, Any] = dict(
+        state.get("documentation") or {
+            "status": "documentation_pending",
+            "pending": [],
+        }
+    )
+    lineage = lineage_metadata(store, compilation_id, card_row)
 
     def record(complete: bool = False, error: str = "") -> None:
         store.record_compilation_materialization(
@@ -197,6 +219,30 @@ def materialize_compilation(
         record()
         return receipt
 
+    def reconcile(receipt: Dict[str, Any]) -> Dict[str, Any]:
+        outcome = reconcile_procedure(
+            store,
+            compilation_id,
+            card_row,
+            receipt,
+            procedure_client,
+            lineage=lineage,
+        )
+        pending = [
+            row for row in documentation.get("pending") or []
+            if str(row.get("workflow_id") or "")
+            != str(receipt.get("workflow_id") or "")
+        ]
+        if outcome["status"] == "documentation_pending":
+            pending.append(outcome)
+        documentation["pending"] = pending
+        documentation["status"] = (
+            "documentation_pending" if pending else "linked"
+        )
+        state["documentation"] = documentation
+        record()
+        return outcome
+
     create = card["assets"]["create"]
     collection_ids: Dict[str, str] = dict(state.get("collections") or {})
     try:
@@ -221,30 +267,107 @@ def materialize_compilation(
                 + (" (replayed)" if receipt.get("replayed") else ""))
         state["collections"] = collection_ids
 
-        # 2. Workflows — deterministic payloads from the approved stages.
+        # 2. Workflows — exact adoption pins first, then deterministic
+        # created payloads from the approved stages.
         workflow_ids: List[str] = []
+        for source in card.get("procedure_sources") or []:
+            if source.get("relationship") != "adopt":
+                continue
+            workflow_id = str(source["workflow_id"])
+            receipt = run_step(
+                f"workflow-adopt:{workflow_id}",
+                lambda s=source: adopted_receipt(s, procedure_client),
+            )
+            workflow_ids.append(workflow_id)
+            outcome = reconcile(receipt)
+            log(
+                f"  workflow {workflow_id}: adopted exact version "
+                f"{receipt.get('version_pin')} "
+                f"({outcome['status']})"
+            )
         for workflow in create.get("workflows") or []:
             identity = workflow["identity"]
+            step_name = f"workflow:{identity}"
             payload = build_workflow_payload(
                 catalog, workflow,
                 collection_ids=_collection_map(
                     workflow, collection_ids
                 ),
+                lineage=lineage,
             )
             digest = payload_digest(payload)
-            receipt = run_step(
-                f"workflow:{identity}",
-                lambda p=payload, i=identity, d=digest:
-                admin.persist_workflow(
-                    p,
-                    idempotency_key=_step_key(
-                        compilation_id, f"workflow:{i}", d[:16]
+            existing_step = existing_steps.get(step_name)
+            if existing_step is not None:
+                receipt = dict(existing_step.get("receipt") or {})
+                version_id = str(receipt.get("version_pin") or "")
+                workflow_id = str(receipt.get("workflow_id") or "")
+                if not version_id or not workflow_id:
+                    raise CapitolError(
+                        f"existing {step_name} receipt has no exact version "
+                        "pin; migration is unresolved and will not guess"
+                    )
+                live_version = procedure_client.get_workflow_version(
+                    workflow_id, version_id,
+                )
+                live_digest = str(live_version["payload_digest"])
+                legacy_payload = build_workflow_payload(
+                    catalog, workflow,
+                    collection_ids=_collection_map(
+                        workflow, collection_ids
                     ),
-                ),
+                )
+                allowed = {
+                    f"sha256:{digest}",
+                    f"sha256:{payload_digest(legacy_payload)}",
+                }
+                if live_digest not in allowed:
+                    raise CapitolError(
+                        f"existing {step_name} payload cannot be proven "
+                        "against the approved Card (migration unresolved; "
+                        "failing closed)"
+                    )
+                receipt["payload_digest"] = live_digest
+                receipt["version_number"] = int(
+                    live_version["version_number"]
+                )
+                receipt["workflow_id"] = workflow_id
+                receipt["version_pin"] = version_id
+                existing_step["receipt"] = receipt
+                record()
+                workflow_ids.append(workflow_id)
+                outcome = reconcile(receipt)
+                log(
+                    f"  workflow {identity}: reconciled existing exact "
+                    f"version {version_id} ({outcome['status']})"
+                )
+                continue
+
+            def persist_created(
+                payload=payload,
+                identity=identity,
+                digest=digest,
+            ):
+                receipt = admin.persist_workflow(
+                    payload,
+                    idempotency_key=_step_key(
+                        compilation_id,
+                        f"workflow:{identity}",
+                        digest[:16],
+                    ),
+                    create_only=True,
+                )
+                receipt["payload_digest"] = f"sha256:{digest}"
+                return receipt
+
+            receipt = run_step(
+                step_name,
+                persist_created,
             )
             workflow_ids.append(str(receipt.get("workflow_id") or ""))
+            outcome = reconcile(receipt)
             log(f"  workflow {identity}: {receipt.get('workflow_id')} "
-                f"version {receipt.get('version_pin')}"
+                f"version {receipt.get('version_pin')} "
+                f"({outcome['status']})"
                 + (" (replayed)" if receipt.get("replayed") else ""))
 
         # 3. Agent + exact allowlist.
@@ -305,7 +428,17 @@ def materialize_compilation(
         #    rollback ref is the directory).
         pack_dir = _write_pack(card, packs_dir)
         state["pack_dir"] = pack_dir
+        procedure_state = (
+            store.get_compilation(compilation_id).get("procedures") or {}
+        )
+        lock = build_lock(
+            compilation_id, card_row, state, procedure_state,
+        )
+        lock_ref = write_lock(Path(pack_dir), lock)
+        state["lock_path"] = lock_ref["path"]
+        state["lock_digest"] = lock_ref["digest"]
         log(f"  pack: {pack_dir}")
+        log(f"  lock: {lock_ref['digest']}")
         record(complete=True)
     except (CapitolError, KernelError) as exc:
         try:
@@ -346,6 +479,7 @@ def verify_compilation(
     compilation_id: str,
     *,
     driver=None,
+    procedure_client=None,
     packs_dir: Optional[Path] = None,
     log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
@@ -375,6 +509,32 @@ def verify_compilation(
 
     pack = load_pack_dir(packs_dir / pack_name)
     log(f"  pack {pack.name}: loads clean ({pack.digest[:23]}…)")
+    materialization = compilation.get("materialization") or {}
+    lock_path = str(materialization.get("lock_path") or "")
+    if not lock_path:
+        raise CapitolError(
+            "compilation has no materialization lock; exact workflow/"
+            "Procedure drift cannot be checked. Re-run materialization to "
+            "reconcile, never guess."
+        )
+    lock = load_lock(lock_path)
+    if procedure_client is None:
+        from ..procedures import CapitolProcedureClient
+
+        procedure_client = CapitolProcedureClient.from_config(config)
+    lock_state = verify_lock(
+        lock,
+        card_row=store.compilation_card(compilation_id),
+        live_pack_digest=pack.digest,
+        client=procedure_client,
+    )
+    pending = lock_state["documentation_pending"]
+    if pending:
+        log(
+            "  documentation pending for "
+            + ", ".join(pending)
+            + " (drill may proceed in shadow; promotion remains blocked)"
+        )
 
     # 2. The generated acceptance drill.
     try:

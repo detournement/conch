@@ -10,9 +10,14 @@ drill gate.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Dict, List
 
 from conch.capitol.errors import CapitolError
+from conch.capitol.procedures import (
+    procedure_content_digest,
+    workflow_payload_digest,
+)
 
 PREFIX = "conch-compile"
 WORKFLOW_IDENTITY = f"{PREFIX}-funding-daily-report"
@@ -246,6 +251,7 @@ class FakeAdmin:
         self.platform_url = "http://localhost:8811"
         self.org_id = "org-test"
         self._token = "test-token"
+        self.workflow_payloads: Dict[str, Dict[str, Any]] = {}
 
     def _mutate(self, op: str, key: str, effect) -> Dict[str, Any]:
         self.calls.append(f"{op}:{key}")
@@ -267,15 +273,34 @@ class FakeAdmin:
                                       "collection_id": f"col-{name}"}},
         )
 
-    def persist_workflow(self, payload, *, idempotency_key):
+    def persist_workflow(
+        self, payload, *, idempotency_key, create_only=False,
+    ):
         workflow_id = payload["id"]
+
+        def effect():
+            if create_only and workflow_id in self.workflow_payloads:
+                raise CapitolError("compiled workflow updates are blocked")
+            self.workflow_payloads[workflow_id] = json.loads(
+                json.dumps(payload)
+            )
+            return {
+                "workflow_id": workflow_id,
+                "name": payload.get("name", ""),
+                "created": True,
+                "version_pin": str(uuid.uuid5(
+                    uuid.NAMESPACE_URL, f"{workflow_id}:v1"
+                )),
+                "version_number": 1,
+                "rollback_ref": {
+                    "kind": "delete_workflow",
+                    "workflow_id": workflow_id,
+                },
+            }
+
         return self._mutate(
             "persist_workflow", idempotency_key,
-            lambda: {"workflow_id": workflow_id,
-                     "name": payload.get("name", ""),
-                     "created": True, "version_pin": "v1",
-                     "rollback_ref": {"kind": "delete_workflow",
-                                      "workflow_id": workflow_id}},
+            effect,
         )
 
     def create_orchestrator_agent(self, name, workflow_ids, *,
@@ -337,6 +362,98 @@ class FakeAdmin:
             "delete_collection", idempotency_key,
             lambda: {"collection_id": collection_id, "deleted": True},
         )
+
+
+class FakeProcedureClient:
+    """Exact-version Procedure REST stand-in sharing FakeAdmin payloads."""
+
+    def __init__(
+        self,
+        admin: FakeAdmin,
+        *,
+        missing: bool = False,
+        latest: bool = True,
+    ):
+        self.admin = admin
+        self.missing = missing
+        self.latest = latest
+        self.markdown_suffix = ""
+        self.org_id = admin.org_id
+
+    @staticmethod
+    def version_id(workflow_id: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{workflow_id}:v1"))
+
+    def seed(self, workflow_id: str, payload: Dict[str, Any]) -> None:
+        self.admin.workflow_payloads[workflow_id] = json.loads(
+            json.dumps(payload)
+        )
+
+    def get_workflow_version(self, workflow_id, workflow_version_id):
+        payload = self.admin.workflow_payloads.get(workflow_id)
+        if payload is None:
+            raise CapitolError("no such workflow", http_status=404)
+        expected = self.version_id(workflow_id)
+        if str(workflow_version_id) != expected:
+            raise CapitolError("no such version", http_status=404)
+        return {
+            "schema_version": "capitol.workflow_version.v1",
+            "id": expected,
+            "workflow_id": workflow_id,
+            "version_number": 1,
+            "version_type": "published",
+            "payload": payload,
+            "payload_digest": workflow_payload_digest(payload),
+            "is_latest": self.latest,
+            "created_by_id": "tester",
+            "created_at": "2026-09-24T00:00:00Z",
+        }
+
+    def get(self, workflow_id, *, version_number=None,
+            workflow_version_id=""):
+        if self.missing:
+            raise CapitolError("not compiled yet", http_status=404)
+        version_id = self.version_id(workflow_id)
+        if workflow_version_id and workflow_version_id != version_id:
+            raise CapitolError("no such Procedure", http_status=404)
+        payload = self.admin.workflow_payloads.get(workflow_id)
+        if payload is None:
+            raise CapitolError("no such Procedure", http_status=404)
+        markdown = (
+            f"# Procedure\n\nWorkflow {workflow_id}."
+            + self.markdown_suffix
+        )
+        doc_json = {
+            "name": payload.get("name") or workflow_id,
+            "workflow_version_id": version_id,
+            "version_number": 1,
+        }
+        return {
+            "schema_version": "capitol.procedure_document.v1",
+            "id": str(uuid.uuid5(
+                uuid.NAMESPACE_URL, f"procedure:{version_id}"
+            )),
+            "workflow_id": workflow_id,
+            "workflow_version_id": version_id,
+            "version_number": 1,
+            "version_type": "published",
+            "is_latest_workflow_version": True,
+            "content_digest": procedure_content_digest(markdown, doc_json),
+            "compiler_version": "1.0.0",
+            "verification": "draft",
+            "verified_by_id": None,
+            "verified_at": None,
+            "health": None,
+            "exposure": {
+                "publish_to_api": True,
+                "publish_to_mcp": False,
+                "publish_to_template": False,
+            },
+            "markdown": markdown,
+            "doc_json": doc_json,
+            "created_at": "2026-09-24T00:00:00Z",
+            "updated_at": "2026-09-24T00:00:00Z",
+        }
 
 
 class FakeRunDriver:

@@ -192,16 +192,20 @@ def _run_compile(arg: str, config: dict):
 # ---------------------------------------------------------------------------
 
 def _component_status(config: dict) -> str:
-    if not _configured(config):
-        return "not configured — /install works to connect a Capitol org"
-    return (f"configured — {config.get('capitol_org') or '?'} at"
+    if not all(
+        str(config.get(key) or "").strip()
+        for key in ("capitol_base_url", "capitol_org", "capitol_agent")
+    ):
+        return (
+            "source module present, installed-unconfigured — "
+            "/install works to connect a Capitol org"
+        )
+    return (f"healthy (source module) — {config.get('capitol_org') or '?'} at"
             f" {config.get('capitol_base_url')}")
 
 
 def _component_setup(config: dict) -> None:
-    import getpass
-
-    from ..config import set_config_values, set_env_values
+    from ..config import set_config_values
 
     print(
         "\n  \033[1mWorks\033[0m — governed business workflows over the"
@@ -210,6 +214,14 @@ def _component_setup(config: dict) -> None:
         " from the edge daemon."
     )
     current = str(config.get("capitol_base_url") or "").strip()
+    current_platform = str(
+        config.get("capitol_platform_url") or ""
+    ).strip()
+    current_org = str(config.get("capitol_org") or "").strip()
+    current_agent = str(config.get("capitol_agent") or "").strip()
+    current_env = str(
+        config.get("capitol_bearer_env") or "CAPITOL_A2A_BEARER"
+    ).strip()
     prompt = ("Capitol gateway base URL"
               + (f" [{current}]" if current else "") + ": ")
     try:
@@ -218,30 +230,44 @@ def _component_setup(config: dict) -> None:
             print("  \033[2mNo gateway URL — leaving works unconfigured."
                   "\033[0m\n")
             return
-        org = input("  Organization id: ").strip()
-        agent = input("  Agent id: ").strip()
-        # The bearer is a secret: hidden input, stored 0600 in the conch
-        # env file (never echoed, never in the config file).
-        bearer = getpass.getpass(
-            "  A2A bearer token (Enter to keep/skip): "
-        ).strip()
+        platform_url = input(
+            "  Platform API URL"
+            + (f" [{current_platform}]" if current_platform else "")
+            + ": "
+        ).strip() or current_platform
+        org = input(
+            "  Organization id"
+            + (f" [{current_org}]" if current_org else "")
+            + ": "
+        ).strip() or current_org
+        agent = input(
+            "  Agent id"
+            + (f" [{current_agent}]" if current_agent else "")
+            + ": "
+        ).strip() or current_agent
+        bearer_env = input(
+            f"  Bearer environment variable [{current_env}]: "
+        ).strip() or current_env
     except (EOFError, KeyboardInterrupt):
         print("\n  \033[2mWorks setup cancelled.\033[0m\n")
         return
-    updates = {"capitol_base_url": base_url}
+    updates = {
+        "capitol_base_url": base_url,
+        "capitol_bearer_env": bearer_env,
+    }
+    if platform_url:
+        updates["capitol_platform_url"] = platform_url
     if org:
         updates["capitol_org"] = org
     if agent:
         updates["capitol_agent"] = agent
     path = set_config_values(updates)
     config.update(updates)
-    if bearer:
-        set_env_values({"CAPITOL_A2A_BEARER": bearer})
-        print("  \033[1;32m✓ bearer stored\033[0m \033[2m(0600 env file)"
-              "\033[0m")
     print(f"\n  \033[1;32m✓ Works configured.\033[0m \033[2m({path})"
           "\033[0m \033[2mTry /capitol card, /capitol workflows, or"
-          " /compile <goal>.\033[0m\n")
+          " /compile <goal>. Export the named bearer variable or use the"
+          " existing A2Actrl registry; bearer bytes were not stored in"
+          " config.\033[0m\n")
 
 
 register_component(Component(

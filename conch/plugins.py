@@ -31,6 +31,9 @@ by :func:`load_builtin_plugins`.
 from __future__ import annotations
 
 import importlib
+import os
+from importlib import metadata
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Product plugin modules, in registration (= tool/command listing) order.
@@ -38,14 +41,37 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # split into separate distributions, absence simply means the feature
 # set is not installed.
 BUILTIN_PLUGIN_MODULES = (
-    "conch.capitol.plugin",
     "conch.fleet.plugin",
 )
+SOURCE_CHECKOUT_PLUGIN_MODULES = ("conch.capitol.plugin",)
+PLUGIN_ENTRYPOINT_GROUP = "conch.plugins"
 
 _loaded = False
+_loaded_entrypoints: "set[str]" = set()
+_plugin_errors: "Dict[str, str]" = {}
 
 
-def load_builtin_plugins() -> None:
+def _is_source_checkout() -> bool:
+    """The monorepo keeps bundled products usable during the split.
+
+    Wheels intentionally do not auto-activate that compatibility copy:
+    installing the ``conch-works`` entry point is what enables Works.
+    """
+    root = Path(__file__).resolve().parents[1]
+    disabled = str(
+        os.environ.get("CONCH_DISABLE_BUNDLED_WORKS") or ""
+    ).lower() in ("1", "true", "yes", "on")
+    return not disabled and (root / ".git").exists()
+
+
+def _entrypoints():
+    discovered = metadata.entry_points()
+    if hasattr(discovered, "select"):
+        return list(discovered.select(group=PLUGIN_ENTRYPOINT_GROUP))
+    return list(discovered.get(PLUGIN_ENTRYPOINT_GROUP, ()))
+
+
+def load_builtin_plugins(*, refresh: bool = False) -> None:
     """Import the product plugin modules (idempotent, fail-soft).
 
     Importing a plugin module runs its registrations. Each module keeps
@@ -53,14 +79,40 @@ def load_builtin_plugins() -> None:
     kernel or the product adapters themselves.
     """
     global _loaded
-    if _loaded:
+    if _loaded and not refresh:
         return
     _loaded = True
-    for name in BUILTIN_PLUGIN_MODULES:
+    entrypoints = _entrypoints()
+    modules = list(BUILTIN_PLUGIN_MODULES)
+    if _is_source_checkout() and not any(
+        entrypoint.name == "works" for entrypoint in entrypoints
+    ):
+        modules.extend(SOURCE_CHECKOUT_PLUGIN_MODULES)
+    for name in modules:
         try:
             importlib.import_module(name)
-        except ImportError:
+        except ImportError as exc:
+            _plugin_errors[name] = f"ImportError: {exc}"
             continue
+    for entrypoint in entrypoints:
+        identity = f"{entrypoint.name}={entrypoint.value}"
+        if identity in _loaded_entrypoints:
+            continue
+        try:
+            entrypoint.load()
+        except Exception as exc:
+            _plugin_errors[identity] = f"{type(exc).__name__}: {exc}"
+            continue
+        _loaded_entrypoints.add(identity)
+        _plugin_errors.pop(identity, None)
+
+
+def loaded_plugin_entrypoints() -> Tuple[str, ...]:
+    return tuple(sorted(_loaded_entrypoints))
+
+
+def plugin_errors() -> Dict[str, str]:
+    return dict(_plugin_errors)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +234,32 @@ def register_component(component: Component) -> None:
 
 def components() -> List[Component]:
     return list(_components.values())
+
+
+# Skill package-data providers. Product distributions register directories;
+# the foundation loader reads them before user skills (which still win).
+_skill_directories: "Dict[str, Callable[[], Path]]" = {}
+
+
+def register_skill_directory(
+    name: str,
+    provider: Callable[[], Path],
+) -> None:
+    _skill_directories[str(name)] = provider
+
+
+def skill_directories() -> List[Path]:
+    directories: List[Path] = []
+    for name, provider in sorted(_skill_directories.items()):
+        try:
+            path = Path(provider())
+        except Exception as exc:
+            _plugin_errors[f"skills:{name}"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+        directories.append(path)
+    return directories
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@ from ..errors import CapitolAuthError, CapitolError
 from ..tool import CapitolSessionClient
 from .card import (
     CARD_SCHEMA,
+    CARD_SCHEMA_V2,
     DEFAULT_ASSET_PREFIX,
     CardError,
     empty_discovery,
@@ -56,7 +57,8 @@ _DISCOVERY_SECTION_CAP = 4000
 #: start, respond, upload/download, admin, packs — is refused by name.
 READ_OPS = frozenset({
     "discover", "workflows", "describe", "suggest", "versions", "stats",
-    "runs", "status", "outputs", "evals",
+    "runs", "status", "outputs", "evals", "procedure_search",
+    "procedure_show",
 })
 
 COMPILER_SYSTEM_PROMPT = """You are the Conch ProcessCompiler running one bounded, headless compilation session. Your job is to DESIGN a process, not to build or run anything: you turn the user's goal into one reviewable Architecture Card. A human reviews and approves the card before any asset is created; nothing you do here has external effects.
@@ -76,11 +78,26 @@ Design constraints (validation enforces them):
 Never ask questions in plain text — the user is not watching this session. The card IS your deliverable."""
 
 
-def card_requirements(prefix: str) -> str:
+def card_requirements(
+    prefix: str,
+    *,
+    schema: str = CARD_SCHEMA,
+    procedure_sources: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """The card contract shown to the model (deterministic text)."""
-    return f"""ARCHITECTURE CARD SHAPE (schema {CARD_SCHEMA}) — emit exactly this JSON object via compiler_workspace op='emit_card':
+    procedure_note = ""
+    if procedure_sources:
+        procedure_note = (
+            "\nThe compilation workspace will attach the immutable "
+            "procedure_sources itself. Do not invent, alter, or copy source "
+            "ids/digests from prose. You may directly adopt the discovered "
+            "source workflow only when it exactly fits; otherwise adapt it "
+            "into a new workflow. A direct adoption lists that workflow in "
+            "assets.reuse and uses its real id in drill/mission references."
+        )
+    return f"""ARCHITECTURE CARD SHAPE (schema {schema}) — emit exactly this JSON object via compiler_workspace op='emit_card':
 {{
-  "schema": "{CARD_SCHEMA}",
+  "schema": "{schema}",
   "goal": "<the goal, verbatimish>",
   "success_criteria": ["<observable outcomes>", ...],
   "narrative": "<how the process works end to end, a short paragraph>",
@@ -111,7 +128,7 @@ def card_requirements(prefix: str) -> str:
     "capitol": {{"workflows": ["$create:<workflow identity>"], "allow_start": false, "allow_respond": true, "bind_scheduled": true}}}}
 }}
 Stage kinds: {", ".join(sorted(STAGE_KINDS))} (first stage must be text_input or json_input; later stages chain via "from"; agent tools must be node-catalog ids).
-Workflow/collection references: "$create:<identity>" for assets this card creates; otherwise a real discovered id."""
+Workflow/collection references: "$create:<identity>" for assets this card creates; otherwise a real discovered id.{procedure_note}"""
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +161,7 @@ def build_discovery(config: dict) -> Dict[str, Any]:
     cannot be reached degrade to a note — discovery never blocks a
     compile, it just narrows it."""
     discovery = empty_discovery()
+    discovery["org_id"] = str(config.get("capitol_org") or "").strip()
     notes: List[str] = []
     try:
         from ..client import CapitolRuntime
@@ -335,9 +353,16 @@ class CompilerWorkspaceClient:
 
     name = "compiler_workspace"
 
-    def __init__(self, discovery: Dict[str, Any], prefix: str):
+    def __init__(
+        self,
+        discovery: Dict[str, Any],
+        prefix: str,
+        *,
+        procedure_sources: Optional[List[Dict[str, Any]]] = None,
+    ):
         self._discovery = discovery
         self._prefix = prefix
+        self._procedure_sources = list(procedure_sources or [])
         self.card: Optional[Dict[str, Any]] = None
         self.attempts = 0
 
@@ -349,7 +374,14 @@ class CompilerWorkspaceClient:
         arguments = arguments or {}
         op = str(arguments.get("op") or "").strip().lower()
         if op == "requirements":
-            return self._text(card_requirements(self._prefix))
+            return self._text(card_requirements(
+                self._prefix,
+                schema=(
+                    CARD_SCHEMA_V2 if self._procedure_sources
+                    else CARD_SCHEMA
+                ),
+                procedure_sources=self._procedure_sources,
+            ))
         if op == "emit_card":
             raw = arguments.get("card")
             if isinstance(raw, str):
@@ -360,6 +392,17 @@ class CompilerWorkspaceClient:
                         f"emit_card rejected: card is not valid JSON "
                         f"({exc})"
                     )
+            if isinstance(raw, dict) and self._procedure_sources:
+                supplied = raw.get("procedure_sources")
+                if supplied is not None and supplied != self._procedure_sources:
+                    return self._text(
+                        "emit_card rejected: procedure_sources are "
+                        "workspace-pinned evidence references and may not "
+                        "be changed by the model"
+                    )
+                raw = dict(raw)
+                raw["schema"] = CARD_SCHEMA_V2
+                raw["procedure_sources"] = list(self._procedure_sources)
             self.attempts += 1
             try:
                 self.card = normalize_card(
@@ -475,6 +518,7 @@ def run_compile_session(
     guidance: str = "",
     prefix: str = "",
     capture_context: str = "",
+    procedure_sources: Optional[List[Dict[str, Any]]] = None,
     session_factory: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Run one bounded compilation session; returns the validated card.
@@ -491,7 +535,9 @@ def run_compile_session(
     )
     if discovery is None:
         discovery = build_discovery(config)
-    workspace = CompilerWorkspaceClient(discovery, prefix)
+    workspace = CompilerWorkspaceClient(
+        discovery, prefix, procedure_sources=procedure_sources,
+    )
     capitol_client = None
     if str(config.get("capitol_base_url") or "").strip():
         capitol_client = ReadOnlyCapitolClient(config)
@@ -499,7 +545,11 @@ def run_compile_session(
     system = "\n\n".join([
         COMPILER_SYSTEM_PROMPT,
         _skill_blocks(),
-        card_requirements(prefix),
+        card_requirements(
+            prefix,
+            schema=CARD_SCHEMA_V2 if procedure_sources else CARD_SCHEMA,
+            procedure_sources=procedure_sources,
+        ),
     ])
     user_parts = [
         f"Compile this goal into an Architecture Card:\n\n{goal}",

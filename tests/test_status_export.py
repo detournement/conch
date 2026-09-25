@@ -108,7 +108,11 @@ class TestSnapshot(ExportCase):
         # unchanged snapshot: no second post
         self.tick(svc)
         self.assertEqual(len(self.posts), 1)
-        # a change pushes again
+        # time alone is not a change (generated_at excluded from digest)
+        self.now += 60
+        self.tick(svc)
+        self.assertEqual(len(self.posts), 1)
+        # a real change pushes again
         self.now += 60
         self.seed_session(title="Vintage compass — brass")
         self.tick(svc)

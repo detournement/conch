@@ -187,7 +187,14 @@ class StatusExporterService:
             return
         import hashlib
 
-        digest = hashlib.sha256(body.encode()).hexdigest()
+        # Change detection must ignore the timestamp, or every build
+        # "changes" and the exporter pushes on every interval.
+        stable = {k: v for k, v in snapshot.items()
+                  if k != "generated_at"}
+        digest = hashlib.sha256(
+            json.dumps(stable, separators=(",", ":"),
+                       sort_keys=True).encode()
+        ).hexdigest()
         if digest == self._last_digest:
             return  # unchanged; save the request
         url = str(self.config.get("status_page_url") or "").rstrip("/")

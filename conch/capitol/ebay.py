@@ -307,8 +307,7 @@ def _post_folder_verb(payload: dict) -> bool:
     """Route a folder-session verb through the daemon (single writer of
     flow state) via the kernel control socket. Returns delivery truth."""
     from ..kernel.client import KernelUnavailable, SocketKernelClient
-
-    from .folder_intake import INBOX_SOURCE
+    from ..kernel.folderwatch import INBOX_SOURCE
 
     try:
         SocketKernelClient().post_event(

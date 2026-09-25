@@ -75,7 +75,13 @@ _INTAKE_KEYS = {
                         "attachments", "session", "start",
                         "context_default"},
     "shell_command": {"kind", "command", "usage", "start"},
-    "watched_folder": {"kind", "path", "enabled", "note"},
+    "watched_folder": {
+        # The folder *path* is operator config (folder_watch_<name>),
+        # never pack data — a pack must not choose where on disk it
+        # reads from. "path" stays allowed for legacy manifests only.
+        "kind", "path", "enabled", "note", "start", "context_default",
+        "attachments", "session",
+    },
 }
 
 _BINDING_KEYS = {"workflow", "kind", "request", "mode_key", "default_mode",

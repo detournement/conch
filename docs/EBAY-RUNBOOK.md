@@ -33,7 +33,10 @@ the sandbox token expired in September with no refresh token stored.
    `conch-edge` in a foreground terminal).
 2. Config present (already wired on this machine):
    `ebay_agent = d96b9401-6a5b-5f45-809e-165edf41ebed` (eBay Sales
-   Operator), `ebay_watch_folder = ~/EbayDrop`,
+   Operator), the watched-folder binding
+   (`folder_watch_ebay = ~/EbayDrop` +
+   `folder_watch_ebay_handler = pack:ebay-listing` — the general
+   folder-watch pattern, eBay is just the first binding), and
    `status_page_url = https://conch-status.vercel.app` (write token in
    `~/.config/conch/env`).
 3. **Drop**: copy 1–12 item photos into `~/EbayDrop`, optionally with a
@@ -74,8 +77,9 @@ the sandbox token expired in September with no refresh token stored.
 ## D. Troubleshooting
 
 - Drop ignored → `/ebay drops` empty: the daemon isn't running the new
-  build, or `ebay_watch_folder` unset. Files in `rejected/` carry a
-  `.reason.txt`.
+  build, or the `folder_watch_ebay` /
+  `folder_watch_ebay_handler` pair is unset. Files in `rejected/`
+  carry a `.reason.txt`.
 - `Capitol credential needed` in a session: the gateway bearer is fine
   (drafting worked) but the **eBay** credential inside Capitol failed —
   redo section A.

@@ -345,13 +345,24 @@ class EdgeDaemon:
             )
 
             load_builtin_plugins()
+            from .folderwatch import FolderWatchService
+
             self._services = [
+                # Kernel-owned generic services first: folder watches
+                # resolve their product handlers through the plugin
+                # registry, so the kernel still never imports a product.
+                FolderWatchService(
+                    self.engine, self.store, self.config,
+                    log=self.log, clock=self.clock,
+                ),
+            ]
+            self._services.extend(
                 factory(
                     self.store, self.config, log=self.log,
                     clock=self.clock,
                 )
                 for factory in daemon_service_factories()
-            ]
+            )
         return self._services
 
     # -- outbox delivery ---------------------------------------------------------

@@ -299,6 +299,35 @@ compiled → approved → materialized → verified → operating
 
 Capture has no shortcut around that lifecycle.
 
+### Watched folders (general pattern)
+
+Named watches turn local folders into governed intake surfaces: the
+edge daemon polls each `folder_watch_<name>` path, groups a multi-file
+drop (plus an optional `.txt` of notes) after a debounce window,
+validates on magic bytes, quarantines, archives originals to
+`processed/` (rejects to `rejected/` with a reason file), and dedupes
+by content digest across restarts. A handler binding decides what the
+drop means:
+
+```ini
+# eBay: drop item photos → a governed listing session
+folder_watch_ebay = ~/EbayDrop
+folder_watch_ebay_handler = pack:ebay-listing
+
+# or: feed a mission (paths + digests journaled, mission woken)
+folder_watch_scans = ~/Scans
+folder_watch_scans_handler = mission:msn-1a2b3c
+```
+
+`pack:` bindings run the flow pack's `watched_folder` intake — for
+`ebay-listing`, the same drafting → clarify → review → exact-approval
+publish flow as the Slack intake, steered from the shell with
+`/ebay drops`, `/ebay answer <drop-id> <text>`, and
+`/ebay approve <id>`. A file drop is never consent for an effect:
+folder sessions always require the origin-bound approval challenge,
+regardless of caps. See `docs/EBAY-RUNBOOK.md` for the worked
+end-to-end example including the sales status page.
+
 ### Browser capture on macOS Chrome
 
 Chrome on macOS is the proven path. Linux Chromium-family host paths ship but

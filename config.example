@@ -535,18 +535,27 @@ api_key_env=ANTHROPIC_API_KEY
 # Sales Operator" in the provisioned org).
 #ebay_agent=
 
-# Watched-folder intake (edge daemon): drop item photos (plus an optional
-# .txt of notes) into this folder and a listing session starts — same
-# governed flow as the Slack intake. Files are validated on magic bytes
-# (12 MB / 12 photos caps), quarantined, and moved to processed/ (never
-# deleted); invalid files land in rejected/ with a reason file. Dropping
-# a file is NEVER consent to sell: folder publishes always require the
-# exact-approval challenge (/ebay approve <id>), regardless of caps.
-# Continue parked sessions with /ebay answer <drop-id> <text>; watch
-# progress with /ebay drops.
-#ebay_watch_folder=~/EbayDrop
-#ebay_watch_poll_seconds=5
-#ebay_watch_debounce_seconds=8
+# --- Watched folders (general pattern, edge daemon) -----------------------------
+# Named watches turn local folders into governed intake surfaces. The
+# kernel owns the mechanics — polling, debounce/grouping (a multi-file
+# drop plus an optional .txt of notes becomes ONE drop), magic-byte
+# validation, quarantine, processed/ and rejected/ archival (originals
+# are never deleted; rejects carry a .reason.txt), and content-digest
+# dedupe that survives restarts. What a drop MEANS is the handler
+# binding:
+#   pack:<name>       start a flow-pack session (the pack's
+#                     watched_folder intake; a drop is never consent
+#                     for an effect — publishes always need the
+#                     origin-bound approval challenge)
+#   mission:<id>      journal the drop as a kernel event and wake the
+#                     mission (file paths + digests, never bytes)
+# Worked example — the eBay sales loop:
+#folder_watch_ebay=~/EbayDrop
+#folder_watch_ebay_handler=pack:ebay-listing
+#folder_watch_ebay_poll=5
+#folder_watch_ebay_debounce=8
+# Continue pack folder sessions from the shell: /ebay drops,
+# /ebay answer <drop-id> <text>, /ebay approve <id> | deny <id>.
 
 # --- Status page (eBay sales dashboard) -----------------------------------------
 # The edge daemon pushes sanitized, allowlisted status snapshots (listing

@@ -4,7 +4,10 @@
     "name": "ebay-listing",
     "version": "1.0.0",
     "description": "Photo → sandbox eBay listing: draft/revise with clarification relay, caps-clamped publish gate, exact-approval publish, effect confirmation over the originating thread.",
-    "replaces": ["conch/capitol/ebay.py", "conch/capitol/channel_flow.py"]
+    "replaces": [
+      "conch/capitol/ebay.py",
+      "conch/capitol/channel_flow.py"
+    ]
   },
   "capitol": {
     "org": "${config.capitol_org}",
@@ -12,12 +15,21 @@
     "workflows": {
       "draft": {
         "pin": "${config.ebay_draft_workflow:}",
-        "discover": {"name_contains_any": ["draft"]},
+        "discover": {
+          "name_contains_any": [
+            "draft"
+          ]
+        },
         "inputs_key": "auto"
       },
       "publish": {
         "pin": "${config.ebay_publish_workflow:}",
-        "discover": {"name_contains_any": ["publish", "approve"]},
+        "discover": {
+          "name_contains_any": [
+            "publish",
+            "approve"
+          ]
+        },
         "inputs_key": "auto"
       }
     }
@@ -28,30 +40,62 @@
       "name": "revision",
       "schema": "ebay.listing_revision.v1",
       "status_field": "status",
-      "identity": ["listing_session_id", "revision", "draft_hash"]
+      "identity": [
+        "listing_session_id",
+        "revision",
+        "draft_hash"
+      ]
     },
     "effect": {
       "schema": "ebay.inventory_effect.v1",
-      "facts": ["state", "listing.listing_id", "listing.offer_id", "listing.sku", "listing.listing_url"],
+      "facts": [
+        "state",
+        "listing.listing_id",
+        "listing.offer_id",
+        "listing.sku",
+        "listing.listing_url"
+      ],
       "link_fact": "listing_url",
-      "success": {"fact": "state", "equals_ci": "PUBLISHED"}
+      "success": {
+        "fact": "state",
+        "equals_ci": "PUBLISHED"
+      }
     },
-    "rejection": {"schema": "ebay.approval_rejection.v1"},
-    "guidance": {"schema": "ebay.draft_request_guidance.v1"}
+    "rejection": {
+      "schema": "ebay.approval_rejection.v1"
+    },
+    "guidance": {
+      "schema": "ebay.draft_request_guidance.v1"
+    }
   },
   "intakes": [
     {
       "kind": "channel_message",
       "channel": "slack",
       "enabled_key": "ebay_channel_intake",
-      "match": {"attachments_mime": ["image/*"], "min_attachments": 1},
+      "match": {
+        "attachments_mime": [
+          "image/*"
+        ],
+        "min_attachments": 1
+      },
       "attachments": {
         "max_count": 12,
         "max_bytes": 52428800,
-        "suffixes": [".jpg", ".jpeg", ".png", ".gif", ".webp"],
+        "suffixes": [
+          ".jpg",
+          ".jpeg",
+          ".png",
+          ".gif",
+          ".webp"
+        ],
         "noun": "photo"
       },
-      "session": {"scope": "thread", "id_scheme": "channel-sha16", "dedupe": "session_per_message_ts"},
+      "session": {
+        "scope": "thread",
+        "id_scheme": "channel-sha16",
+        "dedupe": "session_per_message_ts"
+      },
       "start": "draft_initial",
       "context_default": "Image-only listing request; no user-supplied listing metadata."
     },
@@ -60,6 +104,13 @@
       "command": "/ebay",
       "usage": "/ebay <photo…> [-- notes about the item] | /ebay sessions",
       "start": "draft_initial"
+    },
+    {
+      "kind": "watched_folder",
+      "enabled": true,
+      "note": "Bind with folder_watch_<name> = <path> + folder_watch_<name>_handler = pack:ebay-listing; the operator's config owns the path. Drops never auto-publish.",
+      "start": "draft_initial",
+      "context_default": "Image-only listing request from a folder drop; no user-supplied listing metadata."
     }
   ],
   "bindings": {
@@ -72,17 +123,32 @@
           "kind": "chat_intake",
           "message": "Please draft a sandbox eBay listing from the attached photo(s). Item context: {item_context}",
           "attachments": "fileparts",
-          "reconcile": {"by": "context_id", "attempts": 6, "delay_seconds": 5}
+          "reconcile": {
+            "by": "context_id",
+            "attempts": 6,
+            "delay_seconds": 5
+          }
         },
-        "typed": {"kind": "typed_request", "upload": "private_artifact", "request": "draft"}
+        "typed": {
+          "kind": "typed_request",
+          "upload": "private_artifact",
+          "request": "draft"
+        }
       }
     },
-    "draft_revise": {"workflow": "draft", "kind": "typed_request", "request": "revise"},
+    "draft_revise": {
+      "workflow": "draft",
+      "kind": "typed_request",
+      "request": "revise"
+    },
     "publish": {
       "workflow": "publish",
       "kind": "typed_request",
       "request": "publish",
-      "gateway_key": {"base": "request.idempotency_key", "retry_suffix": ":retry{attempt}"}
+      "gateway_key": {
+        "base": "request.idempotency_key",
+        "retry_suffix": ":retry{attempt}"
+      }
     }
   },
   "requests": {
@@ -111,7 +177,15 @@
     "revise": {
       "schema": "ebay.draft_request.v1",
       "from_contract": "revision",
-      "require": ["app_id", "account_ref", "listing_session_id", "actor_principal_id", "channel", "thread_id", "revision"],
+      "require": [
+        "app_id",
+        "account_ref",
+        "listing_session_id",
+        "actor_principal_id",
+        "channel",
+        "thread_id",
+        "revision"
+      ],
       "fields": {
         "mode": "revise",
         "app_id": "${contract.app_id}",
@@ -132,7 +206,14 @@
     "publish": {
       "schema": "ebay.publish_request.v1",
       "from_contract": "revision",
-      "require": ["app_id", "listing_session_id", "revision", "draft_hash", "channel", "thread_id"],
+      "require": [
+        "app_id",
+        "listing_session_id",
+        "revision",
+        "draft_hash",
+        "channel",
+        "thread_id"
+      ],
       "fields": {
         "app_id": "${contract.app_id}",
         "listing_session_id": "${contract.listing_session_id}",
@@ -151,7 +232,15 @@
   },
   "flow": {
     "session_contract": "revision",
-    "phases": ["drafting", "clarify", "hitl", "awaiting_approval", "publishing", "done", "failed"],
+    "phases": [
+      "drafting",
+      "clarify",
+      "hitl",
+      "awaiting_approval",
+      "publishing",
+      "done",
+      "failed"
+    ],
     "on_status": {
       "needs_info": {
         "phase": "clarify",
@@ -159,37 +248,86 @@
         "max_rounds": 5,
         "reply_action": "draft_revise"
       },
-      "draft_review": {"phase": "gate", "approval": "ebay_publish"}
+      "draft_review": {
+        "phase": "gate",
+        "approval": "ebay_publish"
+      }
     },
     "hitl": {
       "park_on": "node.input_required",
-      "clarification": {"relay": "originating_thread", "reply_feeds": "response"},
-      "intervention": {"relay": "originating_thread", "tokens": ["continue", "stop"]}
+      "clarification": {
+        "relay": "originating_thread",
+        "reply_feeds": "response"
+      },
+      "intervention": {
+        "relay": "originating_thread",
+        "tokens": [
+          "continue",
+          "stop"
+        ]
+      }
     },
-    "recovery_order": ["hitl", "contract_status", "failed"],
+    "recovery_order": [
+      "hitl",
+      "contract_status",
+      "failed"
+    ],
     "revision_invalidates_approval": true
   },
   "approvals": [
     {
       "kind": "ebay_publish",
       "constructs": "publish",
-      "pin": ["session.id", "contract.revision", "contract.draft_hash"],
+      "pin": [
+        "session.id",
+        "contract.revision",
+        "contract.draft_hash"
+      ],
       "policy_event": "capitol.ebay.publish",
-      "policy_fields": ["app_id", "listing_session_id", "revision", "draft_hash"],
+      "policy_fields": [
+        "app_id",
+        "listing_session_id",
+        "revision",
+        "draft_hash"
+      ],
       "caps": {
         "toggle_key": "ebay_auto_publish",
         "checks": [
-          {"field": "listing.category_id", "op": "in_csv", "config_key": "ebay_allowed_category_ids", "skip_when_unset": true, "label": "category"},
-          {"field": "listing.price.value", "op": "lte_float", "config_key": "ebay_max_price_usd", "skip_when_unset": true, "label": "price", "unit": "USD"}
+          {
+            "field": "listing.category_id",
+            "op": "in_csv",
+            "config_key": "ebay_allowed_category_ids",
+            "skip_when_unset": true,
+            "label": "category"
+          },
+          {
+            "field": "listing.price.value",
+            "op": "lte_float",
+            "config_key": "ebay_max_price_usd",
+            "skip_when_unset": true,
+            "label": "price",
+            "unit": "USD"
+          }
         ],
         "unreadable_outcome": "exact_approval"
       },
       "auto_within_caps": {
-        "shell": {"confirm": true},
-        "channel": {"opt_in_key": "ebay_channel_auto_publish", "default": false}
+        "shell": {
+          "confirm": true
+        },
+        "channel": {
+          "opt_in_key": "ebay_channel_auto_publish",
+          "default": false
+        }
       },
-      "exact": {"phrase": "proceed to post", "challenge": "POST r{revision} {draft_hash[-12:]}"},
-      "on_effect_failure": {"reissue": true, "reason": "the previous publish attempt failed upstream"},
+      "exact": {
+        "phrase": "proceed to post",
+        "challenge": "POST r{revision} {draft_hash[-12:]}"
+      },
+      "on_effect_failure": {
+        "reissue": true,
+        "reason": "the previous publish attempt failed upstream"
+      },
       "ttl_key": "remote_approval_ttl",
       "describe": "publish eBay listing r{revision} ({listing.title:120=untitled})"
     }
@@ -198,16 +336,58 @@
     "store": "pack_state",
     "file": "ebay_pilot.json",
     "effect_field": "listing",
-    "session_fields": ["phase", "channel", "thread_id", "sender", "origin_ts", "item_context", "photos", "media", "workflows", "context_id", "intake", "revision", "clarify_rounds", "approval_id", "publish_attempts", "hitl", "listing"],
+    "session_fields": [
+      "phase",
+      "channel",
+      "thread_id",
+      "sender",
+      "origin_ts",
+      "item_context",
+      "photos",
+      "media",
+      "workflows",
+      "context_id",
+      "intake",
+      "revision",
+      "clarify_rounds",
+      "approval_id",
+      "publish_attempts",
+      "hitl",
+      "listing"
+    ],
     "collections": {
-      "runs": ["kind", "run_id", "idempotency_key", "started_at", "last_sequence", "status"],
-      "revisions": ["revision", "draft_hash", "status"]
+      "runs": [
+        "kind",
+        "run_id",
+        "idempotency_key",
+        "started_at",
+        "last_sequence",
+        "status"
+      ],
+      "revisions": [
+        "revision",
+        "draft_hash",
+        "status"
+      ]
     },
-    "threads": {"key": "{channel}:{thread_id}", "value": "session_id", "doubles_as": "intake_dedupe"}
+    "threads": {
+      "key": "{channel}:{thread_id}",
+      "value": "session_id",
+      "doubles_as": "intake_dedupe"
+    }
   },
   "notifications": {
-    "progress": {"target": "originating_thread", "events": ["session_started", "revising", "auto_publishing"]},
-    "results": {"target": "originating_thread"}
+    "progress": {
+      "target": "originating_thread",
+      "events": [
+        "session_started",
+        "revising",
+        "auto_publishing"
+      ]
+    },
+    "results": {
+      "target": "originating_thread"
+    }
   },
   "messages": {
     "channel": {
@@ -267,8 +447,14 @@
       "Draft r{revision} — {listing.title:120}",
       "  Price {listing.price.value:20} {listing.price.currency:8} · Category {listing.category_id:40} · Condition {listing.condition:60} · Qty {listing.quantity:12}",
       "  Photos {#media} · Hash …{draft_hash[-12:]}",
-      {"if": "listing.description", "line": "  About: {listing.description:300}"},
-      {"each": "warnings", "line": "  ⚠ {item:200}"}
+      {
+        "if": "listing.description",
+        "line": "  About: {listing.description:300}"
+      },
+      {
+        "each": "warnings",
+        "line": "  ⚠ {item:200}"
+      }
     ],
     "shell": [
       "",
@@ -279,20 +465,41 @@
       "    Price:     {listing.price.value:20} {listing.price.currency:8}",
       "    Quantity:  {listing.quantity:12}",
       "    Media:     {#media} photo(s)",
-      {"if": "listing.policies", "line": "    Shipping:  fulfillment {listing.policies.fulfillment_policy_id:40}, returns {listing.policies.return_policy_id:40}"},
-      {"if": "listing.description", "line": "    About:     {listing.description:300}"},
-      {"each": "warnings", "line": "    ⚠ {item:200}"}
+      {
+        "if": "listing.policies",
+        "line": "    Shipping:  fulfillment {listing.policies.fulfillment_policy_id:40}, returns {listing.policies.return_policy_id:40}"
+      },
+      {
+        "if": "listing.description",
+        "line": "    About:     {listing.description:300}"
+      },
+      {
+        "each": "warnings",
+        "line": "    ⚠ {item:200}"
+      }
     ],
     "effect": {
       "channel": [
         "Publish effect: {state:40=?}",
-        {"if": "listing_id", "append": " — listing {listing_id:40}"},
-        {"if": "listing_url", "append": "\n{listing_url:200}"}
+        {
+          "if": "listing_id",
+          "append": " — listing {listing_id:40}"
+        },
+        {
+          "if": "listing_url",
+          "append": "\n{listing_url:200}"
+        }
       ],
       "shell": [
         "\n  Publish effect: {state:40=?}",
-        {"if": "listing_id", "append": " — listing {listing_id}"},
-        {"if": "listing_url", "append": "\n  {listing_url}"}
+        {
+          "if": "listing_id",
+          "append": " — listing {listing_id}"
+        },
+        {
+          "if": "listing_url",
+          "append": "\n  {listing_url}"
+        }
       ]
     }
   },
@@ -301,5 +508,8 @@
     "module": "tests.capitol_golden_scenarios",
     "note": "The R0 equivalence suite: every scenario (shell intake, clarify/revise, caps auto vs gate, exact-approval publish, effect-failure re-arm, chat FilePart intake, thread-session mapping, HITL park/resume) replays against the fake A2A gateway and must match its recorded fixture byte-identically modulo the normalized volatile fields."
   },
-  "scope": {"org_config_key": "capitol_org", "agent_config_key": "capitol_agent"}
+  "scope": {
+    "org_config_key": "capitol_org",
+    "agent_config_key": "capitol_agent"
+  }
 }

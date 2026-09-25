@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 from ..plugins import (
+    register_folder_handler,
     Component,
     SlashCommand,
     register_component,
@@ -439,6 +440,22 @@ register_mission_tool_provider(
     "capitol_control", CapitolMissionToolProvider()
 )
 register_daemon_service(CapitolDaemonService)
+
+
+def _pack_folder_handler(target: str, store, config: dict, log=print):
+    from .folder_intake import pack_folder_handler_factory
+
+    return pack_folder_handler_factory(target, store, config, log=log)
+
+
+def _status_exporter_service(store, config: dict, log=print, clock=None):
+    from .status_export import StatusExporterService
+
+    return StatusExporterService(store, config, log=log, clock=clock)
+
+
+register_folder_handler("pack", _pack_folder_handler)
+register_daemon_service(_status_exporter_service)
 register_slash_command(SlashCommand(
     "/ebay",
     "/ebay <photo...> [-- notes]",

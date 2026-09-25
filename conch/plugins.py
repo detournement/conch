@@ -266,6 +266,32 @@ def skill_directories() -> List[Path]:
 # Daemon services: supervision passes inside the edge-daemon tick.
 # ---------------------------------------------------------------------------
 
+_folder_handler_factories: "Dict[str, Callable[..., Any]]" = {}
+
+
+def register_folder_handler(kind: str, factory: Callable[..., Any]) -> None:
+    """Register a folder-watch handler binding (e.g. ``pack``).
+
+    The generic folder-watch service (kernel-side) resolves a watch's
+    ``handler = <kind>:<target>`` binding through this registry, so
+    products supply drop handlers without the kernel importing them.
+    A factory is called as ``factory(target, store, config, log)`` and
+    returns a handler object with:
+
+    - ``accepts()`` → dict(extensions, max_bytes, max_count,
+      notes_sidecar) describing what the watch admits;
+    - ``handle_drop(watch, drop_id, attachments, notes, notify)``
+      → optional reply text;
+    - optionally ``handle_verb(payload, notify)`` for continuation
+      verbs (answers, approvals) routed from the shell.
+    """
+    _folder_handler_factories[str(kind)] = factory
+
+
+def folder_handler_factory(kind: str) -> Optional[Callable[..., Any]]:
+    return _folder_handler_factories.get(str(kind))
+
+
 _daemon_service_factories: "List[Callable[..., Any]]" = []
 
 

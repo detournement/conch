@@ -52,7 +52,9 @@ class ChannelListingFlow(PackChannelFlow):
 
     def __init__(self, config: dict, approvals, notify, *,
                  state: Optional[PackState] = None):
+        from .folder_intake import ebay_flow_config
+
         super().__init__(
-            ebay_pack(), config or {}, approvals, notify,
-            state=state or PilotState(),
+            ebay_pack(), ebay_flow_config(config or {}), approvals,
+            notify, state=state or PilotState(),
         )

@@ -290,11 +290,63 @@ USAGE = (
     "\n  \033[1;36m/ebay — sandbox photo→listing pilot\033[0m\n"
     "    /ebay <photo…> [-- notes about the item]\n"
     "    /ebay sessions\n"
+    "    /ebay drops                     folder-drop sessions + status\n"
+    "    /ebay answer <drop-id> <text>   answer a parked clarification\n"
+    "    /ebay approve <id> | deny <id>  decide a folder publish gate\n"
     "  \033[2mNeeds capitol_base_url/capitol_org/capitol_agent config and a\n"
     "  bearer in $CAPITOL_A2A_BEARER or ~/.capitol-a2a/agents.yaml.\n"
-    "  Sandbox only: publishing goes through Capitol's exact-approval\n"
-    "  workflow; nothing is sent without your confirmation.\033[0m\n"
+    "  Set ebay_agent to target the eBay orchestrator; set\n"
+    "  ebay_watch_folder to start listings by dropping photos into a\n"
+    "  folder (edge daemon required). Sandbox only: publishing goes\n"
+    "  through Capitol's exact-approval workflow; nothing is sent\n"
+    "  without your confirmation.\033[0m\n"
 )
+
+
+def _post_folder_verb(payload: dict) -> bool:
+    """Route a folder-session verb through the daemon (single writer of
+    flow state) via the kernel control socket. Returns delivery truth."""
+    from ..kernel.client import KernelUnavailable, SocketKernelClient
+
+    from .folder_intake import INBOX_SOURCE
+
+    try:
+        SocketKernelClient().post_event(
+            INBOX_SOURCE,
+            f"{payload.get('verb')}:{payload.get('drop') or payload.get('request_id')}:{__import__('time').time()}",
+            payload,
+        )
+        return True
+    except (KernelUnavailable, Exception) as exc:  # noqa: BLE001
+        print(
+            "\n  \033[31medge daemon unreachable — folder sessions are "
+            f"daemon-owned ({exc}).\033[0m"
+            "\n  \033[2mStart it with: conch-edge install (or conch-edge "
+            "for a foreground run).\033[0m\n"
+        )
+        return False
+
+
+def _print_drops() -> None:
+    from .folder_intake import drops_summary
+
+    drops = drops_summary()
+    if not drops:
+        print("\n  \033[2mNo folder drops yet. Set ebay_watch_folder and "
+              "drop photos there.\033[0m\n")
+        return
+    print(f"\n  \033[1;36meBay folder drops ({len(drops)}):\033[0m")
+    for record in drops:
+        approval = record.get("approval_id")
+        tail = f"  approval #{approval} pending" if approval else ""
+        print(
+            f"    \033[1m{record['drop_id']}\033[0m  "
+            f"{record['phase']}  {len(record['photos'])} photo(s)"
+            f"{' + notes' if record['notes'] else ''}{tail}"
+        )
+        for item in (record.get("history") or [])[-2:]:
+            print(f"      \033[2m{item.get('text', '')[:110]}\033[0m")
+    print()
 
 
 def run_ebay_command(arg: str, config: dict) -> None:
@@ -322,6 +374,34 @@ def run_ebay_command(arg: str, config: dict) -> None:
             print(f"    \033[1m{session_id}\033[0m  {tail}")
         print()
         return
+    if arg.lower() == "drops":
+        _print_drops()
+        return
+    lowered = arg.split(None, 1)
+    if lowered and lowered[0].lower() == "answer":
+        rest = (lowered[1] if len(lowered) > 1 else "").split(None, 1)
+        if len(rest) < 2:
+            print("\n  usage: /ebay answer <drop-id> <text>\n")
+            return
+        if _post_folder_verb(
+            {"verb": "answer", "drop": rest[0], "text": rest[1]}
+        ):
+            print(f"\n  \033[2manswer queued for {rest[0]} — the daemon "
+                  "applies it within its poll interval; check /ebay "
+                  "drops.\033[0m\n")
+        return
+    if lowered and lowered[0].lower() in ("approve", "deny"):
+        verb = lowered[0].lower()
+        try:
+            request_id = int((lowered[1] if len(lowered) > 1 else "").strip())
+        except ValueError:
+            print(f"\n  usage: /ebay {verb} <approval-id>\n")
+            return
+        if _post_folder_verb({"verb": verb, "request_id": request_id}):
+            print(f"\n  \033[2m{verb} queued for approval #{request_id} — "
+                  "the daemon consumes it within its poll interval; "
+                  "check /ebay drops.\033[0m\n")
+        return
     try:
         photo_args = shlex.split(arg)
     except ValueError as exc:
@@ -336,9 +416,12 @@ def run_ebay_command(arg: str, config: dict) -> None:
         print(USAGE)
         return
     try:
-        runtime = CapitolRuntime.from_config(config)
+        from .folder_intake import ebay_flow_config
+
+        flow_config = ebay_flow_config(config)
+        runtime = CapitolRuntime.from_config(flow_config)
         runtime.discover()
-        pilot = EbayPilot(runtime, config)
+        pilot = EbayPilot(runtime, flow_config)
         pilot.sell(photo_args, notes)
     except CapitolError as exc:
         print(f"\n  \033[31meBay pilot: {exc}\033[0m")

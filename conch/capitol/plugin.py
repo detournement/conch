@@ -439,6 +439,22 @@ register_mission_tool_provider(
     "capitol_control", CapitolMissionToolProvider()
 )
 register_daemon_service(CapitolDaemonService)
+
+
+def _folder_intake_service(store, config: dict, log=print, clock=None):
+    from .folder_intake import FolderIntakeService
+
+    return FolderIntakeService(store, config, log=log, clock=clock)
+
+
+def _status_exporter_service(store, config: dict, log=print, clock=None):
+    from .status_export import StatusExporterService
+
+    return StatusExporterService(store, config, log=log, clock=clock)
+
+
+register_daemon_service(_folder_intake_service)
+register_daemon_service(_status_exporter_service)
 register_slash_command(SlashCommand(
     "/ebay",
     "/ebay <photo...> [-- notes]",

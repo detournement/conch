@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -112,16 +113,57 @@ class HttpMcpClient:
 
 
 class StdioMcpClient:
-    def __init__(self, client_name: str, command: str, args: Optional[List[str]] = None):
+    def __init__(self, client_name: str, command: str,
+                 args: Optional[List[str]] = None,
+                 env: Optional[dict] = None):
         self.name = client_name
+        # Inherit the parent environment so PATH/HOME still resolve, then
+        # layer the server's own env (credentials) on top. Without this,
+        # stdio servers configured purely via env (Jira, GitHub, ...) start
+        # unauthenticated and advertise zero tools.
+        proc_env = dict(os.environ)
+        proc_env.update(_expand_env(env))
+        # stderr -> DEVNULL: these servers emit banners/warnings, and an
+        # undrained PIPE fills its buffer and deadlocks the child.
         self._proc = subprocess.Popen(
             [command] + (args or []),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
+            env=proc_env,
         )
         self._next_request_id = 1
+        self._ready = False
+
+    def _notify(self, method: str, params: Optional[dict] = None) -> None:
+        """Fire-and-forget JSON-RPC notification (no id, no reply)."""
+        if not self._proc.stdin:
+            return
+        payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        try:
+            self._proc.stdin.write(json.dumps(payload) + "\n")
+            self._proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _handshake(self) -> None:
+        """Perform the MCP initialize exchange once, before any real call.
+
+        Spec-compliant servers (anything on FastMCP) refuse tools/list until
+        initialize has completed, which previously surfaced as "0 tools".
+        """
+        if self._ready:
+            return
+        self._ready = True
+        self._send("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "conch", "version": "0.6.0"},
+        })
+        self._notify("notifications/initialized")
 
     def _send(self, method: str, params: Optional[dict] = None) -> dict:
         if not self._proc.stdin or not self._proc.stdout:
@@ -149,6 +191,7 @@ class StdioMcpClient:
                 return data
 
     def list_tools(self) -> List[dict]:
+        self._handshake()
         response = self._send("tools/list")
         raw_tools = response.get("result", {}).get("tools", [])
         tools = []
@@ -167,6 +210,7 @@ class StdioMcpClient:
         return tools
 
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self._handshake()
         response = self._send("tools/call", {"name": tool_name, "arguments": arguments})
         return response.get("result", {"content": [{"type": "text", "text": response.get("error", {}).get("message", "Unknown MCP error")}]} )
 
@@ -182,13 +226,36 @@ def _load_config() -> dict:
         return {"mcpServers": {}}
 
 
+def _expand_env(values: Optional[dict]) -> Dict[str, str]:
+    """Expand ${VAR} / $VAR in MCP config values from the environment.
+
+    Used for both HTTP ``headers`` and stdio ``env`` blocks, so mcp.json can
+    reference secrets by name instead of storing them in plaintext. Entries
+    whose variables are unset are dropped, so a missing credential surfaces
+    as an auth error rather than a literal "${VAR}".
+    """
+    out: Dict[str, str] = {}
+    for key, value in (values or {}).items():
+        if not isinstance(value, str):
+            continue
+        expanded = os.path.expandvars(value)
+        if "$" in expanded and expanded != value:
+            continue
+        if re.fullmatch(r"\$\{?\w+\}?", expanded):
+            continue
+        out[str(key)] = expanded
+    return out
+
+
 def create_clients() -> Dict[str, Any]:
     clients: Dict[str, Any] = {}
     for name, cfg in _load_config().get("mcpServers", {}).items():
         if cfg.get("type") == "http" and cfg.get("url"):
-            clients[name] = HttpMcpClient(name, cfg["url"])
+            clients[name] = HttpMcpClient(
+                name, cfg["url"], _expand_env(cfg.get("headers")))
         elif cfg.get("command"):
-            clients[name] = StdioMcpClient(name, cfg["command"], cfg.get("args", []))
+            clients[name] = StdioMcpClient(
+                name, cfg["command"], cfg.get("args", []), cfg.get("env"))
     return clients
 
 

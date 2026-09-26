@@ -54,17 +54,26 @@ def list_apps() -> List[Tuple[str, str]]:
         return _FALLBACK_APPS
 
     try:
-        data = _api_get("/api/v1/apps", {"limit": "100"})
-        items = data.get("items", data) if isinstance(data, dict) else data
+        # v3 toolkits; v1 /apps was retired (HTTP 410).
+        data = _api_get("/api/v3/toolkits", {"limit": "100"})
+        items = data.get("items", []) if isinstance(data, dict) else []
         if not isinstance(items, list):
             return _FALLBACK_APPS
         apps = []
         for app in items:
-            slug = (app.get("key") or app.get("name") or "").lower()
-            desc = (app.get("description") or app.get("displayName") or "")[:60]
-            if slug:
+            slug = (app.get("slug") or app.get("name") or "").lower()
+            meta = app.get("meta") or {}
+            desc = (meta.get("description") or app.get("name") or "")[:60]
+            # `deprecated` is a metadata object (e.g. {"toolkitId": ...}),
+            # not a boolean -- only skip on an explicit deprecation flag.
+            dep = app.get("deprecated")
+            is_dep = dep is True or (
+                isinstance(dep, dict)
+                and bool(dep.get("is_deprecated") or dep.get("deprecated"))
+            )
+            if slug and not is_dep:
                 apps.append((slug, desc))
-        return apps if apps else _FALLBACK_APPS
+        return sorted(apps) if apps else _FALLBACK_APPS
     except Exception:
         return _FALLBACK_APPS
 
@@ -74,12 +83,24 @@ def check_connection(app_slug: str) -> Tuple[bool, str]:
     if not is_available():
         return False, "COMPOSIO_API_KEY not set"
     try:
-        data = _api_get("/api/v1/connectedAccounts", {"appNames": app_slug})
+        # v3 connected_accounts; v1 /connectedAccounts was retired (HTTP 410).
+        data = _api_get("/api/v3/connected_accounts", {"limit": "100"})
         items = data.get("items", []) if isinstance(data, dict) else []
+        target = (app_slug or "").lower()
+        seen = []
         for item in items:
-            status = (item.get("status") or item.get("connectionStatus") or "").upper()
+            toolkit = item.get("toolkit") or {}
+            slug = (toolkit.get("slug") or "").lower()
+            if slug != target:
+                continue
+            status = (item.get("status") or "").upper()
+            seen.append(status)
             if status == "ACTIVE":
-                return True, f"{app_slug} is connected (account: {item.get('id', 'unknown')[:12]})"
+                return True, f"{app_slug} is connected (account: {str(item.get('id', 'unknown'))[:14]})"
+        if seen:
+            # Distinguish "never connected" from "needs re-auth" -- EXPIRED
+            # accounts look connected in the dashboard but cannot serve tools.
+            return False, f"{app_slug} connection is {seen[0]} -- re-authorize with /connect {app_slug}"
         return False, f"{app_slug} has no active connection"
     except Exception as exc:
         return False, f"Failed to check connection: {exc}"

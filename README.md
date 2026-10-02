@@ -436,7 +436,22 @@ Destructive commands such as `rm`, `dd`, `mkfs`, `git push --force`, and
 refused in non-interactive runs.
 
 At the prompt, Enter or `y` runs, `n` declines with optional feedback, `e`
-edits the command, and `a` allowlists that prefix for the session.
+edits the command, and `a` allowlists that prefix for the session. No answer
+is never consent: Ctrl-C or a closed stdin (EOF) at the prompt declines and
+the command is not run.
+
+### Non-interactive runs
+
+A session that cannot answer an approval prompt never gets one. Pass
+`conch --non-interactive …`, or let conch detect it: when stdin is not a
+terminal (a pipe, a redirect, `< /dev/null`, cron) the session is
+non-interactive automatically. The two signals are OR'd — either one makes
+the session non-interactive, and there is no flag to force prompting back on.
+In that mode commands that would need a y/n answer are refused (the model
+sees "cannot prompt" / "Refused: destructive commands require interactive
+confirmation") and the first-run wizard is skipped. Commands that need no
+approval — agent mode, `allow_prefixes`, `safe_auto` read-only commands —
+still run; destructive commands are refused regardless.
 
 ### Sandboxed execution
 

@@ -555,10 +555,17 @@ def _startup_conversation(conv_mgr, model_name, provider, system_prompt,
     return current_conv, messages
 
 
-def chat_loop(new_conversation=False):
+def chat_loop(new_conversation=False, interactive=True):
     # Startup wiring lives in conch.bootstrap so headless modes can reuse it;
     # this function owns only the interactive composition (warnings printed
     # to stderr, startup failures become process exits).
+    #
+    # ``interactive=False`` (``--non-interactive`` or a non-TTY stdin) keeps
+    # the loop reading commands but makes every approval-gated tool refuse
+    # instead of prompt: a pipe cannot answer an approval question.
+    interactive = bool(interactive)
+    if not interactive:
+        print(_NON_INTERACTIVE_NOTICE, file=sys.stderr)
     config = load_config()
     agent_mode_from_config = apply_agent_mode_from_config(config)
     try:
@@ -590,13 +597,13 @@ def chat_loop(new_conversation=False):
     # the same state the module-level helpers expose.
     session = AgentSession(
         config,
-        interactive=True,
+        interactive=interactive,
         permissions=default_permissions(),
         memory=memory,
     )
     session.budgets.max_tool_rounds = MAX_TOOL_ROUNDS
     builtin_clients = _make_builtin_clients(
-        memory, config, interactive=True, permissions=session.permissions
+        memory, config, interactive=interactive, permissions=session.permissions
     )
     session.attach_clients(builtin_clients)
 
@@ -871,12 +878,12 @@ def chat_loop(new_conversation=False):
 
     def _set_foreground_policies():
         standard = LocalShellPolicy(
-            interactive=True,
+            interactive=interactive,
             allow_auto_execute=get_agent_mode(),
             input_fn=_safe_input,
         )
         handoff = LocalShellPolicy(
-            interactive=True,
+            interactive=interactive,
             allow_auto_execute=get_agent_mode(),
             input_fn=_safe_input,
             handoff_context=_terminal_handoff_context,
@@ -885,7 +892,7 @@ def chat_loop(new_conversation=False):
         builtin_clients["interactive_terminal"].set_policy(handoff)
         builtin_clients["ssh_remote"].set_policy(handoff)
         builtin_clients["skill_manage"].configure(
-            interactive=True, input_fn=_safe_input
+            interactive=interactive, input_fn=_safe_input
         )
 
     def _run_slash_builtin(tool_name: str, arguments: dict):
@@ -1426,7 +1433,7 @@ def chat_loop(new_conversation=False):
 
 
 _USAGE = """\
-usage: conch [--new] [prompt ...]
+usage: conch [--new] [--non-interactive] [prompt ...]
 
 The LLM-assisted shell. With no arguments, resumes your most recent
 conversation; any other arguments are sent as a one-shot prompt.
@@ -1436,7 +1443,32 @@ options:
   -V, --version  Show the version and exit.
   -n, --new      Start the interactive shell with a fresh conversation
                  instead of resuming the most recent one (same as /new
-                 inside the shell)."""
+                 inside the shell).
+  --non-interactive
+                 Never prompt for approval: any command that would need a
+                 y/n answer is refused instead of run (fail closed), and the
+                 first-run wizard is skipped. Implied automatically when
+                 stdin is not a terminal (pipes, redirects, cron); the flag
+                 and the auto-detection are OR'd, so either one makes the
+                 session non-interactive and nothing re-enables prompting."""
+
+
+def session_is_interactive(argv_flag: bool = False, stdin=None) -> bool:
+    """Decide whether this process may prompt the operator for approvals.
+
+    Non-interactive wins whenever either signal says so: an explicit
+    ``--non-interactive`` flag, or a stdin that is not a terminal (a pipe,
+    a redirect, ``< /dev/null``, cron). There is deliberately no way to
+    force prompting back on — without a TTY an approval prompt cannot get
+    a real answer, and no answer must never count as consent.
+    """
+    if argv_flag:
+        return False
+    stream = stdin if stdin is not None else sys.stdin
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
 
 
 def main():
@@ -1448,21 +1480,27 @@ def main():
     if argv and argv[0] in ("--help", "-h"):
         print(_USAGE)
         return
+    non_interactive_flag = False
+    new_conversation = False
+    while argv and argv[0] in ("--non-interactive", "--new", "-n"):
+        if argv[0] == "--non-interactive":
+            non_interactive_flag = True
+        else:
+            new_conversation = True
+        argv = argv[1:]
+    interactive = session_is_interactive(non_interactive_flag)
     # First-run onboarding: on a truly unconfigured interactive launch
     # (real TTY, no config anywhere, no provider key), walk through
     # provider + key setup before anything else loads config. Pipes,
-    # daemons, and configured installs never see it.
-    from .onboarding import maybe_run_first_run_wizard
+    # daemons, --non-interactive, and configured installs never see it.
+    if interactive:
+        from .onboarding import maybe_run_first_run_wizard
 
-    maybe_run_first_run_wizard()
-    new_conversation = False
-    if argv and argv[0] in ("--new", "-n"):
-        new_conversation = True
-        argv = argv[1:]
-        if argv:
-            print("conch: --new starts the interactive shell and takes no "
-                  "prompt", file=sys.stderr)
-            sys.exit(2)
+        maybe_run_first_run_wizard()
+    if new_conversation and argv:
+        print("conch: --new starts the interactive shell and takes no "
+              "prompt", file=sys.stderr)
+        sys.exit(2)
     if argv:
         config = load_config()
         apply_agent_mode_from_config(config)
@@ -1492,9 +1530,11 @@ def main():
         user_text = " ".join(argv)
         memory = MemoryStore()
         mem_context = memory.build_context(user_text)
+        if not interactive:
+            print(_NON_INTERACTIVE_NOTICE, file=sys.stderr)
         session = build_agent_session(
             config,
-            interactive=True,
+            interactive=interactive,
             permissions=default_permissions(),
             memory=memory,
         )
@@ -1514,4 +1554,10 @@ def main():
         finally:
             session.close()
     else:
-        chat_loop(new_conversation=new_conversation)
+        chat_loop(new_conversation=new_conversation, interactive=interactive)
+
+
+_NON_INTERACTIVE_NOTICE = (
+    "\033[2m  (non-interactive: commands that need approval are refused, "
+    "not run)\033[0m"
+)

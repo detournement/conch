@@ -921,8 +921,11 @@ class LocalShellClient:
             try:
                 sys.stdout.flush()
                 answer = _input("  \033[1;33mExecute? [y/n/e/a/A/?]\033[0m ").strip()
-            except (EOFError, KeyboardInterrupt):
-                answer = ""
+            except (EOFError, KeyboardInterrupt) as exc:
+                # No answer is not consent: a closed stdin or Ctrl-C at the
+                # approval prompt declines (fail closed), even though a bare
+                # Enter would have approved.
+                return self._text(self._no_answer_decline(exc))
 
             if answer == "?":
                 print(
@@ -958,8 +961,10 @@ class LocalShellClient:
         if answer.lower() in ("e", "edit"):
             try:
                 edited = _input("  \033[1;33mCommand:\033[0m ").strip()
-            except (EOFError, KeyboardInterrupt):
-                edited = ""
+            except (EOFError, KeyboardInterrupt) as exc:
+                # Abandoning the edit must not fall back to running the
+                # original command unreviewed.
+                return self._text(self._no_answer_decline(exc))
             cmd = edited or cmd
             print(f"  \033[2m\u2192 {cmd}\033[0m")
             return self._run_command(cmd, timeout)
@@ -973,6 +978,21 @@ class LocalShellClient:
         if feedback:
             msg += f" Feedback: {feedback}"
         return self._text(msg)
+
+    @staticmethod
+    def _no_answer_decline(exc: BaseException) -> str:
+        """Decline because the approval prompt got no answer (EOF or Ctrl-C).
+        Prints the one-line operator notice and returns the tool result."""
+        how = "interrupted" if isinstance(exc, KeyboardInterrupt) else "closed (EOF)"
+        print(
+            f"\n  \033[1;31m\u2717 Command not run\033[0m \033[2m\u2014 "
+            f"approval prompt {how}; no answer counts as no.\033[0m",
+            flush=True,
+        )
+        return (
+            "User did not approve the command (the approval prompt was "
+            f"{how}); it was not run."
+        )
 
 
 class InteractiveTerminalClient:

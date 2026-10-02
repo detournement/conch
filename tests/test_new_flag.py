@@ -24,7 +24,7 @@ class TestMainArgvWiring(unittest.TestCase):
     def _run_main(self, argv):
         calls = []
 
-        def fake_chat_loop(new_conversation=False):
+        def fake_chat_loop(new_conversation=False, interactive=True):
             calls.append(new_conversation)
 
         with mock.patch("conch.app.chat_loop", fake_chat_loop), \

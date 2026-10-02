@@ -31,6 +31,18 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # A session is summarized into memory on /new and exit only when it
     # had this many user turns (or ran a tool); 0/off disables summaries.
     "session_summary_min_turns": "3",
+    # Startup model check: every launch probes the configured model before
+    # the first call (models-list endpoint, or the tool-call conformance
+    # probe for local endpoints) and, when it fails, offers alternatives
+    # interactively or walks fallback_models non-interactively. "off"
+    # skips the probe. model_check_timeout bounds each probe request.
+    "model_check": "on",
+    "model_check_timeout": "4",
+    # Ordered, pre-approved "provider/model" entries (comma-separated) a
+    # non-interactive run (pipe, cron, conch-ask, conch-edge) may switch
+    # to when the configured model fails its startup check. Empty means
+    # fail closed instead.
+    "fallback_models": "",
 }
 
 ENV_CONFIG_KEYS = {
@@ -58,6 +70,9 @@ ENV_CONFIG_KEYS = {
     "CONCH_DETECT_LOCATION": "detect_location",
     "CONCH_AGENT_MODE": "agent_mode",
     "CONCH_SESSION_SUMMARY_MIN_TURNS": "session_summary_min_turns",
+    "CONCH_MODEL_CHECK": "model_check",
+    "CONCH_MODEL_CHECK_TIMEOUT": "model_check_timeout",
+    "CONCH_FALLBACK_MODELS": "fallback_models",
     "CONCH_PERMISSION_MODE": "permission_mode",
     "CONCH_TOOL_PROFILE": "tool_profile",
     "CONCH_SSH_CONTROL_PERSIST": "ssh_control_persist",

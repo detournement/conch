@@ -206,9 +206,17 @@ class EdgeDaemon:
             )
             self._verify_journal_or_refuse()
             self.epoch = self.store.adopt_epoch()
+            # Real mission sessions go through the startup model check
+            # (fallback_models or fail closed, logged) before each run;
+            # an injected factory (tests, embedders) is used as given.
+            session_factory = self._session_factory
+            if session_factory is None:
+                from .engine import checked_session_factory
+
+                session_factory = checked_session_factory(self.config, log=self.log)
             self.engine = MissionEngine(
                 self.store, self.config, holder=self.holder,
-                session_factory=self._session_factory,
+                session_factory=session_factory,
                 kernel_dir=self.kernel_dir, log=self.log,
             )
             report = migrate_tasks_json(
@@ -264,6 +272,43 @@ class EdgeDaemon:
             f"journal verified: {report['events_verified']} event(s) across"
             f" {report['missions']} mission(s) in {report['seconds']:.3f}s"
         )
+
+    def startup_model_check(self) -> str:
+        """Probe the configured model once at start and log the outcome.
+
+        Never fatal: a model that is down at boot parks missions (the
+        per-session check plus the engine's error backoff) rather than
+        crash-looping the daemon under launchd/systemd. Works on a copy of
+        the config so a fallback used here never becomes the daemon's
+        default — every session re-checks the configured model first.
+        """
+        from ..bootstrap import StartupError
+        from ..modelcheck import ensure_working_model
+
+        resolved = dict(self.config)
+        try:
+            outcome = ensure_working_model(
+                resolved, interactive=False, announce=self.log, discover=True,
+            )
+        except StartupError as exc:
+            summary = (
+                "model check FAILED — mission sessions will park with backoff"
+                f" until a configured or fallback model answers: {exc}"
+            )
+            self.log(summary)
+            return summary
+        if not outcome.checked:
+            summary = "model check off (model_check=off): sessions run unverified"
+        elif outcome.via_fallback:
+            summary = (
+                f"model check: configured model unavailable; fallback_models"
+                f" entry {outcome.label} answers"
+            )
+        else:
+            elapsed = outcome.result.elapsed if outcome.result is not None else 0.0
+            summary = f"model check: {outcome.label} ok ({elapsed:.1f}s)"
+        self.log(summary)
+        return summary
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -804,6 +849,10 @@ def run_edge_daemon(config: dict, *, foreground: bool = True,
         f" {daemon.socket_path}, log {daemon.log_path})",
         flush=True,
     )
+    # Non-interactive model rule, applied once up front and logged: the
+    # daemon cannot ask anyone, so only fallback_models may replace a
+    # failing configured model; otherwise sessions fail closed and park.
+    print(f"conch-edge: {daemon.startup_model_check()}", flush=True)
     if once:
         try:
             stats = daemon.tick()

@@ -470,13 +470,16 @@ _ASK_CALLERS = {
 }
 
 def ask(user_request: str, context: Optional[dict] = None) -> str:
-    """Main entry: build context, call configured provider, return one command line."""
-    from .providers import (
-        DEFAULT_API_KEY_ENVS,
-        get_fallback_chain,
-        get_fallback_model,
-        validate_model_for_provider,
-    )
+    """Main entry: build context, call configured provider, return one command line.
+
+    Runs the startup model check first, in its non-interactive form:
+    conch-ask prints exactly one command for a shell widget to consume,
+    so it never prompts — a failing model is replaced only by a
+    pre-approved ``fallback_models`` entry, otherwise this raises
+    :class:`conch.bootstrap.StartupError` (the CLI exits with its code).
+    """
+    from .modelcheck import ensure_working_model
+    from .providers import DEFAULT_API_KEY_ENVS, get_fallback_chain
 
     config = load_config()
     context = context or {}
@@ -488,27 +491,13 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
     if n and "history" not in context and os.environ.get("CONCH_HISTORY"):
         context["history"] = os.environ["CONCH_HISTORY"]
 
-    provider = (config.get("provider") or "openai").lower()
-    current_model = config.get("model") or get_fallback_model(provider, config)
-    verified, reason = validate_model_for_provider(
-        provider, current_model, config
-    )
-    if verified is not True:
-        replacement = get_fallback_model(provider, config)
-        if not replacement:
-            print(
-                f"conch: no verified model for {provider}: {reason}",
-                file=sys.stderr,
-            )
-            return ""
-        print(
-            f"conch: model '{current_model}' rejected ({reason}); "
-            f"using {provider}/{replacement}",
-            file=sys.stderr,
-        )
-        current_model = replacement
-        config["model"] = replacement
-        config["chat_model"] = replacement
+    # conch-ask calls with `model`; the check reads `chat_model` — align
+    # them for this process so the model that is verified is the one used.
+    ask_model = (config.get("model") or config.get("chat_model") or "").strip()
+    config["model"] = config["chat_model"] = ask_model
+    model_check = ensure_working_model(config, interactive=False, discover=False)
+    provider = model_check.provider or (config.get("provider") or "openai").lower()
+    current_model = (config.get("model") or "").strip()
 
     caller = _ASK_CALLERS.get(provider)
     if not caller:

@@ -24,19 +24,18 @@ from .bootstrap import (
     load_runtime_tools as _load_runtime_tools,
     make_builtin_clients as _make_builtin_clients,
     make_scheduled_executor,
-    resolve_ollama_startup_model,
     resolve_startup_model,
     resolve_startup_provider,
     route_scheduled_output as _route_scheduled_output,
     start_remote_loop,
     start_scheduler,
     start_task_backend,
-    warn_unknown_cloud_model,
 )
 from .commands import handle_slash_command
 from .config import get_bool, load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
+from .modelcheck import ensure_working_model
 from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS
 from .render import highlight, StreamPrinter
 from .runtime import sanitize_anthropic_messages
@@ -54,7 +53,6 @@ from . import multiline
 # Names still importable from conch.app for backwards compatibility (tests
 # and external callers); their implementations live in conch.bootstrap now.
 __bootstrap_reexports__ = (
-    resolve_ollama_startup_model,
     _route_scheduled_output,
     make_scheduled_executor,
     start_scheduler,
@@ -135,11 +133,15 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
     Deliberately contains nothing volatile (no timestamp, no per-turn memory
     context): the system prompt must stay byte-stable within a session so
     Ollama's KV prefix cache survives between turns. Per-turn context rides
-    on the user message instead (see _augment_user_message).
+    on the user message instead (see _augment_user_message). The working
+    directory (``send_cwd``) qualifies as stable: conch never chdir()s
+    during a session, so it is fixed for the session's lifetime.
     """
     parts = []
     if location:
         parts.append(f"User location: {location}.")
+    if get_bool(config or {}, "send_cwd", False):
+        parts.append(f"Working directory: {os.getcwd()}.")
     if provider and model:
         from .prompts import build_self_description
         parts.append(build_self_description(provider, model, config))
@@ -634,6 +636,19 @@ def chat_loop(new_conversation=False, interactive=True):
     for warning in model_warnings:
         print(f"\033[33m  ⚠ {warning}\033[0m", file=sys.stderr)
 
+    # Startup model check: verify the configured model before anything
+    # calls it. A failure puts alternatives in front of the user (TTY) or
+    # walks the pre-approved fallback_models list (non-interactive); it
+    # never swaps a model silently. Fails closed when nothing works.
+    try:
+        model_check = ensure_working_model(config, interactive=interactive)
+    except StartupError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(exc.code)
+    if model_check.switched:
+        provider, model_name = model_check.provider, model_check.model
+        raw_fn = RAW_FNS[provider]
+
     from .prompts import get_chat_prompt
     base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
 
@@ -767,7 +782,16 @@ def chat_loop(new_conversation=False, interactive=True):
     def _print_banner():
         _print_conch_shell_art()
         from . import __version__
-        print(f"\033[1;36mConch chat\033[0m \033[2mv{__version__} ({provider}/{model_name})\033[0m")
+        if not model_check.checked:
+            check_note = ", model check off"
+        elif model_check.switched:
+            check_note = " ✓ verified, switched with approval"
+        else:
+            check_note = " ✓ verified"
+        print(
+            f"\033[1;36mConch chat\033[0m \033[2mv{__version__} "
+            f"({provider}/{model_name}{check_note})\033[0m"
+        )
         if chat_state.all_tools:
             if len(chat_state.tools) < len(chat_state.all_tools):
                 print(f"\033[2m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active (/tools to manage)\033[0m")
@@ -1691,15 +1715,17 @@ def main():
         except StartupError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(exc.code)
-        model_name = config.get("chat_model", config.get("model", ""))
-        _model_warning = warn_unknown_cloud_model(provider, model_name)
-        if _model_warning:
-            print(f"\033[33m  ⚠ {_model_warning}\033[0m", file=sys.stderr)
-            from .providers import get_fallback_model
-
-            model_name = get_fallback_model(provider, config)
-            config["model"] = model_name
-            config["chat_model"] = model_name
+        model_name, _warnings = resolve_startup_model(config, provider)
+        # Same startup model check as the shell: a one-shot in a terminal
+        # may ask the user to pick an alternative; a piped/--non-interactive
+        # one-shot walks fallback_models or fails closed. No silent swap.
+        try:
+            model_check = ensure_working_model(config, interactive=interactive)
+        except StartupError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(exc.code)
+        if model_check.switched:
+            provider, model_name = model_check.provider, model_check.model
         base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
         location = (
             _detect_location()

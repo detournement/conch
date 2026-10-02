@@ -22,6 +22,16 @@ class _FakeStdin(io.StringIO):
         return self._tty
 
 
+def _model_check_off(config, **_kwargs):
+    """Stand-in for the startup model check (tested in test_modelcheck)."""
+    from conch.modelcheck import ModelCheckOutcome
+
+    return ModelCheckOutcome(
+        config.get("provider", ""), config.get("chat_model", ""), None,
+        checked=False,
+    )
+
+
 class TestSplitLeadingOptions(unittest.TestCase):
     def test_only_leading_dash_tokens_are_options(self):
         self.assertEqual(
@@ -146,7 +156,7 @@ class TestMainArgumentHandling(unittest.TestCase):
                 mock.patch("conch.app.apply_agent_mode_from_config"), \
                 mock.patch("conch.app.resolve_startup_provider",
                            return_value=("openai", lambda *a, **k: None)), \
-                mock.patch("conch.app.warn_unknown_cloud_model", return_value=""), \
+                mock.patch("conch.app.ensure_working_model", _model_check_off), \
                 mock.patch("conch.app.get_chat_prompt", return_value="sys"), \
                 mock.patch("conch.app._build_system_prompt", return_value="sys"), \
                 mock.patch("conch.app._augment_user_message",

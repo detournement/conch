@@ -104,6 +104,22 @@ api_key_env=ANTHROPIC_API_KEY
 #chat_model=moonshotai/kimi-k3
 #api_key_env=OPENROUTER_API_KEY
 
+# --- Startup model check -----------------------------------------------------
+# Every start probes the configured model once (catalog + models list for
+# cloud providers, /api/tags + tools capability for Ollama, /v1/models + the
+# tool-call probe for custom endpoints) before the first real call. In a
+# terminal a failure shows the diagnosis and a ranked list of alternatives
+# to pick from (session only, or saved as the new default — your choice).
+# Non-interactive runs (--non-interactive, pipes, cron, conch-ask, the edge
+# daemon) never prompt: they try fallback_models in order and otherwise fail
+# closed with exit status 69. Nothing is ever switched silently.
+#model_check=on
+#model_check_timeout=4
+# Pre-approved alternatives for non-interactive runs, tried in order.
+# custom/<model> uses custom_base_url; llamaidx/<box>/<model> resolves via
+# the registry; cloud entries need their key and respect local_only.
+#fallback_models=ollama/qwen2.5:7b, anthropic/claude-sonnet-5
+
 # --- Behavior ----------------------------------------------------------------
 # Auto-execute shell commands without confirmation (a startup notice is shown
 # when this is enabled here). Off by default.
@@ -583,7 +599,8 @@ api_key_env=ANTHROPIC_API_KEY
 #ask_prompt:ollama=~/.config/conch/prompts/local-ask.md
 
 # --- Ask-mode context ---------------------------------------------------------
-# Extra context sent with one-shot `conch-ask` requests.
+# Extra context sent with one-shot `conch-ask` requests. send_cwd also puts
+# the working directory in the chat system prompt (fixed per session).
 send_cwd=true
 send_os_shell=true
 send_history_count=0

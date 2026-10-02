@@ -118,9 +118,11 @@ def missing_api_key_startup_error(provider: str,
 
 
 def warn_unknown_cloud_model(provider: str, model_name: str) -> str:
-    """Startup scrutiny for config-file model values on cloud providers
-    (warn-and-replace): "" when the model is known, otherwise a warning with
-    close-match suggestions."""
+    """Catalog scrutiny for a cloud model name: "" when the model is in
+    conch's verified tool-capable catalog, otherwise a diagnosis with
+    close-match suggestions and the catalog default. Purely advisory —
+    nothing is substituted here; the startup model check
+    (:mod:`conch.modelcheck`) decides what happens next, with the user."""
     from .providers import (
         KNOWN_MODELS,
         get_fallback_model,
@@ -135,106 +137,27 @@ def warn_unknown_cloud_model(provider: str, model_name: str) -> str:
         return ""
     suggestions = suggest_models(model_name, known)
     hint = f" — did you mean {', '.join(suggestions)}?" if suggestions else ""
-    replacement = get_fallback_model(provider)
+    default = get_fallback_model(provider)
     return (
         f"Configured model '{model_name}' isn't in conch's {provider} "
-        f"catalog of tool-capable models{hint}; using '{replacement}' instead"
+        f"catalog of tool-capable models{hint} (catalog default: '{default}')"
     )
-
-
-def resolve_ollama_startup_model(config: dict, model_name: str) -> tuple:
-    """Verify the configured Ollama model at startup, substituting one that
-    exists on the server when possible.
-
-    Returns (model_name, warnings). Never raises and never dead-ends: an
-    unreachable server, a missing configured model, or an empty server all
-    degrade to a warning so the session still starts.
-    """
-    from .providers import (
-        get_fallback_model,
-        get_ollama_base_url,
-        list_ollama_models,
-        ollama_model_matches,
-    )
-
-    live_models = list_ollama_models(config)
-    if live_models is None:
-        return model_name, [
-            f"Ollama server unreachable at {get_ollama_base_url(config)} — "
-            f"model '{model_name}' unverified"
-        ]
-    if ollama_model_matches(model_name, live_models):
-        return model_name, []
-    replacement = get_fallback_model("ollama", config)
-    if replacement:
-        return replacement, [
-            f"Model '{model_name}' is not available/tool-capable on the "
-            f"Ollama server — using '{replacement}' instead"
-        ]
-    installed = list_ollama_models(config, tool_capable_only=False) or []
-    if installed:
-        warning = (
-            "No tool-capable models installed on the Ollama server — chat "
-            "needs tool support (try `ollama pull qwen2.5`, or /provider to "
-            "switch)"
-        )
-    else:
-        warning = (
-            "No models installed on the Ollama server — pull one (e.g. "
-            "`ollama pull qwen2.5`) or /provider to switch"
-        )
-    return model_name, [warning]
 
 
 def resolve_startup_model(config: dict, provider: str) -> tuple:
-    """Validate/normalize the configured model for *provider* at startup.
+    """The configured model name for *provider* at startup.
 
-    Returns (model_name, warnings) and updates config in place exactly the
-    way the interactive shell always has (model/chat_model/custom_model).
+    Returns (model_name, warnings). This is pure normalization: it makes
+    no network calls and never substitutes a different model. Whether
+    the model actually works is decided by the startup model check in
+    :mod:`conch.modelcheck`, which either verifies it silently or puts
+    the alternatives in front of the user (interactive) / walks the
+    pre-approved ``fallback_models`` list (non-interactive). The silent
+    "model X unavailable; using Y" swap that used to live here is gone
+    on purpose: nothing switches without approval.
     """
-    model_name = config.get("chat_model", config.get("model", ""))
-    warnings: list = []
-    if provider == "ollama":
-        resolved, warnings = resolve_ollama_startup_model(config, model_name)
-        if resolved != model_name:
-            model_name = resolved
-            config["model"] = resolved
-            config["chat_model"] = resolved
-    elif provider == "custom":
-        from .providers import get_custom_base_url, list_custom_models
-
-        available = list_custom_models(config, timeout=3.0)
-        if available is None:
-            warnings.append(
-                f"Custom endpoint unreachable at "
-                f"{get_custom_base_url(config)}; model is unverified"
-            )
-        elif model_name not in available and available:
-            replacement = available[0]
-            warnings.append(
-                f"Custom model '{model_name}' is unavailable or "
-                f"failed tool conformance; using '{replacement}'"
-            )
-            model_name = replacement
-            config["model"] = replacement
-            config["chat_model"] = replacement
-            config["custom_model"] = replacement
-        elif not available:
-            warnings.append(
-                "No custom endpoint models passed native tool-call conformance"
-            )
-    else:
-        # Cloud config values are subject to the same tools-only catalog gate
-        # as interactive switches.
-        model_warning = warn_unknown_cloud_model(provider, model_name)
-        if model_warning:
-            warnings.append(model_warning)
-            from .providers import get_fallback_model
-
-            model_name = get_fallback_model(provider, config)
-            config["model"] = model_name
-            config["chat_model"] = model_name
-    return model_name, warnings
+    model_name = (config.get("chat_model") or config.get("model") or "").strip()
+    return model_name, []
 
 
 def make_builtin_clients(

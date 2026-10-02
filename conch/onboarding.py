@@ -31,9 +31,11 @@ from .config import (
     find_project_rc,
     get_config_path,
     get_env_file_path,
+    load_config,
     set_config_values,
     set_env_values,
 )
+from .modelcheck import ensure_working_model
 
 CYAN = "\033[1;36m"
 GREEN = "\033[1;32m"
@@ -331,9 +333,29 @@ def run_first_run_wizard() -> bool:
         print(f"  {YELLOW}No key saved{RST} {DIM}— add a line"
               f" `{env_name}=...` to {get_env_file_path()} or export it"
               f" in your shell before chatting.{RST}")
+    verify_configured_model()
     print(f"  {DIM}Try: conch \"what can you do?\"  ·  /help lists"
           f" commands  ·  /install lists components{RST}\n")
     return True
+
+
+def verify_configured_model() -> None:
+    """Run the startup model check on the configuration the wizard just
+    wrote, so first run ends in a verified-working state — or in the same
+    approved alternatives flow the shell uses. Because the wizard is the
+    step that writes config, an approved pick is saved as the default
+    (``persist_mode="always"``); declining raises StartupError for the
+    gatekeeper to turn into a clean non-zero exit."""
+    config = load_config()
+    label = f"{config.get('provider')}/{config.get('chat_model') or config.get('model')}"
+    print(f"  {DIM}Checking {label} …{RST}")
+    outcome = ensure_working_model(config, interactive=True, persist_mode="always")
+    if not outcome.checked:
+        print(f"  {DIM}model check is off (model_check=off); {label} unverified{RST}")
+    elif not outcome.switched:
+        detail = outcome.result.detail if outcome.result is not None else ""
+        print(f"  {GREEN}✓ {outcome.label} verified{RST}"
+              + (f" {DIM}— {detail}{RST}" if detail else ""))
 
 
 def maybe_run_first_run_wizard() -> bool:
@@ -344,9 +366,20 @@ def maybe_run_first_run_wizard() -> bool:
             return False
     except Exception:
         return False
+    from .bootstrap import StartupError
+
     try:
         return run_first_run_wizard()
     except (KeyboardInterrupt, EOFError):
         print(f"\n  {DIM}Setup skipped — run `conch` again anytime, or"
               f" create {get_config_path()} yourself.{RST}")
         return False
+    except StartupError as exc:
+        # The post-setup model check found nothing working (or the user
+        # declined every alternative): the config is saved; exit cleanly
+        # so the next launch re-checks instead of chatting with a model
+        # that is known not to answer.
+        print(str(exc), file=sys.stderr)
+        print(f"  {DIM}Setup is saved in {get_config_path()} — run `conch`"
+              f" again once the model is reachable, or edit the config.{RST}")
+        sys.exit(exc.code)

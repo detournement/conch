@@ -139,13 +139,31 @@ class TestResolveStartupModel(BootstrapTestCase):
         self.assertEqual(resolved, model)
         self.assertEqual(warnings, [])
 
-    def test_unknown_cloud_model_is_replaced_with_warning(self):
+    def test_unknown_cloud_model_is_never_silently_replaced(self):
+        """The silent 'model X unavailable; using Y' swap is gone: the
+        configured name is returned untouched (the startup model check
+        in conch.modelcheck decides what happens, with the user)."""
         config = {"provider": "openai", "chat_model": "gpt-imaginary-99"}
         resolved, warnings = resolve_startup_model(config, "openai")
-        self.assertNotEqual(resolved, "gpt-imaginary-99")
-        self.assertTrue(warnings and "gpt-imaginary-99" in warnings[0])
-        self.assertEqual(config["chat_model"], resolved,
-                         "config must be updated in place")
+        self.assertEqual(resolved, "gpt-imaginary-99")
+        self.assertEqual(warnings, [])
+        self.assertEqual(config["chat_model"], "gpt-imaginary-99",
+                         "config must not be rewritten behind the user")
+
+    def test_custom_and_ollama_make_no_network_calls(self):
+        """Startup normalization is offline; live verification belongs to
+        the model check, which is bounded and user-approved."""
+        with patch("urllib.request.urlopen",
+                   side_effect=AssertionError("network call at startup")):
+            for provider, config in (
+                ("custom", {"provider": "custom",
+                            "custom_base_url": "http://192.0.2.9:8080/v1",
+                            "chat_model": "qwen-x"}),
+                ("ollama", {"provider": "ollama", "chat_model": "llama9"}),
+            ):
+                resolved, warnings = resolve_startup_model(config, provider)
+                self.assertEqual(resolved, config["chat_model"])
+                self.assertEqual(warnings, [])
 
 
 class TestBuildAgentSession(BootstrapTestCase):

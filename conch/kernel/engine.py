@@ -270,6 +270,41 @@ class MissionControlClient:
         return self._text(f"Unknown mission_control op {op!r}")
 
 
+def checked_session_factory(config: dict,
+                            log: Optional[Callable[[str], None]] = None) -> Callable:
+    """The daemon's session runner: the startup model check, in its
+    non-interactive form, before every mission session.
+
+    The daemon cannot ask anyone, so a failing configured model is
+    replaced only by a pre-approved ``fallback_models`` entry (announced
+    in the daemon log); otherwise the session raises StartupError, which
+    :meth:`MissionEngine.run_session` records as the session error — the
+    mission parks on the engine's existing error backoff (>= 5 minutes)
+    instead of crash-looping or calling a model that is known to be down.
+    Each session probes the *configured* model again (a resolved copy of
+    the config is used per session), so a recovered primary is picked up
+    automatically and a fallback never silently becomes the new default.
+    """
+    say = log or (lambda line: None)
+
+    def run(mission: Dict[str, Any], messages: List[dict],
+            control: MissionControlClient, caps: Dict[str, int]):
+        from ..modelcheck import ensure_working_model
+
+        resolved = dict(config)
+        outcome = ensure_working_model(
+            resolved, interactive=False, announce=say, discover=False,
+        )
+        if outcome.checked:
+            say(
+                f"model check for {mission.get('mission_id', '?')}:"
+                f" {outcome.label} {'(fallback) ' if outcome.via_fallback else ''}ok"
+            )
+        return _default_session_factory(resolved)(mission, messages, control, caps)
+
+    return run
+
+
 def _default_session_factory(config: dict) -> Callable:
     """Real AgentSession runner (bootstrap wiring, fresh session per run)."""
 

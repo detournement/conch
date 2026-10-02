@@ -1069,67 +1069,68 @@ class TestOldLocalOllamaServer(OllamaCacheTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Startup model resolution must degrade gracefully, never dead-end
+# Startup model check for Ollama: classify, never substitute
 # ---------------------------------------------------------------------------
 
-class TestResolveOllamaStartupModel(OllamaCacheTestCase):
-    def _resolve(self, config, model):
-        from conch.app import resolve_ollama_startup_model
-        return resolve_ollama_startup_model(config, model)
+class TestOllamaStartupProbe(OllamaCacheTestCase):
+    """The startup model check (conch.modelcheck) replaced the old
+    resolve_ollama_startup_model substitution: a configured model that is
+    missing or not tool-capable is reported by class, and the config is
+    left exactly as the user wrote it."""
 
-    def test_configured_model_present_no_warning(self):
-        side_effect = _fake_ollama_server(
-            installed=["qwen2.5:3b"], tool_capable=["qwen2.5:3b"],
-        )
+    def _probe(self, model, side_effect):
+        from conch.modelcheck import probe_model
+
+        config = {"provider": "ollama", "chat_model": model, "model": model}
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            model, warnings = self._resolve({"provider": "ollama"}, "qwen2.5:3b")
-        self.assertEqual(model, "qwen2.5:3b")
-        self.assertEqual(warnings, [])
+            result = probe_model("ollama", model, config, timeout=1.0)
+        self.assertEqual(config["chat_model"], model, "config untouched")
+        return result
 
-    def test_missing_configured_model_substituted(self):
+    def test_configured_model_present_passes(self):
+        result = self._probe("qwen2.5:3b", _fake_ollama_server(
+            installed=["qwen2.5:3b"], tool_capable=["qwen2.5:3b"],
+        ))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "ok")
+
+    def test_bare_name_matches_tagged_install(self):
+        result = self._probe("qwen2.5", _fake_ollama_server(
+            installed=["qwen2.5:3b"], tool_capable=["qwen2.5:3b"],
+        ))
+        self.assertTrue(result.ok)
+
+    def test_missing_configured_model_is_model_not_found_not_swapped(self):
         # User config says qwen3.5:122b; only small local models installed.
-        side_effect = _fake_ollama_server(
+        result = self._probe("qwen3.5:122b", _fake_ollama_server(
             installed=["qwen2.5:3b"], tool_capable=["qwen2.5:3b"],
-        )
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
-        self.assertEqual(model, "qwen2.5:3b")
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("qwen3.5:122b", warnings[0])
-        self.assertIn("qwen2.5:3b", warnings[0])
+        ))
+        self.assertEqual(result.status, "model_not_found")
+        self.assertIn("qwen3.5:122b", result.detail)
+        self.assertIn("qwen2.5:3b", result.detail)  # what IS installed
 
-    def test_missing_model_not_substituted_on_unverifiable_old_server(self):
-        side_effect = _old_ollama_server(["qwen2.5:3b"])
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
-        self.assertEqual(model, "qwen3.5:122b")
-        self.assertTrue(any("tool" in warning.lower() for warning in warnings))
+    def test_unverifiable_old_server_is_conformance_failure(self):
+        result = self._probe("qwen2.5:3b", _old_ollama_server(["qwen2.5:3b"]))
+        self.assertEqual(result.status, "conformance_failed")
+        self.assertIn("tool", result.detail.lower())
 
-    def test_unreachable_server_keeps_model_with_warning(self):
-        side_effect = _fake_ollama_server([], reachable=False)
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
-        self.assertEqual(model, "qwen3.5:122b")
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("unreachable", warnings[0])
+    def test_unreachable_server_is_classified(self):
+        result = self._probe("qwen3.5:122b", _fake_ollama_server([], reachable=False))
+        self.assertEqual(result.status, "unreachable")
+        self.assertIn("Ollama server", result.detail)
 
-    def test_zero_tool_capable_models_warns_without_crashing(self):
-        side_effect = _fake_ollama_server(
+    def test_installed_without_tools_is_conformance_failure(self):
+        result = self._probe("gemma3:latest", _fake_ollama_server(
             installed=["gemma3:latest"], tool_capable=[],
-        )
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
-        self.assertEqual(model, "qwen3.5:122b")
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("tool", warnings[0].lower())
+        ))
+        self.assertEqual(result.status, "conformance_failed")
+        self.assertIn("tool", result.detail.lower())
 
-    def test_empty_server_warns_without_crashing(self):
-        side_effect = _fake_ollama_server(installed=[], tool_capable=[])
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            model, warnings = self._resolve({"provider": "ollama"}, "qwen3.5:122b")
-        self.assertEqual(model, "qwen3.5:122b")
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("No models installed", warnings[0])
+    def test_empty_server_is_model_not_found_with_pull_hint(self):
+        result = self._probe("qwen3.5:122b", _fake_ollama_server(installed=[], tool_capable=[]))
+        self.assertEqual(result.status, "model_not_found")
+        self.assertIn("no models installed", result.detail)
+        self.assertIn("ollama pull", result.detail)
 
 
 class TestOllamaModelMatching(OllamaCacheTestCase):

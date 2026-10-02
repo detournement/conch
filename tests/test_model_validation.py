@@ -7,7 +7,7 @@ import io
 import unittest
 from unittest.mock import patch
 
-from conch.app import warn_unknown_cloud_model
+from conch.bootstrap import warn_unknown_cloud_model
 from conch.providers import (
     KNOWN_MODELS,
     suggest_models,
@@ -151,11 +151,13 @@ class TestStartupModelScrutiny(unittest.TestCase):
     def test_known_model_no_warning(self):
         self.assertEqual(warn_unknown_cloud_model("anthropic", "claude-sonnet-4-6"), "")
 
-    def test_unknown_model_warns_and_names_safe_replacement(self):
+    def test_unknown_model_warns_and_names_catalog_default_without_switching(self):
         warning = warn_unknown_cloud_model("anthropic", "claude-sonet-4-6")
         self.assertIn("isn't in conch's anthropic catalog", warning)
         self.assertIn("did you mean claude-sonnet-4-6", warning)
-        self.assertIn("using 'claude-sonnet-5'", warning)
+        self.assertIn("catalog default: 'claude-sonnet-5'", warning)
+        # Advisory only: the wording must not claim a silent substitution.
+        self.assertNotIn("using", warning)
 
     def test_gibberish_warns_without_suggestions(self):
         warning = warn_unknown_cloud_model("openai", "ogooaboog")

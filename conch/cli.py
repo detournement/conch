@@ -75,7 +75,18 @@ def main(argv=None):
     if not request:
         print("conch-ask: provide a request (try --help)", file=sys.stderr)
         sys.exit(1)
-    cmd = ask(request)
+    try:
+        cmd = ask(request)
+    except Exception as exc:
+        # The startup model check failed closed (conch-ask never prompts;
+        # only a pre-approved fallback_models entry may take over). The
+        # import stays lazy so the happy path never loads the shell wiring.
+        from .bootstrap import StartupError
+
+        if not isinstance(exc, StartupError):
+            raise
+        print(str(exc), file=sys.stderr)
+        sys.exit(exc.code)
     if not cmd:
         print("conch: [no response]", file=sys.stderr)
         sys.exit(1)

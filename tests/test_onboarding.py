@@ -107,6 +107,19 @@ class TestShouldOfferWizard(OnboardingCase):
 SECRET = "sk-ant-wizard-secret-123"
 
 
+def _verified(config, **_kwargs):
+    """Stand-in for the post-setup model check: reports the configured
+    model as verified without any network (its own tests live in
+    test_modelcheck / TestWizardModelCheck below)."""
+    from conch.modelcheck import OK, ModelCheckOutcome, ProbeResult
+
+    provider = config.get("provider", "")
+    model = config.get("chat_model") or config.get("model") or ""
+    return ModelCheckOutcome(
+        provider, model, ProbeResult(provider, model, OK, "stubbed")
+    )
+
+
 class TestWizardFlow(OnboardingCase):
     def _run(self, inputs, getpass_values):
         """Run the wizard with scripted answers; return captured stdout."""
@@ -116,6 +129,7 @@ class TestWizardFlow(OnboardingCase):
         with patch("conch.onboarding.detect_ollama", return_value=None), \
              patch("conch.onboarding.probe_provider",
                    return_value=(True, "key accepted")), \
+             patch("conch.onboarding.ensure_working_model", _verified), \
              patch("builtins.input", side_effect=lambda *_: next(answers)), \
              patch("conch.onboarding.getpass.getpass",
                    side_effect=lambda *_: next(keys)), \
@@ -142,6 +156,7 @@ class TestWizardFlow(OnboardingCase):
         answers = iter(["4", "n"])
         with patch("conch.onboarding.detect_ollama",
                    return_value=["llama3.3:latest"]), \
+             patch("conch.onboarding.ensure_working_model", _verified), \
              patch("builtins.input", side_effect=lambda *_: next(answers)), \
              patch("sys.stdout", io.StringIO()):
             self.assertTrue(onboarding.run_first_run_wizard())
@@ -176,6 +191,7 @@ class TestCustomEndpointFlow(OnboardingCase):
                    return_value=(True, "endpoint reachable (no key sent)")), \
              patch("conch.onboarding.discover_custom_models",
                    return_value=models) as discover, \
+             patch("conch.onboarding.ensure_working_model", _verified), \
              patch("builtins.input", side_effect=lambda *_: next(answers)), \
              patch("conch.onboarding.getpass.getpass",
                    side_effect=lambda *_: next(keys)), \

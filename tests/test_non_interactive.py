@@ -27,6 +27,17 @@ class _FakeStdin:
         return self._tty
 
 
+def _model_check_off(config, **_kwargs):
+    """Stand-in for the startup model check (its own tests live in
+    test_modelcheck): reports the check as disabled, no probe, no switch."""
+    from conch.modelcheck import ModelCheckOutcome
+
+    return ModelCheckOutcome(
+        config.get("provider", ""), config.get("chat_model", ""), None,
+        checked=False,
+    )
+
+
 class TestSessionIsInteractive(unittest.TestCase):
     def test_tty_without_flag_is_interactive(self):
         self.assertTrue(session_is_interactive(False, stdin=_FakeStdin(True)))
@@ -125,7 +136,7 @@ class TestMainWiring(unittest.TestCase):
                 mock.patch("conch.app.apply_agent_mode_from_config"), \
                 mock.patch("conch.app.resolve_startup_provider",
                            return_value=("openai", lambda *a, **k: None)), \
-                mock.patch("conch.app.warn_unknown_cloud_model", return_value=""), \
+                mock.patch("conch.app.ensure_working_model", _model_check_off), \
                 mock.patch("conch.app.get_chat_prompt", return_value="sys"), \
                 mock.patch("conch.app._build_system_prompt", return_value="sys"), \
                 mock.patch("conch.app.MemoryStore") as mem, \

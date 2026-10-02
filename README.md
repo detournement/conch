@@ -424,6 +424,11 @@ verifies the provider when requested, and stores the key with mode `0600` in
 `~/.config/conch/env`. Conch loads that file itself, so supervised daemons can
 use the same provider configuration without depending on a shell profile.
 
+The wizard ends by running the [startup model check](#startup-model-check) on
+the model it just configured, so a first run finishes in a verified-working
+state — or in the same approved pick-an-alternative flow every later start
+uses.
+
 Set `CONCH_NO_WIZARD=1` to suppress the wizard. Non-interactive contexts never
 show it.
 
@@ -465,6 +470,14 @@ sees "cannot prompt" / "Refused: destructive commands require interactive
 confirmation") and the first-run wizard is skipped. Commands that need no
 approval — agent mode, `allow_prefixes`, `safe_auto` read-only commands —
 still run; destructive commands are refused regardless.
+
+The startup model check follows the same rule: a non-interactive run never
+asks which model to use. If the configured model fails its probe, the
+pre-approved `fallback_models` list is tried in order (the entry in use is
+announced on stderr); with no list, or no working entry, the run fails closed
+with exit status 69 and a message naming the problem and the alternatives that
+answered. `conch-ask` and the `conch-edge` daemon are always non-interactive
+in this sense.
 
 ### Sandboxed execution
 
@@ -561,6 +574,57 @@ The cloud catalog was live-audited on 2026-09-23:
 Responses-only models are not advertised because Conch currently uses Chat
 Completions for OpenAI-compatible tools. `/models` shows the usable catalog
 for the active configuration, and `/model <name>` validates before switching.
+
+### Startup model check
+
+Every start — the interactive shell, a one-shot `conch "…"`, `conch-ask`, the
+first-run wizard, and each `conch-edge` mission session — begins with one
+cheap, bounded probe of the configured model, before the first real call and
+without asking anything. Cloud providers are checked against Conch's verified
+catalog and then the provider's models-list endpoint (a 1-token completion
+only when the list cannot settle it); Ollama via `/api/tags` plus the
+advertised `tools` capability; custom endpoints via `/v1/models` plus the same
+forced tool-call probe the catalog uses. A pass costs a sub-second request
+and shows as `✓ verified` in the banner. A failure is classified — `no API
+key`, `unreachable`, `authentication failed`, `model not found`, `timed out`,
+`failed tool-call conformance`, `rate limited`, `quota/billing exhausted`,
+`server error` — and what happens next depends on whether anyone can answer:
+
+- **In a terminal**, Conch prints the diagnosis and a ranked list of
+  alternatives it probed in parallel within a few seconds: other verified
+  models of the same provider (only when the failure is model-level), other
+  providers whose key variable is present (cloud ones only when `local_only`
+  allows), and the local endpoints it can see — the Ollama server, a
+  configured custom endpoint, the llama-idx registry. Verified entries come
+  first and are marked `✓`; failed ones say why. You pick one; the pick is
+  verified again if needed; a pick that fails is dropped and the list
+  continues. Then one more question: use it for this session only, or save it
+  as the new default (the config file is rewritten in place — provider, model,
+  endpoint, and the key *variable name*; keys are never written or printed).
+  `q` or Ctrl-C exits cleanly with status 69. Nothing switches without that
+  approval.
+- **Non-interactively**, see [Non-interactive runs](#non-interactive-runs):
+  `fallback_models` or fail closed.
+
+The old behaviour — silently starting on a substitute (`model X is
+unavailable…; using Y`) — is gone.
+
+```ini
+model_check = on            # off: skip the probe entirely (nothing is switched)
+model_check_timeout = 4     # seconds per probe request (0.5–60)
+fallback_models = ollama/qwen2.5:7b, anthropic/claude-sonnet-5
+```
+
+`fallback_models` is an ordered `provider/model` list and is the only way a
+non-interactive run may switch models; it is your consent in advance.
+`custom/<model>` entries use the configured `custom_base_url`;
+`llamaidx/<box>/<model>` entries resolve through the registry; cloud entries
+still need their key variable and are skipped under `local_only`. The
+`conch-edge` daemon applies the same rule at every mission session: a down
+primary with no working fallback parks the mission on its usual error
+backoff (five minutes or more) instead of crash-looping, and the daemon log
+records the outcome. `CONCH_MODEL_CHECK`, `CONCH_MODEL_CHECK_TIMEOUT`, and
+`CONCH_FALLBACK_MODELS` override the three keys from the environment.
 
 ### llama-idx
 
@@ -920,6 +984,9 @@ network sandbox for tools you explicitly enable or approve.
 | `agent_mode` | `false` | Auto-execute ordinary shell commands for the session |
 | `permission_mode` | `prompt_all` | `prompt_all`, `safe_auto`, or `yolo` |
 | `local_only` | `auto` | Prevent cloud fallback for local-provider sessions |
+| `model_check` | `on` | Probe the configured model at every start; `off` skips it |
+| `model_check_timeout` | `4` | Seconds per startup-probe request (0.5–60) |
+| `fallback_models` | unset | Ordered `provider/model` list a non-interactive run may switch to |
 | `tool_profile` | automatic | Built-in or custom tool profile |
 | `show_token_stats` | `true` | Per-reply token, cost, context, and throughput line |
 | `repo_map` | `true` | Inject a bounded structural map in Git repositories |

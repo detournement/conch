@@ -546,6 +546,9 @@ class TestRealProcessLifecycle(unittest.TestCase):
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "CONCH_EDGE_DAEMON": "true",
             "CONCH_PROVIDER": "openai",
+            # Lifecycle tests spawn the real entrypoint: keep the startup
+            # model check (its own suite: test_modelcheck) off the network.
+            "CONCH_MODEL_CHECK": "off",
         })
         (self.root / "runtime").mkdir(parents=True, exist_ok=True)
         os.chmod(self.root / "runtime", 0o700)

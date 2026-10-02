@@ -52,7 +52,7 @@ may carry `data.retryable` and `data.actionable_hint`.
 | `handshake` | `caller {system, version}`, `capabilities {supports_sse}` | `session.context_id` — thread onto later messages |
 | `list_workflows` | — | the agent's workflow allowlist; ids pass back verbatim |
 | `get_workflow_details` | `workflow_id` | fields list: `node_instance_id`, `field_id`, `valid_types`, `required`. Input key = `"{node_instance_id}.{field_id}"` |
-| `call_workflow` | `workflow_id?`, `inputs` (keyed map), `artifacts[]`, `idempotency_key` | returns `run_id`; same key + same inputs ⇒ `replayed: true` (success); same key + different inputs ⇒ `-32005 IdempotencyConflict` |
+| `call_workflow` | `workflow_id?`, `inputs` (keyed map), `artifacts[]`, `idempotency_key` | returns `{run_id, session_id, status: queued\|running, sub_agents[], total_sub_agents}`; same key within 24 h ⇒ the **stored original response** (same `run_id`, `status` still `queued`, no `replayed` flag — detect replay by run id and follow with `get_workflow_status`); same key + different inputs ⇒ `-32005 IdempotencyConflict` |
 | `get_workflow_status` | `run_id` | terminal statuses: `success/failed/stopped/cancelled` |
 | `get_workflow_output` | `run_id` | terminal-node outputs under `outputs` (keyed by output node id, text in `value`) plus `logical_outputs`; eval roll-up under `eval_rollup`. File deliverables ride `workflow.files_available` events (below); some gateways also expose a terminal `files[]` with `{id, name, presigned_url, mime_type}` — normalize both |
 | `get_workflow_events` | `run_id`, `since_sequence`, `types[]` | polling fallback when streaming is unavailable |
@@ -82,6 +82,12 @@ frames on `\n\n`, and join the `data:` lines of each frame as JSON:
   `message/stream` on `-32601`, falling back to `get_workflow_events`
   polling if streaming is unavailable entirely. The run keeps executing
   server-side across all of this.
+- Status first. The stream backfills persisted events and then tails
+  live; for a run that already finished the backfill does not always
+  include the terminal frame, so the stream can sit open forever. Call
+  `get_workflow_status` before subscribing (a keyed re-submit often
+  returns a finished run) and periodically while the stream is open;
+  a terminal status ends the wait regardless of the stream.
 - Node progress: `node.node_started` / node-scoped events flip the
   pipeline display pending → running → done. File deliverables arrive
   as `workflow.files_available` events whose `data.files[]` rows carry
@@ -117,11 +123,12 @@ baked baseline, silently retrying next request.
 
 | var | holds | lives |
 |---|---|---|
-| `CAPITOL_A2A_BEARER` (or the env named by conch's `capitol_bearer_env`) | `cap_a2a_*` gateway token | shell env / `~/.capitol-a2a/agents.yaml`; browser consoles hold it in localStorage |
+| `CAPITOL_A2A_BEARER` | `cap_a2a_*` gateway token | the user's shell env (ask them to export it — never read it out of `~/.capitol-a2a/agents.yaml` or any config file yourself); browser consoles hold it in localStorage |
 | `FILESTORE_BASE` | facade origin (e.g. `http://127.0.0.1:19700`, a tunnel URL, or `https://…/proxy/filestore`) | server env |
 | `FILESTORE_ORG_TOKEN` | org filestore token | server env, marked sensitive in the host (e.g. `vercel env add … --sensitive`) |
-| `*_ORG_ID`, `*_REPO`, `*_DOC_PATH` / records path | document addressing | server env with safe defaults |
-| `ALLOWLIST`, `SESSION_SECRET`, `GOOGLE_OAUTH_CLIENT_ID` | portal sign-in (Google Identity + allowlist + signed session cookie) | server env |
+| `FILESTORE_ORG_ID`, `FILESTORE_REPO`, `DOC_PATH` (fed page), `RECORDS_PREFIX` (portal) | document addressing — the names the shipped templates read | server env, required (fail closed) |
+| `EXPECTED_ID`, `EXPECTED_SCHEMA` | fed page: values the fetched document must carry to be trusted | server env, optional |
+| `ALLOWLIST`, `SESSION_SECRET`, `GOOGLE_OAUTH_CLIENT_ID`, `ALLOW_DEV_LOGIN` | portal sign-in (Google Identity + allowlist + HMAC session cookie; dev login is local-only and ignored in production) | server env |
 
 Config values enter code via env reads with explicit fail-closed checks
 — a missing required var is a 500 "misconfigured", never a fixture

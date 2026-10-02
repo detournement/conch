@@ -27,6 +27,93 @@ SKILL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 # Bound the block injected into context so a skill can't swamp small models.
 SKILL_BODY_MAX_CHARS = 8000
 SKILLS_CONTEXT_MAX = 12  # skills listed in the system prompt
+# Per-skill line budget in the system-prompt block: the first sentence
+# plus the "Use when …" trigger sentence, so natural-language requests
+# route to the right skill without paying for the whole description.
+SKILLS_CONTEXT_DESC_MAX = 260
+# The one-liner /skills and the introspect report show.
+SKILL_ONE_LINER_MAX = 140
+
+# Tools a shipped skill may declare that belong to an optional product
+# module or a config gate — the message a user sees when a skill needs
+# one that this install/session does not have.
+SKILL_TOOL_HINTS = {
+    "capitol_control": (
+        "the Capitol runtime tool: `/install works`, then set "
+        "capitol_base_url (+ capitol_org, capitol_agent) in the conch "
+        "config and restart conch"
+    ),
+    "fleet_delegate": "the fleet task plane: `/install fleet`",
+    "personal_items": "personal items: enable personal_items in the conch config",
+}
+
+
+def skill_one_liner(skill: Dict[str, Any],
+                    limit: int = SKILL_ONE_LINER_MAX) -> str:
+    """The first sentence of a skill's description, bounded.
+
+    Trigger-rich frontmatter is for skill *selection*; listings and the
+    bounded introspect report want one scannable line.
+    """
+    description = (skill.get("description") or "").strip()
+    if not description:
+        return "(no description)"
+    first = re.split(r"(?<=[.!?])\s+", description, maxsplit=1)[0].strip()
+    return _clip(first, limit)
+
+
+def skill_context_line(skill: Dict[str, Any],
+                       limit: int = SKILLS_CONTEXT_DESC_MAX) -> str:
+    """First sentence plus the "Use when …" trigger sentence, bounded."""
+    description = (skill.get("description") or "").strip()
+    if not description:
+        return "(no description)"
+    sentences = re.split(r"(?<=[.!?])\s+", description)
+    summary = sentences[0].strip()
+    trigger = next(
+        (s.strip() for s in sentences[1:] if s.lower().startswith("use when")),
+        "",
+    )
+    if trigger and trigger not in summary:
+        summary = f"{summary} {trigger}"
+    return _clip(summary, limit)
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if " " in cut[limit // 2:]:
+        cut = cut[: cut.rfind(" ")]
+    return cut.rstrip(",;:—- ") + "…"
+
+
+def missing_skill_tools(skill: Dict[str, Any], available) -> List[str]:
+    """Tools the skill declares that *available* (a tool_map or a set of
+    tool names) does not provide. ``available=None`` means availability is
+    unknown (nothing is reported missing). A skill without a ``tools``
+    line declares nothing."""
+    if available is None:
+        return []
+    required = skill.get("tools") or []
+    names = set(available.keys() if hasattr(available, "keys") else available)
+    return [tool for tool in required if tool not in names]
+
+
+def describe_missing_skill_tools(skill_name: str, missing: List[str]) -> str:
+    """The user-facing explanation when a skill's tools are unavailable."""
+    lines = [
+        f"Skill '{skill_name}' needs tools this session does not have: "
+        + ", ".join(missing)
+        + "."
+    ]
+    for tool in missing:
+        hint = SKILL_TOOL_HINTS.get(
+            tool, "not loaded here — /tools lists what this session has"
+        )
+        lines.append(f"  {tool} — {hint}")
+    return "\n".join(lines)
 
 
 def skills_dir() -> Path:
@@ -173,7 +260,38 @@ def render_skill(skill: Dict[str, Any]) -> str:
                 + ", ".join(companions)
                 + " there when this skill points at them]"
             )
+        assets = skill_asset_dirs(directory)
+        if assets:
+            rendered += (
+                "\n[Skill assets: "
+                + ", ".join(
+                    f"{directory}/{name}/ ({count} files)"
+                    for name, count in assets
+                )
+                + " — copy these verbatim when the skill says to scaffold "
+                "from them; do not retype them]"
+            )
     return rendered
+
+
+def skill_asset_dirs(directory) -> List[tuple]:
+    """``[(subdir_name, file_count), …]`` for the non-markdown asset trees
+    shipped beside a SKILL.md (e.g. ``templates/``), sorted by name."""
+    result = []
+    try:
+        entries = sorted(Path(directory).iterdir())
+    except OSError:
+        return result
+    for entry in entries:
+        if not entry.is_dir() or entry.name.startswith((".", "__")):
+            continue
+        count = sum(
+            1 for path in entry.rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+        )
+        if count:
+            result.append((entry.name, count))
+    return result
 
 
 def format_skill_file(
@@ -235,8 +353,7 @@ def build_skills_context() -> str:
         return ""
     lines = ["Available skills (invoke with the skill_manage tool, action='use'):"]
     for name, skill in list(sorted(skills.items()))[:SKILLS_CONTEXT_MAX]:
-        desc = skill.get("description") or "(no description)"
-        lines.append(f"- {name}: {desc[:100]}")
+        lines.append(f"- {name}: {skill_context_line(skill)}")
     if len(skills) > SKILLS_CONTEXT_MAX:
         lines.append(f"- ... and {len(skills) - SKILLS_CONTEXT_MAX} more")
     return "\n".join(lines)

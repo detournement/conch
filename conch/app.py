@@ -700,6 +700,12 @@ def chat_loop(new_conversation=False, interactive=True):
         chat_state.tool_map = new_state.tool_map
         chat_state.tools = new_state.tools
         chat_state.needs_tool_refresh = False
+        if chat_state.pinned_tools:
+            # Skill-activated tools survive a reload the way they survive
+            # the per-request cap.
+            from .tooling import ensure_tools_active
+            ensure_tools_active(chat_state, sorted(chat_state.pinned_tools))
+            chat_state.needs_tool_refresh = False
         print(f"  \033[1;32m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active\033[0m\n")
 
     def _print_banner():
@@ -778,6 +784,9 @@ def chat_loop(new_conversation=False, interactive=True):
 
     # Subagent delegation reads live config/tool state (plan 3.1)
     builtin_clients["delegate_task"].bind_session(session)
+    # skill_manage action='use' activates a skill's declared tools the
+    # same way /skill does (and reports the ones this session lacks).
+    builtin_clients["skill_manage"].bind_state(chat_state)
 
     # Remote agentic loop (plan 4.3): opt-in via remote_enabled=true.
     _remote_loop, _remote_reason = start_remote_loop(
@@ -1102,9 +1111,36 @@ def chat_loop(new_conversation=False, interactive=True):
                     continue
                 if isinstance(result, tuple) and result[0] == "user_prompt":
                     _custom_prompt = result[1]
+                    _prompt_meta = result[2] if len(result) > 2 else None
                     result = None
                     preview = _custom_prompt.strip().splitlines()[0][:70]
                     print(f"  \033[2m→ {preview}\033[0m")
+                    if isinstance(_prompt_meta, dict) and _prompt_meta.get("tools"):
+                        # A skill's declared tools are the operator's
+                        # explicit offer: activate any the profile hid and
+                        # pin them for the rest of the session.
+                        from .tooling import ensure_tools_active
+                        _added = ensure_tools_active(
+                            chat_state, _prompt_meta["tools"]
+                        )
+                        if _added:
+                            print(
+                                f"  \033[2m(skill {_prompt_meta.get('skill')}: "
+                                f"enabled {', '.join(_added)} for this "
+                                "session)\033[0m"
+                            )
+                    if isinstance(_prompt_meta, dict) and _prompt_meta.get("rounds"):
+                        # A skill's rounds: line is its declared budget
+                        # (delegate_task honours it); the main-session
+                        # default of 25 cut a scaffold+verify arc short.
+                        _wanted = int(_prompt_meta["rounds"])
+                        if _wanted > session.budgets.max_tool_rounds:
+                            session.budgets.max_tool_rounds = _wanted
+                            print(
+                                f"  \033[2m(skill {_prompt_meta.get('skill')}: "
+                                f"tool round budget raised to {_wanted} for "
+                                "this session; /rounds to change)\033[0m"
+                            )
                 if result == "new_conversation":
                     _save_current()
                     # Summarize in the background: the LLM call would

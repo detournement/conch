@@ -1,19 +1,37 @@
-# capitol-frontend cookbook — worked scaffolds for this machine
+# capitol-frontend cookbook — recipes with exact commands
 
-Three complete recipes, one per archetype. Each names the local
-reference app whose code is the proven implementation — copy from it
-rather than re-deriving the wire handling. Recipes end with the live
-verify steps; a scaffold ships only after they pass.
+One recipe per archetype. Every recipe starts from the matching
+directory under `templates/` (beside this file; the absolute path is in
+the `[Skill assets: …]` line of the rendered skill), copies it, fills in
+the `REPLACE_*` placeholders, and ends with the template's headless
+verifier plus a fallback drill. The expected output lines shown are
+what a passing run prints (ids will differ). A scaffold ships only after
+they pass.
+
+The templates were distilled from proven apps and fix three defects the
+originals had: the idempotency key is derived from the form contents
+(the originals minted a UUID per click), the run follower checks
+`get_workflow_status` before trusting the stream (a finished run's
+stream does not always replay its terminal frame), and HITL prompts are
+relayed. Do not "improve" the templates back toward the originals.
 
 ## Recipe 1 — workflow console (A2A, static ES modules)
 
-Reference app: `~/composer/cap-app-acc-market-research` — intake form →
-`call_workflow` → live SSE node progress → HITL relay → deliverable
-download rows. Its `js/a2a-client.js` is the dependency-free browser
-client for the whole gateway contract (envelope, streaming, resume,
-uploads); reuse it unchanged.
+Template: `templates/console/`
 
-1. Pin the workflow with `capitol_control`:
+```
+index.html, app.css          one <main>, four panels (setup, form, run, output)
+config/app.config.json       gateway_url, workflow_id, idempotency_prefix, fields[]
+js/a2a-client.js             the browser/Node A2A client — do not edit
+js/run.js                    idempotency key, composeInputs, waitForTerminal, HITL answer
+js/run-view.js               node progress, reasoning toggle, deliverables
+js/app.js                    token setup (localStorage) → form → run → deliverables
+preflight.sh                 card + handshake + list_workflows with the bearer
+verify-run.mjs               headless card → handshake → keyed run → terminal → deliverables
+README.md                    run/serve/verify instructions for the user
+```
+
+1. Pin the workflow (tool calls, not curl):
 
 ```json
 {"op": "workflows"}
@@ -23,123 +41,208 @@ uploads); reuse it unchanged.
 {"op": "describe", "workflow_id": "<id from the catalog>"}
 ```
 
-   Record the workflow id, the field rows, and the request-input key
-   (`"<node_instance_id>.<field_id>"`). The intake form is generated
-   from these fields: required fields as visible inputs, optional ones
-   under an "Advanced" fold, everything else from schema defaults.
-2. Scaffold the directory:
+   Keep the workflow id and the `fields[].key` strings
+   (`"<node_instance_id>.<field_id>"`) exactly as returned.
+
+2. Scaffold and configure:
 
 ```
-<app>/
-  index.html              ES-module entry, one <main> per view
-  app.css                 single stylesheet
-  config/app.config.json  app name, gateway_url, intake definition,
-                          pipeline (workflow id + input mapping)
-  js/a2a-client.js        copied from the reference app
-  js/app.js               view router + token/localStorage handling
-  js/intake.js            form generated from the described fields
-  js/run-view.js          node progress + deliverables + HITL prompts
+cp -R "<skill assets dir>/templates/console" <app-dir> && cd <app-dir>
 ```
 
-   `gateway_url` is the full `{base}/a2a/{org}/{agent}` endpoint. The
-   token flows in via a setup screen into localStorage (a
-   `bootstrap_token` in config is localhost-demo-only — say so in the
-   README).
-3. Wire the run per reference.md: `handshake` once per session;
-   `call_workflow` with the canonical input keys and a stable
-   `idempotency_key` derived from the form contents (not minted per
-   click); `subscribeRunEvents` for progress with `tasks/resubscribe`
-   resume; deliverables collected from `workflow.files_available`
-   events (`data.files[]`, deduped by `file_id`); `node.input_required`
-   rendered verbatim with the matching response skill on submit.
-4. Verify live:
-   - `curl -sf -H "Authorization: Bearer $CAPITOL_A2A_BEARER" <gateway_url>/.well-known/agent-card.json | head -c 200`
-     — card reachable with the configured token.
-   - `python3 -m http.server 8080` in the app dir; `curl -sf http://localhost:8080/` serves the entry page.
-   - Drive one run end to end in the browser (user-approved if the
-     workflow has real external effects) and watch it reach a terminal
-     event with deliverables rendered.
+   Edit `config/app.config.json`: `gateway_url` = the agent's full
+   `{base}/a2a/{org}/{agent}` URL from `op='discover'`; `workflow_id`;
+   `fields[]` — one row per field you expose (`key` from describe,
+   `label`, `type` = `textarea`|`text`|`number`, `required`, `default`,
+   `help`). Required fields render as visible inputs, optional ones
+   under an "Optional fields" fold. Leave no `REPLACE_` anywhere
+   (`grep -r REPLACE_ . ` must print nothing).
+
+3. Preflight (the bearer comes from the user's shell, never from a file
+   you went looking for):
+
+```
+bash preflight.sh
+```
+
+   Expected:
+
+```
+card: <agent name> (streaming=true)
+handshake: context_id=<uuid>
+workflows: <workflow id> …
+preflight: PASS
+```
+
+4. Verify headlessly. The verifier uses the config's `fields[].default`
+   values unless you pass `--input KEY=VALUE`:
+
+```
+node verify-run.mjs --timeout 2400
+```
+
+   Expected:
+
+```
+card: <agent name> streaming=true
+handshake: context_id=<uuid>
+run: <run id> key=<prefix>:<workflow id>:<16 hex> nodes=<n> status=<queued|running|success> (new | existing run — replayed, nothing new started)
+stream: live
+events: workflow.run_started=1 node.node_started=… workflow.files_available=… workflow.run_completed=1
+terminal: success
+deliverable: <filename> <mime> url=yes
+deliverables: <n>
+verify: PASS
+```
+
+   Run it twice with the same inputs: the second run prints the same
+   run id with `existing run — replayed` — that is the idempotency
+   drill. A long workflow takes as long as it takes (tens of minutes
+   is normal); keep the timeout generous and do not start a second run
+   while one is in flight.
+
+5. Serve and hand over:
+
+```
+python3 -m http.server 8080      # in <app-dir>; curl -sf http://localhost:8080/ | head -c 200
+```
+
+   The user pastes the `cap_a2a_*` token on the setup screen (stored in
+   localStorage). Remind them the console is for local/demo deployments
+   where the gateway is reachable from the browser.
+
+6. Fallback drill: set `gateway_url` to a dead port (e.g.
+   `http://localhost:1/a2a/x/y`), reload — the app must show "Could not
+   reach the agent" and nothing else; restore the URL.
 
 ## Recipe 2 — workflow-fed page (filestore data island)
 
-Reference app: `~/composer/cap-app-prop40-tracker` — a static page
-whose `<script id="…-data" type="application/json">` island is spliced
-at serve time with the latest filestore document; a Capitol workflow
-(scheduled) keeps that document fresh. See its `api/index.js` for the
-complete splice handler and `README.md` for the architecture diagram.
-
-1. Confirm with the user: org id, repo, document path, the document's
-   schema id, and where the static page template comes from. Fetch the
-   real document once (server-side token) and extract the island's
-   baseline bytes to `data/baseline.json`.
-2. Scaffold:
+Template: `templates/fed-page/`
 
 ```
-<app>/
-  template/index.html   the page, never modified by the handler
-  data/baseline.json    cold-start fallback, byte-exact island content
-  api/index.js          the only backend: fetch doc → validate →
-                        splice island → serve
-  vercel.json           rewrites / + /index.html to the function,
-                        security headers
+template/index.html          the page; only the app-data island content changes at serve time
+public/page.js, page.css     reads the island, renders it (replace with the real design)
+data/baseline.json           cold-start fallback — a REAL copy of the document
+api/index.js                 fetch doc → validate → splice island → serve (X-Data-Source header)
+vercel.json                  / and /index.html → the function; security headers
+serve.mjs                    local stand-in for the Vercel runtime
+verify-page.mjs              fetches the page, parses the island, checks the source
 ```
 
-3. The handler contract (from the reference implementation): locate the
-   island markers once at module load; fetch
-   `{FILESTORE_BASE}/v1/orgs/{org}/repos/{repo}/files/{path}` with the
-   server-side token and a timeout; validate (parse + expected schema
-   id); cache ~15 s; on any failure serve last-known-good then
-   baseline, retrying next request; escape `</` → `<\/` before
-   splicing.
-4. Verify live: run the handler locally (or `vercel dev`), curl `/` and
-   confirm the island carries the live document; point `FILESTORE_BASE`
-   at a dead port and confirm the page still serves (fallback), then
-   restore. Byte-identity check if the template was provided:
-   render with the baseline and `cmp` against the original.
+1. Confirm with the user: `FILESTORE_BASE`, org id, repo, document
+   path, and (if the document has them) the `id`/`schema` values to
+   trust. Fetch the document once and make it the baseline:
+
+```
+curl -sf -H "Authorization: Bearer $FILESTORE_ORG_TOKEN" \
+  "$FILESTORE_BASE/v1/orgs/$FILESTORE_ORG_ID/repos/$FILESTORE_REPO/files/<url-encoded DOC_PATH>" \
+  > data/baseline.json && python3 -m json.tool data/baseline.json | head -20
+```
+
+2. Scaffold: `cp -R "<skill assets dir>/templates/fed-page" <app-dir>`,
+   replace `data/baseline.json` with the real document (step 1), then
+   adapt `public/page.js` to the document's actual keys.
+
+3. Run and verify (env vars are read by `api/index.js`; the token never
+   appears in the page):
+
+```
+FILESTORE_BASE=… FILESTORE_ORG_TOKEN=… FILESTORE_ORG_ID=… FILESTORE_REPO=… \
+DOC_PATH=… EXPECTED_SCHEMA=… node serve.mjs 3000 &
+node verify-page.mjs http://localhost:3000/ --expect-source live
+```
+
+   Expected:
+
+```
+status: 200
+source: live
+island: id=<document id> keys=<n> title="<title>"
+verify: PASS
+```
+
+   A second request within 15 s prints `source: cached`.
+
+4. Fallback drill: restart with `FILESTORE_ORG_TOKEN=bad` (or
+   `FILESTORE_BASE=http://127.0.0.1:1`) and run the verifier with
+   `--expect-source baseline`: the page still serves, from the baked
+   baseline. Restore and re-check `source: live`.
+
+5. Deploy (`vercel --prod`) only when the user asks; set the same env
+   vars in the project settings. The page must never fetch the facade
+   from the browser.
 
 ## Recipe 3 — filestore portal (BFF + sign-in)
 
-Reference apps: `~/cg-worktrees/cap-app-together-feed-ref` (deal-flow
-feed) and `~/cg-worktrees/cap-app-government-opportunities` (records
-portal). Browser → own `/api/*` only; the BFF holds the org token,
-verifies Google Identity sign-in against an allowlist, and reads the
-facade — live (`DATA_SOURCE=facade`) or from a synced snapshot
-(`DATA_SOURCE=kv`) that survives tunnel outages.
-
-1. Confirm the records contract first: repo, records path, the record
-   schema id, and one real record fetched and read before any render
-   code. Malformed records are dropped and logged, partial records
-   degrade gracefully — never guessed into shape.
-2. Scaffold from the reference app's layout:
+Template: `templates/portal/`
 
 ```
-<app>/
-  index.html, app.css, js/   static UI (api-client, render, app)
-  api/_shared.js             env config, session cookie, facadeFetch
-  api/auth/…                 Google ID-token verify + allowlist gate
-  api/feed.js                records list (snapshot or facade)
-  api/file.js                document pass-through downloads
-  api/cron/sync.js           facade /tree + /files → snapshot
-  vercel.json                rewrites, headers, cron schedule
+public/index.html, app.js, app.css   sign-in panel (Google button or dev login), records list
+api/_shared.js                       env config (fail-closed), session cookie, allowlist, facadeFetch
+api/auth/login.js, me.js, logout.js  Google ID-token verify + allowlist → HMAC session cookie
+api/feed.js                          tree + files under RECORDS_PREFIX → records (live | cached | last-known-good)
+serve.mjs                            local stand-in for the Vercel runtime (routes /api/* to api/*.js)
+verify-portal.mjs                    401 anonymous, 403 denied, session, feed, me, logout
+vercel.json                          security headers
 ```
 
-3. Fail-closed rules to preserve verbatim: missing org/filestore/auth
-   env ⇒ 500 misconfigured; fixture mode refuses to run on production;
-   production never falls back to fixtures; a down facade in snapshot
-   mode serves last-known-good **with a staleness banner**, in live
-   mode an error banner — never fabricated rows.
-4. Verify: `npm test` (contract: allowlist, session, record shapes) and
-   the e2e drill (sign-in gate, denial, rows render, download through
-   the BFF, backend-down banner via a second instance pointed at a dead
-   port), per the reference app's `tests/`.
+1. Confirm the records contract: `FILESTORE_BASE`, org id, repo,
+   `RECORDS_PREFIX` (folder holding `*.json` records), the allowlist,
+   and one real record fetched and read before touching render code:
+
+```
+curl -sf -H "Authorization: Bearer $FILESTORE_ORG_TOKEN" \
+  "$FILESTORE_BASE/v1/orgs/$FILESTORE_ORG_ID/repos/$FILESTORE_REPO/tree?recursive=true&path=<RECORDS_PREFIX>" | head -c 600
+```
+
+2. Scaffold: `cp -R "<skill assets dir>/templates/portal" <app-dir>`;
+   adapt `renderRecords` in `public/app.js` to the record shape.
+
+3. Run locally with dev sign-in (local only — `ALLOW_DEV_LOGIN` is
+   ignored when `VERCEL_ENV=production`) and verify:
+
+```
+FILESTORE_BASE=… FILESTORE_ORG_TOKEN=… FILESTORE_ORG_ID=… FILESTORE_REPO=… RECORDS_PREFIX=… \
+SESSION_SECRET="$(openssl rand -hex 32)" ALLOWLIST="you@example.com,*@your-domain" \
+ALLOW_DEV_LOGIN=1 node serve.mjs 3000 &
+node verify-portal.mjs http://localhost:3000 --email you@example.com
+```
+
+   Expected:
+
+```
+ok   anonymous /api/feed is refused — status 401
+ok   non-allowlisted sign-in is refused — status 403
+ok   allowlisted dev sign-in issues a session — status 200
+ok   /api/auth/me reflects the signed-in email — {…}
+ok   /api/feed answers with records — status 200
+     source=live records=<n> stale=false
+ok   logout clears the session
+verify: PASS
+```
+
+4. Fallback drills: start without `SESSION_SECRET` → every `/api/*`
+   answers `{"error":"misconfigured", …}` (fail closed). With a warm
+   cache, point `FILESTORE_BASE` at a dead port → `/api/feed` answers
+   `source=last-known-good stale=true` and the UI shows the staleness
+   note; with a cold cache it answers 502 `upstream` — never rows it
+   made up.
+
+5. Production: set `GOOGLE_OAUTH_CLIENT_ID` (Google Identity Services
+   client id for the deployed origin), the `FILESTORE_*` vars,
+   `SESSION_SECRET`, `ALLOWLIST`; do not set `ALLOW_DEV_LOGIN`.
 
 ## Shared checklist (any archetype)
 
-- Secrets: grep the scaffold for `cap_a2a_`, `token`, and the org id
-  before committing; server tokens only in env, browser tokens only in
+- Secrets: `grep -rE "cap_a2a_[A-Za-z0-9_-]{20,}" <app-dir>` and
+  `grep -rn "token" <app-dir> --include=*.json` must show no literal
+  tokens (the templates mention the `cap_a2a_` *prefix* in docs and
+  prompts — that is not a token; a real one is `cap_a2a_` + 48
+  base64url chars); server tokens only in env, browser tokens only in
   localStorage, demo bootstrap tokens documented as demo-only.
-- Honesty drill: kill the upstream (gateway or facade) and confirm the
-  app shows its declared degraded state rather than stale-as-fresh or
-  invented content.
-- Idempotency drill (console): double-submit the form; the second
-  submit must replay (`replayed: true`), not start a second run.
+- Honesty drill done (upstream dead ⇒ declared degraded state, never
+  stale-as-fresh or invented content).
+- Idempotency drill done (console): the second `verify-run.mjs` with the
+  same inputs prints the same run id and `existing run — replayed`.
+- The `capitol-frontend checklist` block from SKILL.md is in your final
+  message, every line filled from real output.

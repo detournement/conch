@@ -69,7 +69,10 @@ include = ["conch*"]
     "data/*/assets/*",
 ]
 # Skills shipped with conch (SKILL.md + companion reference/cookbook
-# documents, discovered by the skill loader; user skills win by name).
+# documents, discovered by the skill loader; user skills win by name)
+# plus the asset trees a skill scaffolds from (templates/**: html, js,
+# css, json, sh — copied verbatim by the model, so every file must ship).
 "conch" = [
     "skills_data/*/*.md",
+    "skills_data/*/templates/**/*",
 ]

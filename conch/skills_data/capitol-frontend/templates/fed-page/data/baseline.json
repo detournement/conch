@@ -1,0 +1,6 @@
+{
+  "id": "REPLACE_WITH_THE_DOCUMENT_ID",
+  "title": "Baseline document",
+  "summary": "Replace this file with a real copy of the document the workflow publishes (curl it from the facade). It is served when the live read fails and is the cold-start last-known-good.",
+  "updated_at": "1970-01-01T00:00:00Z"
+}

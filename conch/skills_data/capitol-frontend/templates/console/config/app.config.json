@@ -4,6 +4,7 @@
   "app_version": "0.1.0",
   "gateway_url": "http://localhost:8300/a2a/REPLACE_ORG_ID/REPLACE_AGENT_ID",
   "workflow_id": "REPLACE_WORKFLOW_ID",
+  "workflow_version_id": "",
   "idempotency_prefix": "console",
   "intro": "Describe the request. The agent runs the workflow and returns the deliverables below.",
   "fields": [

@@ -27,9 +27,28 @@ async function sha256Hex(text) {
  * re-submitting the same inputs replays the existing run (``replayed:
  * true`` on the call_workflow response) instead of starting a second one.
  */
-export async function idempotencyKey(prefix, workflowId, inputs) {
-  const hash = await sha256Hex(canonicalJson(inputs));
+export async function idempotencyKey(prefix, workflowId, inputs, versionId = "") {
+  // A pinned version is part of the key: moving the pin must start a new
+  // run, while an unpinned app keeps replaying the same key for the same
+  // inputs.
+  const hash = await sha256Hex(canonicalJson(versionId ? { inputs, version_id: versionId } : inputs));
   return `${prefix}:${workflowId}:${hash.slice(0, 16)}`;
+}
+
+/**
+ * Compare the app's pinned workflow version with what the gateway holds.
+ * Returns {pinned, latest, state} where state is "unpinned", "current",
+ * "behind" (a newer version exists — see the cookbook's Upgrading
+ * section) or "missing" (the pin is not a saved version: fail closed).
+ */
+export async function checkVersionPin(client, workflowId, pinnedVersionId) {
+  const details = await client.getWorkflowDetails(workflowId);
+  const latest = details?.version_id || "";
+  if (!pinnedVersionId) return { pinned: "", latest, state: "unpinned" };
+  if (pinnedVersionId === latest) return { pinned: pinnedVersionId, latest, state: "current" };
+  const history = await client.getWorkflowVersions(workflowId);
+  const known = (history?.versions || []).some((v) => (v.version_id || v.id) === pinnedVersionId);
+  return { pinned: pinnedVersionId, latest, state: known ? "behind" : "missing" };
 }
 
 /** Build the inputs map from the config fields and the collected values. */

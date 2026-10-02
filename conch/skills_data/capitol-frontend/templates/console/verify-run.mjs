@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Headless end-to-end check for the console: agent card → handshake →
- * keyed call_workflow → live events → terminal status → deliverables.
+ * version pin check → keyed call_workflow → live events → terminal
+ * status → deliverables.
  * Uses the same client, inputs and idempotency key as the browser app,
  * so running it twice with the same inputs replays one run instead of
  * starting two.
@@ -26,7 +27,7 @@ if (major < 20) {
 }
 
 const { A2AClient } = await import(pathToFileURL(resolve(here, "js/a2a-client.js")).href);
-const { composeInputs, idempotencyKey, waitForTerminal } = await import(
+const { checkVersionPin, composeInputs, idempotencyKey, waitForTerminal } = await import(
   pathToFileURL(resolve(here, "js/run.js")).href
 );
 const { extractOutputFiles, normalizeFile } = await import(pathToFileURL(resolve(here, "js/run-view.js")).href);
@@ -66,8 +67,13 @@ console.log(`card: ${card.name || "(unnamed)"} streaming=${Boolean(card.capabili
 const hs = await step("handshake", () => client.handshake(config.app_slug, config.app_version));
 console.log(`handshake: context_id=${hs?.session?.context_id || "(none)"}`);
 
-const key = await idempotencyKey(config.idempotency_prefix || config.app_slug, config.workflow_id, inputs);
-const call = await step("call_workflow", () => client.callWorkflow(config.workflow_id, inputs, { idempotencyKey: key }));
+const versionId = config.workflow_version_id || "";
+const pin = await step("version_pin", () => checkVersionPin(client, config.workflow_id, versionId));
+if (pin.state === "missing") fail(1, `version: pinned ${pin.pinned} is not a saved version of ${config.workflow_id} (latest ${pin.latest}) — re-pin from capitol_control op=describe`);
+console.log(`version: ${pin.state === "unpinned" ? `unpinned (latest ${pin.latest})` : `pinned ${pin.pinned} (${pin.state}${pin.state === "behind" ? `; latest ${pin.latest} — upgrade available` : ""})`}`);
+
+const key = await idempotencyKey(config.idempotency_prefix || config.app_slug, config.workflow_id, inputs, versionId);
+const call = await step("call_workflow", () => client.callWorkflow(config.workflow_id, inputs, { idempotencyKey: key, versionId }));
 // A repeated key returns the stored original response (same run_id, no
 // flag); the status check below tells whether that run already finished.
 const before = await step("get_workflow_status", () => client.getWorkflowStatus(call.run_id));

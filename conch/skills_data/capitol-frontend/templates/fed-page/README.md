@@ -25,12 +25,12 @@ retries. The response header `X-Data-Source` says which one was used
 ```
 curl -sf -H "Authorization: Bearer $FILESTORE_ORG_TOKEN" \
   "$FILESTORE_BASE/v1/orgs/$FILESTORE_ORG_ID/repos/$FILESTORE_REPO/files/<url-encoded DOC_PATH>" > data/baseline.json
-node serve.mjs 3000 &
-node verify-page.mjs http://localhost:3000/ --expect-source live     # → "verify: PASS"
+node serve.mjs 4320 &
+node verify-page.mjs http://localhost:4320/ --expect-source live     # → "verify: PASS"
 ```
 
 Fallback drill: restart with `FILESTORE_ORG_TOKEN=bad` and run
-`node verify-page.mjs http://localhost:3000/ --expect-source baseline`.
+`node verify-page.mjs http://localhost:4320/ --expect-source baseline`.
 
 ## Deploy
 

@@ -119,6 +119,81 @@ def _require_approved(compilation: Dict[str, Any],
             )
 
 
+#: Fields the serving stack recomputes on save from its live node catalog
+#: (provenance of the node contract, not card content). Observed on the
+#: local stack 2026-10-02: AgentNode's catalog digests differ between the
+#: payload POSTed and the version stored.
+_SERVER_MANAGED_FIELDS = frozenset({
+    "catalog_contract_digest",
+    "repeat_catalog_digest",
+})
+
+
+def payload_divergences(sent: Dict[str, Any], stored: Any) -> List[str]:
+    """Paths where the *stored* workflow payload disagrees with what the
+    compiler *sent*.
+
+    The workflow API normalizes on save: top-level defaults are added
+    (``authoring_context``, ``software_repo_*``, …) and per-node catalog
+    provenance digests are recomputed. Those are not drift. Anything the
+    card controlled — ids, node types and params, edges, names, publish
+    flags, lineage metadata — must round-trip exactly; a difference there
+    is reported by path so the caller can fail closed with evidence.
+    """
+    found: List[str] = []
+
+    def walk(a: Any, b: Any, path: str, top: bool) -> None:
+        if isinstance(a, dict):
+            if not isinstance(b, dict):
+                found.append(path or "/")
+                return
+            for key in sorted(a):
+                if key in _SERVER_MANAGED_FIELDS:
+                    continue
+                if key not in b:
+                    found.append(f"{path}/{key}")
+                    continue
+                walk(a[key], b[key], f"{path}/{key}", False)
+            if not top:
+                for key in sorted(set(b) - set(a) - _SERVER_MANAGED_FIELDS):
+                    found.append(f"{path}/{key}")
+        elif isinstance(a, list):
+            if not isinstance(b, list) or len(a) != len(b):
+                found.append(path or "/")
+                return
+            for index, (x, y) in enumerate(zip(a, b)):
+                walk(x, y, f"{path}[{index}]", False)
+        elif a != b:
+            found.append(path or "/")
+
+    walk(sent, stored, "", True)
+    return found
+
+
+def _prove_stored_version(procedure_client, receipt: Dict[str, Any],
+                          sent_payload: Dict[str, Any], *,
+                          what: str) -> Dict[str, Any]:
+    """Read back the exact version a persist produced, prove its payload
+    is the card's payload modulo server normalization, and return the
+    live version row (whose ``payload_digest`` is the pin's digest)."""
+    workflow_id = str(receipt.get("workflow_id") or "")
+    version_id = str(receipt.get("version_pin") or "")
+    if not workflow_id or not version_id:
+        raise CapitolError(
+            f"{what}: persist returned no exact version pin (failing closed)"
+        )
+    live = procedure_client.get_workflow_version(workflow_id, version_id)
+    divergences = payload_divergences(sent_payload, live.get("payload"))
+    if divergences:
+        shown = ", ".join(divergences[:6])
+        more = f" (+{len(divergences) - 6} more)" if len(divergences) > 6 else ""
+        raise CapitolError(
+            f"{what}: stored version {version_id} does not round-trip the "
+            f"approved payload at {shown}{more} (failing closed)"
+        )
+    return live
+
+
 def _step_key(compilation_id: str, step: str, extra: str = "") -> str:
     key = f"compile:{compilation_id}:{step}"
     return f"{key}:{extra}" if extra else key
@@ -316,11 +391,11 @@ def materialize_compilation(
                         workflow, collection_ids
                     ),
                 )
-                allowed = {
-                    f"sha256:{digest}",
-                    f"sha256:{payload_digest(legacy_payload)}",
-                }
-                if live_digest not in allowed:
+                stored_payload = live_version.get("payload")
+                if (
+                    payload_divergences(payload, stored_payload)
+                    and payload_divergences(legacy_payload, stored_payload)
+                ):
                     raise CapitolError(
                         f"existing {step_name} payload cannot be proven "
                         "against the approved Card (migration unresolved; "
@@ -356,7 +431,16 @@ def materialize_compilation(
                     ),
                     create_only=True,
                 )
-                receipt["payload_digest"] = f"sha256:{digest}"
+                # The pin's digest is the *stored* version's: the API
+                # normalizes on save, so hashing what we sent would fail
+                # every later exact-version check. Prove the stored
+                # payload is ours first, then record its digest.
+                live = _prove_stored_version(
+                    procedure_client, receipt, payload,
+                    what=f"workflow:{identity}",
+                )
+                receipt["payload_digest"] = str(live["payload_digest"])
+                receipt["version_number"] = int(live["version_number"])
                 return receipt
 
             receipt = run_step(

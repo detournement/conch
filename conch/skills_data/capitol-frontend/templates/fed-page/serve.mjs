@@ -10,7 +10,7 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 
-const port = Number(process.argv[2] || process.env.PORT || 3000);
+const port = Number(process.argv[2] || process.env.PORT || 4320);
 const { default: handler } = await import("./api/index.js");
 const TYPES = { ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".html": "text/html" };
 

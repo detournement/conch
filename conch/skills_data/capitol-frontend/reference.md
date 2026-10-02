@@ -1,11 +1,17 @@
 # Capitol frontend wire contracts
 
+Document version 2026-10-02.2. Verified against: local Capitol stack,
+A2A gateway wire schema `1.0.27` (agent card `version`), backend
+`agentic-backend-guardrails` commit `678435ca`, conch adapter at edge
+`d26eb10`+. Bump the version line whenever an observed wire fact below
+changes; the drift test in `tests/test_shipped_skills.py` keeps the
+skill ids here equal to the adapter's.
+
 The contracts a frontend app speaks, as implemented by the gateway and
 mirrored by conch's own adapter (`conch/capitol/client.py`) and the
-browser reference client
-(`~/composer/cap-app-acc-market-research/js/a2a-client.js`). Where this
-document and those implementations diverge, the implementations win —
-fix this file.
+browser client shipped with this skill
+(`templates/console/js/a2a-client.js`). Where this document and those
+implementations diverge, the implementations win — fix this file.
 
 ## The A2A gateway
 
@@ -51,8 +57,9 @@ may carry `data.retryable` and `data.actionable_hint`.
 |---|---|---|
 | `handshake` | `caller {system, version}`, `capabilities {supports_sse}` | `session.context_id` — thread onto later messages |
 | `list_workflows` | — | the agent's workflow allowlist; ids pass back verbatim |
-| `get_workflow_details` | `workflow_id` | fields list: `node_instance_id`, `field_id`, `valid_types`, `required`. Input key = `"{node_instance_id}.{field_id}"` |
-| `call_workflow` | `workflow_id?`, `inputs` (keyed map), `artifacts[]`, `idempotency_key` | returns `{run_id, session_id, status: queued\|running, sub_agents[], total_sub_agents}`; same key within 24 h ⇒ the **stored original response** (same `run_id`, `status` still `queued`, no `replayed` flag — detect replay by run id and follow with `get_workflow_status`); same key + different inputs ⇒ `-32005 IdempotencyConflict` |
+| `get_workflow_details` | `workflow_id`, `version_id?` | fields list: `node_instance_id`, `field_id`, `valid_types`, `required`. Input key = `"{node_instance_id}.{field_id}"`. Also returns `version_id` (the saved version the schema came from — latest unless pinned) and `capitol_workflow_id` (the UUID behind a slug id) |
+| `get_workflow_versions` | `workflow_id` | `{workflow_id, count, versions[{version_id, created_at}]}` newest first — the set a pin must belong to |
+| `call_workflow` | `workflow_id?`, `inputs` (keyed map), `artifacts[]`, `idempotency_key`, `version_id?` (UUID — run exactly that saved version; default latest) | returns `{run_id, session_id, status: queued\|running, sub_agents[], total_sub_agents}`; same key within 24 h ⇒ the **stored original response** (same `run_id`, `status` still `queued`, no `replayed` flag — detect replay by run id and follow with `get_workflow_status`); same key + different inputs ⇒ `-32005 IdempotencyConflict` |
 | `get_workflow_status` | `run_id` | terminal statuses: `success/failed/stopped/cancelled` |
 | `get_workflow_output` | `run_id` | terminal-node outputs under `outputs` (keyed by output node id, text in `value`) plus `logical_outputs`; eval roll-up under `eval_rollup`. File deliverables ride `workflow.files_available` events (below); some gateways also expose a terminal `files[]` with `{id, name, presigned_url, mime_type}` — normalize both |
 | `get_workflow_events` | `run_id`, `since_sequence`, `types[]` | polling fallback when streaming is unavailable |
@@ -103,6 +110,43 @@ and `data.input_kind`. `input_kind == "clarification"` answers via
 (continue/stop) answered via `submit_intervention_response` with the
 node id from the event. Render the prompt verbatim; submit the user's
 words verbatim.
+
+## Workflow versions, authoring and the approval gate
+
+Observed on the local stack (2026-10-02):
+
+- Every save of a workflow is a new **version** (`get_workflow_versions`
+  lists them newest first; `get_workflow_details.version_id` is the
+  latest). `call_workflow` and `get_workflow_details` take an optional
+  `version_id` to pin; without it the gateway uses the latest saved
+  version. The shipped console sends the pin from
+  `config.workflow_version_id` and folds it into the idempotency key.
+- Workflow ids on the wire may be slugs (`market_research_sources_sought_analyzer`)
+  or UUIDs; the admin API (`/api/v1/orgs/{org}/workflows/{id}/versions`)
+  takes the UUID only — `capitol_workflow_id` from describe.
+- Authoring is an **operator** surface, not a tool the model calls:
+  - `/compile "<goal>"` → Architecture Card (stage graph, assets to
+    create, schedules, HITL points, drill fixtures) as a kernel event;
+    `/compile approve <id>` pins the card digest (local origin only);
+    `/compile materialize <id>` drives `CapitolAdmin` in order —
+    collections → `POST /api/v1/orgs/{org}/workflows` (one new version,
+    the pin) → orchestrator agent + exact allowlist (bearer sunk into
+    the user's registry, never shown) → schedules (disabled unless the
+    card says) → pack + `materialization-lock.json` (workflow ids,
+    version ids, payload digests, schedule ids) → acceptance drill (one
+    real run) → supervising mission. Every mutation is keyed
+    `compile:<id>:<step>` and carries a rollback ref; `/compile rollback
+    <id>` replays those refs in reverse.
+  - `/capitol admin persist|publish|rollback|schedule-add|…` is the same
+    ledgered client for hand-written payloads (`--key` replays a prior
+    idempotency key). `capitol_admin=true` is required; the policy
+    registry can deny any `capitol.admin.<op>`.
+  - The compile session itself gets `capitol_control` restricted to
+    read ops; it designs, it never provisions or runs.
+- Rollback semantics: a first persist's undo deletes the workflow;
+  publish's undo re-persists with `publish_to_api=false` (same version
+  lineage); created agents and schedules are deleted. After a rollback
+  the app's preflight fails closed on the agent card — by design.
 
 ## The filestore facade
 

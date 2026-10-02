@@ -12,7 +12,7 @@ import { readFile, access } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const port = Number(process.argv[2] || process.env.PORT || 3000);
+const port = Number(process.argv[2] || process.env.PORT || 4330);
 const TYPES = { ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".html": "text/html" };
 const handlers = new Map();
 

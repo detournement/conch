@@ -3,13 +3,13 @@
  * Proves the served page carries the live document: fetches the page,
  * parses the app-data island, and reports which source the server used.
  *
- *   node verify-page.mjs [http://localhost:3000/] [--expect-source live]
+ *   node verify-page.mjs [http://localhost:4320/] [--expect-source live]
  *
  * Exit 0 when the island parses (and matches --expect-source when given),
  * 1 otherwise. Run `node serve.mjs` first (with the FILESTORE_* env set).
  */
 const args = process.argv.slice(2);
-let url = "http://localhost:3000/";
+let url = "http://localhost:4320/";
 let expectSource = null;
 for (let i = 0; i < args.length; i += 1) {
   if (args[i] === "--expect-source") expectSource = args[++i];

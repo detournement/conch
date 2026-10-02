@@ -51,6 +51,21 @@ class TestStableSystemPrompt(unittest.TestCase):
         self.assertIn("Austin, TX", prompt)
         self.assertIn("anthropic/claude-sonnet-4-6", prompt)
 
+    def test_send_cwd_renders_the_working_directory(self):
+        """``send_cwd`` (ask-mode context since day one) now reaches the
+        chat system prompt too; the process cwd is fixed for a session, so
+        the prompt stays byte-stable."""
+        import os
+
+        cwd = os.getcwd()
+        on = _build_system_prompt("base", config={"send_cwd": "true", "repo_map": "false"})
+        self.assertIn(f"Working directory: {cwd}.", on)
+        off = _build_system_prompt("base", config={"repo_map": "false"})
+        self.assertNotIn("Working directory:", off)
+        self.assertEqual(
+            on, _build_system_prompt("base", config={"send_cwd": "true", "repo_map": "false"})
+        )
+
 
 class TestAugmentUserMessage(unittest.TestCase):
     def test_timestamp_attached_to_user_message(self):

@@ -1763,7 +1763,23 @@ def chat_turn(
         max_parallel_tool_calls = 16
     previous_batch = ""
     identical_batches = 0
-    for _round in range(max_tool_rounds):
+    # The round budget is mutable: a skill loaded mid-turn (skill_manage
+    # use) may declare a larger ``rounds:`` budget, which raises this
+    # turn's bound exactly as /skill raises it before a turn starts.
+    round_budget = int(max_tool_rounds)
+    _round = -1
+    while True:
+        _round += 1
+        wanted = int(getattr(chat_state, "requested_tool_rounds", 0) or 0)
+        if wanted > round_budget:
+            print(
+                f"  \033[2m(tool round budget raised to {wanted} for this "
+                f"turn by a skill's declared rounds)\033[0m",
+                file=sys.stderr,
+            )
+            round_budget = wanted
+        if _round >= round_budget:
+            break
         if (
             token_budget
             and _round
@@ -2313,7 +2329,7 @@ def chat_turn(
     # Round budget exhausted: summarize progress instead of a bare marker
     # (plan 2.6).
     print(
-        f"  \033[33m⚠ Tool round budget ({max_tool_rounds}) exhausted — "
+        f"  \033[33m⚠ Tool round budget ({round_budget}) exhausted — "
         f"summarizing progress\033[0m",
         file=sys.stderr,
     )

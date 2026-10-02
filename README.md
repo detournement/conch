@@ -714,6 +714,11 @@ tools, model, and round budget:
 /skill <name> [task]
 ```
 
+A skill's `rounds:` budget applies whether you load it with `/skill` or the
+model loads it itself mid-turn (`skill_manage use`): the running turn's tool
+round budget rises to it, the session keeps the raised value, and it is never
+lowered (`/rounds` changes it again).
+
 The model can delegate a bounded subtask into a fresh context with
 `delegate_task`; recursive delegation and self-management tools are excluded.
 Markdown files in `~/.config/conch/commands/` become custom slash commands,

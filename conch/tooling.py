@@ -598,6 +598,11 @@ class ToolRuntimeState:
     # survive the per-request relevance cap like PINNED_TOOL_NAMES do, so a
     # later "continue" turn that never mentions the tool keeps it.
     pinned_tools: Set[str] = field(default_factory=set)
+    # A skill's declared ``rounds:`` budget requested mid-turn (skill_manage
+    # use): runtime.chat_turn raises the running turn's round budget to it
+    # and AgentSession carries it into the session budget — the same effect
+    # /skill has before a turn starts. Only ever raised, never lowered.
+    requested_tool_rounds: int = 0
 
 
 def ensure_tools_active(chat_state, names) -> List[str]:
@@ -2295,6 +2300,24 @@ class SkillManageClient:
             )
         return "\n\n".join(notes)
 
+    def _request_rounds(self, skill: dict) -> str:
+        """Honour the skill's ``rounds:`` budget the way /skill does: the
+        running turn (and then the session) is raised to it, never cut."""
+        try:
+            wanted = int(skill.get("rounds") or 0)
+        except (TypeError, ValueError):
+            wanted = 0
+        state = self._chat_state
+        if wanted <= 0 or state is None:
+            return ""
+        current = int(getattr(state, "requested_tool_rounds", 0) or 0)
+        if wanted > current:
+            state.requested_tool_rounds = wanted
+        return (
+            f"(this skill declares a budget of {wanted} tool rounds; the "
+            "session's round budget is raised to it if lower)"
+        )
+
     def _confirm(self, prompt: str) -> bool:
         _input = self._input_fn or input
         try:
@@ -2336,6 +2359,9 @@ class SkillManageClient:
             note = self._tool_availability_note(skill)
             if note:
                 text += "\n\n" + note
+            rounds_note = self._request_rounds(skill)
+            if rounds_note:
+                text += "\n\n" + rounds_note
             return self._text(text)
 
         if action == "save":

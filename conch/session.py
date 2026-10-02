@@ -143,23 +143,33 @@ class AgentSession:
             config["turn_token_budget"] = self.budgets.turn_token_budget
         from .runtime import chat_turn
 
-        return chat_turn(
-            config,
-            self.provider,
-            raw_fn,
-            messages,
-            tools,
-            tool_map,
-            self.builtin_clients,
-            max_tool_rounds=(
-                max_tool_rounds
-                if max_tool_rounds is not None
-                else self.budgets.max_tool_rounds
-            ),
-            chat_state=self.chat_state,
-            on_token=on_token,
-            input_fn=input_fn,
-        )
+        try:
+            return chat_turn(
+                config,
+                self.provider,
+                raw_fn,
+                messages,
+                tools,
+                tool_map,
+                self.builtin_clients,
+                max_tool_rounds=(
+                    max_tool_rounds
+                    if max_tool_rounds is not None
+                    else self.budgets.max_tool_rounds
+                ),
+                chat_state=self.chat_state,
+                on_token=on_token,
+                input_fn=input_fn,
+            )
+        finally:
+            # A skill loaded mid-turn (skill_manage use) that declares a
+            # larger rounds: budget keeps it for the rest of the session,
+            # exactly as /skill does (/rounds changes it again).
+            wanted = int(
+                getattr(self.chat_state, "requested_tool_rounds", 0) or 0
+            )
+            if wanted > self.budgets.max_tool_rounds:
+                self.budgets.max_tool_rounds = wanted
 
     # -- lifecycle -----------------------------------------------------------
 

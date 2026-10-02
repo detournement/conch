@@ -214,6 +214,112 @@ class TestSkillManageTool(SkillsDirTestCase):
         self.assertIn("Deleted", text)
         self.assertIsNone(get_skill("deploy-check"))
 
+    def test_use_requests_the_skills_round_budget(self):
+        self._write("deploy-check", SKILL_MD)  # rounds: 6
+        state = ToolRuntimeState(all_tools=[], tool_map={}, tools=[])
+        client = self._client()
+        client.bind_state(state)
+        text = self._call(client, {"action": "use", "name": "deploy-check"})
+        self.assertEqual(state.requested_tool_rounds, 6)
+        self.assertIn("budget of 6 tool rounds", text)
+        # a smaller skill never lowers an earlier request
+        self._write("tiny", "---\nname: tiny\nrounds: 2\n---\nbody\n")
+        self._call(client, {"action": "use", "name": "tiny"})
+        self.assertEqual(state.requested_tool_rounds, 6)
+
+    def test_use_without_rounds_requests_nothing(self):
+        self._write("plain", "---\nname: plain\n---\nbody\n")
+        state = ToolRuntimeState(all_tools=[], tool_map={}, tools=[])
+        client = self._client()
+        client.bind_state(state)
+        self._call(client, {"action": "use", "name": "plain"})
+        self.assertEqual(state.requested_tool_rounds, 0)
+
+
+class TestRoundsBudgetRaisedMidTurn(SkillsDirTestCase):
+    """NL-routed ``skill_manage use`` honours the skill's ``rounds:`` the
+    way /skill does: the running turn's round budget rises to it (never
+    falls), and the session keeps the raised budget afterwards."""
+
+    def _turn(self, skill_rounds, max_tool_rounds, *, session=None):
+        from conch.runtime import chat_turn
+
+        self._write(
+            "long-arc",
+            f"---\nname: long-arc\nrounds: {skill_rounds}\n---\n"
+            "1. scaffold\n2. verify\n3. report\n",
+        )
+        state = ToolRuntimeState(
+            all_tools=[], tool_map={}, tools=[_tool("skill_manage"), _tool("noop")],
+        )
+        skills = SkillManageClient()
+        skills.configure(interactive=False)
+        skills.bind_state(state)
+        clients = {"skill_manage": skills, "noop": _FakeShell()}
+        seen = {"tool_rounds": 0}
+
+        def raw_fn(config, messages, tools):
+            if tools is None:  # exhaustion summary
+                return {"content": "ran out", "tool_calls": None,
+                        "_usage": {"input_tokens": 1, "output_tokens": 1},
+                        "_model": "t"}
+            seen["tool_rounds"] += 1
+            n = seen["tool_rounds"]
+            if n == 1:
+                call = {"name": "skill_manage",
+                        "arguments": '{"action": "use", "name": "long-arc"}'}
+            elif n < 5:
+                call = {"name": "noop", "arguments": "{}"}
+            else:
+                return {"content": "done after five rounds", "tool_calls": None,
+                        "_usage": {"input_tokens": 1, "output_tokens": 1},
+                        "_model": "t"}
+            return {"content": "", "_model": "t",
+                    "_usage": {"input_tokens": 1, "output_tokens": 1},
+                    "tool_calls": [{"id": f"c{n}", "type": "function",
+                                    "function": call}]}
+
+        messages = [{"role": "user", "content": "do the long arc"}]
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr), patch("sys.stdout", io.StringIO()):
+            if session is not None:
+                session.attach_clients(clients, chat_state=state, bind=False)
+                session.config.update({"provider": "openai"})
+                with patch.object(session, "raw_fn", return_value=raw_fn):
+                    reply, _ = session.run_turn(messages)
+            else:
+                reply, _ = chat_turn(
+                    config={}, provider="openai", raw_fn=raw_fn,
+                    messages=messages, tools=state.tools, tool_map={},
+                    builtin_clients=clients, max_tool_rounds=max_tool_rounds,
+                    chat_state=state,
+                )
+        return reply, seen["tool_rounds"], stderr.getvalue()
+
+    def test_turn_budget_rises_to_the_skills_rounds(self):
+        # Without the raise, max_tool_rounds=2 would exhaust after two rounds.
+        reply, rounds, err = self._turn(skill_rounds=6, max_tool_rounds=2)
+        self.assertEqual(reply, "done after five rounds")
+        self.assertEqual(rounds, 5)
+        self.assertIn("tool round budget raised to 6 for this turn", err)
+
+    def test_turn_budget_is_never_lowered(self):
+        reply, rounds, err = self._turn(skill_rounds=1, max_tool_rounds=3)
+        self.assertTrue(reply.startswith("ran out"), reply)  # exhausted at 3, not cut to 1
+        self.assertEqual(rounds, 3)
+        self.assertNotIn("raised", err)
+        self.assertIn("Tool round budget (3) exhausted", err)
+
+    def test_session_keeps_the_raised_budget(self):
+        from conch.session import AgentSession, SessionBudgets
+
+        session = AgentSession(
+            {"provider": "openai"}, budgets=SessionBudgets(max_tool_rounds=2),
+        )
+        reply, rounds, _ = self._turn(skill_rounds=6, max_tool_rounds=2, session=session)
+        self.assertEqual(reply, "done after five rounds")
+        self.assertEqual(session.budgets.max_tool_rounds, 6)
+
 
 class _FakeShell:
     name = "local_shell"

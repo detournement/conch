@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from conch.capitol.commands import run_capitol_command, watch_cursor
-from conch.commands import SLASH_COMMANDS, slash_command_names
+from conch.commands import slash_command_names
 
 from tests.test_capitol_admin import (
     MINTED,

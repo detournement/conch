@@ -36,7 +36,7 @@ import subprocess
 import urllib.error
 import urllib.request
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 class SandboxError(Exception):

@@ -21,7 +21,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 from conch.execbackend import (
-    BACKEND_KINDS,
     DockerExecBackend,
     E2BExecBackend,
     SandboxError,
@@ -217,7 +216,7 @@ class _FakeE2B:
                     payload = fake._create_response or {
                         "sandboxID": "sbx-123",
                         # Point the "sandbox host" back at this fake.
-                        "domain": f"IGNORED",
+                        "domain": "IGNORED",
                         "envdAccessToken": "envd-token-abc",
                     }
                     raw = json.dumps(payload).encode()

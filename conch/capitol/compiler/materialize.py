@@ -36,6 +36,7 @@ from urllib.parse import urlparse
 
 from ...kernel.model import CompilationStatus, KernelError
 from ..admin import CapitolAdmin
+from .. import credentials as _credentials
 from ..errors import CapitolError
 from . import drill as drill_mod
 from .graph import build_workflow_payload, payload_digest
@@ -693,7 +694,9 @@ def rollback_compilation(
         )
     ensure_local_stack(config)
     admin = admin or _admin(store, config)
-    outcome: Dict[str, Any] = {"reverted": [], "skipped": []}
+    outcome: Dict[str, Any] = {
+        "reverted": [], "skipped": [], "registry_entries_removed": 0,
+    }
 
     # The supervising mission first (stop supervision before tearing
     # down what it supervises).
@@ -732,9 +735,23 @@ def rollback_compilation(
                     idempotency_key=key,
                 )
             elif kind == "delete_agent":
-                admin.delete_agent(
-                    str(ref.get("agent_id") or ""), idempotency_key=key,
+                agent_id = str(ref.get("agent_id") or "")
+                admin.delete_agent(agent_id, idempotency_key=key)
+                # The bearer minted at materialization lives only in the
+                # A2Actrl registry; with the agent gone it is dead, and a
+                # stale alias there would masquerade as a live credential.
+                # Swept here (idempotently) so rollback is complete even
+                # when the admin's own delete did not reach the registry
+                # (replayed receipts, other admin implementations).
+                removed = _credentials.forget_registry_entries(
+                    org_id=str(getattr(admin, "org_id", "") or ""),
+                    agent_id=agent_id,
                 )
+                if removed:
+                    outcome["registry_entries_removed"] += removed
+                    log(f"  registry: removed {removed} bearer entr"
+                        f"{'y' if removed == 1 else 'ies'} for agent "
+                        f"{agent_id} from {_credentials.REGISTRY_PATH}")
             elif kind == "delete_workflow":
                 admin.delete_workflow(
                     str(ref.get("workflow_id") or ""),

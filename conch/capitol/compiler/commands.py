@@ -720,12 +720,16 @@ def _cmd_rollback(store, tokens: List[str], config: dict):
     outcome = rollback_compilation(
         store, config, compilation["compilation_id"], log=_print,
     )
+    removed = int(outcome.get("registry_entries_removed") or 0)
     _print(
         f"\n  \033[1;32m✓ rolled back\033[0m — "
         f"{len(outcome['reverted'])} step(s) reverted"
         + (f", {len(outcome['skipped'])} skipped "
            "(adopted/pre-existing assets are never deleted)"
-           if outcome["skipped"] else "") + "\n"
+           if outcome["skipped"] else "")
+        + (f", {removed} registry bearer entr"
+           f"{'y' if removed == 1 else 'ies'} removed"
+           if removed else "") + "\n"
     )
 
 

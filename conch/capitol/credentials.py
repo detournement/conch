@@ -294,6 +294,71 @@ def sink_bearer_to_registry(
     return bearer_fingerprint(bearer)
 
 
+def forget_registry_entries(*, org_id: str, agent_id: str) -> int:
+    """Remove every A2Actrl registry entry for (*org_id*, *agent_id*).
+
+    The counterpart of :func:`sink_bearer_to_registry` for an agent that
+    no longer exists platform-side (``/compile rollback``, agent
+    deletion): its minted bearers can never authenticate again, so their
+    aliases must not linger as live-looking credentials. Idempotent and
+    fail-safe — returns the number of entries removed, ``0`` when the
+    registry is missing or holds none, and never raises on a malformed
+    file (the registry is left untouched). An empty *agent_id* removes
+    nothing. Other entries are preserved byte-for-byte; the rewrite is
+    atomic and 0600.
+    """
+    org_id = str(org_id or "").strip()
+    agent_id = str(agent_id or "").strip()
+    if not org_id or not agent_id:
+        return 0
+    path = REGISTRY_PATH
+    try:
+        text = path.read_text()
+    except OSError:
+        return 0
+    lines = text.splitlines()
+    blocks: List[Tuple[int, int]] = []
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip().startswith("- "):
+            if start is not None:
+                blocks.append((start, index))
+            start = index
+    if start is not None:
+        blocks.append((start, len(lines)))
+
+    def _value(block: List[str], key: str) -> str:
+        for entry_line in block:
+            stripped = entry_line.strip().lstrip("- ")
+            if stripped.startswith(f"{key}:"):
+                return stripped.split(":", 1)[1].strip().strip("'\"")
+        return ""
+
+    doomed = [
+        (begin, end) for begin, end in blocks
+        if _value(lines[begin:end], "org_id") == org_id
+        and _value(lines[begin:end], "agent_id") == agent_id
+    ]
+    if not doomed:
+        return 0
+    drop = set()
+    for begin, end in doomed:
+        drop.update(range(begin, end))
+    kept = [line for index, line in enumerate(lines) if index not in drop]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(kept) + "\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return len(doomed)
+
+
 def resolve_admin_token(
     config: dict,
     org_id: str,

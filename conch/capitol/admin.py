@@ -60,6 +60,7 @@ from ..policy import evaluate_required_policy
 from ..swarm.protocol import ActionClass
 from .credentials import (
     ensure_endpoint_allowed,
+    forget_registry_entries,
     redact_text,
     resolve_admin_token,
     sink_bearer_to_registry,
@@ -431,12 +432,21 @@ class CapitolAdmin:
 
     def delete_agent(self, agent_id: str, *,
                      idempotency_key: str) -> Dict[str, Any]:
+        """Delete the agent platform-side, then drop its bearers from the
+        A2Actrl registry: a deleted agent's minted tokens can never
+        authenticate again, so leaving their aliases behind would only
+        present dead credentials as live ones. The registry sweep runs
+        after a successful DELETE only and is idempotent."""
         def effect() -> Dict[str, Any]:
             self._request(
                 self.platform_url, f"/agents/{self.org_id}/{agent_id}",
                 method="DELETE",
             )
-            return {"agent_id": agent_id, "deleted": True}
+            removed = forget_registry_entries(
+                org_id=self.org_id, agent_id=agent_id,
+            )
+            return {"agent_id": agent_id, "deleted": True,
+                    "registry_entries_removed": removed}
         return self._mutation(
             "delete_agent", idempotency_key, {"agent_id": agent_id},
             effect,

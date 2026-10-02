@@ -452,6 +452,80 @@ class AdminCase(unittest.TestCase):
         self.assertTrue(revoked["revoked"])
         self.assertEqual(FakeAdminGateway.bearers[agent_id], [])
 
+    def test_delete_agent_forgets_its_registry_bearers_only(self):
+        """A deleted agent's minted bearers are dead platform-side; the
+        registry must not keep presenting them as live credentials —
+        while every other agent's entry survives byte-for-byte."""
+        from conch.capitol.credentials import forget_registry_entries
+
+        self.registry.write_text(
+            "# operator-maintained\n"
+            "agents:\n"
+            "- name: other-agent\n"
+            "  base_url: http://127.0.0.1:8300\n"
+            "  org_id: org-phase3\n"
+            "  agent_id: agent-other\n"
+            "  bearer: cap_a2a_OTHER\n"
+            "  description: keep me\n"
+        )
+        created = self.admin.create_orchestrator_agent(
+            "conch-phase3-gone", ["wf-1"], idempotency_key="k-gone0",
+            registry_alias="gone-alias",
+        )
+        agent_id = created["agent_id"]
+        # a second alias for the same agent on another host (the sink
+        # keys entries by org/agent/host) — must go too
+        with self.registry.open("a") as handle:
+            handle.write(
+                "- name: gone-remote\n"
+                "  base_url: https://capitol.example.net\n"
+                f"  org_id: {ORG}\n"
+                f"  agent_id: {agent_id}\n"
+                "  bearer: cap_a2a_REMOTECOPY\n"
+            )
+        before = parse_agents_yaml(self.registry.read_text())
+        self.assertEqual(
+            len([e for e in before if e.get("agent_id") == agent_id]), 2
+        )
+        deleted = self.admin.delete_agent(agent_id, idempotency_key="k-gone1")
+        self.assertTrue(deleted["deleted"])
+        self.assertEqual(deleted["registry_entries_removed"], 2)
+        after = parse_agents_yaml(self.registry.read_text())
+        self.assertEqual([e["name"] for e in after], ["other-agent"])
+        self.assertEqual(after[0]["bearer"], "cap_a2a_OTHER")
+        text = self.registry.read_text()
+        self.assertIn("# operator-maintained", text)
+        self.assertNotIn(MINTED, text)
+        self.assertEqual(self.registry.stat().st_mode & 0o777, 0o600)
+        # replay by idempotency key does not touch the registry again
+        replay = self.admin.delete_agent(agent_id, idempotency_key="k-gone1")
+        self.assertTrue(replay["replayed"])
+        # and a second sweep for an already-forgotten agent is a no-op
+        self.assertEqual(
+            forget_registry_entries(org_id=ORG, agent_id=agent_id), 0
+        )
+        self.assertEqual(self.registry.read_text(), text)
+
+    def test_forget_registry_entries_is_fail_safe(self):
+        from conch.capitol.credentials import forget_registry_entries
+
+        # missing registry
+        self.assertEqual(
+            forget_registry_entries(org_id=ORG, agent_id="agent-x"), 0
+        )
+        self.assertFalse(self.registry.exists())
+        # an empty agent id can never match (and must never wipe entries)
+        self.registry.write_text(
+            "agents:\n- name: a\n  org_id: org-phase3\n  agent_id: ''\n"
+            "  bearer: cap_a2a_A\n"
+        )
+        self.assertEqual(forget_registry_entries(org_id=ORG, agent_id=""), 0)
+        self.assertIn("cap_a2a_A", self.registry.read_text())
+        # a different org with the same agent id is left alone
+        self.assertEqual(
+            forget_registry_entries(org_id="org-elsewhere", agent_id="a"), 0
+        )
+
     def test_allowlist_pin_captures_prior_for_rollback(self):
         created = self.admin.create_orchestrator_agent(
             "conch-phase3-allow", ["wf-1"], idempotency_key="k-al0",

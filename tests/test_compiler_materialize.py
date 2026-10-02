@@ -473,6 +473,76 @@ class TestPartialFailureAndRollback(MaterializeCase):
                 log=lambda line: None,
             )
 
+    def test_rollback_forgets_the_minted_bearer_registry_entry(self):
+        """Materialization sinks the orchestrator's once-only bearer into
+        the A2Actrl registry. Rollback deletes the agent, so that alias is
+        dead — it must leave the registry too, leaving other entries
+        untouched; a second rollback of the same receipts (or a registry
+        that never had it) is a no-op, not an error."""
+        from unittest.mock import patch
+
+        from conch.capitol.credentials import parse_agents_yaml
+
+        registry = Path(self._tmp.name) / "a2a" / "agents.yaml"
+        registry.parent.mkdir()
+        cid = self.compile_and_approve()
+        admin = FakeAdmin()
+        state = self.materialize(cid, admin)
+        agent_step = next(
+            s for s in state["steps"] if s["step"].startswith("agent:")
+        )
+        agent_id = agent_step["rollback_ref"]["agent_id"]
+        registry.write_text(
+            "agents:\n"
+            "- name: unrelated\n"
+            "  base_url: http://localhost:8300\n"
+            f"  org_id: {admin.org_id}\n"
+            "  agent_id: ag-someone-else\n"
+            "  bearer: cap_a2a_UNRELATED\n"
+            f"- name: {AGENT_IDENTITY[:48]}\n"
+            "  base_url: http://localhost:8300\n"
+            f"  org_id: {admin.org_id}\n"
+            f"  agent_id: {agent_id}\n"
+            "  bearer: cap_a2a_MINTEDATMATERIALIZE\n"
+            "  description: minted by conch CapitolAdmin\n"
+        )
+        lines = []
+        with patch("conch.capitol.credentials.REGISTRY_PATH", registry):
+            outcome = rollback_compilation(
+                self.store, self.config, cid, admin=admin, log=lines.append,
+            )
+        self.assertIn(f"agent:{AGENT_IDENTITY}", outcome["reverted"])
+        self.assertEqual(outcome["registry_entries_removed"], 1)
+        self.assertTrue(any("registry: removed 1 bearer entry" in line
+                            for line in lines), lines)
+        entries = parse_agents_yaml(registry.read_text())
+        self.assertEqual([e["name"] for e in entries], ["unrelated"])
+        self.assertEqual(entries[0]["bearer"], "cap_a2a_UNRELATED")
+        self.assertNotIn("MINTEDATMATERIALIZE", registry.read_text())
+        self.assertEqual(registry.stat().st_mode & 0o777, 0o600)
+        # the recorded outcome never carries bearer bytes
+        recorded = self.store.get_compilation(cid)["materialization"]
+        self.assertNotIn("cap_a2a_", json.dumps(recorded))
+
+    def test_rollback_with_no_registry_entry_is_not_an_error(self):
+        from unittest.mock import patch
+
+        registry = Path(self._tmp.name) / "a2a" / "agents.yaml"
+        cid = self.compile_and_approve()
+        admin = FakeAdmin()
+        self.materialize(cid, admin)
+        with patch("conch.capitol.credentials.REGISTRY_PATH", registry):
+            outcome = rollback_compilation(
+                self.store, self.config, cid, admin=admin,
+                log=lambda line: None,
+            )
+        self.assertEqual(outcome["registry_entries_removed"], 0)
+        self.assertFalse(registry.exists())
+        self.assertEqual(
+            self.store.get_compilation(cid)["status"],
+            CompilationStatus.ROLLED_BACK,
+        )
+
 
 class TestDrillGate(MaterializeCase):
     def materialize_ok(self):

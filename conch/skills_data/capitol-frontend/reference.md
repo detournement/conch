@@ -54,7 +54,7 @@ may carry `data.retryable` and `data.actionable_hint`.
 | `get_workflow_details` | `workflow_id` | fields list: `node_instance_id`, `field_id`, `valid_types`, `required`. Input key = `"{node_instance_id}.{field_id}"` |
 | `call_workflow` | `workflow_id?`, `inputs` (keyed map), `artifacts[]`, `idempotency_key` | returns `run_id`; same key + same inputs ⇒ `replayed: true` (success); same key + different inputs ⇒ `-32005 IdempotencyConflict` |
 | `get_workflow_status` | `run_id` | terminal statuses: `success/failed/stopped/cancelled` |
-| `get_workflow_output` | `run_id` | terminal-node outputs; files as `files[]` with `{id, name, presigned_url, mime_type}`; eval roll-up under `eval_rollup` |
+| `get_workflow_output` | `run_id` | terminal-node outputs under `outputs` (keyed by output node id, text in `value`) plus `logical_outputs`; eval roll-up under `eval_rollup`. File deliverables ride `workflow.files_available` events (below); some gateways also expose a terminal `files[]` with `{id, name, presigned_url, mime_type}` — normalize both |
 | `get_workflow_events` | `run_id`, `since_sequence`, `types[]` | polling fallback when streaming is unavailable |
 | `subscribe_workflow_events` | `run_id`, `since_sequence`, `types[]` | sent via `message/stream` (see SSE below) |
 | `upload_file` | top-level `filename`, `content_base64`, `content_type?` | inline ≤ 50 MB; returns `file_id` for workflow file inputs. NOT a nested artifact object |
@@ -83,9 +83,11 @@ frames on `\n\n`, and join the `data:` lines of each frame as JSON:
   polling if streaming is unavailable entirely. The run keeps executing
   server-side across all of this.
 - Node progress: `node.node_started` / node-scoped events flip the
-  pipeline display pending → running → done. File deliverable events
-  carry `{file_id, filename, download_url, mime_type, size_bytes}`;
-  dedupe against the terminal output's `files[]` by id.
+  pipeline display pending → running → done. File deliverables arrive
+  as `workflow.files_available` events whose `data.files[]` rows carry
+  `{file_id, filename, download_url (presigned), mime_type,
+  size_bytes, node_id}`; dedupe by `file_id` across events and any
+  terminal-output file rows.
 
 ### HITL events
 

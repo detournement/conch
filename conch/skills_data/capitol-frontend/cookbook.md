@@ -49,9 +49,9 @@ uploads); reuse it unchanged.
    `call_workflow` with the canonical input keys and a stable
    `idempotency_key` derived from the form contents (not minted per
    click); `subscribeRunEvents` for progress with `tasks/resubscribe`
-   resume; deliverables deduped by file id across events and the
-   terminal `files[]`; `node.input_required` rendered verbatim with the
-   matching response skill on submit.
+   resume; deliverables collected from `workflow.files_available`
+   events (`data.files[]`, deduped by `file_id`); `node.input_required`
+   rendered verbatim with the matching response skill on submit.
 4. Verify live:
    - `curl -sf -H "Authorization: Bearer $CAPITOL_A2A_BEARER" <gateway_url>/.well-known/agent-card.json | head -c 200`
      — card reachable with the configured token.

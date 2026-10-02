@@ -684,7 +684,7 @@ def chat_loop(new_conversation=False, interactive=True):
     _bg_chat_state: list = [None]
 
     def _bg_load_tools():
-        mc, cs = _load_runtime_tools(builtin_clients)
+        mc, cs = _load_runtime_tools(builtin_clients, config=config)
         _bg_mcp_clients[0] = mc
         _bg_chat_state[0] = cs
         _tools_ready.set()
@@ -765,7 +765,7 @@ def chat_loop(new_conversation=False, interactive=True):
         nonlocal mcp_clients
         print("  \033[2mReloading MCP tools...\033[0m")
         mcp_mod.close_all(mcp_clients)
-        mcp_clients, new_state = _load_runtime_tools(builtin_clients)
+        mcp_clients, new_state = _load_runtime_tools(builtin_clients, config=config)
         session.mcp_clients = mcp_clients
         chat_state.all_tools = new_state.all_tools
         chat_state.tool_map = new_state.tool_map

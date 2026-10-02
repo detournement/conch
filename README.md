@@ -1051,6 +1051,7 @@ network sandbox for tools you explicitly enable or approve.
 | `capitol_bearer_env` | `CAPITOL_A2A_BEARER` | Runtime bearer environment-variable name |
 | `capitol_admin` | `false` | Enable policy-gated provisioning |
 | `capitol_platform_url` | unset | Capitol management API |
+| `capitol_docs_url` | unset | Capitol docs MCP endpoint (release-true platform documentation; `capitol-docs` skill) |
 
 <!-- markdownlint-enable MD013 -->
 

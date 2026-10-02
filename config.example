@@ -451,6 +451,15 @@ api_key_env=ANTHROPIC_API_KEY
 #capitol_platform_url=http://localhost:8811
 #capitol_admin_token_env=CAPITOL_ADMIN_TOKEN
 
+# Capitol docs: the platform's release-true documentation MCP server
+# (capitol-docs-server, mcp-servers-runner). When set, conch mounts it as
+# the MCP server "capitol-docs" (tools search_capitol_docs, how_do_i,
+# explain_concept, get_doc, whats_new, ...) and the capitol / capitol-docs
+# skills answer "what is X / how do I X" from it, citing doc ids and the
+# corpus_version. Unset = no docs tools, zero traffic. An mcp.json entry
+# named "capitol-docs" (e.g. with auth headers) takes precedence.
+#capitol_docs_url=http://localhost:8042/mcp
+
 # ProcessCompiler (/compile): a stated goal becomes a reviewed Architecture
 # Card and, on your approval, a materialized + drilled + supervised process.
 # v1 is interactive-only and materializes on the local stack only;

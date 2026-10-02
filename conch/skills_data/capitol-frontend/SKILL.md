@@ -9,10 +9,10 @@ rounds: 40
 
 Web apps whose backend is Capitol: runs over the A2A gateway, documents
 over the filestore facade. This file is the procedure; `reference.md`
-the wire contracts; `cookbook.md` the recipes, the **app catalog** and
+the wire contracts; `cookbook.md` the recipes, the **App catalog** and
 the **authoring** recipe. Known-good apps live in `templates/<archetype>/`
-beside this file (path in the `[Skill assets: …]` line at the end).
-**Copy them; never retype them.**
+beside this file (see `[Skill assets: …]`). **Copy them; never retype
+them.**
 
 ## Step 0 — pick exactly one archetype
 
@@ -23,12 +23,12 @@ beside this file (path in the `[Skill assets: …]` line at the end).
 | to *browse/search many records* behind sign-in | **portal** | `templates/portal/` |
 
 Mixing archetypes leaks tokens or fabricates data. Unsure what to
-build? Offer `cookbook.md` § App catalog entries. Ambiguous? Ask once.
+build? Offer `cookbook.md` § App catalog. Ambiguous? Ask.
 
 ## Step 1 — preflight (prove the backend is real before writing code)
 
-Console — needs `capitol_control`; without it say so and stop (no curl
-hand-rolling).
+Console — needs `capitol_control`; without it say so and stop (no
+curl).
 
 1. `capitol_control {"op": "discover"}` → agent card (name, gateway URL,
    `capabilities.streaming`). Record the gateway URL.
@@ -40,14 +40,14 @@ hand-rolling).
 
 Fed page / portal — confirm `FILESTORE_BASE`, org id, repo, document
 path or records prefix with the user (never guess); fetch one real
-document with the server-side token:
+document with the server token:
 
 ```
 curl -sf -H "Authorization: Bearer $FILESTORE_ORG_TOKEN" \
   "$FILESTORE_BASE/v1/orgs/$ORG/repos/$REPO/files/<url-encoded path>" | head -c 400
 ```
 
-That document's actual shape is the render contract.
+That document's shape is the render contract.
 
 ## Step 1b — no fitting workflow? Author one (the user approves)
 
@@ -78,7 +78,7 @@ Edit **only** the marked places (placeholders start with `REPLACE_`):
 `workflow_version_id`, field keys from Step 1), `data/baseline.json`
 (fed page: a real copy of the document), env vars per the template
 README (fed page, portal). Do not rewrite `js/a2a-client.js`,
-`js/run.js`, `api/index.js`, `api/_shared.js`; extend only on request.
+`js/run.js`, `api/index.js`, `api/_shared.js`; extend on request only.
 
 ## Step 3 — verify headlessly (no browser needed)
 
@@ -92,13 +92,13 @@ Run the template's verifier and paste the output:
 
 The console verifier derives the browser app's idempotency key, so the
 same inputs replay the existing run. A new run costs real compute: at
-most one, only if the user agreed or the workflow is a demo. Then do the
+most one, only if the user agreed or the workflow is a demo. Then the
 cookbook's fallback drill (upstream at a dead port ⇒ declared state).
 
 ## Step 4 — finish with the checklist
 
-End with this block, each line from real output (`not done — <why>`
-rather than guessing):
+End with this block, each line from real output (`not done — <why>`,
+never guessed):
 
 ```
 capitol-frontend checklist
@@ -143,20 +143,22 @@ capitol-frontend checklist
   workflows, minting bearers: never from the app or by curl — hand over
   `/compile …` / `/capitol admin …` (Step 1b).
 - **Use the tools you were given.** Never read conch's source or
-  site-packages to work around a missing tool — report the gap.
+  site-packages to work around a missing tool; report the gap.
+- **Platform facts: the docs tools** (`how_do_i`, `explain_concept`,
+  skill `capitol-docs`), cited by doc id.
 
 ## Failure modes
 
 | Symptom | Cause | Do this |
 |---|---|---|
 | no `capitol_control` | works plugin missing or `capitol_base_url` unset | user: `/install works`, set `capitol_base_url` (+ org, agent), restart; stop |
-| agent card 401 `Bearer token does not match agent` | the exported bearer is another agent's | say which agent id needs its bearer exported; stop — no diagnosis, no file/env reads |
-| `-32008` on `call_workflow` | input keys ≠ described fields | re-run `op='describe'`, copy `fields[].key` verbatim |
-| `version: … (behind)` | workflow re-saved since the build | run as pinned; offer the cookbook's Upgrading steps — never silently move the pin |
+| agent card 401 `Bearer token does not match agent` | the exported bearer is another agent's | say which agent id needs its bearer exported; stop — no file/env reads |
+| `-32008` on `call_workflow` | input keys ≠ described fields | re-run `op='describe'`; copy `fields[].key` verbatim |
+| `version: … (behind)` | workflow re-saved since the build | run as pinned; offer the cookbook's Upgrading steps — never move the pin silently |
 | fed page `source: baseline`, facade up | wrong path/org/repo or `EXPECTED_*` | curl the document (Step 1); compare `id`/`schema` |
 | portal `{"error":"misconfigured"}` | required env var missing | set it; refusing to serve is the design |
 
 Stack down, bearer missing, workflow not allowlisted (and not to be
-authored), or `capitol_control` absent: say exactly what is missing and
-what the user should do, then stop. An app that has never spoken to its
-real gateway/facade is a draft, not a deliverable.
+authored), or `capitol_control` absent: say what is missing and what
+the user should do, then stop. An app that never spoke to its real
+gateway/facade is a draft, not a deliverable.

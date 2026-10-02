@@ -1,6 +1,6 @@
 ---
 name: capitol
-description: Run and steer Capitol AI workflows and read their Procedure projections in plain language via the capitol_control tool. Use when the user asks to run, drive, check, watch, resume, or backfill a Capitol workflow; search/show a Procedure or SOP; mentions runs, HITL checkpoints, artifacts, outputs, or evals; names a workflow; or asks what the Capitol agent can do. Covers discover → confirm → start keyed → watch bounded → report outputs, plus side-effect-free Procedure reads.
+description: Run and steer Capitol AI workflows and read their Procedure projections in plain language via the capitol_control tool. Use when the user asks to run, drive, check, watch, resume, or backfill a Capitol workflow; search/show a Procedure or SOP; mentions runs, HITL checkpoints, artifacts, outputs, or evals; names a workflow; or asks what the Capitol agent can do. Covers discover → confirm → start keyed → watch bounded → report outputs, plus side-effect-free Procedure reads. Platform "what is / how do I" questions are answered from the Capitol docs tools (search_capitol_docs, how_do_i, explain_concept) with doc ids and corpus_version cited, never from memory.
 tools: capitol_control, local_shell
 ---
 
@@ -43,6 +43,23 @@ Every "run X for me" request follows one arc. Do not skip steps.
 5. **Report outputs.** On terminal success, `op='outputs'` (and
    `op='evals'` when the user cares about quality gates). Read machine
    facts from outputs, never out of assistant prose.
+
+## Platform questions: answer from the docs, not from memory
+
+"What is a pass/fail eval?", "how do I add a guardrail?", "which tools
+does an agent need to read a collection?" are documentation questions,
+not runs. When the session has the Capitol docs tools, use them first:
+`explain_concept {"term": …}` for "what is", `how_do_i {"task": …}`
+then `get_doc {"id_or_slug": …}` for "how do I", `search_capitol_docs
+{"query": …}` otherwise, `whats_new` for "what changed". Answer from the
+returned text and end with `Sources: <doc id>, … (corpus
+<corpus_version>)`. A response with `error` set (for example
+`corpus not loaded`) is reported verbatim, not papered over. If the docs
+tools are not in this session, say so — the user sets `capitol_docs_url`
+in the conch config (or `/skill capitol-docs` for the full procedure) —
+and do not improvise platform behaviour from memory. The docs say how
+the platform works at a release; `op='workflows'`/`op='describe'` say
+what exists for this org right now — report both when they differ.
 
 ## Hard rules
 

@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -29,8 +30,53 @@ class ToolExecutionResult:
     error: str = ""
 
 
+MCP_PROTOCOL_VERSION = "2025-06-18"
+_SESSION_HEADER = "mcp-session-id"
+
+
+def _parse_sse(body: str, request_id: Any = None) -> Optional[dict]:
+    """The JSON-RPC message for *request_id* from an SSE body.
+
+    A Streamable HTTP response may carry several events (progress or log
+    notifications before the actual response); prefer the one whose ``id``
+    matches, else the last parseable message.
+    """
+    last: Optional[dict] = None
+    for line in body.split("\n"):
+        if not line.startswith("data:"):
+            continue
+        try:
+            message = json.loads(line[5:].strip())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(message, dict):
+            continue
+        if request_id is not None and message.get("id") == request_id:
+            return message
+        last = message
+    return last
+
+
+def _looks_like_session_error(response: dict) -> bool:
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return False
+    message = str(error.get("message", "")).lower()
+    return "session" in message and (
+        "missing" in message or "invalid" in message or "not found" in message
+        or "expired" in message or "terminated" in message
+    )
+
+
 class HttpMcpClient:
-    """MCP client that communicates over HTTP using JSON-RPC."""
+    """MCP client that communicates over HTTP using JSON-RPC.
+
+    Speaks the Streamable HTTP transport: the first call performs the
+    ``initialize`` handshake, keeps the ``mcp-session-id`` the server
+    issues and sends it on every later request. Servers that answer
+    plain JSON-RPC without sessions keep working — the handshake is
+    best-effort and a server that rejects ``initialize`` is used as-is.
+    """
 
     name = "http"
 
@@ -42,23 +88,26 @@ class HttpMcpClient:
         # MCP servers); values are used by reference and never logged.
         self.headers = dict(headers or {})
         self._next_request_id = 1
+        self._session_id: Optional[str] = None
+        self._handshake_done = False
+        self.server_info: Dict[str, Any] = {}
 
-    def _rpc(self, method: str, params: Optional[dict] = None) -> dict:
-        """Send a JSON-RPC request to the MCP HTTP server.
+    def _post(self, payload: dict) -> Tuple[dict, Dict[str, str]]:
+        """POST one JSON-RPC message; return (message, response headers).
 
-        Supports both plain JSON and SSE (Streamable HTTP) responses,
-        as required by the MCP HTTP transport spec.
+        Supports both plain JSON and SSE (Streamable HTTP) responses, as
+        required by the MCP HTTP transport spec. Transport failures come
+        back as a JSON-RPC-shaped ``{"error": {...}}`` so callers have one
+        code path.
         """
-        request_id = self._next_request_id
-        self._next_request_id += 1
-        payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            payload["params"] = params
         request_headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             "User-Agent": "conch/1.0",
+            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
         }
+        if self._session_id:
+            request_headers[_SESSION_HEADER] = self._session_id
         request_headers.update(self.headers)
         req = urllib.request.Request(
             self.url,
@@ -68,19 +117,85 @@ class HttpMcpClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
-                ct = response.headers.get("Content-Type", "")
+                response_headers = {
+                    str(k).lower(): str(v) for k, v in response.headers.items()
+                }
+                ct = response_headers.get("content-type", "")
                 body = response.read().decode("utf-8", errors="replace")
+                if not body.strip():
+                    # 202 Accepted: the server took a notification.
+                    return {}, response_headers
                 if "event-stream" in ct:
-                    for line in body.split("\n"):
-                        if line.startswith("data: "):
-                            try:
-                                return json.loads(line[6:])
-                            except json.JSONDecodeError:
-                                continue
-                    return {"error": {"message": "No valid SSE data received"}}
-                return json.loads(body)
+                    message = _parse_sse(body, payload.get("id"))
+                    if message is None:
+                        return {"error": {"message": "No valid SSE data received"}}, response_headers
+                    return message, response_headers
+                return json.loads(body), response_headers
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+                exc.close()
+            except Exception:
+                pass
+            try:
+                parsed = json.loads(detail) if detail else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+                return parsed, {}
+            return {"error": {"message": f"HTTP {exc.code}: {detail or exc.reason}"}}, {}
         except Exception as exc:
-            return {"error": {"message": str(exc)}}
+            return {"error": {"message": str(exc)}}, {}
+
+    def _handshake(self) -> None:
+        """Streamable HTTP session setup: initialize → session id →
+        initialized notification. Best-effort; never raises."""
+        self._handshake_done = True
+        self._session_id = None
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        message, response_headers = self._post({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "conch", "version": "1.0"},
+            },
+        })
+        if "error" in message:
+            return
+        result = message.get("result") or {}
+        if isinstance(result, dict):
+            info = result.get("serverInfo")
+            if isinstance(info, dict):
+                self.server_info = dict(info)
+        session_id = response_headers.get(_SESSION_HEADER, "").strip()
+        if session_id:
+            self._session_id = session_id
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _rpc(self, method: str, params: Optional[dict] = None) -> dict:
+        """Send a JSON-RPC request to the MCP HTTP server.
+
+        Performs the session handshake on first use and once more when
+        the server reports the session gone (restart, expiry), replaying
+        the request a single time.
+        """
+        if not self._handshake_done:
+            self._handshake()
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        message, _ = self._post(payload)
+        if _looks_like_session_error(message):
+            self._handshake()
+            message, _ = self._post(payload)
+        return message
 
     def list_tools(self) -> List[dict]:
         """Query the server for available tools via JSON-RPC."""
@@ -247,7 +362,23 @@ def _expand_env(values: Optional[dict]) -> Dict[str, str]:
     return out
 
 
+CAPITOL_DOCS_SERVER_NAME = "capitol-docs"
+
+
+def capitol_docs_url(config: Optional[dict]) -> str:
+    """The Capitol docs MCP endpoint from the conch config (``capitol_docs_url``),
+    or "" when unset. The docs server answers "what is X / how do I X" for
+    the release an environment runs; pointing conch at it is one config
+    key next to ``capitol_base_url`` rather than a hand-written mcp.json
+    block. Unset = the server is absent: zero traffic."""
+    if not config:
+        return ""
+    return str(config.get("capitol_docs_url") or "").strip()
+
+
 def create_clients() -> Dict[str, Any]:
+    """MCP clients from ``mcp.json`` (config-keyed servers are added by
+    :func:`mount_config_servers`)."""
     clients: Dict[str, Any] = {}
     for name, cfg in _load_config().get("mcpServers", {}).items():
         if cfg.get("type") == "http" and cfg.get("url"):
@@ -256,6 +387,20 @@ def create_clients() -> Dict[str, Any]:
         elif cfg.get("command"):
             clients[name] = StdioMcpClient(
                 name, cfg["command"], cfg.get("args", []), cfg.get("env"))
+    return clients
+
+
+def mount_config_servers(clients: Dict[str, Any], config: Optional[dict]) -> Dict[str, Any]:
+    """Add the MCP servers the conch config names (today: the Capitol
+    docs server via ``capitol_docs_url``) to *clients*, in place.
+
+    An explicit ``mcp.json`` entry of the same name wins — it may carry
+    auth headers; the config key is the zero-ceremony path.
+    """
+    docs_url = capitol_docs_url(config)
+    if docs_url and CAPITOL_DOCS_SERVER_NAME not in clients:
+        clients[CAPITOL_DOCS_SERVER_NAME] = HttpMcpClient(
+            CAPITOL_DOCS_SERVER_NAME, docs_url)
     return clients
 
 

@@ -91,6 +91,9 @@ ENV_CONFIG_KEYS = {
     "CONCH_CAPITOL_ADMIN": "capitol_admin",
     "CONCH_CAPITOL_PLATFORM_URL": "capitol_platform_url",
     "CONCH_CAPITOL_ADMIN_TOKEN_ENV": "capitol_admin_token_env",
+    # Capitol docs MCP server (ENG-5629/5630): the release-true platform
+    # documentation endpoint. Unset = no docs tools, zero traffic.
+    "CONCH_CAPITOL_DOCS_URL": "capitol_docs_url",
     # Edge daemon / mission kernel (Swarm Phase 1). Off by default: the
     # interactive shell keeps its in-process scheduler and never imports
     # the kernel unless this is enabled.

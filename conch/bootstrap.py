@@ -277,12 +277,17 @@ def make_builtin_clients(
     return clients
 
 
-def load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False):
-    """Create MCP clients and assemble the session tool state."""
+def load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False,
+                       config: Optional[dict] = None):
+    """Create MCP clients and assemble the session tool state.
+
+    ``config`` is the conch config; it contributes config-keyed MCP
+    endpoints (``capitol_docs_url``) on top of ``mcp.json``.
+    """
     if use_cache:
         cached = mcp_mod.load_cached_tools()
         if cached is not None:
-            mcp_clients = mcp_mod.create_clients()
+            mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
             all_tools = list(cached)
             tool_map: Dict[str, Any] = {}
             # Map cached tools to clients by server name
@@ -307,7 +312,7 @@ def load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False)
             state = ToolRuntimeState(all_tools=all_tools, tool_map=tool_map, tools=tools)
             builtin_clients["manage_tools"].bind(state)
             return mcp_clients, state
-    mcp_clients = mcp_mod.create_clients()
+    mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
     all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
     mcp_mod.save_tool_cache(all_tools)
     inject_builtin_tools(all_tools, tool_map, builtin_clients)
@@ -353,7 +358,9 @@ def build_agent_session(
         memory, config, interactive=interactive,
         permissions=session.permissions,
     )
-    mcp_clients, state = load_runtime_tools(builtins, use_cache=use_cached_tools)
+    mcp_clients, state = load_runtime_tools(
+        builtins, use_cache=use_cached_tools, config=config
+    )
     session.attach_clients(builtins, chat_state=state, mcp_clients=mcp_clients)
     builtins["delegate_task"].bind_session(session)
     builtins["conch_introspect"].bind(

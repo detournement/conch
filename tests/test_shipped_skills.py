@@ -45,7 +45,7 @@ from conch.tooling import DelegateTaskClient, ToolRuntimeState
 
 from tests.test_capitol_client import AGENT, BEARER, ORG, FakeGateway
 
-SHIPPED = ("capitol", "pack-author", "capitol-frontend")
+SHIPPED = ("capitol", "pack-author", "capitol-frontend", "capitol-docs")
 
 
 class IsolatedDirsCase(unittest.TestCase):
@@ -164,6 +164,114 @@ class TestFrontmatter(IsolatedDirsCase):
         self.assertIn("Park on ambiguity", body)
         self.assertIn("Relay HITL questions verbatim", body)
         self.assertIn("Admin is user-explicit", body)
+
+    def test_capitol_routes_platform_questions_to_the_docs_tools(self):
+        """ENG-5630: 'what is / how do I' about the platform is answered
+        from the docs corpus with doc ids + corpus_version, never from
+        memory; a missing docs server is named, not papered over."""
+        skill = get_skill("capitol")
+        for tool in ("search_capitol_docs", "how_do_i", "explain_concept"):
+            self.assertIn(tool, skill["description"])
+        body = skill["body"]
+        self.assertIn("answer from the docs, not from memory", body)
+        for anchor in ('explain_concept {"term"', 'how_do_i {"task"',
+                       'get_doc {"id_or_slug"', "corpus_version",
+                       "corpus not loaded", "capitol_docs_url",
+                       "/skill capitol-docs"):
+            self.assertIn(anchor, body, anchor)
+        # The docs tools are consulted when present, not declared as
+        # required: the runtime skill must keep working without a docs server.
+        self.assertEqual(skill["tools"], ["capitol_control", "local_shell"])
+
+    def test_capitol_frontend_points_at_the_docs_tools(self):
+        body = get_skill("capitol-frontend")["body"]
+        self.assertIn("Platform facts", body)
+        for anchor in ("how_do_i", "explain_concept", "capitol-docs"):
+            self.assertIn(anchor, body, anchor)
+
+    def test_capitol_docs_frontmatter(self):
+        skill = get_skill("capitol-docs")
+        self.assertEqual(skill["name"], "capitol-docs")
+        for trigger in ("Use when", "what something on Capitol is",
+                        "how to do it", "compile", "release", "ENG-5630",
+                        "corpus_version", "quantitative-check",
+                        "data collections"):
+            self.assertIn(trigger, skill["description"], trigger)
+        # The docs tools are declared so /skill activates them and names
+        # the missing ones; local_shell drives the compile.
+        self.assertEqual(skill["tools"], [
+            "local_shell", "search_capitol_docs", "how_do_i",
+            "explain_concept", "get_doc", "whats_new",
+        ])
+        self.assertGreaterEqual(skill["rounds"], 30)
+
+    def test_capitol_docs_procedure_is_model_robust(self):
+        """Numbered steps, verbatim commands with expected output, an
+        echoed checklist, fail-closed preflights — the capitol-frontend
+        shape."""
+        body = get_skill("capitol-docs")["body"]
+        for anchor in (
+            "## A. Answering a platform question",
+            "## B. `compile <domain>`",
+            "## C. `release <from> <to>`",
+            "capitol-docs checklist",
+            "## Hard rules", "## Failure modes",
+            # fail-closed preflight lines
+            "git -C \"$REPO\" remote get-url origin",
+            "git -C \"$REPO\" status --porcelain",
+            "reference/extracts/CURRENT",
+            "python3 \"$REPO/gates/run_gates.py\"",
+            # the compile arc
+            "domain.yaml", "COVERAGE.md", "AUTHORING.md",
+            "python3 gates/run_gates.py",
+            "python3 gates/coverage_report.py --domain <domain>",
+            "gh pr create", "Faction-V/capitol-docs",
+            # the release arc
+            "python3 -m compiler diff --from <from> --to <to>",
+            "ops.release-note.<to>",
+            "python3 -m compiler build --release-name <to>",
+            # answering
+            'explain_concept', 'how_do_i {"task"', 'get_doc {"id_or_slug"',
+            "corpus_version", "corpus not loaded",
+            # hard rules
+            "No invented platform facts", "Version-true",
+            "Read-only against live systems", "Secrets never land",
+            "PRs only; Faction-V only", "Not verified live",
+        ):
+            self.assertIn(anchor, body, anchor)
+        self.assertNotIn("push origin main", body)
+
+    def test_capitol_docs_ships_doc_templates(self):
+        templates = builtin_skills_dir() / "capitol-docs" / "templates"
+        for name in ("concept.md", "howto.md", "faq.md", "runbook.md"):
+            text = (templates / name).read_text()
+            self.assertTrue(text.startswith("---\n"), name)
+            self.assertIn(f"type: {name[:-3]}", text)
+            self.assertIn("status: draft", text)
+            self.assertIn("owner: TBD", text)
+            self.assertIn("## Sources", text)
+            self.assertIn("Not verified live; documented from code at", text)
+            self.assertIn("REPLACE_", text)
+        rendered = render_skill(get_skill("capitol-docs"))
+        self.assertIn("[Skill assets:", rendered)
+        self.assertIn("templates/", rendered)
+
+    def test_capitol_docs_reference_matches_the_docs_server_tools(self):
+        """The reference documents the 13 tools of capitol-docs-server
+        (mcp-servers-runner PR #325) with their exact argument names."""
+        reference = (builtin_skills_dir() / "capitol-docs" / "reference.md").read_text()
+        for tool in ("search_capitol_docs", "get_doc", "explain_concept",
+                     "how_do_i", "list_capabilities", "list_node_reference",
+                     "get_node_reference", "list_tool_reference",
+                     "get_tool_reference", "list_workflow_patterns",
+                     "get_guide", "whats_new", "related_docs"):
+            self.assertIn(f"`{tool}`", reference, tool)
+        for arg in ("`id_or_slug`", "`term`", "`task`", "`since_version?`",
+                    "`node_type`", "`tool_name`", "`topic`", "`doc_id`"):
+            self.assertIn(arg, reference, arg)
+        self.assertIn("corpus_version", reference)
+        self.assertIn("capitol_docs_url", reference)
+        self.assertIn("mcp-session-id", reference)
 
     def test_pack_author_states_the_invariants_verbatim(self):
         body = get_skill("pack-author")["body"]

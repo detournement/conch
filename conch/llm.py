@@ -357,6 +357,7 @@ def call_anthropic(config: dict, messages: list) -> str:
 
 
 def call_ollama(config: dict, messages: list) -> str:
+    import urllib.error
     import urllib.request
 
     from .providers import (
@@ -400,6 +401,8 @@ def call_ollama(config: dict, messages: list) -> str:
             data = json.loads(r.read().decode())
     except Exception as e:
         print(f"conch: Ollama error: {e}", file=sys.stderr)
+        if isinstance(e, urllib.error.HTTPError):
+            e.close()
         return ""
     return command_from_tool_calls(data.get("message") or {})
 

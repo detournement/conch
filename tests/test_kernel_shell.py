@@ -199,7 +199,14 @@ class TestMissionCommands(ShellCase):
         self.assertIn("watch the repo", out)
         _, out = self.run_command(f"/mission abort {mission_id}",
                                   sched=sched)
-        self.assertIn("cancelled", out)
+        self.assertIn("aborted", out)
+        self.assertIn("is now cancelled", out)
+        # A finished mission cannot be aborted again: the message says so
+        # rather than announcing its old final state as if it just changed.
+        _, out = self.run_command(f"/mission abort {mission_id}",
+                                  sched=sched)
+        self.assertIn("had already finished (cancelled)", out)
+        self.assertNotIn("is now", out)
 
     def test_mission_new_json_spec(self):
         sched = self.kernel_sched()

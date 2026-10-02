@@ -20,7 +20,8 @@ class TestVersion(unittest.TestCase):
         self.assertGreaterEqual((major, minor, patch), (0, 4, 0))
 
     def test_pyproject_single_sources_version(self):
-        text = open("pyproject.toml").read()
+        with open("pyproject.toml", encoding="utf-8") as handle:
+            text = handle.read()
         self.assertIn('dynamic = ["version"]', text)
         self.assertIn('version = {attr = "conch.__version__"}', text)
         self.assertNotRegex(text, r'^version = "\d', "no hardcoded version left")

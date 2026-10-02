@@ -28,6 +28,18 @@ def _tokenize(text: str) -> set[str]:
     return {part.lower() for part in text.replace("\n", " ").split() if part.strip()}
 
 
+def _summary_tokens(text: str) -> set[str]:
+    """Word set for near-duplicate comparison: case-folded, with bullet
+    glyphs and punctuation stripped so `- Sorted downloads.` and
+    `• sorted Downloads` compare equal."""
+    words = set()
+    for part in text.replace("\n", " ").split():
+        word = part.strip("-•*·.,;:!?()[]{}\"'`").lower()
+        if word:
+            words.add(word)
+    return words
+
+
 def credential_withheld(content: str, where: str) -> bool:
     """Scan-on-read guard for one retrieved entry: True when it must be
     withheld. Legacy entries predating the write gate (or slipping
@@ -159,6 +171,29 @@ class MemoryStore:
         self._entries.append(entry)
         self._save()
         return entry
+
+    def near_duplicate(
+        self, content: str, source: Optional[str] = None, threshold: float = 0.8
+    ) -> Optional[Dict[str, Union[str, int]]]:
+        """The stored entry whose wording is near-identical to *content*
+        (token-set Jaccard similarity ≥ *threshold*), optionally limited
+        to one *source*; None when there is no such entry. Used to keep
+        repeated session summaries from piling up."""
+        candidate = _summary_tokens(content)
+        if not candidate:
+            return None
+        best: Optional[Dict[str, Union[str, int]]] = None
+        best_score = 0.0
+        for entry in self._entries:
+            if source is not None and str(entry.get("source", "")) != source:
+                continue
+            existing = _summary_tokens(str(entry.get("content", "")))
+            if not existing:
+                continue
+            score = len(candidate & existing) / len(candidate | existing)
+            if score >= threshold and score > best_score:
+                best, best_score = entry, score
+        return best
 
     def forget(self, entry_id: int) -> bool:
         before = len(self._entries)

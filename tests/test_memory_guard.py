@@ -217,6 +217,8 @@ class TestWriteGate(GuardCase):
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "sort my downloads"},
             {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "now by date"},
+            {"role": "assistant", "content": "done"},
             {"role": "user", "content": "thanks"},
         ]
 

@@ -230,6 +230,8 @@ class TestWeakModelCompaction(unittest.TestCase):
             {"role": "user", "content": "one"},
             {"role": "assistant", "content": "r"},
             {"role": "user", "content": "two"},
+            {"role": "assistant", "content": "r"},
+            {"role": "user", "content": "three"},
         ]
         config = {"provider": "ollama", "weak_model": "qwen3-8b"}
         with patch.dict("conch.providers.RAW_FNS", {"ollama": weak_raw_fn}), \

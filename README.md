@@ -49,6 +49,11 @@ one, or send a single prompt without entering the interactive shell:
 conch "explain the failing tests in this repository"
 ```
 
+Options (`--new`, `--non-interactive`, `--help`, `--version`) are recognised
+only before the prompt, so words inside a prompt are never read as options;
+put `--` before a prompt whose first word starts with a dash. Unknown options
+are rejected with a usage error.
+
 ### Edit code with a sandbox and undo
 
 Start `conch` from a Git repository, then:
@@ -433,9 +438,15 @@ show it.
 - `yolo` — commands auto-run, also toggled for a session with `/agent` or
   `/yolo`.
 
-Destructive commands such as `rm`, `dd`, `mkfs`, `git push --force`, and
-`git reset --hard` still require confirmation in agent/yolo mode and are
-refused in non-interactive runs.
+Destructive commands still require confirmation in agent/yolo mode and are
+refused in non-interactive runs: `rm`, `dd`, `mkfs`, `find … -delete`,
+`curl|sh` / `wget|sh`, `git push --force` / `+refspec` / `--delete`,
+`git reset --hard`, `git branch -D`, `git stash drop`, `rsync --delete`,
+`docker … prune`, `kubectl delete`, `terraform destroy`, `crontab -r`,
+`DELETE FROM` / `TRUNCATE` / `DROP`, `chmod 000`, `shutil.rmtree(`, and
+`> file` when `file` already exists with content (`>>`, `> /dev/null`,
+`2>&1`, and redirects into new files are ordinary). The list is a
+heuristic, not a sandbox.
 
 At the prompt, Enter or `y` runs, `n` declines with optional feedback, `e`
 edits the command, and `a` allowlists that prefix for the session. No answer
@@ -607,9 +618,18 @@ Only native tool calls are executable; repeated identical call batches stop.
 ### Conversations, memory, and context
 
 - Conversations persist across launches. `/new`, `/convos`, `/switch`,
-  `/delete`, `/clear`, and `/search` manage them.
+  `/delete`, `/clear`, and `/search` manage them. Transcript files are
+  owner-only (0600 in a 0700 directory), and credential-shaped spans in
+  model and tool output are replaced with `[credential redacted]` before
+  a transcript is written or indexed — the running session keeps the
+  original; what the user typed is stored as typed.
 - `/remember` and the `save_memory` tool write searchable memory. `/fact`
   appends bounded, always-loaded facts to `~/.config/conch/facts.md`.
+- On `/new` and exit, a `[Session summary]` memory is written only when the
+  session had substance: at least `session_summary_min_turns` user turns
+  (default 3) or any tool use. A summary near-identical to one already
+  stored is not written again. `session_summary_min_turns=0` turns
+  session summaries off.
 - Every memory write and read passes deterministic credential detection.
   Secret-bearing entries are rejected whole; legacy matches are withheld.
 - Starting in a Git repository injects a bounded repository map. `CONCH.md`,
@@ -906,6 +926,7 @@ network sandbox for tools you explicitly enable or approve.
 | `editor` | `$VISUAL`, `$EDITOR`, nano, vi | Editor for `/edit` and `/notes` |
 | `turn_token_budget` | off | Per-turn cap; exhaustion produces a progress summary |
 | `weak_model`, `weak_provider` | unset | Small model for summaries, compaction, and mission reviews |
+| `session_summary_min_turns` | `3` | User turns before a session is summarized into memory (tool use also qualifies); `0` disables |
 | `subagent_model`, `subagent_rounds` | parent, `10` | Defaults for delegated subtasks |
 | `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds |
 

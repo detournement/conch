@@ -36,19 +36,22 @@ def _atomic_write_text(path: Path, text: str):
     fsynced, so a power cut could publish the rename before the content
     reached disk. The unique name plus fsync-before-replace closes both;
     the target file is either the complete old content or the complete new
-    content, never a mix. The target's permission bits are preserved.
+    content, never a mix. Files are written 0600 (transcripts can contain
+    anything the model or a tool said), which also tightens pre-existing
+    0644 files on their next save.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(path.parent)
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     try:
-        with open(tmp, "w", encoding="utf-8") as handle:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            tmp.chmod(path.stat().st_mode & 0o7777)
+            tmp.chmod(PRIVATE_FILE_MODE)  # the umask may have widened it
         except OSError:
-            pass  # new file: keep the umask default
+            pass
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -56,6 +59,115 @@ def _atomic_write_text(path: Path, text: str):
         except OSError:
             pass
         raise
+
+
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+REDACTION_MARKER = "[credential redacted]"
+
+
+def _ensure_private_dir(directory: Path) -> None:
+    """Transcripts are private to the user: the directory is created
+    0700, and an existing one is tightened to 0700 (best effort)."""
+    directory.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
+    try:
+        if directory.stat().st_mode & 0o077:
+            directory.chmod(PRIVATE_DIR_MODE)
+    except OSError:
+        pass
+
+
+def _scrub_text(text: str) -> str:
+    from .secretguard import redact_credentials
+
+    scrubbed, _labels = redact_credentials(text, REDACTION_MARKER)
+    return scrubbed
+
+
+def scrub_messages_for_storage(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copy of *messages* with credential-shaped spans in model and tool
+    output replaced by ``REDACTION_MARKER``: assistant text, assistant
+    tool-call arguments (a `curl -H 'Authorization: …'` the model
+    composed), and tool results (the `cat .env` case). The in-memory
+    conversation is left intact for the running session; only what is
+    persisted or indexed is scrubbed."""
+    scrubbed: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            scrubbed.append(message)
+            continue
+        role = message.get("role")
+        if role in ("assistant", "tool"):
+            copy = dict(message)
+            copy["content"] = _scrub_content(copy.get("content"))
+            tool_calls = copy.get("tool_calls")
+            if isinstance(tool_calls, list):
+                copy["tool_calls"] = [_scrub_tool_call(call) for call in tool_calls]
+            scrubbed.append(copy)
+        elif role == "user" and isinstance(message.get("content"), list):
+            # Anthropic wire shape: tool results ride in a user turn as
+            # tool_result blocks. Those are tool output; the user's own
+            # text blocks are left alone.
+            copy = dict(message)
+            copy["content"] = [
+                _scrub_content([block])[0]
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+                else block
+                for block in message["content"]
+            ]
+            scrubbed.append(copy)
+        else:
+            scrubbed.append(message)
+    return scrubbed
+
+
+def _scrub_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return _scrub_text(content)
+    if isinstance(content, list):
+        blocks = []
+        for block in content:
+            if isinstance(block, dict):
+                block = dict(block)
+                for key in ("text", "content"):
+                    if isinstance(block.get(key), str):
+                        block[key] = _scrub_text(block[key])
+                    elif isinstance(block.get(key), list):
+                        block[key] = _scrub_content(block[key])
+                if "input" in block:
+                    block["input"] = _scrub_json_value(block["input"])
+                blocks.append(block)
+            elif isinstance(block, str):
+                blocks.append(_scrub_text(block))
+            else:
+                blocks.append(block)
+        return blocks
+    return content
+
+
+def _scrub_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _scrub_text(value)
+    if isinstance(value, dict):
+        return {key: _scrub_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub_json_value(item) for item in value]
+    return value
+
+
+def _scrub_tool_call(call: Any) -> Any:
+    if not isinstance(call, dict):
+        return call
+    call = dict(call)
+    function = call.get("function")
+    if isinstance(function, dict):
+        function = dict(function)
+        if isinstance(function.get("arguments"), str):
+            function["arguments"] = _scrub_text(function["arguments"])
+        elif isinstance(function.get("arguments"), (dict, list)):
+            function["arguments"] = _scrub_json_value(function["arguments"])
+        call["function"] = function
+    return call
 
 
 def _slugify_title(text: str) -> str:
@@ -98,10 +210,27 @@ class Conversation:
             "updated_at": self.updated_at,
         }
 
+    def storage_copy(self) -> "Conversation":
+        """The conversation as it may be written to disk or indexed:
+        same metadata, messages scrubbed of credential-shaped model and
+        tool output."""
+        return Conversation(
+            id=self.id,
+            title=self.title,
+            model=self.model,
+            provider=self.provider,
+            messages=scrub_messages_for_storage(self.messages),
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+            schema_version=self.schema_version,
+        )
+
     def save(self):
         self.updated_at = datetime.now().isoformat()
         self.title = self.title or _extract_title(self.messages)
-        _atomic_write_text(self.path, json.dumps(self.to_dict(), indent=2))
+        _atomic_write_text(
+            self.path, json.dumps(self.storage_copy().to_dict(), indent=2)
+        )
 
     @classmethod
     def load(cls, path: Path) -> "Conversation":
@@ -185,9 +314,13 @@ class SearchIndex:
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
-            _state_dir().mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(_state_dir() / "search.db"),
-                                   check_same_thread=False)
+            _ensure_private_dir(_state_dir())
+            db_path = _state_dir() / "search.db"
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            try:
+                os.chmod(db_path, PRIVATE_FILE_MODE)  # indexed transcript text
+            except OSError:
+                pass
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5("
                 "conv_id UNINDEXED, message_index UNINDEXED, role UNINDEXED, text)"
@@ -327,7 +460,8 @@ class ConversationManager:
         self._upsert_index_entry(conversation)
         if self._search_index.available():
             try:
-                self._search_index.index_conversation(conversation)
+                # Index what was written, never the unscrubbed original.
+                self._search_index.index_conversation(conversation.storage_copy())
             except sqlite3.Error:
                 pass
 
@@ -361,7 +495,6 @@ class ConversationManager:
         if salvaged is not None:
             try:
                 _atomic_write_text(path, json.dumps(salvaged, indent=2))
-                path.chmod(backup.stat().st_mode & 0o7777)
                 conv = Conversation.load(path)
             except (OSError, json.JSONDecodeError, KeyError, TypeError):
                 salvaged = None  # fall through to quarantine

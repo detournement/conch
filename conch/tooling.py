@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import stat as _stat
 import subprocess
 import time
 import sys
@@ -136,22 +137,103 @@ REMOTE_SAFE_COMMAND_PREFIXES = (
 
 _SHELL_CHAIN_RE = re.compile(r"[;&|`><]|\$\(")
 
+# One shell "segment": no newline, pipe, `;` or `&` — so an option is only
+# tied to the command it actually belongs to (`find … -delete`, not
+# `find … | xargs rm -delete-me`).
+_SEG = r"[^\n|;&]*"
+# A pipe into a shell interpreter, optionally via sudo: `| sh`, `| bash -s`,
+# `| sudo -E bash`. `\b` keeps `shasum`, `shuf` and friends out.
+_SHELL_WORD = r"(?:ba|z|da|k|fi|)sh\b"
+_SUDO = r"(?:sudo\s+(?:-\S+\s+)*)?"
+
 _DESTRUCTIVE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
-    r"\brm\b", r"\brmdir\b", r"\bmkfs", r"\bdd\b", r"\bshred\b",
+    # `(?<!-)` keeps option spellings such as `docker run --rm` out.
+    r"(?<!-)\brm\b", r"(?<!-)\brmdir\b", r"\bmkfs", r"\bdd\b", r"\bshred\b",
     r"\btruncate\b", r"\bshutdown\b", r"\breboot\b", r"\bhalt\b",
     r"\bpoweroff\b", r"\bkillall\b", r"\bpkill\b",
     r"git\s+push\s+[^\n]*(-f\b|--force)", r"git\s+reset\s+--hard",
     r"git\s+clean\b", r"git\s+checkout\s+\.\s*$",
     r"\bchmod\s+-r\b", r"\bchown\s+-r\b",
-    r">\s*/dev/(sd|disk|nvme)", r"\bdrop\s+(table|database)\b",
+    r">\s*/dev/(sd|disk|nvme)", r"\bdrop\s+(table|database|schema|column)\b",
     r":\s*\(\s*\)\s*\{",
+    # -- review finding F14: previously undetected, all auto-ran in agent mode
+    r"\bfind\b" + _SEG + r"\s-delete\b",
+    r"\b(?:curl|wget)\b[^\n|]*\|\s*" + _SUDO + _SHELL_WORD,
+    r"\b" + _SHELL_WORD + r"\s+(?:-\S+\s+)*<\(\s*(?:curl|wget)\b",
+    r"\b" + _SHELL_WORD + r"\s+(?:-\S+\s+)*-c\s+[\"']?\$\(\s*(?:curl|wget)\b",
+    r"git\s+push\b" + _SEG + r"\s\+\S",                # plus-refspec force
+    r"git\s+push\b" + _SEG + r"\s(?:--delete|-d)\b",   # delete remote ref
+    r"git\s+push\b" + _SEG + r"\s:\S",                 # `origin :branch`
+    r"git\s+branch\b" + _SEG + r"\s-(?-i:[a-zA-Z]*D[a-zA-Z]*)\b",
+    r"git\s+branch\b" + _SEG + r"\s(?:--delete\s+--force|--force\s+--delete)\b",
+    r"git\s+stash\s+(?:drop|clear)\b",
+    r"\brsync\b" + _SEG + r"\s--delete",
+    r"\bdocker\s+(?:\w+\s+)?prune\b",
+    r"\bdocker\s+volume\s+(?:rm|remove)\b",
+    r"\bdocker(?:\s+|-)compose\b" + _SEG + r"\sdown\b" + _SEG + r"\s(?:-v|--volumes)\b",
+    r"\bkubectl\s+delete\b",
+    r"\bhelm\s+(?:uninstall|delete|del|un)\b",
+    r"\b(?:terraform|tofu|pulumi)\s+destroy\b",
+    r"\b(?:terraform|tofu)\s+apply\b" + _SEG + r"\s-destroy\b",
+    r"\bcrontab\b" + _SEG + r"\s-\w*r\b",
+    r"\bdelete\s+from\b",
+    r"\bchmod\b" + _SEG + r"\s0?000\b",
+    r"\bchmod\b" + _SEG + r"\s[augo]*-rwx\b",
+    r"\bshutil\.rmtree\s*\(",
 )]
 
+# `cmd > file` truncates `file`. Not: `>>` (append), `2>&1` / `>&2` (fd
+# duplication), `->` / `=>` (arrows), or redirects into /dev/null-style
+# sinks. Group 1 is `|` for the explicit clobber form `>|`.
+_TRUNCATE_RE = re.compile(r"(?<![-=<>&])[&\d]?>(\|?)(?![>&])\s*([^\s|&;<>()]+)")
+_QUOTED_RE = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
+_QUOTED_PLACEHOLDER = "__quoted__"
 
-def is_destructive_command(cmd: str) -> bool:
+
+def truncation_targets(cmd: str):
+    """(clobber, target) for every `> target` redirection in *cmd*, with
+    quoted spans replaced by a placeholder first so a `>` inside a string
+    (`echo "a > b"`, `awk '$1 > 5'`) is not read as a redirection."""
+    text = _QUOTED_RE.sub(_QUOTED_PLACEHOLDER, cmd or "")
+    for match in _TRUNCATE_RE.finditer(text):
+        target = match.group(2)
+        if target.startswith("/dev/"):
+            continue  # sinks; raw block devices are caught by the pattern table
+        yield match.group(1) == "|", target
+
+
+def truncates_existing_file(cmd: str, cwd: Optional[str] = None) -> bool:
+    """True when *cmd* redirects output over a file that exists and has
+    content — the case where `>` destroys something. Redirecting into a
+    new file is ordinary work and is not flagged; a target that cannot be
+    resolved statically (`$OUT`, globs, quoted) is not flagged either,
+    except for the explicit clobber form `>|`."""
+    for clobber, target in truncation_targets(cmd):
+        if clobber:
+            return True
+        if any(ch in target for ch in "$*?[{`") or _QUOTED_PLACEHOLDER in target:
+            continue
+        path = Path(os.path.expanduser(target))
+        if not path.is_absolute():
+            path = Path(cwd or os.getcwd()) / path
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        if _stat.S_ISREG(info.st_mode) and info.st_size > 0:
+            return True
+    return False
+
+
+def is_destructive_command(cmd: str, cwd: Optional[str] = None) -> bool:
     """True for commands that can destroy data or take down the machine.
-    These prompt for confirmation even in agent/yolo mode."""
-    return any(p.search(cmd or "") for p in _DESTRUCTIVE_PATTERNS)
+    These prompt for confirmation even in agent/yolo mode and are refused
+    when nobody can be asked. *cwd* resolves relative paths for the
+    `> existing-file` truncation check (defaults to the process cwd)."""
+    text = cmd or ""
+    if any(p.search(text) for p in _DESTRUCTIVE_PATTERNS):
+        return True
+    return truncates_existing_file(text, cwd)
 
 
 def is_safe_command(cmd: str) -> bool:
@@ -949,7 +1031,7 @@ class LocalShellClient:
             where = "Run locally:"
         print(f"\n  \033[1;33m\u26a0 {where}\033[0m \033[1m{cmd}\033[0m", flush=True)
 
-        destructive = is_destructive_command(cmd)
+        destructive = is_destructive_command(cmd, cwd=self._cwd)
         mode = self.permissions().get_permission_mode()
         auto_execute = self.policy.allow_auto_execute or mode == "yolo"
 

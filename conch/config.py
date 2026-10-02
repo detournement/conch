@@ -28,6 +28,9 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # snapshot the worktree to refs/conch/checkpoints/* (user branch and
     # index untouched). /checkpoint and /undo manage them.
     "git_checkpoints": "true",
+    # A session is summarized into memory on /new and exit only when it
+    # had this many user turns (or ran a tool); 0/off disables summaries.
+    "session_summary_min_turns": "3",
 }
 
 ENV_CONFIG_KEYS = {
@@ -54,6 +57,7 @@ ENV_CONFIG_KEYS = {
     "CONCH_LOCAL_ONLY": "local_only",
     "CONCH_DETECT_LOCATION": "detect_location",
     "CONCH_AGENT_MODE": "agent_mode",
+    "CONCH_SESSION_SUMMARY_MIN_TURNS": "session_summary_min_turns",
     "CONCH_PERMISSION_MODE": "permission_mode",
     "CONCH_TOOL_PROFILE": "tool_profile",
     "CONCH_SSH_CONTROL_PERSIST": "ssh_control_persist",

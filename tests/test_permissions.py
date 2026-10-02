@@ -2,6 +2,7 @@
 yolo modes, safe-command detection, prefix allowlists, and the destructive
 check that prompts even in agent mode."""
 
+import contextlib
 import io
 import sys
 import unittest
@@ -39,6 +40,18 @@ class _CaptureStderr:
     def __exit__(self, *args):
         sys.stderr = self._old
 
+
+
+class _QuietStdout:
+    """Swallow the approval banners LocalShellClient prints so the suite's
+    output stays readable; tests that assert on stdout redirect it again
+    inside the test, which takes precedence."""
+
+    def setUp(self):
+        redirect = contextlib.redirect_stdout(io.StringIO())
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        super().setUp()
 
 class PermissionStateMixin:
     def setUp(self):
@@ -132,7 +145,7 @@ class TestCommandPrefix(unittest.TestCase):
         self.assertEqual(command_prefix(""), "")
 
 
-class TestShellPermissionFlow(PermissionStateMixin, unittest.TestCase):
+class TestShellPermissionFlow(_QuietStdout, PermissionStateMixin, unittest.TestCase):
     def _client(self, answers=(), interactive=True, auto=False):
         scripted = _ScriptedInput(answers)
         client = LocalShellClient()
@@ -198,7 +211,7 @@ class TestShellPermissionFlow(PermissionStateMixin, unittest.TestCase):
         self.assertGreater(len(scripted.prompts), 0)
 
 
-class TestPermissionModeFromConfig(PermissionStateMixin, unittest.TestCase):
+class TestPermissionModeFromConfig(_QuietStdout, PermissionStateMixin, unittest.TestCase):
     def test_config_sets_mode(self):
         from conch.app import apply_agent_mode_from_config
         apply_agent_mode_from_config({"permission_mode": "safe_auto"})

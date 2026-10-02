@@ -30,10 +30,11 @@ dependencies = [
 conch = "conch.app:main"
 conch-chat = "conch.app:main"
 conch-ask = "conch.cli:main"
-# Swarm entrypoints. conch-edge is live (Phase 1): the personal edge daemon
-# owning the mission kernel, gated on edge_daemon=true. The others remain
-# dormant — each prints a "not yet enabled" notice and exits nonzero until
-# its phase lands.
+# Swarm entrypoints, all live. conch-edge (Phase 1) is the personal edge
+# daemon owning the mission kernel, gated on edge_daemon=true.
+# conch-controller is the fleet controller (gated on fleet_controller=true);
+# conch-worker and conch-hostctl (Phase 2) are the bounded worker supervisor
+# and the stdlib-only on-host control utility.
 conch-controller = "conch.entrypoints:controller_main"
 conch-edge = "conch.entrypoints:edge_main"
 conch-worker = "conch.entrypoints:worker_main"

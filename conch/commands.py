@@ -558,10 +558,20 @@ def _handle_mission_command(command: str, arg: str, config: dict, sched):
                 "pause": client.pause, "resume": client.resume,
                 "abort": client.abort,
             }[sub]
+            before = client.get_mission(mission_id)["status"]
             action(mission_id)
             mission = client.get_mission(mission_id)
-            print(f"\n  \033[1;32m✓ {sub}\033[0m \033[2m{mission_id} is now "
-                  f"{mission['status']}\033[0m\n")
+            status = mission["status"]
+            if sub == "abort" and status == before:
+                # Abort only moves a live mission to cancelled; a mission
+                # that had already finished keeps its final state, so say
+                # that instead of announcing the old state as news.
+                print(f"\n  \033[2m· {mission_id} had already finished "
+                      f"({status}) — nothing to abort\033[0m\n")
+                return
+            verb = "aborted" if sub == "abort" else sub
+            print(f"\n  \033[1;32m✓ {verb}\033[0m \033[2m{mission_id} is now "
+                  f"{status}\033[0m\n")
             return
         print(
             "\n  \033[2mUsage: /mission show|new|pause|resume|abort|input"

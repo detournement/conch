@@ -916,8 +916,21 @@ def format_http_api_error(exc: BaseException) -> str:
                 return str(err)
         except Exception:
             pass
+        finally:
+            _close_quietly(exc)
         return str(exc)
     return str(exc)
+
+
+def _close_quietly(exc: BaseException) -> None:
+    """HTTPError carries the response body as an open file; close it once
+    the message has been extracted so nothing lingers until GC."""
+    close = getattr(exc, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 # Per-1M-token pricing (input, output). $0 = free tier.

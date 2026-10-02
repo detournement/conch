@@ -43,7 +43,19 @@ class _CaptureStderr:
         sys.stderr = self._old
 
 
-class TestLocalShellApproval(unittest.TestCase):
+
+class _QuietStdout:
+    """Swallow the approval banners LocalShellClient prints so the suite's
+    output stays readable; tests that assert on stdout redirect it again
+    inside the test, which takes precedence."""
+
+    def setUp(self):
+        redirect = contextlib.redirect_stdout(io.StringIO())
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        super().setUp()
+
+class TestLocalShellApproval(_QuietStdout, unittest.TestCase):
     def test_yes_runs_command(self):
         client = LocalShellClient()
         client.set_policy(LocalShellPolicy(
@@ -181,7 +193,7 @@ class TestLocalShellApproval(unittest.TestCase):
         self.assertIn("background tasks", result["content"][0]["text"].lower())
 
 
-class TestBeforeRunHook(unittest.TestCase):
+class TestBeforeRunHook(_QuietStdout, unittest.TestCase):
     """The pre-execution hook app.py uses for the pre-turn git checkpoint
     (/undo): fires with the command right before an approved command
     runs, not when the command is declined, and can never block it."""
@@ -272,7 +284,7 @@ class TestBeforeRunHook(unittest.TestCase):
         self.assertIn("exit code 0", result["content"][0]["text"])
 
 
-class TestNoAnswerDeclines(unittest.TestCase):
+class TestNoAnswerDeclines(_QuietStdout, unittest.TestCase):
     """No answer at the approval prompt is a "no" — never consent.
 
     A closed stdin (``conch 'prompt' < /dev/null``, an exhausted pipe) or
@@ -282,6 +294,7 @@ class TestNoAnswerDeclines(unittest.TestCase):
     """
 
     def setUp(self):
+        super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.victim = os.path.join(self._tmp.name, "victim.txt")
@@ -412,7 +425,7 @@ class TestNoAnswerDeclines(unittest.TestCase):
         self.assertTrue(os.path.exists(self.marker))
 
 
-class TestLocalShellExecution(unittest.TestCase):
+class TestLocalShellExecution(_QuietStdout, unittest.TestCase):
     def test_empty_command_errors(self):
         client = LocalShellClient()
         client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))

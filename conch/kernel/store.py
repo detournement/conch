@@ -1200,6 +1200,8 @@ class MissionStore:
         self._writer_error: Optional[BaseException] = None
         self._closed = False
         self._read_local = threading.local()
+        self._read_conns: List[sqlite3.Connection] = []
+        self._read_conns_lock = threading.Lock()
         self._writer = threading.Thread(
             target=self._writer_loop, name="conch-kernel-writer", daemon=True
         )
@@ -1338,10 +1340,18 @@ class MissionStore:
     def _read_conn(self) -> sqlite3.Connection:
         conn = getattr(self._read_local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(str(self.path), isolation_level=None)
+            # One read connection per thread, used only by that thread;
+            # check_same_thread is relaxed solely so close() can shut
+            # every reader down from whichever thread closes the store
+            # (server/tick threads' connections used to leak until GC).
+            conn = sqlite3.connect(
+                str(self.path), isolation_level=None, check_same_thread=False
+            )
             self._configure(conn, writer=False)
             conn.row_factory = sqlite3.Row
             self._read_local.conn = conn
+            with self._read_conns_lock:
+                self._read_conns.append(conn)
         return conn
 
     def close(self) -> None:
@@ -1350,10 +1360,14 @@ class MissionStore:
         self._closed = True
         self._queue.put(None)
         self._writer.join(timeout=10)
-        conn = getattr(self._read_local, "conn", None)
-        if conn is not None:
-            conn.close()
-            self._read_local.conn = None
+        with self._read_conns_lock:
+            readers, self._read_conns = self._read_conns, []
+        for conn in readers:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        self._read_local.conn = None
 
     def __enter__(self) -> "MissionStore":
         return self

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import codecs
 import contextlib
 import datetime
@@ -205,9 +206,61 @@ def _history_path() -> str:
     )
 
 
+SESSION_SUMMARY_MIN_TURNS_DEFAULT = 3
+SESSION_SUMMARY_SIMILARITY = 0.8
+
+
+def session_summary_min_turns(config: dict) -> Optional[int]:
+    """The `session_summary_min_turns` setting: user turns a session needs
+    before it is worth a summary. 0 or off/false/never disables session
+    summaries; unparseable values fall back to the default."""
+    raw = str((config or {}).get("session_summary_min_turns", "")).strip().lower()
+    if raw in ("off", "false", "never", "none", "no"):
+        return None
+    try:
+        value = int(raw) if raw else SESSION_SUMMARY_MIN_TURNS_DEFAULT
+    except ValueError:
+        return SESSION_SUMMARY_MIN_TURNS_DEFAULT
+    return None if value <= 0 else value
+
+
+def _session_used_tools(messages: List[dict]) -> bool:
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            return True
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            for block in content
+        ):
+            return True
+    return False
+
+
+def session_worth_summarizing(messages: List[dict], config: dict) -> bool:
+    """A session earns a `[Session summary]` memory when it had substance:
+    at least `session_summary_min_turns` user turns, or any tool use (work
+    was done on the machine). Trivial exchanges — a greeting, one question
+    — are not remembered, which is what kept filling memory with noise."""
+    min_turns = session_summary_min_turns(config)
+    if min_turns is None:
+        return False
+    user_turns = [
+        m for m in messages
+        if isinstance(m, dict) and m.get("role") == "user"
+        and isinstance(m.get("content"), str) and m["content"].strip()
+    ]
+    if not user_turns:
+        return False
+    return len(user_turns) >= min_turns or _session_used_tools(messages)
+
+
 def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: MemoryStore):
-    user_turns = [m for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)]
-    if len(user_turns) < 2:
+    if not session_worth_summarizing(messages, config):
         return
     try:
         summary_prompt = "Summarize this conversation in 2-3 concise bullet points."
@@ -234,11 +287,15 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
         if summary:
             from .secretguard import CredentialRejected
 
+            entry_text = f"[Session summary] {summary}"
+            near_duplicate = getattr(memory, "near_duplicate", None)
+            if near_duplicate is not None and near_duplicate(
+                entry_text, source="summary", threshold=SESSION_SUMMARY_SIMILARITY
+            ):
+                return  # the same session, or the same routine, is already remembered
             try:
                 with serialized_agent_execution():
-                    memory.add(
-                        f"[Session summary] {summary}", source="summary"
-                    )
+                    memory.add(entry_text, source="summary")
             except CredentialRejected:
                 # A summary quoting credential material is dropped whole —
                 # same discipline as the mission-lesson gate. Losing one
@@ -254,8 +311,7 @@ def _summarize_and_save_async(messages: List[dict], config: dict, raw_fn, memory
     starting a fresh conversation must not wait on it. Snapshots the
     transcript and summarizes on a daemon thread; the summary is
     best-effort, so losing it on an early exit is acceptable."""
-    user_turns = [m for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)]
-    if len(user_turns) < 2:
+    if not session_worth_summarizing(messages, config):
         return None
     snapshot = list(messages)
     thread = threading.Thread(
@@ -1500,25 +1556,90 @@ def chat_loop(new_conversation=False, interactive=True):
         conv_mgr.close()
 
 
-_USAGE = """\
-usage: conch [--new] [--non-interactive] [prompt ...]
+class _ArgumentParser(argparse.ArgumentParser):
+    """argparse with a usage error that also explains ``--``: a prompt
+    whose first word starts with a dash is the one case a user would
+    otherwise be stuck on."""
 
-The LLM-assisted shell. With no arguments, resumes your most recent
-conversation; any other arguments are sent as a one-shot prompt.
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        hint = ""
+        if "unrecognized arguments" in message:
+            hint = ("\n  (options are recognised only before the prompt;"
+                    " put -- before a prompt that starts with a dash)")
+        print(f"{self.prog}: error: {message}{hint}", file=sys.stderr)
+        sys.exit(2)
 
-options:
-  -h, --help     Show this help and exit.
-  -V, --version  Show the version and exit.
-  -n, --new      Start the interactive shell with a fresh conversation
-                 instead of resuming the most recent one (same as /new
-                 inside the shell).
-  --non-interactive
-                 Never prompt for approval: any command that would need a
-                 y/n answer is refused instead of run (fail closed), and the
-                 first-run wizard is skipped. Implied automatically when
-                 stdin is not a terminal (pipes, redirects, cron); the flag
-                 and the auto-detection are OR'd, so either one makes the
-                 session non-interactive and nothing re-enables prompting."""
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(
+        prog="conch",
+        usage="conch [-n | --new] [--non-interactive] [--] [prompt ...]",
+        description=(
+            "The LLM-assisted shell. With no arguments, resumes your most"
+            " recent\nconversation; any other arguments are sent as a"
+            " one-shot prompt."
+        ),
+        epilog=(
+            "Options are recognised only before the prompt, so words inside"
+            " a prompt are\nnever treated as options. Put -- before a prompt"
+            " whose first word starts\nwith a dash:  conch -- -rf is the"
+            " dangerous part, right?"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False,
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "-h", "--help", action="store_true",
+        help="Show this help and exit.",
+    )
+    parser.add_argument(
+        "-V", "--version", action="store_true",
+        help="Show the version and exit.",
+    )
+    parser.add_argument(
+        "-n", "--new", action="store_true",
+        help=("Start the interactive shell with a fresh conversation\n"
+              "instead of resuming the most recent one (same as /new\n"
+              "inside the shell). Takes no prompt."),
+    )
+    parser.add_argument(
+        "--non-interactive", action="store_true",
+        help=("Never prompt for approval: any command that would need a\n"
+              "y/n answer is refused instead of run (fail closed), and the\n"
+              "first-run wizard is skipped. Implied automatically when\n"
+              "stdin is not a terminal (pipes, redirects, cron); the flag\n"
+              "and the auto-detection are OR'd, so either one makes the\n"
+              "session non-interactive and nothing re-enables prompting."),
+    )
+    return parser
+
+
+def split_leading_options(argv):
+    """Split argv into (option tokens, prompt words).
+
+    Only tokens *before* the first non-option word are options; everything
+    from that word on is the prompt, verbatim, so a prompt like
+    ``what does -n mean`` keeps its ``-n``. A bare ``--`` ends the
+    options and is dropped, which is how a prompt may start with a dash.
+    """
+    for index, token in enumerate(argv):
+        if token == "--":
+            return list(argv[:index]), list(argv[index + 1:])
+        if not (token.startswith("-") and len(token) > 1):
+            return list(argv[:index]), list(argv[index:])
+    return list(argv), []
+
+
+def parse_argv(argv):
+    """-> (namespace, prompt words); exits 2 on an unknown leading option."""
+    leading, prompt = split_leading_options(argv)
+    namespace = build_arg_parser().parse_args(leading)
+    return namespace, prompt
+
+
+_USAGE = build_arg_parser().format_help()
 
 
 def session_is_interactive(argv_flag: bool = False, stdin=None) -> bool:
@@ -1540,23 +1661,16 @@ def session_is_interactive(argv_flag: bool = False, stdin=None) -> bool:
 
 
 def main():
-    argv = sys.argv[1:]
-    if argv and argv[0] in ("--version", "-V"):
+    options, argv = parse_argv(sys.argv[1:])
+    if options.version:
         from . import __version__
         print(f"conch {__version__}")
         return
-    if argv and argv[0] in ("--help", "-h"):
-        print(_USAGE)
+    if options.help:
+        print(_USAGE, end="")
         return
-    non_interactive_flag = False
-    new_conversation = False
-    while argv and argv[0] in ("--non-interactive", "--new", "-n"):
-        if argv[0] == "--non-interactive":
-            non_interactive_flag = True
-        else:
-            new_conversation = True
-        argv = argv[1:]
-    interactive = session_is_interactive(non_interactive_flag)
+    new_conversation = options.new
+    interactive = session_is_interactive(options.non_interactive)
     # First-run onboarding: on a truly unconfigured interactive launch
     # (real TTY, no config anywhere, no provider key), walk through
     # provider + key setup before anything else loads config. Pipes,

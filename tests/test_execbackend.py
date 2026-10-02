@@ -10,6 +10,8 @@ round-trip is opt-in behind CONCH_SANDBOX_DOCKER_DRILL=1.
 """
 
 import base64
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -71,7 +73,19 @@ def _auto_shell(backend=None) -> LocalShellClient:
     return client
 
 
-class BackendRoutingTests(unittest.TestCase):
+
+class _QuietStdout:
+    """Swallow the approval banners LocalShellClient prints so the suite's
+    output stays readable; tests that assert on stdout redirect it again
+    inside the test, which takes precedence."""
+
+    def setUp(self):
+        redirect = contextlib.redirect_stdout(io.StringIO())
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        super().setUp()
+
+class BackendRoutingTests(_QuietStdout, unittest.TestCase):
     def test_no_backend_runs_locally(self):
         client = _auto_shell()
         self.assertIsNone(client.exec_backend())
@@ -119,7 +133,7 @@ class BackendRoutingTests(unittest.TestCase):
         self.assertLess(len(text), 4000)
 
 
-class GatingTests(unittest.TestCase):
+class GatingTests(_QuietStdout, unittest.TestCase):
     def _make_clients(self, config: dict, extra_env=None):
         from conch.bootstrap import make_builtin_clients
         from conch.memory import MemoryStore
@@ -285,8 +299,9 @@ def _backend_for(fake: _FakeE2B, **config) -> E2BExecBackend:
         return E2BExecBackend(cfg, _urlopen=urlopen)
 
 
-class E2BContractTests(unittest.TestCase):
+class E2BContractTests(_QuietStdout, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.fake = _FakeE2B()
         self.addCleanup(self.fake.stop)
 

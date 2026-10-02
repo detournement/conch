@@ -19,11 +19,15 @@ class FakeMemory:
 
 
 def _messages():
+    # Three user turns: enough substance for a session summary at the
+    # default session_summary_min_turns.
     return [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "reply"},
         {"role": "user", "content": "two"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "three"},
     ]
 
 
@@ -96,7 +100,7 @@ class TestSummarizeAsync(unittest.TestCase):
         messages.clear()  # what happens conceptually on /new
         release.set()
         thread.join(5)
-        self.assertEqual(seen["turns"], ["one", "reply", "two"])
+        self.assertEqual(seen["turns"], ["one", "reply", "two", "reply", "three"])
 
 
 class TestSummarizeBoundedOnExit(unittest.TestCase):

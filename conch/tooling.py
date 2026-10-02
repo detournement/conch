@@ -3294,8 +3294,10 @@ class ConchConfigClient:
 
 # Sized to hold the full live capability report (every slash command +
 # tool + skill line) with headroom; the /notes family pushed the report
-# past the old 4000.
-INTROSPECT_OUTPUT_MAX = 5200
+# past the old 4000, and the source overview's module map (which must
+# reach conch/runtime.py — see _source_overview) past 5200 once
+# modelcheck.py joined the core modules.
+INTROSPECT_OUTPUT_MAX = 5600
 
 CONCH_INTROSPECT_TOOL = {
     "type": "function",

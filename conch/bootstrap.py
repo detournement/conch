@@ -13,6 +13,7 @@ wants.
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Any, Dict, Optional
 
@@ -94,7 +95,26 @@ def resolve_startup_provider(config: dict) -> tuple:
     raw_fn = RAW_FNS.get(provider)
     if raw_fn is None:
         raise StartupError(f"conch: unknown provider {provider}", code=1)
+    missing = missing_api_key_startup_error(provider, config)
+    if missing is not None:
+        raise missing
     return provider, raw_fn
+
+
+def missing_api_key_startup_error(provider: str,
+                                  config: dict) -> Optional[StartupError]:
+    """A StartupError naming the unset key variable and the remedy when
+    *provider* needs an API key that is not in the environment; None when
+    the provider is keyless or the key is present. Checked at startup so a
+    misconfigured install fails with one clear message instead of a bare
+    `[no response]` on every turn."""
+    from .providers import api_key_env_for, missing_api_key_message
+
+    key_env = api_key_env_for(provider, config)
+    if not key_env or os.environ.get(key_env, "").strip():
+        return None
+    return StartupError(f"conch: {missing_api_key_message(provider, key_env)}",
+                        code=2)
 
 
 def warn_unknown_cloud_model(provider: str, model_name: str) -> str:

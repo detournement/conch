@@ -226,6 +226,32 @@ class TestMissionCommands(ShellCase):
         _, out = self.run_command("/mission show msn-nope", sched=sched)
         self.assertIn("No mission matching", out)
 
+    def test_mission_verify_reports_and_detects_tampering(self):
+        import sqlite3
+
+        sched = self.kernel_sched()
+        self.run_command("/mission new verify demo", sched=sched)
+        _, out = self.run_command("/mission verify", sched=sched)
+        self.assertIn("Journal verified", out)
+        self.assertIn("across 1 mission(s)", out)
+        self.assertIn("hash chains", out)
+        _, out = self.run_command("/mission verify full", sched=sched)
+        self.assertIn("replay match", out)
+        _, out = self.run_command("/mission verify nonsense", sched=sched)
+        self.assertIn("Usage: /mission verify [full]", out)
+
+        db_path = Path(sched.client().status()["kernel"])
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE mission_events SET data=replace(data, 'verify demo',"
+            " 'rewritten goal') WHERE kind='mission_created'"
+        )
+        conn.commit()
+        conn.close()
+        _, out = self.run_command("/mission verify", sched=sched)
+        self.assertIn("Journal verification FAILED", out)
+        self.assertIn("hash mismatch", out)
+
     def test_approval_flow_via_commands(self):
         sched = self.kernel_sched()
         self.run_command("/mission new approval demo", sched=sched)

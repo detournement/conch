@@ -342,7 +342,11 @@ def load_config() -> Dict[str, str]:
             config["ollama_base_url"] = config["base_url"]
     elif provider == "custom":
         # Custom OpenAI-compatible endpoint (plan 2.4): vLLM, LM Studio, etc.
-        config.setdefault("api_key_env", "")
+        # Keyless unless the user names a variable: the Anthropic default
+        # from DEFAULT_CONFIG must not leak through (setdefault would keep
+        # it, and /status would then claim api_key_env=ANTHROPIC_API_KEY).
+        if "api_key_env" not in explicit:
+            config["api_key_env"] = ""
         if config.get("base_url") and not config.get("custom_base_url"):
             config["custom_base_url"] = config["base_url"]
         model = (config.get("model") or "").strip()

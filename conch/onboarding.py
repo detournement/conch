@@ -123,8 +123,13 @@ def probe_provider(provider: str, api_key: str,
     except Exception as exc:
         return False, f"unreachable ({type(exc).__name__})"
     if status in (401, 403):
+        if provider == "custom" and not api_key:
+            return False, "the endpoint requires an API key"
         return False, "the API rejected this key"
     if 200 <= status < 300:
+        if provider == "custom" and not api_key:
+            # Nothing was authenticated: say what was actually checked.
+            return True, "endpoint reachable (no key sent)"
         return True, "key accepted"
     return False, f"unexpected response (HTTP {status})"
 
@@ -194,6 +199,81 @@ def _collect_key(env_name: str) -> str:
     return key
 
 
+CUSTOM_KEY_ENV = "CONCH_CUSTOM_API_KEY"
+
+
+def discover_custom_models(base_url: str, api_key: str = "",
+                           timeout: float = 5.0) -> Tuple[Optional[List[str]], bool]:
+    """(models, tool_capable) for a custom endpoint: the models that passed
+    conch's native tool-call conformance probe when any did, else every
+    model the endpoint lists (tool_capable=False); None when unreachable.
+    A key is passed only through the process environment for the probe."""
+    from .providers import list_custom_models
+
+    config = {"provider": "custom", "custom_base_url": base_url}
+    previous = os.environ.get(CUSTOM_KEY_ENV)
+    if api_key:
+        config["api_key_env"] = CUSTOM_KEY_ENV
+        os.environ[CUSTOM_KEY_ENV] = api_key
+    try:
+        capable = list_custom_models(config, timeout=timeout, force_refresh=True)
+        if capable is None:
+            return None, False
+        if capable:
+            return list(capable), True
+        listed = list_custom_models(
+            config, timeout=timeout, tool_capable_only=False
+        )
+        return list(listed or []), False
+    finally:
+        if api_key:
+            if previous is None:
+                os.environ.pop(CUSTOM_KEY_ENV, None)
+            else:
+                os.environ[CUSTOM_KEY_ENV] = previous
+
+
+def _choose_custom_model(base_url: str, api_key: str) -> str:
+    """Pick the endpoint's model so the config is complete on first launch
+    (an empty custom_model otherwise warns on every start). Returns ""
+    when nothing could be discovered — the user is told how to set it."""
+    print(f"  {DIM}Looking up models at {base_url} …{RST}")
+    models, tool_capable = discover_custom_models(base_url, api_key)
+    if models is None:
+        print(f"  {YELLOW}! Endpoint unreachable{RST} {DIM}— add"
+              f" `custom_model = <name>` to {get_config_path()} once it is"
+              f" up (conch verifies it at startup).{RST}")
+        return ""
+    if not models:
+        print(f"  {YELLOW}! The endpoint lists no models{RST} {DIM}— set"
+              f" `custom_model = <name>` in {get_config_path()} when one is"
+              f" loaded.{RST}")
+        return ""
+    if tool_capable:
+        print(f"  {GREEN}✓ {len(models)} model(s) passed the native"
+              f" tool-call check{RST}")
+    else:
+        print(f"  {YELLOW}! No model passed the native tool-call check"
+              f"{RST} {DIM}— tool use may not work with this endpoint.{RST}")
+    if len(models) == 1:
+        print(f"  {DIM}model: {models[0]}{RST}")
+        return models[0]
+    for index, name in enumerate(models[:12], start=1):
+        print(f"    {BOLD}{index}{RST}. {name}")
+    while True:
+        raw = input(
+            f"  Model [1-{min(len(models), 12)}, Enter=1]: "
+        ).strip()
+        if not raw:
+            return models[0]
+        if raw.isdigit() and 1 <= int(raw) <= min(len(models), 12):
+            return models[int(raw) - 1]
+        if raw in models:
+            return raw
+        print(f"  {RED}Pick a number between 1 and"
+              f" {min(len(models), 12)}.{RST}")
+
+
 def run_first_run_wizard() -> bool:
     """The interactive flow. Returns True when config was written."""
     provider, env_name, _ollama_models = _choose_provider()
@@ -230,15 +310,19 @@ def run_first_run_wizard() -> bool:
 
     updates = {"provider": provider}
     if provider == "custom" and base_url:
-        updates["base_url"] = base_url
+        updates["custom_base_url"] = base_url
+        custom_model = _choose_custom_model(base_url, key)
+        if custom_model:
+            updates["custom_model"] = custom_model
+    if key and provider == "custom":
+        # Custom endpoints read OPENAI_API_KEY-style bearer via api_key_env;
+        # store under a conch-specific name and point config at it.
+        updates["api_key_env"] = CUSTOM_KEY_ENV
     config_path = set_config_values(updates, header=CONFIG_HEADER)
     if key and env_name:
         set_env_values({env_name: key})
     elif key and provider == "custom":
-        # Custom endpoints read OPENAI_API_KEY-style bearer via api_key_env;
-        # store under a conch-specific name and point config at it.
-        set_config_values({"api_key_env": "CONCH_CUSTOM_API_KEY"})
-        set_env_values({"CONCH_CUSTOM_API_KEY": key})
+        set_env_values({CUSTOM_KEY_ENV: key})
 
     print(f"\n  {GREEN}✓ You're set.{RST} {DIM}config: {config_path}")
     if key:

@@ -103,10 +103,14 @@ class TestOpenRouterBody(unittest.TestCase):
 
 
 class TestRawOpenRouter(unittest.TestCase):
-    def test_missing_key_is_silent_empty(self):
+    def test_missing_key_is_a_clear_error(self):
+        # Used to be a silent empty reply, which the shell rendered as
+        # `[no response]` (review finding F4).
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}):
             result = raw_openrouter({}, [])
-        self.assertEqual(result["content"], "")
+        self.assertTrue(result.get("_error"))
+        self.assertIn("OPENROUTER_API_KEY", result["content"])
+        self.assertIn("setup wizard", result["content"])
         self.assertIsNone(result["tool_calls"])
 
     def test_request_and_response(self):

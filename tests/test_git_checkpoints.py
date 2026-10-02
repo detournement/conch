@@ -129,6 +129,142 @@ class SnapshotTests(_RepoCase):
         self.assertFalse(os.path.exists(os.path.join(self.root, ".env")))
 
 
+class BeforeAfterTests(_RepoCase):
+    """The before/after pair behind /undo (review finding F9: a post-turn
+    snapshot alone cannot undo the turn that produced it)."""
+
+    def test_before_snapshot_is_recorded_even_when_nothing_changed(self):
+        _write(self.root, "app.py", "print('v2')\n")
+        self.assertIsNotNone(self.ckpt.snapshot("turn 1"))
+        # Nothing moved since; an "after" would dedupe, a "before" must not.
+        self.assertIsNone(self.ckpt.snapshot("turn 2 after", kind="after"))
+        before = self.ckpt.snapshot("turn 2", kind="before")
+        self.assertIsNotNone(before)
+        self.assertEqual(before["kind"], "before")
+        kinds = [e["kind"] for e in self.ckpt.list()]
+        self.assertEqual(kinds, ["after", "before"])
+
+    def test_before_snapshot_of_clean_worktree_is_recorded(self):
+        before = self.ckpt.snapshot("first turn", kind="before")
+        self.assertIsNotNone(before, "clean tree == HEAD must still record")
+        self.assertEqual(self.ckpt.list()[0]["label"], "first turn")
+
+    def test_latest_by_kind_and_labels_round_trip(self):
+        self.ckpt.snapshot("edit widgets", kind="before")
+        _write(self.root, "app.py", "print('v2')\n")
+        self.ckpt.snapshot("edit widgets", kind="after")
+        self.assertEqual(self.ckpt.latest()["kind"], "after")
+        self.assertEqual(self.ckpt.latest("before")["label"], "edit widgets")
+        self.assertEqual(self.ckpt.latest("after")["label"], "edit widgets")
+        self.assertNotEqual(self.ckpt.latest("before")["sha"],
+                            self.ckpt.latest("after")["sha"])
+
+    def test_undo_sequence_restores_pre_turn_state(self):
+        before = self.ckpt.snapshot("rewrite app", kind="before")
+        _write(self.root, "app.py", "print('v2')\n")
+        _write(self.root, "new.txt", "created by the turn\n")
+        self.ckpt.snapshot("rewrite app", kind="after")
+        # The old /undo restored the latest entry — the post-turn state —
+        # which is a no-op. The before entry is what undo needs.
+        self.assertFalse(self.ckpt.worktree_matches(before["sha"]))
+        ok, _ = self.ckpt.restore(self.ckpt.latest("before")["sha"])
+        self.assertTrue(ok)
+        with open(os.path.join(self.root, "app.py")) as fh:
+            self.assertEqual(fh.read(), "print('v1')\n")
+        self.assertTrue(self.ckpt.worktree_matches(before["sha"]))
+        # Files the turn created are left alone, as documented.
+        self.assertTrue(os.path.exists(os.path.join(self.root, "new.txt")))
+
+    def test_two_snapshots_in_one_millisecond_keep_distinct_refs(self):
+        from unittest.mock import patch
+
+        with patch("conch.gitcheckpoint.time.time", return_value=1_700_000_000.0):
+            self.ckpt.snapshot("turn", kind="before")
+            _write(self.root, "app.py", "print('v2')\n")
+            self.ckpt.snapshot("turn", kind="after")
+        self.assertEqual(len(self.ckpt.list()), 2)
+
+    def test_unknown_kind_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.ckpt.snapshot("x", kind="sideways")
+
+    def test_legacy_subject_parses_as_after(self):
+        from conch.gitcheckpoint import _parse_subject
+
+        self.assertEqual(_parse_subject("conch checkpoint: old"), ("after", "old"))
+        self.assertEqual(_parse_subject("conch checkpoint [before]: t"),
+                         ("before", "t"))
+        self.assertEqual(_parse_subject("something else"),
+                         ("after", "something else"))
+
+
+class UndoCommandTests(_RepoCase):
+    """/undo through the slash-command handler: reverts to the last
+    'before' checkpoint, checkpoints the current state first, is
+    idempotent, and never runs on an empty or before-less history."""
+
+    def _undo(self, answer="y"):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        from conch.commands import handle_slash_command
+
+        out = io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            with contextlib.redirect_stdout(out), \
+                    patch("builtins.input", return_value=answer):
+                handle_slash_command(
+                    "/undo", {}, "ollama", "qwen3", lambda v: None
+                )
+        finally:
+            os.chdir(cwd)
+        return out.getvalue()
+
+    def _app(self):
+        with open(os.path.join(self.root, "app.py")) as fh:
+            return fh.read()
+
+    def test_undo_reverts_last_turn_and_is_idempotent(self):
+        self.ckpt.snapshot("make it v2", kind="before")
+        _write(self.root, "app.py", "print('v2')\n")
+        self.ckpt.snapshot("make it v2", kind="after")
+        _write(self.root, "app.py", "print('v2 plus manual edit')\n")
+
+        output = self._undo()
+        self.assertIn("make it v2", output)
+        self.assertIn("\u2713", output)
+        self.assertEqual(self._app(), "print('v1')\n")
+        labels = [e["label"] for e in self.ckpt.list()]
+        self.assertTrue(any(lbl.startswith("before /undo of") for lbl in labels),
+                        labels)
+
+        again = self._undo()
+        self.assertIn("Nothing to undo", again)
+        self.assertEqual(self._app(), "print('v1')\n")
+
+    def test_undo_declined_changes_nothing(self):
+        self.ckpt.snapshot("make it v2", kind="before")
+        _write(self.root, "app.py", "print('v2')\n")
+        self.ckpt.snapshot("make it v2", kind="after")
+        output = self._undo(answer="n")
+        self.assertIn("cancelled", output)
+        self.assertEqual(self._app(), "print('v2')\n")
+
+    def test_undo_without_any_checkpoints(self):
+        output = self._undo()
+        self.assertIn("Nothing to undo", output)
+
+    def test_undo_with_only_after_checkpoints_points_at_restore(self):
+        _write(self.root, "app.py", "print('v2')\n")
+        self.ckpt.snapshot("legacy turn")  # pre-fix history: after only
+        output = self._undo()
+        self.assertIn("/checkpoint restore", output)
+        self.assertEqual(self._app(), "print('v2')\n")
+
+
 class RestoreTests(_RepoCase):
     def test_restore_round_trip(self):
         _write(self.root, "app.py", "print('v2')\n")

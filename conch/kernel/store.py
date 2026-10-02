@@ -4520,6 +4520,34 @@ class MissionStore:
                 verified += 1
         return verified
 
+    def verify_journal(self, full: bool = False) -> Dict[str, Any]:
+        """Verify the event journal and report what was checked and how long
+        it took. The default is the bounded startup check — every mission's
+        hash chain, no replay — which is linear in the number of events.
+        ``full=True`` adds the SQLite integrity check and replay
+        equivalence (``verify_integrity``). Raises KernelError on any
+        mismatch; nothing is modified either way."""
+        started = _time.monotonic()
+        conn = self._read_conn()
+        missions = int(conn.execute(
+            "SELECT COUNT(DISTINCT mission_id) FROM mission_events"
+        ).fetchone()[0])
+        if full:
+            result = self.verify_integrity()
+            events = int(result["events_verified"])
+            replay = result["replay"]
+        else:
+            events = self.verify_chain()
+            replay = "skipped"
+        return {
+            "events_verified": events,
+            "missions": missions,
+            "replay": replay,
+            "seconds": round(_time.monotonic() - started, 3),
+            "checked_at": float(_time.time()),
+            "full": bool(full),
+        }
+
     def replay_projections(self) -> sqlite3.Connection:
         """Rebuild every replayed projection into a fresh in-memory database
         by applying the event journal in order. Fails closed on unknown

@@ -7,6 +7,7 @@ is never returned as a chat reply, appended to history, or saved to memory.
 """
 
 import io
+import os
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -82,6 +83,103 @@ class TestRawOllamaUnifiedErrors(unittest.TestCase):
         self.assertTrue(result.get("_error"))
         self.assertTrue(result["content"].startswith("[API error:"))
         self.assertNotIn("Ollama error", result["content"])
+
+
+class TestMissingApiKeyIsAnError(unittest.TestCase):
+    """A provider whose key env var is unset must answer with a clear
+    error naming the variable and the remedy — never a bare empty reply
+    (which the shell used to print as `[no response]`)."""
+
+    def _without(self, *names):
+        env = {k: v for k, v in os.environ.items() if k not in names}
+        return patch.dict(os.environ, env, clear=True)
+
+    def _assert_missing_key_error(self, result, env_name, provider):
+        self.assertTrue(result.get("_error"), result)
+        detail = result["content"]
+        self.assertIn(env_name, detail)
+        self.assertIn(provider, detail)
+        self.assertIn("setup wizard", detail)
+        self.assertIn("/env", detail)
+        self.assertTrue(is_structural_error(detail),
+                        "must not retry the same provider's other models")
+        self.assertFalse(is_transient_error(detail))
+
+    def test_every_keyed_provider_sync_and_stream(self):
+        from conch import providers
+
+        cases = [
+            ("openai", "OPENAI_API_KEY", providers.raw_openai,
+             providers.stream_openai),
+            ("anthropic", "ANTHROPIC_API_KEY", providers.raw_anthropic,
+             providers.stream_anthropic),
+            ("cerebras", "CEREBRAS_API_KEY", providers.raw_cerebras,
+             providers.stream_cerebras),
+            ("openrouter", "OPENROUTER_API_KEY", providers.raw_openrouter,
+             providers.stream_openrouter),
+            ("bedrock", "AWS_BEARER_TOKEN_BEDROCK", providers.raw_bedrock,
+             providers.stream_bedrock),
+        ]
+        for provider, env_name, raw_fn, stream_fn in cases:
+            with self.subTest(provider=provider), self._without(env_name), \
+                    patch("urllib.request.urlopen",
+                          side_effect=AssertionError("network call")):
+                config = {"provider": provider}
+                self._assert_missing_key_error(
+                    raw_fn(config, [{"role": "user", "content": "hi"}]),
+                    env_name, provider,
+                )
+                self._assert_missing_key_error(
+                    stream_fn(config, [{"role": "user", "content": "hi"}],
+                              None, lambda _t: None),
+                    env_name, provider,
+                )
+
+    def test_configured_api_key_env_name_is_reported(self):
+        from conch.providers import raw_openai
+
+        with self._without("OPENAI_API_KEY", "TEAM_OPENAI_KEY"):
+            result = raw_openai(
+                {"provider": "openai", "api_key_env": "TEAM_OPENAI_KEY"},
+                [{"role": "user", "content": "hi"}],
+            )
+        self.assertIn("TEAM_OPENAI_KEY", result["content"])
+        self.assertNotIn("OPENAI_API_KEY is", result["content"])
+
+    def test_message_helper_falls_back_to_default_env_name(self):
+        from conch.providers import missing_api_key_message
+
+        self.assertIn("ANTHROPIC_API_KEY",
+                      missing_api_key_message("anthropic", ""))
+
+    def test_one_shot_turn_reports_missing_key_and_fails(self):
+        """End to end through chat_turn: the user sees the env var, the
+        turn fails (empty reply + usage error), nothing is persisted."""
+        from conch.providers import raw_anthropic
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+        ]
+        err = io.StringIO()
+        with self._without("ANTHROPIC_API_KEY"), \
+                patch("sys.stderr", err), \
+                patch("conch.runtime.time.sleep"), \
+                patch("conch.providers.get_fallback_chain", return_value=[]):
+            reply, usage = chat_turn(
+                config={"provider": "anthropic", "chat_model": "claude-sonnet-5"},
+                provider="anthropic",
+                raw_fn=raw_anthropic,
+                messages=messages,
+                tools=None,
+                tool_map={},
+                builtin_clients={},
+                max_tool_rounds=3,
+            )
+        self.assertEqual(reply, "")
+        self.assertIn("ANTHROPIC_API_KEY", usage.get("error", ""))
+        self.assertIn("ANTHROPIC_API_KEY", err.getvalue())
+        self.assertEqual(len(messages), 2)
 
 
 class _QuietStderr(unittest.TestCase):

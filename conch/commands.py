@@ -35,6 +35,68 @@ from .tooling import (
 
 
 # ---------------------------------------------------------------------------
+# Unknown-command handling. Every builtin the dispatcher below answers to,
+# listed explicitly so a typo gets a nearest-match suggestion instead of
+# silence; tests/test_user_commands.py asserts this stays in sync with the
+# literals handle_slash_command compares against.
+# ---------------------------------------------------------------------------
+
+BUILTIN_SLASH_COMMANDS = (
+    "/?", "/agent", "/approvals", "/approve", "/apps", "/cancel",
+    "/checkpoint", "/clear", "/connect", "/convos", "/cost", "/delete",
+    "/deny", "/disable", "/edit", "/enable", "/fact", "/facts", "/find",
+    "/forget", "/grep", "/h", "/help", "/install", "/list", "/llamaidx",
+    "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
+    "/models", "/new", "/note", "/notes", "/paste", "/profile", "/profiles",
+    "/provider", "/queue", "/registry", "/reload", "/remember", "/reset",
+    "/resettools", "/rounds", "/s", "/sandbox", "/schedule", "/search",
+    "/skill", "/skills", "/ssh", "/status", "/switch", "/tasks",
+    "/terminal", "/tks", "/todo", "/tools", "/tty", "/undo", "/verbose",
+    "/yolo",
+)
+
+# Handled by the shell loop before the dispatcher sees them.
+_LOOP_SLASH_COMMANDS = ("/q",)
+
+# Commands an optional product contributes. When the product is not
+# installed its plugin never registers, so the dispatcher would otherwise
+# fall through to "unknown" — point at the component instead.
+_OPTIONAL_PRODUCT_COMMANDS = {
+    "/compile": ("Works", "/install works"),
+    "/capitol": ("Works", "/install works"),
+    "/ebay": ("Works", "/install works"),
+}
+
+
+def known_slash_commands() -> List[str]:
+    """Every command the shell currently answers to: builtins, loop
+    commands, registered product commands, and user-defined commands."""
+    from .plugins import slash_commands
+
+    names = set(BUILTIN_SLASH_COMMANDS) | set(_LOOP_SLASH_COMMANDS)
+    names.update(entry.name for entry in slash_commands())
+    names.update(f"/{name}" for name in load_user_commands())
+    return sorted(names)
+
+
+def unknown_slash_command_message(command: str,
+                                  known: Optional[List[str]] = None) -> str:
+    """Operator-facing text for a command nothing claimed."""
+    import difflib
+
+    if command in _OPTIONAL_PRODUCT_COMMANDS:
+        product, remedy = _OPTIONAL_PRODUCT_COMMANDS[command]
+        return (
+            f"{command} needs the {product} module, which isn't installed "
+            f"— run {remedy} to add it."
+        )
+    candidates = known if known is not None else known_slash_commands()
+    matches = difflib.get_close_matches(command, candidates, n=3, cutoff=0.6)
+    hint = f" — did you mean {', '.join(matches)}?" if matches else ""
+    return f"Unknown command {command}{hint} — try /help"
+
+
+# ---------------------------------------------------------------------------
 # User-defined slash commands (plan 1.7): markdown files in
 # ~/.config/conch/commands/ become /name commands; the file body is a prompt
 # template with $ARGUMENTS interpolation.
@@ -110,12 +172,13 @@ SLASH_COMMANDS = [
      "Run approved shell commands in a sandbox instead of locally"),
     ("/checkpoint [list|diff <#>|restore <#>|on|off]",
      "Turn-level git checkpoints of the worktree (refs/conch/checkpoints)"),
-    ("/undo", "Restore the worktree from the latest git checkpoint"),
+    ("/undo", "Revert the last turn that ran commands (pre-turn git checkpoint)"),
     ("/schedule <interval> <prompt>", "Schedule a recurring task"),
     ("/tasks", "List scheduled tasks"),
     ("/cancel <id>", "Cancel a scheduled task"),
     ("/missions", "List durable missions (edge daemon)"),
-    ("/mission <show|new|pause|resume|abort|input> ...", "Manage a mission"),
+    ("/mission <show|new|pause|resume|abort|input|verify> ...",
+     "Manage a mission; verify checks the journal hash chain"),
     ("/install [component]",
      "List conch components or set one up (edge, fleet, works)"),
     ("/todo [add|done|due|list|show|work|escalate ...]",
@@ -345,6 +408,37 @@ def _handle_mission_command(command: str, arg: str, config: dict, sched):
         parts = arg.split(None, 1)
         sub = parts[0].lower() if parts else ""
         rest = parts[1].strip() if len(parts) > 1 else ""
+        if sub == "verify":
+            full = rest.lower() == "full"
+            if rest and not full:
+                print("\n  \033[2mUsage: /mission verify [full]\033[0m\n")
+                return
+            try:
+                report = client.verify(full=full)
+            except KernelError as exc:
+                print(
+                    f"\n  \033[31m\u2717 Journal verification FAILED:"
+                    f" {exc}\033[0m\n  \033[2mThe mission journal is"
+                    " append-only and hash-chained; a mismatch means the"
+                    " kernel database was changed outside the kernel or is"
+                    " damaged. A running conch-edge refuses to start on"
+                    " this. Restore your backup copy of the kernel database"
+                    " or move it aside.\033[0m\n"
+                )
+                return
+            scope = (
+                "hash chains + SQLite integrity + replay equivalence"
+                if report.get("full") else "hash chains"
+            )
+            replay = report.get("replay", "skipped")
+            print(
+                f"\n  \033[1;32m\u2713 Journal verified\033[0m \033[2m\u2014"
+                f" {report.get('events_verified', 0)} event(s) across"
+                f" {report.get('missions', 0)} mission(s) in"
+                f" {float(report.get('seconds', 0.0)):.3f}s"
+                f" ({scope}; replay {replay})\033[0m\n"
+            )
+            return
         if sub == "new":
             if not rest:
                 print(
@@ -470,8 +564,8 @@ def _handle_mission_command(command: str, arg: str, config: dict, sched):
                   f"{mission['status']}\033[0m\n")
             return
         print(
-            "\n  \033[2mUsage: /mission show|new|pause|resume|abort|input "
-            "...\033[0m\n"
+            "\n  \033[2mUsage: /mission show|new|pause|resume|abort|input"
+            "|verify ...\033[0m\n"
         )
     except KernelError as exc:
         print(f"\n  \033[31mMission command failed: {exc}\033[0m\n")
@@ -1207,6 +1301,59 @@ def _handle_registry_command(arg: str, config: dict) -> None:
     print(_REGISTRY_USAGE)
 
 
+def _undo_last_turn(ckpt) -> None:
+    """``/undo``: put the worktree back to the state recorded just before
+    the most recent turn that ran a command (its ``before`` checkpoint).
+    Idempotent — a second /undo reports there is nothing further to undo
+    and points at ``/checkpoint restore <#>`` for going further back."""
+    entries = ckpt.list()
+    target = ckpt.latest("before")
+    if target is None:
+        if entries:
+            print("\n  \033[2mNo pre-turn checkpoint recorded yet — /undo"
+                  " reverts the last turn that ran commands. Older"
+                  " snapshots: /checkpoint list, then /checkpoint restore"
+                  " <#>.\033[0m\n")
+        else:
+            print("\n  \033[2mNothing to undo — no turn has run commands"
+                  " in this repository yet.\033[0m\n")
+        return
+    number = next(
+        (i for i, e in enumerate(entries, 1) if e["ref"] == target["ref"]),
+        len(entries),
+    )
+    if ckpt.worktree_matches(target["sha"]):
+        print(f"\n  \033[2mNothing to undo — the worktree already matches"
+              f" the state before \u201c{target['label']}\u201d"
+              f" (checkpoint #{number}). Further back: /checkpoint list ·"
+              f" /checkpoint restore <#>.\033[0m\n")
+        return
+    print(f"\n  Undo \u201c\033[1m{target['label']}\033[0m\u201d \u2014"
+          f" restore the worktree to checkpoint #{number}"
+          f" ({target['sha'][:10]}, before that turn ran its first"
+          " command)?")
+    print("  \033[2mOverwrites files present in the snapshot; files created"
+          " afterwards are left alone. Uncommitted — nothing touches your"
+          " branch. The current state is checkpointed first.\033[0m")
+    try:
+        answer = input("  \033[1;33mUndo? [y/N]\033[0m ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer not in ("y", "yes"):
+        print("  \033[2m(cancelled)\033[0m\n")
+        return
+    # Safety net: whatever is in the worktree now (the turn's result plus
+    # any manual edits since) stays reachable via /checkpoint restore.
+    ckpt.snapshot(f"before /undo of \u201c{target['label']}\u201d", kind="after")
+    ok, msg = ckpt.restore(target["sha"])
+    marker = "\033[1;32m\u2713\033[0m" if ok else "\033[31m\u2717\033[0m"
+    print(f"  {marker} {msg}")
+    if ok:
+        print("  \033[2mFurther back: /checkpoint list · /checkpoint restore"
+              " <#>\033[0m")
+    print()
+
+
 def handle_slash_command(
     cmd: str,
     config: dict,
@@ -1265,12 +1412,12 @@ def handle_slash_command(
             "  \033[1m/tks [on|off]\033[0m        Toggle the per-message token stats line (tok/s)\n"
             "  \033[1m/sandbox [docker|e2b|off]\033[0m Run approved commands in a sandbox, not locally\n"
             "  \033[1m/checkpoint [verb]\033[0m    List/diff/restore turn-level git checkpoints\n"
-            "  \033[1m/undo\033[0m                Restore the worktree from the latest checkpoint\n"
+            "  \033[1m/undo\033[0m                Revert the last turn that ran commands\n"
             "  \033[1m/schedule <interval> <prompt>\033[0m  Schedule a task\n"
             "  \033[1m/tasks\033[0m               List scheduled tasks\n"
             "  \033[1m/cancel <id>\033[0m         Cancel a scheduled task\n"
             "  \033[1m/missions\033[0m            List durable missions (edge daemon)\n"
-            "  \033[1m/mission show|new|pause|resume|abort|input\033[0m  Manage a mission\n"
+            "  \033[1m/mission show|new|pause|resume|abort|input|verify\033[0m  Manage a mission / verify the journal\n"
             "  \033[1m/install [component]\033[0m List or set up components (edge, fleet, works, capture)\n"
             "  \033[1m/todo\033[0m                Today's personal todos (due, overdue, most urgent)\n"
             "  \033[1m/todo add <title> [due:...] [p1-5] [#tag] [-- body]\033[0m  Capture a todo\n"
@@ -1486,7 +1633,8 @@ def handle_slash_command(
         parts = arg.split()
         verb = parts[0].lower() if parts else ""
         if command == "/undo":
-            verb, parts = "restore", ["restore", "latest"]
+            _undo_last_turn(ckpt)
+            return None
 
         if verb in ("on", "off"):
             config["git_checkpoints"] = "true" if verb == "on" else "false"
@@ -1498,15 +1646,20 @@ def handle_slash_command(
         entries = ckpt.list()
         if verb in ("", "list"):
             if not entries:
-                print("\n  \033[2mNo checkpoints yet — one is saved after"
-                      " every turn that changes the worktree.\033[0m\n")
+                print("\n  \033[2mNo checkpoints yet — a turn that runs"
+                      " commands saves one before its first command and"
+                      " one after it changes the worktree.\033[0m\n")
                 return None
             print("\n  \033[1;36mGit checkpoints (oldest first):\033[0m\n")
             for i, entry in enumerate(entries, 1):
+                kind = entry.get("kind", "after")
                 print(f"  \033[1m{i}\033[0m  {entry['sha'][:10]}  "
-                      f"{entry['label']}")
-            print("\n  \033[2m/checkpoint diff <#> · /checkpoint restore <#>"
-                  " · /undo = restore latest\033[0m\n")
+                      f"\033[2m{kind:<6}\033[0m  {entry['label']}")
+            print("\n  \033[2mbefore = state before that turn ran its first"
+                  " command · after = state when the turn ended\n"
+                  "  /checkpoint diff <#> · /checkpoint restore <#>"
+                  " · /undo = revert the last turn that ran commands"
+                  "\033[0m\n")
             return None
 
         def _pick(token: str):
@@ -2269,5 +2422,12 @@ def handle_slash_command(
     if custom_name in user_commands:
         return ("user_prompt", render_user_command(user_commands[custom_name], arg))
 
+    # Nothing claimed it: say so instead of silently swallowing the line.
+    if command in BUILTIN_SLASH_COMMANDS:
+        # A builtin whose session dependency (conversation manager,
+        # scheduler, tool state) is absent here.
+        print(f"\n  \033[2m{command} is unavailable in this session.\033[0m\n")
+        return None
+    print(f"\n  \033[31m{unknown_slash_command_message(command)}\033[0m\n")
     return None
 

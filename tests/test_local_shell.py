@@ -181,6 +181,97 @@ class TestLocalShellApproval(unittest.TestCase):
         self.assertIn("background tasks", result["content"][0]["text"].lower())
 
 
+class TestBeforeRunHook(unittest.TestCase):
+    """The pre-execution hook app.py uses for the pre-turn git checkpoint
+    (/undo): fires with the command right before an approved command
+    runs, not when the command is declined, and can never block it."""
+
+    def test_hook_fires_before_an_approved_command(self):
+        events = []
+        marker = os.path.join(tempfile.mkdtemp(prefix="conch-hook-"), "m")
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(
+            interactive=True, allow_auto_execute=False,
+            input_fn=_ScriptedInput(["y"]),
+        ))
+        client.set_before_run(
+            lambda cmd: events.append((cmd, os.path.exists(marker)))
+        )
+        with _CaptureStderr():
+            client.call_tool("local_shell", {"command": f"touch {marker}"})
+        self.assertEqual(events, [(f"touch {marker}", False)],
+                         "hook must see the command before it has run")
+        self.assertTrue(os.path.exists(marker))
+
+    def test_hook_does_not_fire_for_a_declined_command(self):
+        events = []
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(
+            interactive=True, allow_auto_execute=False,
+            input_fn=_ScriptedInput(["n", ""]),
+        ))
+        client.set_before_run(events.append)
+        with _CaptureStderr():
+            client.call_tool("local_shell", {"command": "echo nope"})
+        self.assertEqual(events, [])
+
+    def test_hook_does_not_fire_when_non_interactive_refuses(self):
+        events = []
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(
+            interactive=False, allow_auto_execute=False,
+            input_fn=_ScriptedInput([]),
+        ))
+        client.set_before_run(events.append)
+        with _CaptureStderr():
+            client.call_tool("local_shell", {"command": "echo nope"})
+        self.assertEqual(events, [])
+
+    def test_hook_failure_never_blocks_the_command(self):
+        def boom(_cmd):
+            raise RuntimeError("checkpoint exploded")
+
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(
+            interactive=True, allow_auto_execute=False,
+            input_fn=_ScriptedInput(["y"]),
+        ))
+        client.set_before_run(boom)
+        with _CaptureStderr():
+            result = client.call_tool("local_shell", {"command": "echo survived"})
+        self.assertIn("survived", result["content"][0]["text"])
+
+    def test_interactive_terminal_hook_fires_before_handoff(self):
+        from conch.tooling import InteractiveTerminalClient
+
+        order = []
+
+        class _Result:
+            approved = True
+            error = ""
+            timed_out = False
+            interrupted = False
+            returncode = 0
+
+        class _Runner:
+            def set_policy(self, policy):
+                pass
+
+            def available(self):
+                return True
+
+            def run(self, argv, *, description, timeout):
+                order.append(("run", list(argv)))
+                return _Result()
+
+        client = InteractiveTerminalClient(runner=_Runner())
+        client.set_before_run(lambda what: order.append(("hook", what)))
+        result = client.call_tool("interactive_terminal", {"command": "vim notes.md"})
+        self.assertEqual(order[0], ("hook", "/bin/sh -c vim notes.md"))
+        self.assertEqual(order[1][0], "run")
+        self.assertIn("exit code 0", result["content"][0]["text"])
+
+
 class TestNoAnswerDeclines(unittest.TestCase):
     """No answer at the approval prompt is a "no" — never consent.
 
@@ -345,10 +436,32 @@ class TestLocalShellExecution(unittest.TestCase):
                 {"command": "printf 'line1\\nline2\\n'"},
             )
         text = result["content"][0]["text"]
-        self.assertIn("line1", text)
-        self.assertIn("line2", text)
+        # Exact: the PTY's CRLF endings must not become blank lines.
+        self.assertEqual(text, "line1\nline2")
         # should also have streamed live to stderr
         self.assertIn("line1", buf.getvalue())
+
+    def test_multiline_output_has_no_doubled_newlines(self):
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))
+        with _CaptureStderr():
+            result = client.call_tool(
+                "local_shell",
+                {"command": "printf 'a\\nb\\nc\\n\\nd\\n'"},
+            )
+        text = result["content"][0]["text"]
+        self.assertEqual(text, "a\nb\nc\n\nd")
+        self.assertNotIn("\r", text)
+
+    def test_bare_carriage_return_still_breaks_line(self):
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))
+        with _CaptureStderr():
+            result = client.call_tool(
+                "local_shell",
+                {"command": "printf '10%%\\r20%%\\r100%%\\n'"},
+            )
+        self.assertEqual(result["content"][0]["text"], "10%\n20%\n100%")
 
     def test_timeout_zero_means_no_timeout(self):
         client = LocalShellClient()

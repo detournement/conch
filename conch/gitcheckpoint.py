@@ -1,6 +1,12 @@
 """Turn-level git checkpoints: every code-writing turn leaves a restorable
 snapshot, without ever touching the user's branch, index, stash, or history.
 
+Each turn that runs a worktree-mutating tool records two snapshots: a
+``before`` one, taken lazily just before the first such tool executes, and
+an ``after`` one at the end of the turn when the worktree changed. ``/undo``
+restores the newest ``before`` snapshot — the state before the last turn
+that ran commands — and ``/checkpoint restore <#>`` reaches any entry.
+
 Mechanism (plumbing only, chosen for non-invasiveness):
 
 - a TEMPORARY index file (``GIT_INDEX_FILE``) is seeded from HEAD, then
@@ -51,6 +57,23 @@ _SNAPSHOT_IDENT = {
     "GIT_COMMITTER_NAME": "conch checkpoint",
     "GIT_COMMITTER_EMAIL": "checkpoint@conch.local",
 }
+
+# Commit subjects encode the checkpoint kind so `list()` can tell a
+# pre-turn snapshot from a post-turn one without extra state files.
+_BEFORE_PREFIX = "conch checkpoint [before]: "
+_AFTER_PREFIX = "conch checkpoint: "
+
+
+def _subject_prefix(kind: str) -> str:
+    return _BEFORE_PREFIX if kind == "before" else _AFTER_PREFIX
+
+
+def _parse_subject(subject: str) -> Tuple[str, str]:
+    if subject.startswith(_BEFORE_PREFIX):
+        return "before", subject[len(_BEFORE_PREFIX):]
+    if subject.startswith(_AFTER_PREFIX):
+        return "after", subject[len(_AFTER_PREFIX):]
+    return "after", subject
 
 
 class GitCheckpoints:
@@ -125,9 +148,18 @@ class GitCheckpoints:
         entries = self.list()
         return entries[-1] if entries else None
 
-    def snapshot(self, label: str) -> Optional[Dict[str, str]]:
+    def snapshot(self, label: str, kind: str = "after") -> Optional[Dict[str, str]]:
         """Record one checkpoint; returns ``{sha, ref, stat}`` or None
-        (disabled, nothing new, or any git failure)."""
+        (disabled, nothing new, or any git failure).
+
+        ``kind="after"`` (the post-turn snapshot) is skipped when the tree
+        equals the previous checkpoint. ``kind="before"`` is the pre-turn
+        snapshot taken just before a turn's first worktree-mutating tool
+        runs; it is never deduplicated, because ``/undo`` means "the state
+        before the last turn that ran commands" and must find exactly that
+        entry even when the worktree had not moved since the last one."""
+        if kind not in ("before", "after"):
+            raise ValueError(f"unknown checkpoint kind {kind!r}")
         root = self.repo_root()
         if not root or not self.enabled():
             return None
@@ -150,31 +182,47 @@ class GitCheckpoints:
             tree = (self._git("write-tree", env=env) or "").strip()
         if not tree:
             return None
-        last = self._last()
-        if last:
-            last_tree = (self._git("rev-parse", f"{last['sha']}^{{tree}}") or "").strip()
-            if last_tree == tree:
-                return None  # nothing new since the previous checkpoint
-        elif head:
-            head_tree = (self._git("rev-parse", "HEAD^{tree}") or "").strip()
-            if head_tree == tree:
-                return None  # worktree is clean; HEAD already has it
-        message = f"conch checkpoint: {(label or 'turn').strip()[:200]}"
+        if kind == "after":
+            last = self._last()
+            if last:
+                last_tree = (self._git("rev-parse", f"{last['sha']}^{{tree}}") or "").strip()
+                if last_tree == tree:
+                    return None  # nothing new since the previous checkpoint
+            elif head:
+                head_tree = (self._git("rev-parse", "HEAD^{tree}") or "").strip()
+                if head_tree == tree:
+                    return None  # worktree is clean; HEAD already has it
+        message = (
+            f"{_subject_prefix(kind)}{(label or 'turn').strip()[:200]}"
+        )
         commit_args = ["commit-tree", tree, "-m", message]
         if head:
             commit_args += ["-p", head]
         sha = (self._git(*commit_args) or "").strip()
         if not sha:
             return None
-        ref = f"{REF_PREFIX}/{int(time.time() * 1000):013d}"
-        if self._git("update-ref", ref, sha) is None:
+        ref = self._fresh_ref()
+        if ref is None or self._git("update-ref", ref, sha) is None:
             return None
         self._prune()
         base = head or (self._git("hash-object", "-t", "tree", "/dev/null") or "").strip()
         stat = ""
         if base:
             stat = (self._git("diff", "--shortstat", base, sha) or "").strip()
-        return {"sha": sha, "ref": ref, "stat": stat or "no diff vs HEAD"}
+        return {"sha": sha, "ref": ref, "kind": kind,
+                "stat": stat or "no diff vs HEAD"}
+
+    def _fresh_ref(self) -> Optional[str]:
+        """A millisecond-stamped ref name not already in use (two snapshots
+        inside one millisecond — a before/after pair on a fast turn — must
+        not overwrite each other)."""
+        taken = {e["ref"] for e in self.list()}
+        stamp = int(time.time() * 1000)
+        for offset in range(1000):
+            ref = f"{REF_PREFIX}/{stamp + offset:013d}"
+            if ref not in taken:
+                return ref
+        return None
 
     def _prune(self) -> None:
         from .config import get_int
@@ -197,13 +245,25 @@ class GitCheckpoints:
             parts = line.split("\t", 2)
             if len(parts) < 2:
                 continue
-            label = parts[2] if len(parts) > 2 else ""
-            if label.startswith("conch checkpoint: "):
-                label = label[len("conch checkpoint: "):]
+            kind, label = _parse_subject(parts[2] if len(parts) > 2 else "")
             entries.append({
-                "ref": parts[0], "sha": parts[1], "label": label,
+                "ref": parts[0], "sha": parts[1], "label": label, "kind": kind,
             })
         return entries
+
+    def latest(self, kind: Optional[str] = None) -> Optional[Dict[str, str]]:
+        """Newest checkpoint, optionally of one kind ("before"/"after")."""
+        for entry in reversed(self.list()):
+            if kind is None or entry["kind"] == kind:
+                return entry
+        return None
+
+    def worktree_matches(self, sha: str) -> bool:
+        """True when restoring *sha* would change nothing: every path in
+        the snapshot already has the snapshot's content in the worktree.
+        (Files created after the snapshot are irrelevant — restore leaves
+        them alone.)"""
+        return self._git("diff", "--quiet", sha, "--", ".") is not None
 
     def _is_checkpoint(self, sha: str) -> bool:
         return any(e["sha"] == sha for e in self.list())

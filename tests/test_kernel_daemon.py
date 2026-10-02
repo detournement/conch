@@ -116,6 +116,132 @@ class TestExclusiveOwnership(DaemonCase):
         successor.store.record_note(mission_id, "successor write")
 
 
+class TestJournalVerificationAtStart(DaemonCase):
+    """Review finding F10: chain verification used to run only in tests.
+    The daemon now verifies every mission's hash chain before it adopts
+    the epoch, logs the result, and refuses to start on a mismatch."""
+
+    def _tamper(self):
+        import sqlite3
+
+        conn = sqlite3.connect(str(self.kernel_dir / "kernel.db"))
+        conn.execute(
+            "UPDATE mission_events SET data=replace(data, 'journal',"
+            " 'tampered') WHERE kind='mission_note'"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_clean_start_verifies_and_logs_duration(self):
+        first = self.make_daemon()
+        first.start()
+        mission_id = first.engine.create_mission(
+            {"goal": "verify me", "budgets": {}}, activate=False
+        )
+        first.store.record_note(mission_id, "journal fact")
+        first.shutdown()
+
+        second = self.make_daemon()
+        second.start()
+        report = second.journal_verification
+        self.assertIsNotNone(report)
+        self.assertGreaterEqual(report["events_verified"], 2)
+        self.assertEqual(report["missions"], 1)
+        self.assertEqual(report["replay"], "skipped")
+        self.assertGreaterEqual(report["seconds"], 0.0)
+        log_text = second.log_path.read_text()
+        self.assertIn("journal verified:", log_text)
+        self.assertIn("event(s) across 1 mission(s) in", log_text)
+        status = self.call("status")
+        self.assertEqual(
+            status["journal_verification"]["events_verified"],
+            report["events_verified"],
+        )
+
+    def test_tampered_journal_refuses_to_start(self):
+        from conch.kernel.daemon import JournalVerificationFailed
+
+        first = self.make_daemon()
+        first.start()
+        mission_id = first.engine.create_mission(
+            {"goal": "verify me", "budgets": {}}, activate=False
+        )
+        first.store.record_note(mission_id, "journal fact")
+        first.shutdown()
+        self._tamper()
+
+        second = self.make_daemon()
+        with self.assertRaises(JournalVerificationFailed) as ctx:
+            second.start()
+        message = ctx.exception.operator_message()
+        self.assertIn("refusing to start", message)
+        self.assertIn("hash mismatch", message)
+        self.assertIn(str(self.kernel_dir / "kernel.db"), message)
+        self.assertIn("Nothing was modified", message)
+        self.assertIn("journal verification FAILED", second.log_path.read_text())
+        # Refused means refused: no socket, lock released, no epoch adopted.
+        self.assertFalse(control.daemon_alive(self.socket_path))
+        self.assertIsNone(second.store)
+        third = self.make_daemon()  # the lock must be free again
+        with self.assertRaises(JournalVerificationFailed):
+            third.start()
+
+    def test_run_edge_daemon_exits_65_with_operator_message(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        from conch.kernel import daemon as daemon_mod
+
+        first = self.make_daemon()
+        first.start()
+        mission_id = first.engine.create_mission(
+            {"goal": "verify me", "budgets": {}}, activate=False
+        )
+        first.store.record_note(mission_id, "journal fact")
+        first.shutdown()
+        self._tamper()
+
+        out = io.StringIO()
+        with mock.patch.object(
+            daemon_mod, "EdgeDaemon",
+            lambda config: self.make_daemon(config),
+        ), mock.patch(
+            "conch.bootstrap.apply_agent_mode_from_config", lambda config: None
+        ), contextlib.redirect_stdout(out):
+            code = daemon_mod.run_edge_daemon(
+                {"provider": "openai"}, foreground=True, once=True
+            )
+        self.assertEqual(code, 65)
+        self.assertIn("refusing to start", out.getvalue())
+        self.assertIn("hash mismatch", out.getvalue())
+
+    def test_verify_op_over_socket_and_direct_client(self):
+        from conch.kernel.client import DirectKernelClient
+
+        daemon = self.make_daemon()
+        daemon.start()
+        mission_id = daemon.engine.create_mission(
+            {"goal": "verify me", "budgets": {}}, activate=False
+        )
+        daemon.store.record_note(mission_id, "journal fact")
+
+        report = self.call("mission.verify")
+        self.assertGreaterEqual(report["events_verified"], 2)
+        self.assertFalse(report["full"])
+        full = self.call("mission.verify", {"full": True})
+        self.assertEqual(full["replay"], "match")
+        self.assertTrue(full["full"])
+        daemon.shutdown()
+
+        self._tamper()
+        direct = DirectKernelClient({"provider": "openai"},
+                                    kernel_dir=self.kernel_dir)
+        self.addCleanup(direct.close)
+        with self.assertRaises(KernelError):
+            direct.verify()
+
+
 class TestControlSocket(DaemonCase):
     def test_socket_permissions(self):
         daemon = self.make_daemon()

@@ -79,13 +79,55 @@ class TestResolveStartupProvider(BootstrapTestCase):
         self.assertIn("local_only", str(ctx.exception))
 
     def test_valid_provider_returns_raw_fn(self):
-        provider, raw_fn = resolve_startup_provider({"provider": "openai"})
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+            provider, raw_fn = resolve_startup_provider({"provider": "openai"})
         self.assertEqual(provider, "openai")
         self.assertTrue(callable(raw_fn))
 
     def test_default_provider_is_openai(self):
-        provider, _ = resolve_startup_provider({})
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+            provider, _ = resolve_startup_provider({})
         self.assertEqual(provider, "openai")
+
+    def test_missing_key_is_a_clear_startup_error(self):
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(StartupError) as ctx:
+                resolve_startup_provider({"provider": "anthropic"})
+        self.assertEqual(ctx.exception.code, 2)
+        message = str(ctx.exception)
+        self.assertIn("ANTHROPIC_API_KEY", message)
+        self.assertIn("setup wizard", message)
+        self.assertIn("/env", message)  # ~/.config/conch/env remedy
+
+    def test_configured_api_key_env_is_the_one_checked(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("OPENAI_API_KEY", "MY_OPENAI")}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(StartupError) as ctx:
+                resolve_startup_provider(
+                    {"provider": "openai", "api_key_env": "MY_OPENAI"}
+                )
+            self.assertIn("MY_OPENAI", str(ctx.exception))
+            with patch.dict(os.environ, {"MY_OPENAI": "sk-alt"}):
+                provider, _ = resolve_startup_provider(
+                    {"provider": "openai", "api_key_env": "MY_OPENAI"}
+                )
+        self.assertEqual(provider, "openai")
+
+    def test_keyless_providers_need_no_key(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                resolve_startup_provider({"provider": "ollama"})[0], "ollama"
+            )
+            self.assertEqual(
+                resolve_startup_provider(
+                    {"provider": "custom", "custom_base_url": "http://x/v1"}
+                )[0],
+                "custom",
+            )
 
 
 class TestResolveStartupModel(BootstrapTestCase):

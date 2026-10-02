@@ -846,6 +846,39 @@ def validate_ollama_model(model: str, config: Optional[dict] = None) -> tuple:
     return True, ""
 
 
+def api_key_env_for(provider: str, config: Optional[dict] = None) -> str:
+    """The environment variable a cloud provider reads its key from
+    ("" for keyless providers: ollama, and custom unless configured)."""
+    provider = (provider or "").lower()
+    configured = str((config or {}).get("api_key_env") or "").strip()
+    if provider in ("ollama", "custom"):
+        return configured if provider == "custom" else ""
+    return configured or DEFAULT_API_KEY_ENVS.get(provider, "")
+
+
+def missing_api_key_message(provider: str, key_env: str) -> str:
+    """Operator-facing explanation for a provider whose key env var is
+    unset: names the variable and both remedies. Worded to register as a
+    structural (authentication) failure so the runtime does not retry the
+    same provider's other models."""
+    from .config import get_env_file_path
+
+    key_env = (key_env or "").strip() or DEFAULT_API_KEY_ENVS.get(
+        (provider or "").lower(), ""
+    ) or "api_key_env"
+    return (
+        f"authentication: no {provider} API key — the environment variable "
+        f"{key_env} is not set. Run `conch` interactively to launch the "
+        f"setup wizard, or set {key_env} in {get_env_file_path()}"
+    )
+
+
+def missing_api_key_response(provider: str, key_env: str) -> dict:
+    """The error result every provider returns instead of a bare empty
+    reply when its key is absent (so the user never sees `[no response]`)."""
+    return error_response(missing_api_key_message(provider, key_env))
+
+
 def error_response(message: str) -> dict:
     """Uniform provider error result.
 
@@ -1229,7 +1262,7 @@ def get_fallback_model(provider: str, config: Optional[dict] = None) -> str:
 def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     api_key = os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), "").strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("cerebras", config.get("api_key_env", "CEREBRAS_API_KEY"))
     base_url = (config.get("base_url") or os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")).rstrip("/")
     body: Dict[str, Any] = {
         "model": config.get("chat_model", config.get("model", "gpt-oss-120b")),
@@ -1272,7 +1305,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
 def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     api_key = os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), "").strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("openai", config.get("api_key_env", "OPENAI_API_KEY"))
     model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
     body = build_openai_chat_request_body(
         model,
@@ -1317,7 +1350,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
 def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     api_key = os.environ.get(config.get("api_key_env", "ANTHROPIC_API_KEY"), "").strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("anthropic", config.get("api_key_env", "ANTHROPIC_API_KEY"))
     system = ""
     user_messages: List[dict] = []
     for message in messages:
@@ -1531,7 +1564,7 @@ def _bedrock_body(config: dict, messages: List[dict], tools: Optional[List[dict]
 def raw_bedrock(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     api_key = os.environ.get(config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK", "").strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("bedrock", config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK")
     body = _bedrock_body(config, messages, tools)
     req = urllib.request.Request(
         f"{get_bedrock_base_url(config)}/chat/completions",
@@ -1617,7 +1650,7 @@ class _ReasoningStreamFilter:
 def stream_bedrock(config: dict, messages: list, tools=None, on_token=None) -> dict:
     api_key = os.environ.get(config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK", "").strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("bedrock", config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK")
     body = _bedrock_body(config, messages, tools)
     reasoning_filter = _ReasoningStreamFilter(on_token) if on_token else None
     result = _stream_openai_compat(
@@ -1675,7 +1708,7 @@ def _openrouter_body(config: dict, messages: List[dict], tools: Optional[List[di
 def raw_openrouter(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     api_key = os.environ.get(config.get("api_key_env") or "OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("openrouter", config.get("api_key_env") or "OPENROUTER_API_KEY")
     body = _openrouter_body(config, messages, tools)
     req = urllib.request.Request(
         f"{OPENROUTER_BASE_URL}/chat/completions",
@@ -1710,7 +1743,7 @@ def raw_openrouter(config: dict, messages: List[dict], tools: Optional[List[dict
 def stream_openrouter(config: dict, messages: list, tools=None, on_token=None) -> dict:
     api_key = os.environ.get(config.get("api_key_env") or "OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("openrouter", config.get("api_key_env") or "OPENROUTER_API_KEY")
     body = _openrouter_body(config, messages, tools)
     body["stream_options"] = {"include_usage": True}
     reasoning_filter = _ReasoningStreamFilter(on_token) if on_token else None
@@ -2434,7 +2467,7 @@ def stream_cerebras(
         config.get("api_key_env", "CEREBRAS_API_KEY"), ""
     ).strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("cerebras", config.get("api_key_env", "CEREBRAS_API_KEY"))
     base_url = (
         config.get("base_url")
         or os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
@@ -2470,7 +2503,7 @@ def stream_openai(
         config.get("api_key_env", "OPENAI_API_KEY"), ""
     ).strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("openai", config.get("api_key_env", "OPENAI_API_KEY"))
     model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
     body = build_openai_chat_request_body(
         model,
@@ -2500,7 +2533,7 @@ def stream_anthropic(
         config.get("api_key_env", "ANTHROPIC_API_KEY"), ""
     ).strip()
     if not api_key:
-        return {"content": "", "tool_calls": None}
+        return missing_api_key_response("anthropic", config.get("api_key_env", "ANTHROPIC_API_KEY"))
 
     system = ""
     user_messages: list[dict] = []

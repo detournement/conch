@@ -79,6 +79,9 @@ class SocketKernelClient:
     def abort(self, mission_id: str) -> None:
         self._call("mission.abort", {"mission_id": mission_id})
 
+    def verify(self, full: bool = False) -> Dict[str, Any]:
+        return self._call("mission.verify", {"full": bool(full)})
+
     def provide_input(self, mission_id: str, text: str,
                       source: str = "local") -> Dict[str, Any]:
         return self._call("mission.input", {
@@ -197,6 +200,9 @@ class DirectKernelClient:
 
     def abort(self, mission_id: str) -> None:
         self.engine.abort_mission(mission_id)
+
+    def verify(self, full: bool = False) -> Dict[str, Any]:
+        return self.store.verify_journal(full=full)
 
     def provide_input(self, mission_id: str, text: str,
                       source: str = "local") -> Dict[str, Any]:

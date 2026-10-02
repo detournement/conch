@@ -61,9 +61,11 @@ Refactor the authentication module and run its focused tests.
 ```
 
 Docker changes where approved shell commands run; it does not bypass Conch's
-permission checks. Conch automatically records each changed turn on
-`refs/conch/checkpoints/*`, without adding commits to your branch. `/undo`
-restores the latest snapshot as uncommitted work after confirmation.
+permission checks. Conch automatically records each turn that runs commands
+on `refs/conch/checkpoints/*` — a `before` snapshot just before the turn's
+first command and an `after` snapshot when it changed the worktree — without
+adding commits to your branch. `/undo` puts the worktree back to the `before`
+state of the last such turn, as uncommitted work, after confirmation.
 
 ### Start a durable mission
 
@@ -480,10 +482,12 @@ Set a startup default with `exec_backend=local`, `docker`, or `e2b`.
 
 ### Automatic Git checkpoints
 
-Inside a Git repository, checkpoints are on by default. After each turn that
-changes the worktree, Conch snapshots it through a temporary index under
-`refs/conch/checkpoints/*`. It does not alter your branch, real index, stash,
-or history.
+Inside a Git repository, checkpoints are on by default. A turn that runs a
+shell command or terminal handoff snapshots the worktree twice through a
+temporary index under `refs/conch/checkpoints/*`: a `before` snapshot right
+before its first command executes, and an `after` snapshot at the end of the
+turn when the worktree changed. Neither alters your branch, real index,
+stash, or history.
 
 ```text
 /checkpoint list
@@ -493,10 +497,19 @@ or history.
 /checkpoint off
 ```
 
+`/undo` reverts the last turn that ran commands: it restores that turn's
+`before` snapshot (after confirmation, and after checkpointing the current
+state so nothing is lost). Running it again reports that there is nothing
+further to undo; use `/checkpoint list` and `/checkpoint restore <number>`
+to go further back or to return to an `after` state. Turns whose only
+changes came through MCP tools get an `after` snapshot but no `before`
+one, so for those use `/checkpoint restore`.
+
 Gitignored files and secret-shaped paths such as `.env`, private keys, and
 credential files are excluded. A restore therefore cannot materialize a
 secret that was skipped. The default retention is 20 snapshots
-(`git_checkpoint_limit`).
+(`git_checkpoint_limit`) — about ten command-running turns, since each
+records a before/after pair.
 
 ### Credentials and terminal handoff
 
@@ -653,6 +666,7 @@ supervised user service:
 /mission resume <id>
 /mission input <id> <answer>
 /mission abort <id>
+/mission verify [full]
 ```
 
 The edge daemon stores missions, plans, tasks, timers, budgets, approvals,
@@ -660,6 +674,13 @@ artifacts, inbox/outbox records, and an immutable event journal in
 `~/.local/state/conch/kernel/kernel.db`. Work happens in bounded,
 checkpointed sessions with fresh rehydrated context rather than an
 ever-growing transcript.
+
+The journal is hash-chained per mission. `conch-edge` recomputes every chain
+when it starts — it logs the event count and duration on success and refuses
+to start, with the failing position and recovery options, if any link does
+not verify. `/mission verify` runs the same check on demand (`/mission verify
+full` adds the SQLite integrity check and a replay-equivalence comparison);
+neither modifies the database.
 
 Important controls:
 

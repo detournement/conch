@@ -162,6 +162,130 @@ class TestWizardFlow(OnboardingCase):
         self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), SECRET)
 
 
+class TestCustomEndpointFlow(OnboardingCase):
+    """The custom-provider branch must leave a config that starts clean:
+    custom_base_url + custom_model persisted, api_key_env only when a key
+    was given, and honest probe wording for a keyless endpoint."""
+
+    def _run(self, inputs, getpass_values, models=(["stub-model"], True)):
+        answers = iter(inputs)
+        keys = iter(getpass_values)
+        out = io.StringIO()
+        with patch("conch.onboarding.detect_ollama", return_value=None), \
+             patch("conch.onboarding.probe_provider",
+                   return_value=(True, "endpoint reachable (no key sent)")), \
+             patch("conch.onboarding.discover_custom_models",
+                   return_value=models) as discover, \
+             patch("builtins.input", side_effect=lambda *_: next(answers)), \
+             patch("conch.onboarding.getpass.getpass",
+                   side_effect=lambda *_: next(keys)), \
+             patch("sys.stdout", out):
+            self.assertTrue(onboarding.run_first_run_wizard())
+        return out.getvalue(), discover
+
+    def test_persists_custom_model_and_base_url_without_key(self):
+        # answers: provider 5, base URL, verify? n
+        output, discover = self._run(
+            ["5", "http://127.0.0.1:18080/v1", "n"], [""]
+        )
+        text = Path(config_mod.get_config_path()).read_text()
+        self.assertIn("custom_base_url = http://127.0.0.1:18080/v1", text)
+        self.assertIn("custom_model = stub-model", text)
+        self.assertNotIn("api_key_env", text)
+        self.assertFalse(Path(config_mod.get_env_file_path()).exists())
+        self.assertIn("stub-model", output)
+        discover.assert_called_once_with("http://127.0.0.1:18080/v1", "")
+
+    def test_loaded_config_is_complete_and_keyless(self):
+        self._run(["5", "http://127.0.0.1:18080/v1", "n"], [""])
+        loaded = config_mod.load_config()
+        self.assertEqual(loaded["provider"], "custom")
+        self.assertEqual(loaded["custom_model"], "stub-model")
+        self.assertEqual(loaded["model"], "stub-model")
+        self.assertEqual(loaded["chat_model"], "stub-model")
+        self.assertEqual(loaded["api_key_env"], "",
+                         "the Anthropic default must not leak under custom")
+
+    def test_key_is_stored_under_conch_name_and_referenced(self):
+        output, discover = self._run(
+            ["5", "http://10.0.0.5:8000/v1", "n"], ["vllm-secret-1"]
+        )
+        text = Path(config_mod.get_config_path()).read_text()
+        self.assertIn("api_key_env = CONCH_CUSTOM_API_KEY", text)
+        env_text = Path(config_mod.get_env_file_path()).read_text()
+        self.assertIn("CONCH_CUSTOM_API_KEY=vllm-secret-1", env_text)
+        self.assertNotIn("vllm-secret-1", output)
+        discover.assert_called_once_with("http://10.0.0.5:8000/v1", "vllm-secret-1")
+        loaded = config_mod.load_config()
+        self.assertEqual(loaded["api_key_env"], "CONCH_CUSTOM_API_KEY")
+
+    def test_multiple_models_offer_a_choice(self):
+        output, _ = self._run(
+            ["5", "http://127.0.0.1:18080/v1", "n", "2"], [""],
+            models=(["alpha", "beta"], True),
+        )
+        text = Path(config_mod.get_config_path()).read_text()
+        self.assertIn("custom_model = beta", text)
+        self.assertIn("passed the native tool-call check", output)
+
+    def test_unreachable_endpoint_leaves_model_unset_with_hint(self):
+        output, _ = self._run(
+            ["5", "http://127.0.0.1:1/v1", "n"], [""], models=(None, False)
+        )
+        text = Path(config_mod.get_config_path()).read_text()
+        self.assertNotIn("custom_model", text)
+        self.assertIn("custom_model", output)  # the how-to hint
+        self.assertIn("unreachable", output.lower())
+
+    def test_no_conformant_model_warns_but_still_persists(self):
+        output, _ = self._run(
+            ["5", "http://127.0.0.1:18080/v1", "n"], [""],
+            models=(["plain-model"], False),
+        )
+        text = Path(config_mod.get_config_path()).read_text()
+        self.assertIn("custom_model = plain-model", text)
+        self.assertIn("tool use may not work", output)
+
+
+class TestCustomProbeWording(OnboardingCase):
+    def test_keyless_success_does_not_claim_a_key_was_accepted(self):
+        with patch("conch.onboarding._http_get", return_value=(200, "")):
+            ok, detail = onboarding.probe_provider("custom", "", "http://x/v1")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "endpoint reachable (no key sent)")
+
+    def test_keyed_success_still_says_key_accepted(self):
+        with patch("conch.onboarding._http_get", return_value=(200, "")):
+            ok, detail = onboarding.probe_provider("custom", "k", "http://x/v1")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "key accepted")
+
+    def test_keyless_401_explains_a_key_is_required(self):
+        with patch("conch.onboarding._http_get", return_value=(401, "")):
+            ok, detail = onboarding.probe_provider("custom", "", "http://x/v1")
+        self.assertFalse(ok)
+        self.assertEqual(detail, "the endpoint requires an API key")
+
+
+class TestCustomProviderConfigDefaults(OnboardingCase):
+    def test_custom_provider_has_empty_api_key_env_by_default(self):
+        config_mod.set_config_values({
+            "provider": "custom",
+            "custom_base_url": "http://127.0.0.1:18080/v1",
+            "custom_model": "m",
+        })
+        self.assertEqual(config_mod.load_config()["api_key_env"], "")
+
+    def test_explicit_api_key_env_is_kept(self):
+        config_mod.set_config_values({
+            "provider": "custom",
+            "custom_base_url": "http://127.0.0.1:18080/v1",
+            "custom_model": "m",
+            "api_key_env": "MY_VLLM_KEY",
+        })
+        self.assertEqual(config_mod.load_config()["api_key_env"], "MY_VLLM_KEY")
+
+
 class TestMaybeRunGate(OnboardingCase):
     def test_noninteractive_is_a_noop(self):
         with patch.multiple(

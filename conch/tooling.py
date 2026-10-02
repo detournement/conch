@@ -673,6 +673,23 @@ class LocalShellClient:
         # machine. Approval/permission logic above is deliberately
         # backend-blind — the sandbox changes where, never whether.
         self._exec_backend = None
+        # Called with the command right before an approved command runs
+        # (app.py uses it for the pre-turn git checkpoint behind /undo).
+        self._before_run = None
+
+    def set_before_run(self, hook) -> None:
+        """Register ``hook(command)`` to run just before an approved
+        command executes. Failures in the hook never block the command."""
+        self._before_run = hook
+
+    def _fire_before_run(self, what) -> None:
+        hook = self._before_run
+        if hook is None:
+            return
+        try:
+            hook(what if isinstance(what, str) else " ".join(map(str, what)))
+        except Exception:
+            pass
 
     def bind_permissions(self, permissions: Optional[PermissionState]):
         """Adopt a session's permission state (None = process default)."""
@@ -809,6 +826,10 @@ class LocalShellClient:
                 + f"\n... [truncated {omitted:,} streamed chars] ...\n"
                 + captured_tail
             )
+        # The PTY emits CRLF line endings (ONLCR); fold those to "\n" first
+        # so they cannot become blank lines, then treat any stray "\r"
+        # (progress bars rewriting a line) as a line break of its own.
+        output = output.replace("\r\n", "\n")
         output = _re.sub(r"\r", "\n", output)
         output = _re.sub(r"\x1b\[[0-9;]*[mABCDEFGHJKLMSTfhilnprsu]", "", output)
         output = _re.sub(r"\n{3,}", "\n\n", output).strip()
@@ -836,6 +857,7 @@ class LocalShellClient:
         return self._exec_backend
 
     def _run_command(self, cmd: str, timeout: int) -> dict:
+        self._fire_before_run(cmd)
         backend = self._exec_backend
         if backend is None:
             return self._run_process(cmd, timeout, shell=True)
@@ -863,6 +885,7 @@ class LocalShellClient:
         return self._text(output)
 
     def _run_argv(self, argv: List[str], timeout: int) -> dict:
+        self._fire_before_run(list(argv))
         return self._run_process(list(argv), timeout, shell=False)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
@@ -1009,9 +1032,16 @@ class InteractiveTerminalClient:
 
         self.policy = LocalShellPolicy()
         self._runner = runner or DirectTerminalRunner()
+        self._before_run = None
 
     def set_policy(self, policy: LocalShellPolicy):
         self.policy = policy
+
+    def set_before_run(self, hook) -> None:
+        """Register ``hook(description)`` to run right before a terminal
+        handoff starts (the child may edit the worktree; app.py takes the
+        pre-turn git checkpoint here). Hook failures never block it."""
+        self._before_run = hook
 
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
@@ -1086,6 +1116,11 @@ class InteractiveTerminalClient:
 
         self._configure_runner()
         clear_active_spinners()
+        if self._before_run is not None:
+            try:
+                self._before_run(" ".join(map(str, argv)))
+            except Exception:
+                pass
         result = self._runner.run(
             argv, description=description, timeout=max(0, int(timeout or 0))
         )
@@ -3072,7 +3107,7 @@ class ConchConfigClient:
 # Sized to hold the full live capability report (every slash command +
 # tool + skill line) with headroom; the /notes family pushed the report
 # past the old 4000.
-INTROSPECT_OUTPUT_MAX = 4500
+INTROSPECT_OUTPUT_MAX = 5200
 
 CONCH_INTROSPECT_TOOL = {
     "type": "function",
@@ -3322,14 +3357,14 @@ class ConchIntrospectClient:
             except (OSError, subprocess.TimeoutExpired):
                 pass
         # Sized so every core conch/*.py module line (alphabetical map:
-        # through runtime.py and beyond) survives the cut; notes.py's
-        # arrival pushed runtime.py out of the old 2800, llamaidx.py's
-        # status-view exports plus plugins.py/onboarding pushed it out of
-        # 3200/3400, and the browser-capture satellite (capture_host_main
-        # entrypoint, kernel/compiler modules) pushed it out of 4000.
-        # Headroom check: this plus the version/branch/commits header
-        # must stay under INTROSPECT_OUTPUT_MAX (4500).
-        overview = build_map_for_root(root, budget_chars=4200)
+        # through runtime.py and beyond) survives the cut; the budget has
+        # been bumped repeatedly as modules grew public symbols. The map
+        # takes whatever the version/branch/commits header leaves under
+        # INTROSPECT_OUTPUT_MAX (minus the final truncation margin), so a
+        # long commit subject can no longer push runtime.py off the end.
+        header_len = sum(len(line) + 1 for line in lines)
+        budget = INTROSPECT_OUTPUT_MAX - header_len - 100
+        overview = build_map_for_root(root, budget_chars=max(1000, budget))
         if overview:
             lines.append(overview)
         return "\n".join(lines)

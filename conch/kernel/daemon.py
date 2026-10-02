@@ -63,6 +63,29 @@ class DaemonAlreadyRunning(KernelError):
     """Another daemon holds the kernel lock."""
 
 
+class JournalVerificationFailed(KernelError):
+    """The mission journal's hash chain did not verify at startup."""
+
+    def __init__(self, detail: str, *, kernel_path: Path):
+        super().__init__(detail)
+        self.detail = detail
+        self.kernel_path = Path(kernel_path)
+
+    def operator_message(self) -> str:
+        return (
+            "conch-edge: refusing to start — the mission journal failed"
+            " verification.\n"
+            f"  {self.detail}\n"
+            f"  kernel: {self.kernel_path}\n"
+            "  The journal is append-only and hash-chained, so a mismatch"
+            " means the database was changed outside the kernel or is"
+            " damaged. Nothing was modified. To recover, stop here and"
+            " restore your own backup copy of the kernel database, or move"
+            " the file aside to start with an empty kernel (missions and"
+            " history in it will no longer be visible)."
+        )
+
+
 class _KernelLock:
     """Exclusive, advisory, crash-released OS lock on the kernel dir."""
 
@@ -145,6 +168,8 @@ class EdgeDaemon:
         self._started_at = 0.0
         self._tick_count = 0
         self._log_lock = threading.Lock()
+        # Report of the startup journal verification (see start()).
+        self.journal_verification: Optional[Dict[str, Any]] = None
 
     # -- logging (never secrets) ----------------------------------------------
 
@@ -179,6 +204,7 @@ class EdgeDaemon:
             self.store = MissionStore(
                 self.kernel_dir / "kernel.db", clock=self.clock
             )
+            self._verify_journal_or_refuse()
             self.epoch = self.store.adopt_epoch()
             self.engine = MissionEngine(
                 self.store, self.config, holder=self.holder,
@@ -220,6 +246,24 @@ class EdgeDaemon:
         except BaseException:
             self.shutdown()
             raise
+
+    def _verify_journal_or_refuse(self) -> None:
+        """Startup gate: recompute every mission's event hash chain before
+        adopting the epoch or executing anything. A tampered or damaged
+        journal must not be built upon — refusing to start is the only
+        safe answer, and the operator gets the exact failing position."""
+        try:
+            report = self.store.verify_journal()
+        except KernelError as exc:
+            self.log(f"journal verification FAILED: {exc}")
+            raise JournalVerificationFailed(
+                str(exc), kernel_path=self.kernel_dir / "kernel.db"
+            ) from exc
+        self.journal_verification = report
+        self.log(
+            f"journal verified: {report['events_verified']} event(s) across"
+            f" {report['missions']} mission(s) in {report['seconds']:.3f}s"
+        )
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -595,6 +639,7 @@ class EdgeDaemon:
                 "pending_outbox": len(self.store.list_outbox(status="pending")),
                 "kernel": str(self.kernel_dir / "kernel.db"),
                 "events": self.store.event_count(),
+                "journal_verification": self.journal_verification,
                 "channel_intake": (
                     {
                         "holder": intake_lease["holder"],
@@ -631,6 +676,10 @@ class EdgeDaemon:
         if op == "mission.abort":
             self.engine.abort_mission(str(args.get("mission_id") or ""))
             return {"ok": True}
+        if op == "mission.verify":
+            # Read-only; raises KernelError (reported to the caller) on
+            # any chain break, exactly like the startup gate.
+            return self.store.verify_journal(full=bool(args.get("full")))
         if op == "mission.input":
             result = self.engine.provide_input(
                 str(args.get("mission_id") or ""),
@@ -741,6 +790,15 @@ def run_edge_daemon(config: dict, *, foreground: bool = True,
     except DaemonAlreadyRunning as exc:
         print(f"conch-edge: {exc}", flush=True)
         return 75  # EX_TEMPFAIL: already running
+    except JournalVerificationFailed as exc:
+        print(exc.operator_message(), flush=True)
+        return 65  # EX_DATAERR: the kernel database cannot be trusted
+    verification = daemon.journal_verification or {}
+    print(
+        f"conch-edge: journal verified ({verification.get('events_verified', 0)}"
+        f" event(s), {verification.get('seconds', 0.0):.3f}s)",
+        flush=True,
+    )
     print(
         f"conch-edge: daemon running (epoch {daemon.epoch}, socket"
         f" {daemon.socket_path}, log {daemon.log_path})",

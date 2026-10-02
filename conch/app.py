@@ -829,6 +829,35 @@ def chat_loop(new_conversation=False, interactive=True):
     from .gitcheckpoint import GitCheckpoints
 
     _git_ckpt = GitCheckpoints(config)
+    # Pre-turn ("before") snapshot state: taken lazily, once per turn,
+    # right before the first worktree-mutating tool runs, so /undo can
+    # revert the turn that just happened (a post-turn snapshot alone
+    # only records the state /undo would want to leave).
+    _ckpt_turn_label = ""
+    _ckpt_before_taken = False
+    _ckpt_lock = threading.Lock()
+
+    def _begin_checkpoint_turn(label: str) -> None:
+        nonlocal _ckpt_turn_label, _ckpt_before_taken
+        with _ckpt_lock:
+            _ckpt_turn_label = label
+            _ckpt_before_taken = False
+
+    def _before_mutation(what: str) -> None:
+        """Hook run by local_shell / interactive_terminal before executing."""
+        nonlocal _ckpt_before_taken
+        with _ckpt_lock:
+            if _ckpt_before_taken or not _git_ckpt.enabled():
+                return
+            _ckpt_before_taken = True
+            label = _ckpt_turn_label or (
+                str(what).strip().splitlines() or ["command"]
+            )[0][:80]
+            _git_ckpt.snapshot(label, kind="before")
+
+    for _hooked in ("local_shell", "interactive_terminal"):
+        if hasattr(builtin_clients.get(_hooked), "set_before_run"):
+            builtin_clients[_hooked].set_before_run(_before_mutation)
 
     def _pause_typeahead():
         nonlocal _typeahead_partial
@@ -1223,6 +1252,9 @@ def chat_loop(new_conversation=False, interactive=True):
             # Cheap pre-turn worktree fingerprint; a changed fingerprint
             # after the turn means the turn wrote something → checkpoint.
             _ckpt_fp = _git_ckpt.fingerprint() if _git_ckpt.enabled() else None
+            _begin_checkpoint_turn(
+                (user_input.strip().splitlines() or [""])[0][:80]
+            )
 
             try:
                 reply, turn_usage = session.run_turn(

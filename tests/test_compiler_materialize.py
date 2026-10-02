@@ -24,9 +24,11 @@ from conch.capitol.compiler.graph import build_workflow_payload
 from conch.capitol.compiler.materialize import (
     ensure_local_stack,
     materialize_compilation,
+    payload_divergences,
     rollback_compilation,
     verify_compilation,
 )
+from conch.capitol.procedures import workflow_payload_digest
 from conch.capitol.errors import CapitolError
 from conch.kernel.model import CompilationStatus, MissionState
 from conch.kernel.store import MissionStore
@@ -210,6 +212,89 @@ class TestMaterializationOrder(MaterializeCase):
         self.assertEqual(
             len(self.store.get_compilation(cid)["procedures"]["links"]), 1,
         )
+
+
+class NormalizingAdmin(FakeAdmin):
+    """The real workflow API does not store what it was sent: it adds
+    top-level defaults and recomputes each node's catalog provenance
+    digests (observed on the local stack 2026-10-02). An optional
+    *corrupt* callable additionally edits card-controlled content, the
+    thing that MUST fail closed."""
+
+    def __init__(self, corrupt=None):
+        super().__init__()
+        self.corrupt = corrupt
+
+    def persist_workflow(self, payload, *, idempotency_key, create_only=False):
+        receipt = super().persist_workflow(
+            payload, idempotency_key=idempotency_key, create_only=create_only,
+        )
+        stored = self.workflow_payloads[payload["id"]]
+        stored.setdefault("authoring_context", None)
+        stored.setdefault("software_repo_url", "")
+        stored.setdefault("clarification_timeout_secs", 300)
+        for node in stored.get("nodes") or []:
+            struct = (node.get("data") or {}).get("struct")
+            if isinstance(struct, dict):
+                struct["catalog_contract_digest"] = "recomputed-by-server"
+                struct["repeat_catalog_digest"] = "recomputed-by-server"
+        if self.corrupt:
+            self.corrupt(stored)
+        return receipt
+
+
+class TestStoredVersionIsTheDigestOfRecord(MaterializeCase):
+    def test_server_normalization_is_not_drift(self):
+        cid = self.compile_and_approve()
+        admin = NormalizingAdmin()
+        state = self.materialize(cid, admin)
+        receipt = state["steps"][0]["receipt"]
+        workflow_id = receipt["workflow_id"]
+        stored_digest = workflow_payload_digest(admin.workflow_payloads[workflow_id])
+        self.assertEqual(receipt["payload_digest"], stored_digest,
+                         "the pin's digest is the stored version's digest")
+        compilation = self.store.get_compilation(cid)
+        self.assertEqual(compilation["status"], CompilationStatus.MATERIALIZED)
+        lock = json.loads(Path(compilation["materialization"]["lock_path"]).read_text())
+        self.assertEqual(lock["workflows"][0]["workflow_payload_digest"], stored_digest)
+        # Re-materializing proves the existing receipt against the stored
+        # payload the same tolerant way (no new effects).
+        before = list(admin.effects)
+        self.materialize(cid, admin)
+        self.assertEqual(admin.effects, before)
+
+    def test_card_controlled_divergence_fails_closed_with_the_path(self):
+        cid = self.compile_and_approve()
+
+        def corrupt(stored):
+            stored["nodes"][0]["data"]["struct"]["class_name"] = "SomethingElse"
+
+        admin = NormalizingAdmin(corrupt=corrupt)
+        with self.assertRaisesRegex(
+            CapitolError, r"does not round-trip .*nodes\[0\]/data/struct/class_name",
+        ):
+            self.materialize(cid, admin)
+        # The persist happened and is recorded with its rollback ref —
+        # nothing is silently lost.
+        materialization = self.store.get_compilation(cid)["materialization"]
+        self.assertIn("round-trip", materialization["error"])
+
+    def test_payload_divergences_paths(self):
+        sent = {"id": "w", "name": "n", "nodes": [{"data": {"struct": {
+            "class_name": "A", "catalog_contract_digest": "x"}}}],
+            "edges": [{"source": "a", "target": "b"}]}
+        stored = json.loads(json.dumps(sent))
+        stored["software_repo_url"] = ""                       # top-level default: fine
+        stored["nodes"][0]["data"]["struct"]["catalog_contract_digest"] = "y"  # server-managed: fine
+        self.assertEqual(payload_divergences(sent, stored), [])
+        stored["name"] = "renamed"
+        stored["edges"].append({"source": "b", "target": "c"})
+        stored["nodes"][0]["data"]["struct"]["extra"] = 1      # nested additions are drift
+        self.assertEqual(
+            payload_divergences(sent, stored),
+            ["/edges", "/name", "/nodes[0]/data/struct/extra"],
+        )
+        self.assertEqual(payload_divergences({"a": 1}, None), ["/"])
 
 
 class TestPartialFailureAndRollback(MaterializeCase):

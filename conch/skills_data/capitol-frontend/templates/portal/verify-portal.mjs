@@ -5,13 +5,13 @@
  * cookie, /api/feed → records with a source, /api/auth/me reflects the
  * email, logout clears the session.
  *
- *   node verify-portal.mjs [http://localhost:3000] --email you@example.com [--deny other@example.org]
+ *   node verify-portal.mjs [http://localhost:4330] --email you@example.com [--deny other@example.org]
  *
  * Requires the server to run with ALLOW_DEV_LOGIN=1 (local only). Exit 0
  * on PASS, 1 on any failed check.
  */
 const args = process.argv.slice(2);
-let base = "http://localhost:3000";
+let base = "http://localhost:4330";
 let email = null;
 let deny = "nobody@invalid.example";
 for (let i = 0; i < args.length; i += 1) {

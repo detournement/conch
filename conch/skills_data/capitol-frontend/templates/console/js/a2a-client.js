@@ -109,18 +109,29 @@ export class A2AClient {
     return this.sendSkill({ skill_id: "list_workflows" });
   }
 
-  async getWorkflowDetails(workflowId) {
-    return this.sendSkill({
-      skill_id: "get_workflow_details",
-      workflow_id: workflowId,
-    });
+  /**
+   * @param {string} workflowId
+   * @param {{versionId?: string}} [opts] versionId pins the saved version
+   *   whose input schema is returned; omitted = the latest saved version.
+   */
+  async getWorkflowDetails(workflowId, { versionId } = {}) {
+    const data = { skill_id: "get_workflow_details", workflow_id: workflowId };
+    if (versionId) data.version_id = versionId;
+    return this.sendSkill(data);
+  }
+
+  async getWorkflowVersions(workflowId) {
+    return this.sendSkill({ skill_id: "get_workflow_versions", workflow_id: workflowId });
   }
 
   /**
    * @param {string|null} workflowId omit only on single-workflow agents
    * @param {Object} inputs canonical "<node_id>.<field_id>" keys
+   * @param {{artifacts?: Array, idempotencyKey?: string, versionId?: string}} [opts]
+   *   versionId runs the exact saved workflow version the app was built
+   *   against (the gateway defaults to the latest saved version).
    */
-  async callWorkflow(workflowId, inputs, { artifacts = [], idempotencyKey } = {}) {
+  async callWorkflow(workflowId, inputs, { artifacts = [], idempotencyKey, versionId } = {}) {
     const data = {
       skill_id: "call_workflow",
       inputs,
@@ -128,6 +139,7 @@ export class A2AClient {
       idempotency_key: idempotencyKey || crypto.randomUUID(),
     };
     if (workflowId) data.workflow_id = workflowId;
+    if (versionId) data.version_id = versionId;
     return this.sendSkill(data);
   }
 

@@ -18,6 +18,7 @@ the fake gateway.
 import io
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
@@ -380,6 +381,50 @@ class TestFrontendTemplates(IsolatedDirsCase):
         pyproject = Path(builtin_skills_dir()).parent.parent / "pyproject.toml"
         self.assertIn('skills_data/*/templates/**/*', pyproject.read_text())
 
+    def test_default_ports_avoid_the_llama_cpp_and_dev_server_conventions(self):
+        """:8080 is the local llama.cpp convention and :3000 every dev
+        server's; the templates must come up beside both."""
+        offenders = []
+        for path in self.templates.rglob("*"):
+            if not path.is_file() or path.suffix not in (".mjs", ".js", ".md", ".sh"):
+                continue
+            text = path.read_text(errors="replace")
+            for port in ("8080", "3000"):
+                if re.search(rf"(localhost|127\.0\.0\.1|PORT[^\n]{{0,20}}|http\.server ):?{port}\b", text):
+                    offenders.append(f"{path.relative_to(self.templates)}:{port}")
+        self.assertEqual(offenders, [])
+        for archetype, port in (("console", "4310"), ("fed-page", "4320"), ("portal", "4330")):
+            readme = (self.templates / archetype / "README.md").read_text()
+            self.assertIn(port, readme, f"{archetype} README should name its default port {port}")
+
+    def test_console_pins_the_workflow_version(self):
+        """An app runs the saved workflow version it was built against:
+        the pin lives in config, rides on describe/call, folds into the
+        idempotency key, and preflight/verify report current|behind and
+        fail closed on a pin that is not a saved version."""
+        config = json.loads(
+            (self.templates / "console" / "config" / "app.config.json").read_text()
+        )
+        self.assertIn("workflow_version_id", config)
+        client = (self.templates / "console" / "js" / "a2a-client.js").read_text()
+        self.assertIn("getWorkflowVersions", client)
+        self.assertIn('skill_id: "get_workflow_versions"', client)
+        self.assertIn("data.version_id = versionId", client)
+        run_js = (self.templates / "console" / "js" / "run.js").read_text()
+        self.assertIn("export async function checkVersionPin", run_js)
+        self.assertIn("version_id: versionId", run_js)
+        for state in ('"unpinned"', '"current"', '"behind"', '"missing"'):
+            self.assertIn(state, run_js)
+        app_js = (self.templates / "console" / "js" / "app.js").read_text()
+        self.assertIn("config.workflow_version_id", app_js)
+        verify = (self.templates / "console" / "verify-run.mjs").read_text()
+        self.assertIn("checkVersionPin", verify)
+        self.assertIn("upgrade available", verify)
+        preflight = (self.templates / "console" / "preflight.sh").read_text()
+        self.assertIn("get_workflow_versions", preflight)
+        self.assertIn("is not a saved version", preflight)
+        self.assertIn("cookbook 'Upgrading'", preflight)
+
     @unittest.skipUnless(__import__("shutil").which("node"), "node not installed")
     def test_javascript_parses(self):
         import subprocess
@@ -388,6 +433,84 @@ class TestFrontendTemplates(IsolatedDirsCase):
             proc = subprocess.run(["node", "--check", str(path)],
                                   capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, f"{path}: {proc.stderr}")
+
+
+class TestFrontendCatalogAndAuthoring(IsolatedDirsCase):
+    """The skill answers 'what can I build?' with a catalog whose entries
+    the shipped templates can actually produce (extensions marked), and
+    it teaches the operator arc that creates the workflow an app needs —
+    compile → approve → materialize → pin — without the model ever
+    holding the admin surface."""
+
+    def setUp(self):
+        super().setUp()
+        root = builtin_skills_dir() / "capitol-frontend"
+        self.skill = get_skill("capitol-frontend")
+        self.cookbook = (root / "cookbook.md").read_text()
+        self.reference = (root / "reference.md").read_text()
+
+    def test_catalog_present_and_every_entry_declares_a_status(self):
+        self.assertIn("## App catalog", self.cookbook)
+        catalog = self.cookbook.split("## App catalog", 1)[1].split("### Leverage patterns", 1)[0]
+        rows = [line for line in catalog.splitlines()
+                if re.match(r"^\| \d+ \|", line)]
+        self.assertGreaterEqual(len(rows), 10)
+        for row in rows:
+            self.assertRegex(row, r"\| (console|fed-page|portal|mixed)",
+                             f"archetype missing: {row}")
+            self.assertRegex(row, r"shipped|extension", f"status missing: {row}")
+        # Honesty: the two things compiled v1 workflows cannot do are named
+        # as extensions, not promised.
+        self.assertIn("extension", catalog)
+        for modeled_on in ("market-research", "prop40", "together", "government-opportunities"):
+            self.assertIn(modeled_on, catalog.lower().replace("gov-opportunities", "government-opportunities"))
+
+    def test_leverage_patterns_cover_the_five_ways_apps_use_workflows(self):
+        section = self.cookbook.split("### Leverage patterns", 1)[1].split("## Recipe 1", 1)[0]
+        for pattern in ("P1", "P2", "P3", "P4", "P5"):
+            self.assertIn(pattern, section)
+        for phrase in ("on-demand", "schedule", "filestore", "trigger", "HITL"):
+            self.assertIn(phrase.lower(), section.lower(), phrase)
+
+    def test_skill_points_at_the_catalog_and_the_authoring_recipe(self):
+        body = self.skill["body"]
+        self.assertIn("App catalog", body)
+        self.assertIn("Step 1b", body)
+        for cmd in ("/compile approve", "/compile materialize", "/compile rollback",
+                    "materialization-lock.json"):
+            self.assertIn(cmd, body, cmd)
+        self.assertIn("workflow version:", body)  # checklist line
+        self.assertIn("Admin stays with the user", body)
+
+    def test_authoring_recipe_states_the_arc_and_the_approval_point(self):
+        self.assertIn("## Recipe 4", self.cookbook)
+        recipe = self.cookbook.split("## Recipe 4", 1)[1].split("## Shared checklist", 1)[0]
+        for anchor in ('/compile "', "/compile show", "/compile approve",
+                       "/compile materialize", "/compile status", "/compile rollback",
+                       "materialization-lock.json", "workflow_version_id",
+                       "/capitol admin persist", "the user runs every command",
+                       "### Pinning and upgrading"):
+            self.assertIn(anchor, recipe, anchor)
+        # The compile order the materializer actually follows.
+        self.assertLess(recipe.index("/compile approve"), recipe.index("/compile materialize"))
+        self.assertLess(recipe.index("/compile materialize"), recipe.index("/compile rollback"))
+
+    def test_reference_is_stamped_and_documents_versions_and_authoring(self):
+        head = self.reference[:600]
+        self.assertRegex(head, r"Document version \d{4}-\d{2}-\d{2}")
+        self.assertIn("Verified against", head)
+        self.assertIn("## Workflow versions, authoring and the approval gate", self.reference)
+        for anchor in ("`get_workflow_versions`", "version_id", "CapitolAdmin",
+                       "capitol_admin=true", "/compile rollback"):
+            self.assertIn(anchor, self.reference, anchor)
+
+    def test_no_machine_paths_anywhere_in_the_skill(self):
+        root = builtin_skills_dir() / "capitol-frontend"
+        for path in root.rglob("*"):
+            if path.is_file():
+                text = path.read_text(errors="replace")
+                for marker in ("/Users/", "~/composer", "~/cg-worktrees", "192.168."):
+                    self.assertNotIn(marker, text, f"{path.relative_to(root)} carries {marker}")
 
 
 class TestSkillScopedOffer(IsolatedDirsCase):

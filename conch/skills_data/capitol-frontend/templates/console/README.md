@@ -33,7 +33,7 @@ Running the verifier twice with the same inputs replays the same run
 ## Serve
 
 ```
-python3 -m http.server 8080     # then open http://localhost:8080/
+python3 -m http.server 4310     # then open http://localhost:4310/
 ```
 
 ES modules do not load from `file://`; always serve over http. The

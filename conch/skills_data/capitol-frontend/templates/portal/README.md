@@ -25,8 +25,8 @@ facade is down). Missing configuration makes every endpoint answer
 
 ```
 FILESTORE_BASE=… FILESTORE_ORG_TOKEN=… FILESTORE_ORG_ID=… FILESTORE_REPO=… RECORDS_PREFIX=… \
-SESSION_SECRET="$(openssl rand -hex 32)" ALLOWLIST="you@example.com" ALLOW_DEV_LOGIN=1 node serve.mjs 3000 &
-node verify-portal.mjs http://localhost:3000 --email you@example.com      # → "verify: PASS"
+SESSION_SECRET="$(openssl rand -hex 32)" ALLOWLIST="you@example.com" ALLOW_DEV_LOGIN=1 node serve.mjs 4330 &
+node verify-portal.mjs http://localhost:4330 --email you@example.com      # → "verify: PASS"
 ```
 
 ## Endpoints

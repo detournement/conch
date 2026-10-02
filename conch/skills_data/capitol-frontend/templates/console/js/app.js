@@ -153,8 +153,9 @@ async function main() {
     hitl.hidden = true;
     show("run-panel");
 
-    const key = await idempotencyKey(config.idempotency_prefix || config.app_slug, config.workflow_id, inputs);
-    const call = await client.callWorkflow(config.workflow_id, inputs, { idempotencyKey: key });
+    const versionId = config.workflow_version_id || "";
+    const key = await idempotencyKey(config.idempotency_prefix || config.app_slug, config.workflow_id, inputs, versionId);
+    const call = await client.callWorkflow(config.workflow_id, inputs, { idempotencyKey: key, versionId });
     // The gateway answers a repeated key with the stored original response
     // (same run_id, no "replayed" flag), so detect replay by the run id.
     const replayed = sessionStorage.getItem(`run:${key}`) === call.run_id;

@@ -235,7 +235,30 @@ def build_self_description(provider: str, model: str, config: dict = None) -> st
             f"temperature: {(config or {}).get('custom_temperature', (config or {}).get('temperature', '0.2'))}; "
             f"max output: {(config or {}).get('custom_max_tokens', (config or {}).get('max_output_tokens', 'automatic'))}."
         )
+    text += capitol_docs_guidance(config)
     return text
+
+
+def capitol_docs_guidance(config: dict = None) -> str:
+    """System-prompt sentence present only when ``capitol_docs_url`` is
+    set: the Capitol docs tools are the source for platform questions,
+    answers cite doc ids + corpus_version, and the platform's
+    "connections" are not conch's own /connect. Empty when unset so the
+    prompt stays tiny for everyone else."""
+    from .mcp import capitol_docs_url
+
+    if not capitol_docs_url(config):
+        return ""
+    return (
+        " Capitol platform docs are mounted (search_capitol_docs, how_do_i, "
+        "explain_concept, get_doc, whats_new, list_capabilities): answer "
+        "what-is / how-do-I questions about the Capitol platform (evals, "
+        "guardrails, collections, workflows, agents, connections, artifacts, "
+        "triggers, apps, admin, releases) from those tools, never from memory, "
+        "and end the answer with the doc id(s) used and the corpus_version. "
+        "Connecting Slack/Gmail/GitHub on Capitol is a platform question, not "
+        "conch's /connect."
+    )
 
 
 # ---------------------------------------------------------------------------

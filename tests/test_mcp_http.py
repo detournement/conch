@@ -265,6 +265,24 @@ class TestCapitolDocsConfigKey(unittest.TestCase):
 
         self.assertEqual(ENV_CONFIG_KEYS.get("CONCH_CAPITOL_DOCS_URL"), "capitol_docs_url")
 
+    def test_system_prompt_routes_platform_questions_only_when_mounted(self):
+        # Without a skill loaded, a one-shot "how do I connect Slack?" went
+        # to conch's own /connect and answers from the docs tools dropped
+        # the citation. The guidance rides on the config key, so the
+        # prompt stays tiny for everyone without a docs server.
+        from conch.prompts import build_self_description, capitol_docs_guidance
+
+        self.assertEqual(capitol_docs_guidance({}), "")
+        self.assertEqual(capitol_docs_guidance(None), "")
+        self.assertNotIn("corpus_version", build_self_description("anthropic", "claude-sonnet-5", {}))
+
+        text = build_self_description(
+            "anthropic", "claude-sonnet-5", {"capitol_docs_url": "http://127.0.0.1:8042/mcp"})
+        for anchor in ("search_capitol_docs", "how_do_i", "explain_concept",
+                       "never from memory", "doc id(s)", "corpus_version",
+                       "not conch's /connect"):
+            self.assertIn(anchor, text)
+
 
 if __name__ == "__main__":
     unittest.main()

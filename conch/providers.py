@@ -2097,7 +2097,8 @@ def get_custom_server_props(
             if isinstance(candidate, dict):
                 props = candidate
                 break
-        except Exception:
+        except Exception as exc:
+            _close_quietly(exc)  # a 404 from a non-llama.cpp server is expected
             continue
     with _local_model_cache_lock:
         _custom_props_cache[root] = (now, props)

@@ -13,7 +13,13 @@ them; its behaviour per failure class is scripted through attributes:
 * ``hang`` — seconds every handler sleeps before answering (``timeout``);
 * ``force_status`` — ``(status, json_body)`` returned by every request
   (quota, rate limiting, server errors);
-* ``requests`` — the log of ``(method, path)`` pairs the server saw.
+* ``ask_commands`` — what ask mode's forced ``shell_command`` tool call
+  gets back, per model id (a model with no entry, or an empty one,
+  answers in prose — the way a model that cannot call tools fails);
+* ``requests`` — the log of ``(method, path)`` pairs the server saw;
+  ``chat_tools`` — the tool names each ``/chat/completions`` request
+  offered, in order, so a test can tell the conformance probe from the
+  real call.
 
 Nothing here ever records or echoes an Authorization header value.
 """
@@ -25,7 +31,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def closed_port_url() -> str:
@@ -40,13 +46,16 @@ def closed_port_url() -> str:
 class StubEndpoint:
     def __init__(self, models=("stub-model",), tool_capable=None, *,
                  require_token: str = "", hang: float = 0.0,
-                 force_status: Optional[Tuple[int, dict]] = None):
+                 force_status: Optional[Tuple[int, dict]] = None,
+                 ask_commands: Optional[Dict[str, str]] = None):
         self.models: List[str] = list(models)
         self.tool_capable = set(self.models if tool_capable is None else tool_capable)
         self.require_token = require_token
         self.hang = hang
         self.force_status = force_status
+        self.ask_commands: Dict[str, str] = dict(ask_commands or {})
         self.requests: List[Tuple[str, str]] = []
+        self.chat_tools: List[List[str]] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         stub = self
@@ -142,7 +151,25 @@ class StubEndpoint:
                     (tool.get("function") or {}).get("name")
                     for tool in body.get("tools") or [] if isinstance(tool, dict)
                 }
-                if "conch_tool_probe" in offered:
+                with stub._lock:
+                    stub.chat_tools.append(sorted(name for name in offered if name))
+                if "shell_command" in offered:
+                    command = stub.ask_commands.get(model, "")
+                    if command:
+                        message = {
+                            "role": "assistant", "content": None,
+                            "tool_calls": [{
+                                "id": "call_ask", "type": "function",
+                                "function": {
+                                    "name": "shell_command",
+                                    "arguments": json.dumps({"command": command}),
+                                },
+                            }],
+                        }
+                    else:
+                        message = {"role": "assistant",
+                                   "content": f"You could run `{model}` style commands."}
+                elif "conch_tool_probe" in offered:
                     if model in stub.tool_capable:
                         message = {
                             "role": "assistant", "content": None,

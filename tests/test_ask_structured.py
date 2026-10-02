@@ -276,6 +276,37 @@ class TestCallCustomStructured(unittest.TestCase):
             recorded["body"]["tools"], [SHELL_COMMAND_TOOL]
         )
 
+    def test_custom_http_error_reports_the_endpoint_message_for_fallback(self):
+        import contextlib
+        import io
+        import urllib.error
+
+        body = io.BytesIO(json.dumps({"error": {
+            "message": "Invalid API key", "type": "authentication_error",
+        }}).encode())
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:8080/v1/chat/completions", 401, "Unauthorized", {}, body,
+        )
+        config = {
+            "provider": "custom",
+            "custom_base_url": "http://127.0.0.1:8080/v1",
+            "model": "local",
+        }
+        stderr = io.StringIO()
+        with patch(
+            "conch.providers.validate_custom_model",
+            return_value=(True, ""),
+        ), patch(
+            "conch.providers.get_custom_context_window",
+            return_value=8192,
+        ), patch("urllib.request.urlopen", side_effect=error), \
+                contextlib.redirect_stderr(stderr):
+            command = call_custom(config, MESSAGES)
+        self.assertEqual(command, "", "an HTTP error hands over to the fallback chain")
+        self.assertIn("Invalid API key", stderr.getvalue())
+        self.assertIn("type=authentication_error", stderr.getvalue())
+        self.assertTrue(body.closed, "the error body is closed once read")
+
 
 class TestCallCerebrasStructured(unittest.TestCase):
     def test_forces_shell_command_tool(self):

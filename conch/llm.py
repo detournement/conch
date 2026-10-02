@@ -1,9 +1,12 @@
-"""LLM clients: OpenAI, Anthropic, Cerebras, Ollama. Return single command string.
+"""Ask-mode LLM callers — one per provider conch supports (OpenAI,
+Anthropic, Cerebras, Bedrock, OpenRouter, Ollama, and custom
+OpenAI-compatible endpoints such as llama.cpp, vLLM, LM Studio). Each
+returns a single command string.
 
-Ask mode uses structured output everywhere (plan 0.6): Ollama gets a JSON
-schema via the ``format`` parameter; OpenAI, Anthropic, and Cerebras get a
-forced single ``shell_command`` tool call. There is no free-text command
-scraping — no regexes, no shell-prefix heuristics.
+Ask mode uses structured output everywhere (plan 0.6): every provider gets
+a forced single ``shell_command`` tool call (Ollama through its native
+``tools`` field). There is no free-text command scraping — no regexes, no
+shell-prefix heuristics.
 """
 import datetime
 import json
@@ -408,11 +411,13 @@ def call_ollama(config: dict, messages: list) -> str:
 
 
 def call_custom(config: dict, messages: list) -> str:
+    import urllib.error
     import urllib.request
 
     from .providers import (
         _clamp_output_to_context,
         _custom_headers,
+        format_http_api_error,
         get_custom_context_window,
         get_custom_base_url,
         validate_custom_model,
@@ -452,6 +457,10 @@ def call_custom(config: dict, messages: list) -> str:
         timeout = float(config.get("custom_timeout", 120) or 120)
         with urllib.request.urlopen(req, timeout=timeout) as response:
             data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        # Surfaces the endpoint's own error message (and closes the body).
+        print(f"conch: custom endpoint error: {format_http_api_error(exc)}", file=sys.stderr)
+        return ""
     except Exception as exc:
         print(f"conch: custom endpoint error: {exc}", file=sys.stderr)
         return ""
@@ -521,7 +530,11 @@ def ask(user_request: str, context: Optional[dict] = None) -> str:
         )
         fb_config = dict(config)
         fb_config["provider"] = fb_provider
-        fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
+        # Another model on the same provider shares its endpoint and key
+        # variable (a keyed custom endpoint, a renamed cloud key); only a
+        # cross-provider hop switches to that provider's default variable.
+        if fb_provider != provider:
+            fb_config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(fb_provider, "")
         fb_config["model"] = fb_model
         fb_messages, _ = build_messages(fb_config, user_request, context)
         result = fb_caller(fb_config, fb_messages)

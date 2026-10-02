@@ -36,6 +36,12 @@ conch-ask "compress this folder but skip node_modules"
 # tar --exclude=node_modules -czf archive.tgz .
 ```
 
+It reads the same provider and key configuration as `conch` — every cloud
+provider, Ollama, and custom OpenAI-compatible endpoints (llama.cpp, vLLM,
+LM Studio) — runs the same startup model check, and never prompts: a model
+that fails its probe is replaced only by a pre-approved `fallback_models`
+entry, otherwise the run exits 69 (see [Non-interactive runs](#non-interactive-runs)).
+
 ### Chat
 
 ```bash

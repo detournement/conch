@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Workflow-fed page</title>
+    <link rel="stylesheet" href="/page.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1 id="page-title">Workflow-fed page</h1>
+        <p class="muted" id="page-updated"></p>
+      </header>
+      <section class="panel">
+        <h2 id="doc-title"></h2>
+        <p id="doc-summary"></p>
+        <dl id="doc-fields"></dl>
+      </section>
+      <footer class="muted">Data is published by a Capitol workflow and refreshed on each visit.</footer>
+    </main>
+
+    <!-- The server replaces ONLY the content of this island at serve time. -->
+    <script id="app-data" type="application/json">{}</script>
+    <script type="module" src="/page.js"></script>
+  </body>
+</html>

@@ -1923,7 +1923,12 @@ def handle_slash_command(
         return None
 
     if command == "/skills":
-        from .skills import load_skills, skills_dir
+        from .skills import (
+            load_skills,
+            missing_skill_tools,
+            skill_one_liner,
+            skills_dir,
+        )
         skills = load_skills()
         if not skills:
             print(f"\n  \033[2mNo skills yet. Ask conch to 'turn what we just did "
@@ -1933,14 +1938,27 @@ def handle_slash_command(
         for name, skill in sorted(skills.items()):
             scope = "all tools" if skill["tools"] is None else ", ".join(skill["tools"])
             model = f"  \033[2mmodel={skill['model']}\033[0m" if skill["model"] else ""
-            print(f"    \033[1m{name:<20}\033[0m {skill['description'] or ''}"
-                  f"  \033[2m[{scope}]\033[0m{model}")
+            # One scannable line per skill: the first sentence. The full
+            # trigger-rich description is for the model's skill selection
+            # (system prompt / skill_manage list), not this listing.
+            missing = missing_skill_tools(skill, tool_map)
+            needs = (
+                f"  \033[33mneeds: {', '.join(missing)} (not in this session)\033[0m"
+                if missing else ""
+            )
+            print(f"    \033[1m{name:<20}\033[0m {skill_one_liner(skill)}"
+                  f"  \033[2m[{scope}]\033[0m{model}{needs}")
         print("\n  \033[2mUse: /skill <name> [task], or delegate with "
               "delegate_task(skill=...)\033[0m\n")
         return None
 
     if command == "/skill":
-        from .skills import get_skill, render_skill
+        from .skills import (
+            describe_missing_skill_tools,
+            get_skill,
+            missing_skill_tools,
+            render_skill,
+        )
         if not arg:
             print("\n  \033[2mUsage: /skill <name> [task for this skill]\033[0m\n")
             return None
@@ -1949,10 +1967,29 @@ def handle_slash_command(
         if skill is None:
             print(f"\n  \033[31mUnknown skill '{parts_[0]}'. /skills to list.\033[0m\n")
             return None
+        # Fail closed when the skill's declared tools are not in this
+        # session: sending the procedure anyway makes the model improvise
+        # around the missing tool (observed: grepping site-packages and
+        # reading credential files to reach the gateway by hand).
+        missing = missing_skill_tools(skill, tool_map)
+        if missing:
+            print(
+                "\n  \033[31m"
+                + describe_missing_skill_tools(skill["name"], missing)
+                .replace("\n", "\n  ")
+                + "\033[0m\n  \033[2mNothing was sent to the model.\033[0m\n"
+            )
+            return None
         prompt = render_skill(skill) + "\n\nFollow this skill's procedure."
         if len(parts_) > 1:
             prompt += f"\n\nTask: {parts_[1]}"
-        return ("user_prompt", prompt)
+        # The third element lets the shell activate the skill's tools for
+        # the session (profile filters may have hidden them) — the skill
+        # is the operator's explicit offer of those tools — and raise the
+        # tool-round budget to the skill's declared ``rounds``.
+        return ("user_prompt", prompt, {"skill": skill["name"],
+                                        "tools": list(skill["tools"] or []),
+                                        "rounds": int(skill.get("rounds") or 0)})
 
     if command == "/forget" and memory is not None:
         try:

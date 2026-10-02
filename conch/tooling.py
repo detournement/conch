@@ -9,9 +9,9 @@ import shlex
 import subprocess
 import time
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 MAX_GROUP_TOOLS = 200
@@ -341,21 +341,24 @@ def cap_tools(tools: List[dict], max_tools: int = MAX_ACTIVE_TOOLS) -> List[dict
     return others[: max_tools - len(pinned)] + pinned
 
 
-def select_relevant_tools(tools: List[dict], query: str, limit: int) -> List[dict]:
+def select_relevant_tools(tools: List[dict], query: str, limit: int,
+                          pinned_names=None) -> List[dict]:
     """Pick at most *limit* tools, ranked by relevance to the user's turn.
 
-    Pinned tools always survive; the remaining slots go to tools whose
-    name/description overlaps the query's keywords (ties keep original
-    order). Replaces the old order-based truncation, which kept whatever
-    happened to be first in the list.
+    Pinned tools always survive (the built-in set plus any session pins
+    in *pinned_names*, e.g. a skill's declared tools); the remaining
+    slots go to tools whose name/description overlaps the query's
+    keywords (ties keep original order). Replaces the old order-based
+    truncation, which kept whatever happened to be first in the list.
     """
     if limit <= 0 or len(tools) <= limit:
         return tools
+    always = PINNED_TOOL_NAMES | set(pinned_names or ())
     pinned: List[dict] = []
     others: List[dict] = []
     for tool in tools:
         name = tool.get("function", {}).get("name", "")
-        (pinned if name in PINNED_TOOL_NAMES else others).append(tool)
+        (pinned if name in always else others).append(tool)
     slots = limit - len(pinned)
     if slots <= 0:
         return pinned[:limit]
@@ -509,6 +512,50 @@ class ToolRuntimeState:
     # forces the corrective reminder on the next request (set by /resettools).
     textual_tool_calls: int = 0
     force_tool_reminder: bool = False
+    # Tools a skill asked for this session (/skill, skill_manage use): they
+    # survive the per-request relevance cap like PINNED_TOOL_NAMES do, so a
+    # later "continue" turn that never mentions the tool keeps it.
+    pinned_tools: Set[str] = field(default_factory=set)
+
+
+def ensure_tools_active(chat_state, names) -> List[str]:
+    """Make *names* part of the session's active toolset and pin them.
+
+    A skill's ``tools:`` line is the operator's explicit offer of those
+    tools (the delegate_task precedent), so invoking the skill in the main
+    session must not leave them profile-filtered away — the local-model
+    minimal profile drops every non-pinned product tool, which would make
+    the skill's own procedure impossible. Only tools that are *loaded*
+    (present in ``all_tools``) can be activated; the caller reports the
+    rest via skills.missing_skill_tools. Returns the names newly added to
+    the active list.
+    """
+    if chat_state is None:
+        return []
+    wanted = [n for n in (names or []) if n]
+    if not wanted:
+        return []
+    active = {
+        t.get("function", {}).get("name") for t in (chat_state.tools or [])
+    }
+    pool = {
+        t.get("function", {}).get("name"): t
+        for t in (chat_state.all_tools or [])
+    }
+    added: List[str] = []
+    for name in wanted:
+        tool_def = pool.get(name)
+        if tool_def is None:
+            continue
+        chat_state.pinned_tools.add(name)
+        if name in active:
+            continue
+        chat_state.tools = list(chat_state.tools or []) + [tool_def]
+        active.add(name)
+        added.append(name)
+    if added:
+        chat_state.needs_tool_refresh = True
+    return added
 
 
 @dataclass
@@ -2129,13 +2176,42 @@ class SkillManageClient:
     def __init__(self):
         self._interactive = True
         self._input_fn = None
+        self._chat_state = None
 
     def configure(self, interactive: bool = True, input_fn=None):
         self._interactive = interactive
         self._input_fn = input_fn
 
+    def bind_state(self, chat_state) -> None:
+        """Bind the session's tool state so action='use' can activate a
+        skill's declared tools (and report the ones this session lacks)."""
+        self._chat_state = chat_state
+
     def _text(self, msg: str) -> dict:
         return {"content": [{"type": "text", "text": msg}]}
+
+    def _tool_availability_note(self, skill: dict) -> str:
+        from . import skills as skills_mod
+
+        state = self._chat_state
+        if state is None or skill.get("tools") is None:
+            return ""
+        missing = skills_mod.missing_skill_tools(skill, state.tool_map)
+        added = ensure_tools_active(
+            state, [t for t in skill["tools"] if t not in missing]
+        )
+        notes = []
+        if added:
+            notes.append(
+                "(enabled for this session: " + ", ".join(added) + ")"
+            )
+        if missing:
+            notes.append(
+                skills_mod.describe_missing_skill_tools(skill["name"], missing)
+                + "\nTell the user plainly which tool is missing instead "
+                "of working around it with other tools."
+            )
+        return "\n\n".join(notes)
 
     def _confirm(self, prompt: str) -> bool:
         _input = self._input_fn or input
@@ -2171,10 +2247,14 @@ class SkillManageClient:
                 return self._text(
                     f"Unknown skill '{arguments.get('name', '')}'. Use action='list'."
                 )
-            return self._text(
+            text = (
                 skills_mod.render_skill(skill)
                 + "\n\nFollow this skill's procedure for the current task."
             )
+            note = self._tool_availability_note(skill)
+            if note:
+                text += "\n\n" + note
+            return self._text(text)
 
         if action == "save":
             skill_name = (arguments.get("name") or "").strip().lower()
@@ -3219,13 +3299,13 @@ class ConchIntrospectClient:
         skills = load_skills()
         lines.append("\n## Skills (reusable procedures; skill_manage / /skill)")
         if skills:
+            from .skills import skill_one_liner
+
             for skill_name, skill in sorted(skills.items()):
                 # First sentence, capped — trigger-rich frontmatter is for
                 # skill selection, not this bounded report (same treatment
                 # as the tool lines above).
-                summary = (skill["description"] or "(no description)")
-                summary = summary.split(". ")[0].strip()[:140]
-                lines.append(f"- {skill_name}: {summary}")
+                lines.append(f"- {skill_name}: {skill_one_liner(skill)}")
         else:
             lines.append("- none saved yet")
 

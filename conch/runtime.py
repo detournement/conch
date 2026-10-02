@@ -1494,8 +1494,13 @@ def select_request_tools(
     provider: str,
     messages: List[dict],
     provider_tool_limits: Dict[str, int],
+    pinned_names=None,
 ) -> Optional[List[dict]]:
-    """Select the exact tools offered to the model for this request."""
+    """Select the exact tools offered to the model for this request.
+
+    *pinned_names* are session pins (a skill's declared tools) that must
+    survive the per-provider relevance cap alongside the built-in pins.
+    """
     send_tools = list(tools or [])
     tool_limit = provider_tool_limits.get(provider)
     if tool_limit and len(send_tools) > tool_limit:
@@ -1510,7 +1515,9 @@ def select_request_tools(
             ),
             "",
         )
-        send_tools = select_relevant_tools(send_tools, user_text, tool_limit)
+        send_tools = select_relevant_tools(
+            send_tools, user_text, tool_limit, pinned_names
+        )
     return send_tools or None
 
 
@@ -1778,7 +1785,8 @@ def chat_turn(
             tools = chat_state.tools
             chat_state.needs_tool_refresh = False
         send_tools = select_request_tools(
-            tools, provider, messages, PROVIDER_TOOL_LIMITS
+            tools, provider, messages, PROVIDER_TOOL_LIMITS,
+            getattr(chat_state, "pinned_tools", None),
         )
         # Model-generated compaction first (plan 1.4); char-capping
         # compress_context stays as the cheap backstop below.
@@ -1952,7 +1960,8 @@ def chat_turn(
                         normalize_messages_on_switch(messages, fb_provider)
                     fb_messages = normalize_messages_for_provider(messages, fb_provider)
                     fb_tools = select_request_tools(
-                        tools, fb_provider, messages, PROVIDER_TOOL_LIMITS
+                        tools, fb_provider, messages, PROVIDER_TOOL_LIMITS,
+                        getattr(chat_state, "pinned_tools", None),
                     )
                     fb_tool_names = {
                         _tool_name(tool)

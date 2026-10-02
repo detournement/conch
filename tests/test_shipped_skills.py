@@ -112,6 +112,7 @@ class TestBuiltinSkillLoading(IsolatedDirsCase):
         pyproject = Path(builtin_skills_dir()).parent.parent / "pyproject.toml"
         text = pyproject.read_text()
         self.assertIn('skills_data/*/*.md', text)
+        self.assertIn('skills_data/*/templates/**/*', text)
 
 
 class TestFrontmatter(IsolatedDirsCase):
@@ -143,6 +144,9 @@ class TestFrontmatter(IsolatedDirsCase):
             self.assertIn(trigger, skill["description"])
         self.assertEqual(skill["tools"],
                          ["local_shell", "capitol_control"])
+        # A scaffold + preflight + verify arc needs more than the
+        # 10-round delegate default.
+        self.assertGreaterEqual(skill["rounds"], 30)
 
     def test_capitol_frontend_hard_rules_present(self):
         body = get_skill("capitol-frontend")["body"]
@@ -241,6 +245,149 @@ class TestFrontendReferenceMatchesAdapter(IsolatedDirsCase):
                        "workflow.run_completed", "node.input_required",
                        "FILESTORE_ORG_TOKEN", "/tree", "/files/"):
             self.assertIn(anchor, reference, f"{anchor} undocumented")
+
+    def test_reference_states_the_observed_replay_semantics(self):
+        # Verified against the gateway source and a live replay: a repeated
+        # idempotency_key returns the stored original response (same run_id,
+        # no flag), so the skill must not promise `replayed: true`.
+        reference = (builtin_skills_dir() / "capitol-frontend" /
+                     "reference.md").read_text()
+        self.assertNotIn("`replayed: true`", reference)
+        self.assertIn("stored original response", reference)
+        self.assertIn("Status first", reference)
+
+    def test_template_client_speaks_only_adapter_skill_ids(self):
+        import re
+
+        templates = builtin_skills_dir() / "capitol-frontend" / "templates"
+        ids = set()
+        for path in (templates / "console" / "js").glob("*.js"):
+            ids.update(re.findall(r'skill_id:\s*"([a-z_]+)"', path.read_text()))
+        self.assertGreaterEqual(len(ids), 8, sorted(ids))
+        client_source = (
+            Path(__file__).resolve().parents[1]
+            / "conch" / "capitol" / "client.py"
+        ).read_text()
+        for skill_id in sorted(ids):
+            self.assertIn(f'"{skill_id}"', client_source,
+                          f"template sends {skill_id!r} but the adapter "
+                          "never does")
+
+
+FRONTEND_TEMPLATE_FILES = {
+    "console": (
+        "README.md", "index.html", "app.css", "config/app.config.json",
+        "js/a2a-client.js", "js/run.js", "js/run-view.js", "js/app.js",
+        "preflight.sh", "verify-run.mjs",
+    ),
+    "fed-page": (
+        "README.md", "template/index.html", "public/page.js", "public/page.css",
+        "data/baseline.json", "api/index.js", "vercel.json", "serve.mjs",
+        "verify-page.mjs",
+    ),
+    "portal": (
+        "README.md", "public/index.html", "public/app.js", "public/app.css",
+        "api/_shared.js", "api/auth/login.js", "api/auth/me.js",
+        "api/auth/logout.js", "api/feed.js", "vercel.json", "serve.mjs",
+        "verify-portal.mjs",
+    ),
+}
+
+
+class TestFrontendTemplates(IsolatedDirsCase):
+    """The capitol-frontend skill ships one known-good minimal app per
+    archetype; the model copies it instead of retyping ~1,800 lines of a
+    reference app (observed: 400k input tokens for one scaffold turn)."""
+
+    def setUp(self):
+        super().setUp()
+        self.templates = builtin_skills_dir() / "capitol-frontend" / "templates"
+
+    def test_every_archetype_ships_its_files(self):
+        for archetype, files in FRONTEND_TEMPLATE_FILES.items():
+            for rel in files:
+                path = self.templates / archetype / rel
+                self.assertTrue(path.is_file(), f"{archetype}/{rel} missing")
+                self.assertGreater(path.stat().st_size, 0, f"{archetype}/{rel} empty")
+        # Invoked as `bash preflight.sh` everywhere so a sync that drops the
+        # exec bit (conch-works) cannot break the recipe.
+        skill_body = get_skill("capitol-frontend")["body"]
+        self.assertIn("bash preflight.sh", skill_body)
+        self.assertNotIn("./preflight.sh", skill_body)
+
+    def test_json_assets_parse_and_placeholders_are_marked(self):
+        for path in self.templates.rglob("*.json"):
+            json.loads(path.read_text())
+        config = json.loads(
+            (self.templates / "console" / "config" / "app.config.json").read_text()
+        )
+        for key in ("gateway_url", "workflow_id"):
+            self.assertIn("REPLACE_", config[key])
+        self.assertIn("REPLACE_", config["fields"][0]["key"])
+
+    def test_no_secrets_or_machine_paths_in_templates(self):
+        for path in self.templates.rglob("*"):
+            if not path.is_file():
+                continue
+            text = path.read_text(errors="replace")
+            self.assertNotIn("cap_a2a_", text.replace("cap_a2a_*", "").replace("cap_a2a_&hellip;", "").replace("cap_a2a_...", ""),
+                             f"{path} carries a token-like literal")
+            self.assertNotIn("bootstrap_token", text, f"{path} ships a bootstrap token")
+            for marker in ("/Users/", "~/composer", "~/cg-worktrees"):
+                self.assertNotIn(marker, text, f"{path} depends on a machine path")
+
+    def test_console_derives_idempotency_from_inputs_and_checks_status_first(self):
+        run_js = (self.templates / "console" / "js" / "run.js").read_text()
+        self.assertIn("export async function idempotencyKey", run_js)
+        self.assertIn("SHA-256", run_js)
+        self.assertNotIn("randomUUID", run_js)
+        # status before subscribing, and while streaming
+        self.assertIn("const initial = await client.getWorkflowStatus(runId)", run_js)
+        self.assertIn("statusCheckMs", run_js)
+        self.assertIn("submit_clarification_response", run_js)
+        self.assertIn("submit_intervention_response", run_js)
+        app_js = (self.templates / "console" / "js" / "app.js").read_text()
+        self.assertIn("idempotencyKey(", app_js)
+        self.assertIn("node.input_required", app_js)
+
+    def test_server_templates_fail_closed(self):
+        fed = (self.templates / "fed-page" / "api" / "index.js").read_text()
+        self.assertIn('replaceAll("</", "<\\\\/")', fed)
+        self.assertIn("X-Data-Source", fed)
+        shared = (self.templates / "portal" / "api" / "_shared.js").read_text()
+        self.assertIn("BFF misconfigured", shared)
+        self.assertIn('process.env.VERCEL_ENV !== "production"', shared)
+        self.assertIn("timingSafeEqual", shared)
+
+    def test_skill_and_cookbook_point_at_the_templates(self):
+        skill = get_skill("capitol-frontend")
+        self.assertEqual(skill["rounds"], 40)
+        for anchor in ("templates/console/", "templates/fed-page/",
+                       "templates/portal/", "capitol-frontend checklist",
+                       "## Failure modes", "verify-run.mjs", "REPLACE_"):
+            self.assertIn(anchor, skill["body"], anchor)
+        rendered = render_skill(skill)
+        self.assertIn("[Skill assets:", rendered)
+        self.assertIn("templates/", rendered)
+        cookbook = (builtin_skills_dir() / "capitol-frontend" / "cookbook.md").read_text()
+        for anchor in ("verify-run.mjs", "verify-page.mjs", "verify-portal.mjs",
+                       "preflight: PASS", "verify: PASS", "--expect-source baseline"):
+            self.assertIn(anchor, cookbook, anchor)
+        for marker in ("~/composer", "~/cg-worktrees"):
+            self.assertNotIn(marker, cookbook, "cookbook must not depend on machine paths")
+
+    def test_package_data_glob_covers_the_templates(self):
+        pyproject = Path(builtin_skills_dir()).parent.parent / "pyproject.toml"
+        self.assertIn('skills_data/*/templates/**/*', pyproject.read_text())
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node not installed")
+    def test_javascript_parses(self):
+        import subprocess
+
+        for path in sorted(self.templates.rglob("*.js")) + sorted(self.templates.rglob("*.mjs")):
+            proc = subprocess.run(["node", "--check", str(path)],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, f"{path}: {proc.stderr}")
 
 
 class TestSkillScopedOffer(IsolatedDirsCase):

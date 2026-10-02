@@ -1,13 +1,15 @@
-"""The shipped-skills convention and the capitol / pack-author skills.
+"""The shipped-skills convention and the capitol-family skills.
 
 Proven here: built-in package skills (conch/skills_data/<name>/SKILL.md)
 are discovered by the same loader as user skills, with user skills
-winning by name (the flow-pack registry rule); the two shipped skills
+winning by name (the flow-pack registry rule); the shipped skills
 carry valid trigger-rich frontmatter, scope the capitol_control tool,
 fit the injection budget un-truncated, and point the model at their
 companion reference/cookbook files; the pack-author reference documents
 the grammar the engine actually implements (checked against the
-manifest module's own constants, not the design doc); a skill-scoped
+manifest module's own constants, not the design doc); the
+capitol-frontend reference documents only gateway skill ids the conch
+adapter itself speaks (doc drift fails a test); a skill-scoped
 sub-turn is the explicit offer of capitol_control; and the capitol
 cookbook's backfill/watch/artifact recipes execute as written against
 the fake gateway.
@@ -42,7 +44,7 @@ from conch.tooling import DelegateTaskClient, ToolRuntimeState
 
 from tests.test_capitol_client import AGENT, BEARER, ORG, FakeGateway
 
-SHIPPED = ("capitol", "pack-author")
+SHIPPED = ("capitol", "pack-author", "capitol-frontend")
 
 
 class IsolatedDirsCase(unittest.TestCase):
@@ -133,6 +135,23 @@ class TestFrontmatter(IsolatedDirsCase):
         self.assertEqual(skill["tools"],
                          ["local_shell", "capitol_control"])
 
+    def test_capitol_frontend_frontmatter(self):
+        skill = get_skill("capitol-frontend")
+        self.assertEqual(skill["name"], "capitol-frontend")
+        for trigger in ("Use when", "frontend", "A2A", "SSE", "HITL",
+                        "filestore", "scaffold", "capitol_control"):
+            self.assertIn(trigger, skill["description"])
+        self.assertEqual(skill["tools"],
+                         ["local_shell", "capitol_control"])
+
+    def test_capitol_frontend_hard_rules_present(self):
+        body = get_skill("capitol-frontend")["body"]
+        self.assertIn("Tokens never ship in client code", body)
+        self.assertIn("Never invent ids", body)
+        self.assertIn("Effectful starts are keyed", body)
+        self.assertIn("Relay HITL verbatim", body)
+        self.assertIn("Fail closed, degrade honestly", body)
+
     def test_capitol_hard_rules_present(self):
         body = get_skill("capitol")["body"]
         self.assertIn("Never invent workflow ids", body)
@@ -186,6 +205,44 @@ class TestPackAuthorReferenceMatchesEngine(IsolatedDirsCase):
         self.assertIn("golden_scenarios", text)
 
 
+class TestFrontendReferenceMatchesAdapter(IsolatedDirsCase):
+    """The capitol-frontend reference documents the gateway contract the
+    conch adapter itself implements — a skill id in the catalog table
+    that client.py never sends is doc drift and fails here."""
+
+    def test_catalog_skill_ids_exist_in_the_adapter(self):
+        import re
+
+        reference = (builtin_skills_dir() / "capitol-frontend" /
+                     "reference.md").read_text()
+        catalog = reference.split("### Gateway skill catalog", 1)[1]
+        catalog = catalog.split("###", 1)[0]
+        ids = set()
+        for line in catalog.splitlines():
+            if not line.startswith("| `"):
+                continue
+            first_cell = line.split("|")[1]
+            ids.update(re.findall(r"`([a-z_]+)`", first_cell))
+        self.assertGreaterEqual(len(ids), 12, sorted(ids))
+        client_source = (
+            Path(__file__).resolve().parents[1]
+            / "conch" / "capitol" / "client.py"
+        ).read_text()
+        for skill_id in sorted(ids):
+            self.assertIn(f'"{skill_id}"', client_source,
+                          f"reference.md documents {skill_id!r} but the "
+                          "adapter never sends it")
+
+    def test_reference_covers_the_frontend_surfaces(self):
+        reference = (builtin_skills_dir() / "capitol-frontend" /
+                     "reference.md").read_text()
+        for anchor in ("agent-card.json", "message/send", "message/stream",
+                       "tasks/resubscribe", "since_sequence",
+                       "workflow.run_completed", "node.input_required",
+                       "FILESTORE_ORG_TOKEN", "/tree", "/files/"):
+            self.assertIn(anchor, reference, f"{anchor} undocumented")
+
+
 class TestSkillScopedOffer(IsolatedDirsCase):
     """The shipped capitol skill is the explicit offer of the
     implicitly-excluded capitol_control tool (personal_items precedent)."""
@@ -225,6 +282,39 @@ class TestSkillScopedOffer(IsolatedDirsCase):
         self.assertIn("capitol_control", seen["clients"])
         # The skill body (with its hard rules) rode into the prompt.
         self.assertIn("Never invent workflow ids", seen["system"])
+
+    def test_capitol_frontend_skill_scopes_the_same_pair(self):
+        seen = {}
+
+        def fake_chat_turn(config, provider, raw_fn, messages, tools,
+                           tool_map, builtin_clients, **kwargs):
+            seen["tools"] = {t["function"]["name"] for t in tools}
+            seen["system"] = messages[0]["content"]
+            return "done", {}
+
+        client = DelegateTaskClient()
+        all_tools = [
+            {"function": {"name": "local_shell"}},
+            {"function": {"name": "capitol_control"}},
+            {"function": {"name": "public_api"}},
+        ]
+        state = ToolRuntimeState(all_tools=all_tools, tool_map={},
+                                 tools=all_tools)
+        builtins = {
+            "local_shell": object(),
+            "capitol_control": object(),
+            "public_api": object(),
+            "delegate_task": client,
+        }
+        client.bind({"provider": "openai"}, state, builtins)
+        with patch("conch.runtime.chat_turn", fake_chat_turn), \
+             patch("sys.stderr", io.StringIO()):
+            client.call_tool("delegate_task", {
+                "task": "scaffold a console app for the intake workflow",
+                "skill": "capitol-frontend",
+            })
+        self.assertEqual(seen["tools"], {"capitol_control", "local_shell"})
+        self.assertIn("Tokens never ship in client code", seen["system"])
 
 
 class TestCookbookSmoke(IsolatedDirsCase):

@@ -3165,7 +3165,12 @@ class ConchIntrospectClient:
         lines.append("\n## Skills (reusable procedures; skill_manage / /skill)")
         if skills:
             for skill_name, skill in sorted(skills.items()):
-                lines.append(f"- {skill_name}: {skill['description'] or '(no description)'}")
+                # First sentence, capped — trigger-rich frontmatter is for
+                # skill selection, not this bounded report (same treatment
+                # as the tool lines above).
+                summary = (skill["description"] or "(no description)")
+                summary = summary.split(". ")[0].strip()[:140]
+                lines.append(f"- {skill_name}: {summary}")
         else:
             lines.append("- none saved yet")
 

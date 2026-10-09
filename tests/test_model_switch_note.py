@@ -141,7 +141,13 @@ class SlashSwitchNoteTests(unittest.TestCase):
         }
 
     def _switch(self, command, config, messages):
-        with _quiet() as out:
+        from conch import modelcheck
+        # The /model switch re-probes a new cloud model (modelcheck); stub it
+        # to a pass since these tests exercise the switch-note logic, not the
+        # network probe. (llamaidx/ollama/custom switches never reach it.)
+        ok = modelcheck.ProbeResult("x", "y", modelcheck.OK, "stubbed")
+        with _quiet() as out, \
+                patch("conch.modelcheck.probe_model", return_value=ok):
             result = handle_slash_command(
                 command, config, "anthropic", "claude-sonnet-5",
                 lambda v: None, messages=messages,

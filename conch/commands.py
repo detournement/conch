@@ -2180,6 +2180,47 @@ def handle_slash_command(
         if key_env and not os.environ.get(key_env, "").strip():
             print(f"\n  \033[31m{key_env} not set — cannot switch to {new_provider}\033[0m\n")
             return None
+        # Re-run the (non-interactive, bounded) model-check probe on the NEW
+        # model before committing the switch, so an unusable model is reported
+        # here instead of surfacing as a dead next turn. Reuses
+        # conch/modelcheck.py — no second probe implementation. Per-model
+        # request state (max_tokens, thinking, the provider tool cap) is
+        # recomputed from config on every request, so committing the new
+        # provider+model below is the whole "refresh".
+        #
+        # Scoped to cloud providers: /model already ran a LIVE validation for
+        # ollama (validate_ollama_model) and custom (validate_custom_model)
+        # above, so re-probing them would just double the network round-trip.
+        # Cloud validation above is only a static catalog check, so the live
+        # probe is exactly the gap this fills.
+        from .modelcheck import (
+            CLOUD_PROVIDERS,
+            model_check_enabled,
+            model_check_timeout,
+            probe_model,
+        )
+
+        if new_provider in CLOUD_PROVIDERS and model_check_enabled(config):
+            probe_config = dict(config)
+            probe_config.update({
+                "provider": new_provider,
+                "api_key_env": key_env,
+                "chat_model": new_model,
+                "model": new_model,
+            })
+            from .render import Spinner
+            with Spinner(f"Verifying {new_provider}/{new_model}"):
+                probe = probe_model(
+                    new_provider, new_model, probe_config,
+                    timeout=model_check_timeout(config),
+                )
+            if not probe.ok:
+                print(
+                    f"\n  \033[31mCannot switch: {new_provider}/{new_model} "
+                    f"{probe.describe()}\033[0m"
+                )
+                print("  \033[2mThe model was not changed.\033[0m\n")
+                return None
         config["provider"] = new_provider
         config["api_key_env"] = key_env
         config["chat_model"] = new_model

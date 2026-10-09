@@ -662,8 +662,10 @@ class TestModelVerificationAnnotations(unittest.TestCase):
 
     def test_every_catalog_entry_is_annotated(self):
         import re
+        # An ISO date (optionally with a "(…)" capability note such as
+        # "(tools: auto-choice)"), or an explicit "unverified …" marker.
         pattern = re.compile(
-            rf"^({self.DATE_RE}|unverified {self.DATE_RE} \(.+\))$"
+            rf"^({self.DATE_RE}( \(.+\))?|unverified {self.DATE_RE} \(.+\))$"
         )
         for provider, models in KNOWN_MODELS.items():
             if provider in ("ollama", "custom"):

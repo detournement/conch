@@ -69,11 +69,17 @@ class TestValidateModelForProvider(unittest.TestCase):
 
 class TestModelSwitchValidation(unittest.TestCase):
     def _run(self, cmd, provider="anthropic", model="claude-sonnet-4-6"):
+        from conch import modelcheck
         from conch.commands import handle_slash_command
         config = {"provider": provider}
         out = io.StringIO()
+        # The /model switch now re-probes the new cloud model (modelcheck);
+        # these unit tests have no network, so stub the probe to a pass. The
+        # rejection tests reject before the probe, so this never masks them.
+        ok = modelcheck.ProbeResult(provider, model, modelcheck.OK, "stubbed")
         with contextlib.redirect_stdout(out), \
-             patch("conch.commands.list_ollama_models", return_value=None):
+             patch("conch.commands.list_ollama_models", return_value=None), \
+             patch("conch.modelcheck.probe_model", return_value=ok):
             result = handle_slash_command(cmd, config, provider, model, lambda v: None)
         return result, out.getvalue(), config
 

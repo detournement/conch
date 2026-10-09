@@ -193,8 +193,24 @@ def _probe_body(provider: str, model: str) -> "tuple[str, dict, dict]":
     return urls[provider], _bearer(provider), body
 
 
+def _anthropic_choice_mode(model: str) -> str:
+    """The tool_choice form the probe uses for *model* ("forced" or "auto").
+    Opus 5.5 / Fable 5.1 reject forced choice, so they are tools-verified
+    through {"type":"auto"} plus strict tool_use extraction."""
+    return "forced" if anthropic_forced_tool_choice_supported(model) else "auto"
+
+
 def _extract_tool_ok(provider: str, payload: dict) -> "tuple[bool, str]":
     if provider == "anthropic":
+        # A policy refusal (stop_reason=refusal, e.g. category "cyber") is a
+        # distinct outcome from a model that simply didn't call the tool;
+        # report it as such so the audit never files it under "no tool call".
+        if payload.get("stop_reason") == "refusal":
+            details = payload.get("stop_details") or {}
+            category = details.get("category")
+            explanation = (details.get("explanation") or "").split(". ", 1)[0].strip()
+            tag = f"refused ({category})" if category else "refused"
+            return False, f"{tag}: {explanation}" if explanation else tag
         for block in payload.get("content") or []:
             if block.get("type") == "tool_use" and block.get("name") == PROBE_TOOL:
                 if (block.get("input") or {}).get("token") == "conch-ok":
@@ -270,6 +286,7 @@ def audit_provider(provider: str) -> "list[dict]":
             )
         return rows
     live = list_models(provider)
+    today = time.strftime("%Y-%m-%d")
     for model in models:
         exists = "unknown" if live is None else ("yes" if model in live else "NO")
         # Absence from the list endpoint is advisory: aliases (e.g.
@@ -277,17 +294,27 @@ def audit_provider(provider: str) -> "list[dict]":
         # completion endpoint without being listed. The probe decides.
         ok, reason = probe_model(provider, model)
         time.sleep(INTER_PROBE_DELAY)
+        # Record HOW tools were verified so the catalog annotation can carry
+        # it: Anthropic's forced-choice-rejecting models (Opus 5.5) are
+        # tools-verified via {"type":"auto"}, not forced choice.
+        choice = _anthropic_choice_mode(model) if provider == "anthropic" else ""
         if ok:
             verdict = "pass"
-            why = reason or "forced tool call verified"
+            why = reason or (
+                f"native tool call verified ({choice} tool_choice)"
+                if choice else "native tool call verified"
+            )
             if exists == "NO":
                 exists = "alias"
                 why += " (unlisted alias)"
+            tools_note = f"tools: {choice}-choice" if choice == "auto" else "tools"
+            annotation = f'    "{model}": "{today} ({tools_note})",'
         else:
             verdict = "PRUNE"
             why = reason
             if exists == "NO":
                 why = f"absent from live model list; probe: {reason}"
+            annotation = ""
         rows.append(
             {
                 "provider": provider,
@@ -296,6 +323,7 @@ def audit_provider(provider: str) -> "list[dict]":
                 "tools": "yes" if ok else "NO",
                 "verdict": verdict,
                 "why": why,
+                "annotation": annotation,
             }
         )
     return rows
@@ -347,6 +375,15 @@ def main(argv=None) -> int:
         )
         if bad:
             print(f"\nWARNING: default model for {provider} ('{default}') failed the audit")
+
+    # "Tools verified" is part of the live audit: emit the exact
+    # MODEL_VERIFIED lines (date + tool-choice mode) for every passing model
+    # so the catalog annotation is driven by the audit, not written by hand.
+    passed = [row for row in rows if row["verdict"] == "pass" and row["annotation"]]
+    if passed:
+        print("\nMODEL_VERIFIED annotations (paste into conch/providers.py):")
+        for row in passed:
+            print(row["annotation"])
 
     if args.prune_suggestions:
         print()

@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import threading
@@ -14,6 +15,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("conch.providers")
+
+# Content-block types conch's Anthropic path knows how to turn into either a
+# textual reply or a dispatchable tool call. Anything else (server_tool_use,
+# web_search_tool_result, mcp_tool_use, future block types) is recorded and
+# surfaced as a loud diagnostic rather than silently dropped on the floor.
+ANTHROPIC_KNOWN_BLOCK_TYPES = frozenset(
+    {"text", "tool_use", "thinking", "redacted_thinking"}
+)
 
 
 # Every cloud catalog entry must pass the live audit (existence via the
@@ -105,7 +116,12 @@ KNOWN_MODELS = {
     # model'); {"type": "auto"} works and the model calls the offered tool
     # reliably (verified live 2026-09-23). See
     # anthropic_forced_tool_choice_supported(), honored by ask mode and
-    # tools/audit_models.py. Note: Anthropic's "preserved thinking" applies
+    # tools/audit_models.py. Opus 5.5 also emits stop_reason="refusal"
+    # (e.g. stop_details.category "cyber") with ZERO content blocks when a
+    # request trips Anthropic's usage policy; stream_anthropic/raw_anthropic
+    # capture that and chat_turn surfaces it loudly instead of rendering a
+    # silent [no response] (diagnose_undispatchable_response). Note:
+    # Anthropic's "preserved thinking" applies
     # to Opus 5.5 (and Fable 5.1) for API accounts created on or after
     # 2026-08-31 — editing prior assistant context can be rejected on such
     # accounts, which affects history-rewriting flows like compaction.
@@ -164,15 +180,20 @@ MODEL_VERIFIED = {
     "o3": "2026-09-23",
     "o3-mini": "2026-09-23",
     "o1": "2026-09-23",
-    "claude-opus-5-5": "2026-09-23",
-    "claude-opus-5": "2026-09-23",
-    "claude-sonnet-5": "2026-09-23",
-    "claude-opus-4-8": "2026-09-23",
-    "claude-opus-4-7": "2026-09-23",
-    "claude-sonnet-4-6": "2026-09-23",
-    "claude-opus-4-6": "2026-09-23",
-    "claude-haiku-4-5": "2026-09-23",
-    "claude-sonnet-4-5-20250929": "2026-09-23",
+    # Anthropic catalog re-audited live 2026-10-09 (existence + native
+    # tool-call probe via tools/audit_models.py): all pass. The "(tools…)"
+    # suffix records the tool_choice mode the probe used — claude-opus-5-5
+    # rejects forced choice, so it is verified with {"type":"auto"} plus
+    # strict tool_use extraction (see anthropic_forced_tool_choice_supported).
+    "claude-opus-5-5": "2026-10-09 (tools: auto-choice)",
+    "claude-opus-5": "2026-10-09 (tools)",
+    "claude-sonnet-5": "2026-10-09 (tools)",
+    "claude-opus-4-8": "2026-10-09 (tools)",
+    "claude-opus-4-7": "2026-10-09 (tools)",
+    "claude-sonnet-4-6": "2026-10-09 (tools)",
+    "claude-opus-4-6": "2026-10-09 (tools)",
+    "claude-haiku-4-5": "2026-10-09 (tools)",
+    "claude-sonnet-4-5-20250929": "2026-10-09 (tools)",
 }
 
 DEFAULT_API_KEY_ENVS = {
@@ -1410,11 +1431,13 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
 
     text_parts: List[str] = []
     tool_calls: List[dict] = []
+    unknown_blocks: List[str] = []
     raw_content = data.get("content", [])
     for block in raw_content:
-        if block.get("type") == "text":
+        btype = block.get("type")
+        if btype == "text":
             text_parts.append(block.get("text", ""))
-        elif block.get("type") == "tool_use":
+        elif btype == "tool_use":
             tool_calls.append({
                 "id": block["id"],
                 "type": "function",
@@ -1423,6 +1446,8 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
                     "arguments": json.dumps(block.get("input", {})),
                 },
             })
+        elif btype not in ANTHROPIC_KNOWN_BLOCK_TYPES:
+            unknown_blocks.append(str(btype))
     return {
         "role": "assistant",
         "content": "\n".join(text_parts).strip(),
@@ -1430,6 +1455,10 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         "_anthropic_content": raw_content,
         "_usage": _normalize_usage(data, "anthropic"),
         "_model": body["model"],
+        "_provider": "anthropic",
+        "_stop_reason": data.get("stop_reason"),
+        "_stop_details": data.get("stop_details"),
+        "_unknown_blocks": unknown_blocks,
     }
 
 
@@ -2592,6 +2621,10 @@ def stream_anthropic(
     text_parts: list[str] = []
     anthropic_content: list[dict] = []
     tool_calls: list[dict] = []
+    unknown_blocks: list[str] = []
+    tool_input_errors: list[dict] = []
+    stop_reason: Optional[str] = None
+    stop_details: Optional[dict] = None
     cur_block_type: Optional[str] = None
     cur_block_meta: dict = {}
     cur_text: list[str] = []
@@ -2627,6 +2660,8 @@ def stream_anthropic(
                     cur_block_meta = block
                     cur_text = []
                     cur_json = ""
+                    if cur_block_type not in ANTHROPIC_KNOWN_BLOCK_TYPES:
+                        unknown_blocks.append(str(cur_block_type))
 
                 elif etype == "content_block_delta":
                     delta = data.get("delta", {})
@@ -2649,10 +2684,25 @@ def stream_anthropic(
                             {"type": "text", "text": "".join(cur_text)}
                         )
                     elif cur_block_type == "tool_use":
-                        try:
-                            inp = json.loads(cur_json) if cur_json else {}
-                        except json.JSONDecodeError:
-                            inp = {}
+                        inp = {}
+                        if cur_json:
+                            try:
+                                inp = json.loads(cur_json)
+                            except json.JSONDecodeError:
+                                # Truncated/invalid tool input (e.g.
+                                # stop_reason=max_tokens mid-block). Fail
+                                # closed: never dispatch a tool call with
+                                # fabricated empty args — withhold it and
+                                # record the error so chat_turn surfaces the
+                                # truncation loudly instead of running a
+                                # half-formed command.
+                                tool_input_errors.append({
+                                    "name": cur_block_meta.get("name", ""),
+                                    "id": cur_block_meta.get("id", ""),
+                                    "partial_chars": len(cur_json),
+                                })
+                                cur_block_type = None
+                                continue
                         anthropic_content.append({
                             "type": "tool_use",
                             "id": cur_block_meta.get("id", ""),
@@ -2684,6 +2734,11 @@ def stream_anthropic(
                     cur_block_type = None
 
                 elif etype == "message_delta":
+                    delta = data.get("delta", {})
+                    if delta.get("stop_reason"):
+                        stop_reason = delta["stop_reason"]
+                    if delta.get("stop_details"):
+                        stop_details = delta["stop_details"]
                     mu = data.get("usage", {})
                     usage["output_tokens"] = mu.get("output_tokens", 0)
     except urllib.error.HTTPError as exc:
@@ -2702,6 +2757,11 @@ def stream_anthropic(
         "_anthropic_content": anthropic_content,
         "_usage": usage,
         "_model": model,
+        "_provider": "anthropic",
+        "_stop_reason": stop_reason,
+        "_stop_details": stop_details,
+        "_unknown_blocks": unknown_blocks,
+        "_tool_input_error": tool_input_errors or None,
     }
 
 

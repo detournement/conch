@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import logging
 import math
 import re
 import json
@@ -15,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 from . import mcp as mcp_mod
 from .render import Spinner, StreamPrinter, clear_active_spinners
+
+logger = logging.getLogger("conch.runtime")
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1699,108 @@ def _sync_anthropic_tool_call_ids(response: dict, tool_calls: List[dict]) -> Non
     response["_anthropic_content"] = synced
 
 
+# Anthropic stop_reasons conch acts on normally: a finished turn, a hit token
+# cap handled elsewhere, a stop sequence, or a (separately dispatched) tool
+# call. Anything else (refusal, pause_turn, future reasons) with no reply is a
+# signal conch must surface rather than drop.
+_BENIGN_STOP_REASONS = frozenset({None, "end_turn", "stop_sequence", "tool_use"})
+
+
+def response_has_undispatchable_signal(response: dict) -> bool:
+    """True when an empty-reply, no-tool-call response still carried a concrete
+    signal worth surfacing loudly: content blocks conch can't dispatch, a
+    truncated tool call, or an unhandled stop_reason (e.g. refusal). A bare
+    empty turn (end_turn / no blocks) returns False so it keeps its "nothing
+    happened" meaning for callers that depend on it — e.g. the fleet plane,
+    which treats an empty reply as a transient failure to retry. (Deliberately
+    NOT keyed on output_tokens: a model can spend tokens and still legitimately
+    render empty, and provider stubs stamp a nonzero count onto empty replies —
+    the stop_reason / block metadata is the reliable discriminator.)"""
+    if response.get("_unknown_blocks") or response.get("_tool_input_error"):
+        return True
+    stop_reason = response.get("_stop_reason")
+    return stop_reason is not None and stop_reason not in _BENIGN_STOP_REASONS
+
+
+def diagnose_undispatchable_response(
+    response: dict, provider: str, model: str
+) -> tuple:
+    """Explain a model turn that produced neither displayable text nor a
+    dispatchable tool call.
+
+    Returns ``(one_line, shape)``: a single credential-free sentence naming
+    the model and the reason (a ``stop_reason`` conch doesn't act on, content
+    blocks it can't dispatch, or a truncated tool call), plus a compact dict
+    of the raw response shape for debug logging. Conch's house rule is
+    fail-loud: this is what replaces a silent ``[no response]`` whenever the
+    model actually returned something conch couldn't turn into a reply.
+    """
+    model = model or response.get("_model") or "the model"
+    stop_reason = response.get("_stop_reason")
+    stop_details = response.get("_stop_details") or {}
+    unknown = [b for b in (response.get("_unknown_blocks") or []) if b]
+    tool_errs = response.get("_tool_input_error") or []
+    usage = response.get("_usage") or {}
+    out_tokens = usage.get("output_tokens", 0)
+
+    shape = {
+        "provider": provider,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_details": stop_details,
+        "unknown_blocks": unknown,
+        "tool_input_errors": tool_errs,
+        "output_tokens": out_tokens,
+    }
+
+    # Priority order: the most specific, actionable reason wins, and the
+    # chosen ``kind`` is what callers record (total_usage["undispatchable"]).
+    if stop_reason == "refusal":
+        kind = "refusal"
+        category = (stop_details or {}).get("category")
+        explanation = ((stop_details or {}).get("explanation") or "").strip()
+        # Keep the first sentence; the API appends integrator boilerplate.
+        explanation = explanation.split(". ", 1)[0].strip()
+        cat = f" ({category})" if category else ""
+        why = f": {explanation}" if explanation else ""
+        line = (
+            f"{model} refused this request{cat}{why} — it returned no text or "
+            f"tool call (stop_reason=refusal)."
+        )
+    elif unknown:
+        kind = "unknown_block"
+        kinds = ", ".join(sorted(set(unknown)))
+        line = (
+            f"{model} returned content blocks conch cannot dispatch ({kinds}); "
+            f"nothing was executed (stop_reason={stop_reason or 'unknown'})."
+        )
+    elif tool_errs:
+        kind = "truncated_tool"
+        names = ", ".join(
+            sorted({e.get("name", "") for e in tool_errs if e.get("name")})
+        ) or "a tool call"
+        line = (
+            f"{model} sent a tool call ({names}) whose arguments conch could "
+            f"not parse — likely truncated (stop_reason="
+            f"{stop_reason or 'unknown'}); raise max_tokens and retry."
+        )
+    elif stop_reason == "max_tokens":
+        kind = "max_tokens"
+        line = (
+            f"{model} hit the output-token limit before producing a reply "
+            f"(stop_reason=max_tokens); raise max_tokens and retry."
+        )
+    else:
+        kind = "empty"
+        line = (
+            f"{model} returned an empty response with no text or tool call "
+            f"(stop_reason={stop_reason or 'unknown'}, "
+            f"{out_tokens} output tokens)."
+        )
+    shape["kind"] = kind
+    return line, shape
+
+
 _AGENT_TURN_LOCK = threading.RLock()
 
 
@@ -2113,6 +2218,27 @@ def chat_turn(
                     "executed\033[0m",
                     file=sys.stderr,
                 )
+            elif not reply.strip() and response_has_undispatchable_signal(response):
+                # Fail loud: the model actually returned something conch
+                # couldn't turn into a reply or a tool call — a refusal or
+                # other unhandled stop_reason, an unknown content block, or
+                # a truncated tool call. Name it instead of a silent
+                # [no response] (the failure the user hit with
+                # claude-opus-5-5's refusal stop_reason). A genuinely empty
+                # turn (end_turn / no stop metadata, no blocks) still returns
+                # "" so callers that treat that as "nothing happened" — e.g.
+                # the fleet plane's transient-failure retry — keep working.
+                detail, shape = diagnose_undispatchable_response(
+                    response, provider,
+                    total_usage.get("model") or response.get("_model") or "",
+                )
+                logger.debug(
+                    "undispatchable model response: %s",
+                    json.dumps(shape, default=str),
+                )
+                print(f"  \033[33m⚠ {detail}\033[0m", file=sys.stderr)
+                total_usage["undispatchable"] = shape.get("kind", "empty")
+                reply = detail
             from .tooling import run_hook
 
             run_hook("on_turn_end", {"reply": reply}, config)

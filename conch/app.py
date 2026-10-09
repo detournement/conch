@@ -18,7 +18,9 @@ import urllib.request
 from typing import List, Optional
 
 from .bootstrap import (
+    TOOL_LOAD_WAIT_SECONDS,
     StartupError,
+    ToolLoader,
     apply_agent_mode_from_config,
     build_agent_session,
     load_runtime_tools as _load_runtime_tools,
@@ -42,7 +44,6 @@ from .runtime import sanitize_anthropic_messages
 from .session import AgentSession
 from .tooling import (
     LocalShellPolicy,
-    ToolRuntimeState,
     default_permissions,
     get_agent_mode,
     set_agent_mode,
@@ -53,6 +54,7 @@ from . import multiline
 # Names still importable from conch.app for backwards compatibility (tests
 # and external callers); their implementations live in conch.bootstrap now.
 __bootstrap_reexports__ = (
+    _load_runtime_tools,
     _route_scheduled_output,
     make_scheduled_executor,
     start_scheduler,
@@ -678,19 +680,15 @@ def chat_loop(new_conversation=False, interactive=True):
     )
     session.attach_clients(builtin_clients)
 
-    # Load tools in background; show prompt immediately
-    _tools_ready = threading.Event()
-    _bg_mcp_clients: list = [None]
-    _bg_chat_state: list = [None]
-
-    def _bg_load_tools():
-        mc, cs = _load_runtime_tools(builtin_clients, config=config)
-        _bg_mcp_clients[0] = mc
-        _bg_chat_state[0] = cs
-        _tools_ready.set()
-
-    _tools_thread = threading.Thread(target=_bg_load_tools, daemon=True)
-    _tools_thread.start()
+    # Builtin tools (local_shell, ...) are usable from the first turn; MCP
+    # discovery runs in the background, bounded per server, and is swapped
+    # into this one live state object when it finishes (see
+    # _attach_loaded_tools). The session never runs on a silently empty
+    # tool set: whatever is still loading or unreachable is named.
+    _tool_loader = ToolLoader(builtin_clients, config).start()
+    chat_state = _tool_loader.builtin_state
+    builtin_clients["manage_tools"].bind(chat_state)
+    mcp_clients: dict = {}
 
     # Each scheduled run gets its own fresh session (bootstrap wiring); the
     # system prompt is read through a closure so provider/model switches keep
@@ -761,23 +759,100 @@ def chat_loop(new_conversation=False, interactive=True):
         if provider == "anthropic":
             sanitize_anthropic_messages(messages)
 
-    def _reload_tools():
+    # Session-only profile selection (plan 1.6): a `tool_profile` config key
+    # wins; otherwise local models default to the minimal profile unless the
+    # user explicitly activated one (saved prefs are never overwritten here).
+    # Re-applied whenever the tool list is rebuilt (startup, late MCP
+    # attach, /reload), since each rebuild recomputes chat_state.tools.
+    def _apply_session_profile():
+        from .tooling import active_profile_name, profile_tool_filter
+        _config_profile = (config.get("tool_profile") or "").strip().lower()
+        if _config_profile:
+            _prof_tools, _prof_desc = profile_tool_filter(
+                _config_profile, chat_state.all_tools, chat_state.tool_map, config
+            )
+            if _prof_tools is not None:
+                chat_state.tools = _prof_tools
+                print(f"\033[2mProfile '{_config_profile}' from config — {_prof_desc}\033[0m")
+            else:
+                print(f"\033[33m  ⚠ {_prof_desc}\033[0m", file=sys.stderr)
+        elif provider in ("ollama", "custom") and not active_profile_name():
+            _prof_tools, _ = profile_tool_filter(
+                "minimal", chat_state.all_tools, chat_state.tool_map, config
+            )
+            if _prof_tools is not None and len(_prof_tools) < len(chat_state.tools):
+                chat_state.tools = _prof_tools
+                print(
+                    "\033[2mLocal model: minimal tool profile active "
+                    "(/profile full to override)\033[0m"
+                )
+
+    # MCP servers whose failure has been reported once already (the banner
+    # and every later attach share this so a dead server is named once).
+    _reported_tool_failures: set = set()
+
+    def _print_tool_notices():
+        """The loader's one-line notices: failed servers (once each) and
+        the servers still loading."""
+        statuses = _tool_loader.statuses()
+        for line in _tool_loader.notice_lines(
+            len(chat_state.all_tools), already_reported=_reported_tool_failures
+        ):
+            print(f"\033[33m{line}\033[0m")
+        _reported_tool_failures.update(
+            name for name, status in statuses.items()
+            if status.state in ("unreachable", "error")
+        )
+
+    def _attach_loaded_tools(announce: bool = True) -> bool:
+        """Swap the background loader's result into the live chat_state if
+        it has finished since the last check. Called only from this (the
+        turn-running) thread, between turns, so a request in flight never
+        has its tool list changed under it. Returns True on the swap."""
         nonlocal mcp_clients
-        print("  \033[2mReloading MCP tools...\033[0m")
-        mcp_mod.close_all(mcp_clients)
-        mcp_clients, new_state = _load_runtime_tools(builtin_clients, config=config)
+        clients = _tool_loader.adopt(chat_state)
+        if clients is None:
+            return False
+        mcp_clients = clients
         session.mcp_clients = mcp_clients
-        chat_state.all_tools = new_state.all_tools
-        chat_state.tool_map = new_state.tool_map
-        chat_state.tools = new_state.tools
-        chat_state.needs_tool_refresh = False
+        _apply_session_profile()
         if chat_state.pinned_tools:
-            # Skill-activated tools survive a reload the way they survive
+            # Skill-activated tools survive a rebuild the way they survive
             # the per-request cap.
             from .tooling import ensure_tools_active
             ensure_tools_active(chat_state, sorted(chat_state.pinned_tools))
-            chat_state.needs_tool_refresh = False
-        print(f"  \033[1;32m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active\033[0m\n")
+        chat_state.needs_tool_refresh = True
+        if announce:
+            active, total = len(chat_state.tools), len(chat_state.all_tools)
+            counts = f"{active} ready" if active == total else f"{active}/{total} ready (/tools to manage)"
+            print(f"\033[2mtools: {counts}\033[0m")
+            _print_tool_notices()
+        return True
+
+    def _reload_tools():
+        nonlocal _tool_loader, mcp_clients
+        print("  \033[2mReloading MCP tools...\033[0m")
+        # Drop whatever is loading or loaded now; the session runs on the
+        # builtin tools until the fresh discovery attaches (bounded per
+        # server, so a dead server costs its timeout, not the session).
+        _tool_loader.supersede()
+        mcp_mod.close_all(mcp_clients)
+        mcp_clients = {}
+        session.mcp_clients = mcp_clients
+        _reported_tool_failures.clear()
+        _tool_loader = ToolLoader(builtin_clients, config).start()
+        from .bootstrap import swap_tool_state
+        swap_tool_state(chat_state, _tool_loader.builtin_state)
+        if not _tool_loader.ready.is_set():
+            from .render import Spinner
+            with Spinner("Loading tools"):
+                _tool_loader.wait(timeout=TOOL_LOAD_WAIT_SECONDS)
+        if _attach_loaded_tools(announce=False):
+            _print_tool_notices()
+            print(f"  \033[1;32m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active\033[0m\n")
+        else:
+            _print_tool_notices()
+            print()
 
     def _print_banner():
         _print_conch_shell_art()
@@ -797,6 +872,10 @@ def chat_loop(new_conversation=False, interactive=True):
                 print(f"\033[2m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active (/tools to manage)\033[0m")
             else:
                 print(f"\033[2m{len(chat_state.tools)} tools available\033[0m")
+        # Dead or still-loading MCP servers are named here, never silent:
+        # a session that quietly ran without its tools made the model
+        # narrate commands it could not run.
+        _print_tool_notices()
         memory_count = len(memory.get_all())
         if memory_count:
             print(f"\033[2m{memory_count} memor{'y' if memory_count == 1 else 'ies'} loaded\033[0m")
@@ -826,41 +905,18 @@ def chat_loop(new_conversation=False, interactive=True):
             "remote hosts: /ssh help (input is never captured).\033[0m\n"
         )
 
-    # Wait for background tool loading (with a brief spinner if needed)
-    if not _tools_ready.is_set():
+    # Wait a bounded time for MCP discovery (with a brief spinner if
+    # needed). When it expires the session starts on the builtin tools and
+    # the loader's result is attached between turns once it arrives.
+    if not _tool_loader.ready.is_set():
         from .render import Spinner
         with Spinner("Loading tools"):
-            _tools_ready.wait(timeout=30)
-    mcp_clients = _bg_mcp_clients[0] or {}
-    chat_state = _bg_chat_state[0] or ToolRuntimeState(all_tools=[], tool_map={}, tools=[])
+            _tool_loader.wait(timeout=TOOL_LOAD_WAIT_SECONDS)
     session.attach_clients(
         builtin_clients, chat_state=chat_state, mcp_clients=mcp_clients
     )
-
-    # Session-only profile selection (plan 1.6): a `tool_profile` config key
-    # wins; otherwise local models default to the minimal profile unless the
-    # user explicitly activated one (saved prefs are never overwritten here).
-    from .tooling import active_profile_name, profile_tool_filter
-    _config_profile = (config.get("tool_profile") or "").strip().lower()
-    if _config_profile:
-        _prof_tools, _prof_desc = profile_tool_filter(
-            _config_profile, chat_state.all_tools, chat_state.tool_map, config
-        )
-        if _prof_tools is not None:
-            chat_state.tools = _prof_tools
-            print(f"\033[2mProfile '{_config_profile}' from config — {_prof_desc}\033[0m")
-        else:
-            print(f"\033[33m  ⚠ {_prof_desc}\033[0m", file=sys.stderr)
-    elif provider in ("ollama", "custom") and not active_profile_name():
-        _prof_tools, _ = profile_tool_filter(
-            "minimal", chat_state.all_tools, chat_state.tool_map, config
-        )
-        if _prof_tools is not None and len(_prof_tools) < len(chat_state.tools):
-            chat_state.tools = _prof_tools
-            print(
-                "\033[2mLocal model: minimal tool profile active "
-                "(/profile full to override)\033[0m"
-            )
+    if not _attach_loaded_tools(announce=False):
+        _apply_session_profile()
 
     # Subagent delegation reads live config/tool state (plan 3.1)
     builtin_clients["delegate_task"].bind_session(session)
@@ -1095,6 +1151,10 @@ def chat_loop(new_conversation=False, interactive=True):
     _backend_failed = False  # preflight the server after a failed turn (plan 3.3)
     try:
         while True:
+            # MCP tools that finished loading since the last turn attach
+            # here, before the prompt (and again after input is read, for
+            # a message typed while they were still loading).
+            _attach_loaded_tools()
             if _typeahead_partial and "\n" in _typeahead_partial:
                 # A block pasted while the model was streaming: libedit's
                 # insert_text silently drops text containing newlines
@@ -1145,6 +1205,7 @@ def chat_loop(new_conversation=False, interactive=True):
             stripped = user_input.strip()
             if not stripped:
                 continue
+            _attach_loaded_tools()
 
             # /paste and /edit compose a literal message: the block they
             # return is never re-parsed as commands or exit words, and
@@ -1208,6 +1269,7 @@ def chat_loop(new_conversation=False, interactive=True):
                     current_conv=current_conv,
                     session_usage=session_usage,
                     messages=messages,
+                    server_status=lambda: _tool_loader.statuses(),
                 )
                 # User-defined slash command: the rendered template becomes
                 # this turn's user message (handled by the normal flow below).

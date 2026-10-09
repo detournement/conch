@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, Optional
+import threading
+from typing import Any, Dict, List, Optional
 
 from .config import get_bool, local_only_enabled
 from .memory import MemoryStore
@@ -277,44 +278,18 @@ def make_builtin_clients(
     return clients
 
 
-def load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False,
-                       config: Optional[dict] = None):
-    """Create MCP clients and assemble the session tool state.
-
-    ``config`` is the conch config; it contributes config-keyed MCP
-    endpoints (``capitol_docs_url``) on top of ``mcp.json``.
+def assemble_tool_state(
+    all_tools: List[dict],
+    tool_map: Dict[str, Any],
+    builtin_clients: Dict[str, Any],
+    server_status: Optional[Dict[str, Any]] = None,
+) -> ToolRuntimeState:
+    """The session tool state for the MCP tools discovered so far plus the
+    builtin and user tools, filtered by the saved prefs. *all_tools* and
+    *tool_map* are extended in place (builtins are injected last, as they
+    always were). Binding ``manage_tools`` is the caller's job: the
+    interactive shell keeps one live state object for the whole session.
     """
-    if use_cache:
-        cached = mcp_mod.load_cached_tools()
-        if cached is not None:
-            mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
-            all_tools = list(cached)
-            tool_map: Dict[str, Any] = {}
-            # Map cached tools to clients by server name
-            for client in mcp_clients.values():
-                try:
-                    live = client.list_tools()
-                except Exception:
-                    live = []
-                for t in live:
-                    tool_name = t.get("function", {}).get("name", "")
-                    if tool_name and tool_name not in tool_map:
-                        tool_map[tool_name] = client
-            all_tools = [
-                tool
-                for tool in all_tools
-                if tool.get("function", {}).get("name", "") in tool_map
-            ]
-            inject_builtin_tools(all_tools, tool_map, builtin_clients)
-            prefs = load_tool_prefs()
-            prefs, _ = auto_disable_oversized_groups(all_tools, tool_map, prefs)
-            tools = cap_tools(apply_filter(all_tools, tool_map, prefs))
-            state = ToolRuntimeState(all_tools=all_tools, tool_map=tool_map, tools=tools)
-            builtin_clients["manage_tools"].bind(state)
-            return mcp_clients, state
-    mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
-    all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
-    mcp_mod.save_tool_cache(all_tools)
     inject_builtin_tools(all_tools, tool_map, builtin_clients)
     prefs = load_tool_prefs()
     prefs, auto_disabled = auto_disable_oversized_groups(all_tools, tool_map, prefs)
@@ -326,9 +301,218 @@ def load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False,
                 file=sys.stderr,
             )
     tools = cap_tools(apply_filter(all_tools, tool_map, prefs))
-    state = ToolRuntimeState(all_tools=all_tools, tool_map=tool_map, tools=tools)
+    return ToolRuntimeState(
+        all_tools=all_tools, tool_map=tool_map, tools=tools,
+        server_status=dict(server_status or {}),
+    )
+
+
+def builtin_tool_state(builtin_clients: Dict[str, Any]) -> ToolRuntimeState:
+    """The tool state a session can use before any MCP server has answered:
+    the builtin clients (local_shell, ...) and user tools, nothing deferred."""
+    return assemble_tool_state([], {}, builtin_clients)
+
+
+def load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False,
+                       config: Optional[dict] = None):
+    """Create MCP clients and assemble the session tool state (blocking;
+    bounded by each client's own timeouts, servers discovered in parallel).
+
+    ``config`` is the conch config; it contributes config-keyed MCP
+    endpoints (``capitol_docs_url``) on top of ``mcp.json``.
+    """
+    if use_cache:
+        cached = mcp_mod.load_cached_tools()
+        if cached is not None:
+            mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
+            # Map cached tools to clients by server name
+            _live, tool_map = mcp_mod.collect_tools(mcp_clients)
+            all_tools = [
+                tool
+                for tool in cached
+                if tool.get("function", {}).get("name", "") in tool_map
+            ]
+            state = assemble_tool_state(
+                all_tools, tool_map, builtin_clients,
+                server_status=mcp_mod.server_statuses(mcp_clients, tool_map),
+            )
+            builtin_clients["manage_tools"].bind(state)
+            return mcp_clients, state
+    mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
+    all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+    mcp_mod.save_tool_cache(all_tools)
+    state = assemble_tool_state(
+        all_tools, tool_map, builtin_clients,
+        server_status=mcp_mod.server_statuses(mcp_clients, tool_map),
+    )
     builtin_clients["manage_tools"].bind(state)
     return mcp_clients, state
+
+
+# How long the interactive shell waits for MCP discovery before starting
+# on builtin tools alone (the loader keeps running and attaches later).
+TOOL_LOAD_WAIT_SECONDS = 30.0
+
+
+def swap_tool_state(live: ToolRuntimeState, loaded: ToolRuntimeState) -> None:
+    """Rebind *live*'s tool collections to *loaded*'s.
+
+    *live* is the one state object the session, ``manage_tools``,
+    ``skill_manage`` and ``conch_introspect`` all hold, so they see the
+    new tools without rebinding; ``needs_tool_refresh`` makes a turn that
+    is already in its tool loop re-read the list at its next request.
+    Only ever called from the thread that runs turns (between them).
+    """
+    live.all_tools = loaded.all_tools
+    live.tool_map = loaded.tool_map
+    live.tools = loaded.tools
+    live.server_status = dict(loaded.server_status)
+    live.needs_tool_refresh = True
+
+
+def tool_status_lines(statuses: Dict[str, Any], ready_count: int,
+                      already_reported=()) -> List[str]:
+    """Plain one-line notices about MCP discovery for the shell to print:
+    one per server that failed (with the reason; servers in
+    *already_reported* are skipped so each is named once) and one naming
+    the servers still loading — the state that used to be silent."""
+    lines: List[str] = []
+    for name, status in statuses.items():
+        if status.state in ("unreachable", "error") and name not in already_reported:
+            lines.append(
+                f"tools: MCP server {name} {status.state}: {status.detail}"
+                " (/tools for status, /reload to retry)"
+            )
+    pending = [name for name, status in statuses.items() if status.state == "loading"]
+    if pending:
+        lines.append(
+            f"tools: {ready_count} builtin ready; {len(pending)} MCP server(s) "
+            f"still loading: {', '.join(pending)} — they attach when ready"
+        )
+    return lines
+
+
+class ToolLoader:
+    """Background MCP discovery for one session, with a usable builtin-only
+    state from the first moment and a safe hand-off of the full state.
+
+    The interactive shell waits a bounded time (:meth:`wait`); when that
+    expires it keeps running on :attr:`builtin_state` and calls
+    :meth:`adopt` at safe points (between turns, on its own thread) until
+    the loaded state has been swapped in. The loader thread never touches
+    a live ``ToolRuntimeState``, so a request in flight never has its tool
+    list change under it. Discovery failures are recorded, never hidden:
+    :attr:`error` for a loader crash, :meth:`statuses` per server.
+    """
+
+    def __init__(self, builtin_clients: Dict[str, Any], config: Optional[dict]):
+        self.builtin_clients = builtin_clients
+        self.config = config
+        self.server_names = mcp_mod.configured_server_names(config)
+        self.builtin_state = builtin_tool_state(builtin_clients)
+        self.builtin_state.server_status = self._placeholder_statuses()
+        self.ready = threading.Event()
+        self.error: Optional[BaseException] = None
+        self._lock = threading.Lock()
+        self._discovery: Optional[mcp_mod.ToolDiscovery] = None
+        self._mcp_clients: Optional[Dict[str, Any]] = None
+        self._state: Optional[ToolRuntimeState] = None
+        self._adopted = False
+        self._superseded = False
+        self._thread: Optional[threading.Thread] = None
+
+    def _placeholder_statuses(self) -> Dict[str, Any]:
+        return {name: mcp_mod.ServerStatus(name) for name in self.server_names}
+
+    def start(self) -> "ToolLoader":
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="conch-tool-loader"
+        )
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            mcp_clients = mcp_mod.mount_config_servers(
+                mcp_mod.create_clients(), self.config
+            )
+            discovery = mcp_mod.ToolDiscovery(mcp_clients)
+            with self._lock:
+                self._discovery = discovery
+            all_tools, tool_map = discovery.run()
+            mcp_mod.save_tool_cache(all_tools)
+            state = assemble_tool_state(
+                all_tools, tool_map, self.builtin_clients,
+                server_status=discovery.statuses(),
+            )
+            with self._lock:
+                self._mcp_clients = mcp_clients
+                self._state = state
+                superseded = self._superseded
+            if superseded:
+                # A /reload replaced this loader while it ran.
+                mcp_mod.close_all(mcp_clients)
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.ready.set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return self.ready.wait(timeout)
+
+    def statuses(self) -> Dict[str, Any]:
+        """Per-server status right now (loading entries for servers
+        discovery has not reached yet)."""
+        with self._lock:
+            discovery, state = self._discovery, self._state
+        if self.error is not None:
+            return {
+                name: mcp_mod.ServerStatus(
+                    name, "error", f"discovery failed: {self.error}"
+                )
+                for name in self.server_names
+            }
+        if state is not None:
+            return dict(state.server_status)
+        if discovery is not None:
+            return discovery.statuses()
+        return self._placeholder_statuses()
+
+    def pending(self) -> List[str]:
+        return [n for n, s in self.statuses().items() if s.state == "loading"]
+
+    def notice_lines(self, ready_count: int, already_reported=()) -> List[str]:
+        if self.error is not None:
+            return [
+                f"tools: MCP discovery failed: {self.error} — builtin tools "
+                "only (/reload to retry)"
+            ]
+        return tool_status_lines(self.statuses(), ready_count, already_reported)
+
+    def adopt(self, live: ToolRuntimeState) -> Optional[Dict[str, Any]]:
+        """Swap the loaded tools into *live* if discovery has finished and
+        this is the first call to do so. Returns the MCP clients on the
+        swap, None while still loading, after a crash, when superseded,
+        or once already adopted."""
+        if not self.ready.is_set():
+            return None
+        with self._lock:
+            if self._adopted or self._superseded or self._state is None:
+                return None
+            self._adopted = True
+            state, clients = self._state, self._mcp_clients
+        swap_tool_state(live, state)
+        return clients
+
+    def supersede(self) -> None:
+        """Discard this loader's result (a /reload replaced it). Clients it
+        already created are closed now; ones still being created are closed
+        by the loader thread when it finishes."""
+        with self._lock:
+            self._superseded = True
+            clients = None if self._adopted else self._mcp_clients
+        if clients is not None:
+            mcp_mod.close_all(clients)
 
 
 def build_agent_session(

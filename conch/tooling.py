@@ -603,6 +603,9 @@ class ToolRuntimeState:
     # and AgentSession carries it into the session budget — the same effect
     # /skill has before a turn starts. Only ever raised, never lowered.
     requested_tool_rounds: int = 0
+    # Per-MCP-server discovery status (name -> mcp.ServerStatus): ready /
+    # loading / unreachable / error, for /tools and the startup notices.
+    server_status: Dict[str, Any] = field(default_factory=dict)
 
 
 def ensure_tools_active(chat_state, names) -> List[str]:

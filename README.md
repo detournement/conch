@@ -673,7 +673,14 @@ Persist the choice with `show_token_stats=true|false`.
 - **Shell and SSH:** approval-gated local commands, direct terminal handoff,
   and validated OpenSSH ControlMaster sessions.
 - **MCP:** stdio and HTTP Model Context Protocol servers from
-  `~/.config/conch/mcp.json`.
+  `~/.config/conch/mcp.json`. Discovery is parallel and bounded per
+  server: an HTTP server gets `connect_timeout` (default 5s) to answer
+  `initialize` and `timeout` (default 30s) per request; a stdio server
+  gets `timeout` (default 60s) per reply — all optional keys on the
+  server block. Builtin tools are available from the first turn; servers
+  still loading when the shell starts are named and attach when ready,
+  and an unreachable server is reported once with the reason (`/tools`
+  shows per-server status, `/reload` retries).
 - **Executable tools:** an executable in `~/.config/conch/tools/` becomes a
   tool when `<name> --schema` returns its JSON schema; calls receive JSON on
   stdin.

@@ -1378,7 +1378,11 @@ def handle_slash_command(
     current_conv=None,
     session_usage=None,
     messages=None,
+    server_status=None,
 ) -> Optional[tuple]:
+    """*server_status*: per-MCP-server discovery status for ``/tools`` — a
+    ``{name: mcp.ServerStatus}`` dict or a callable returning one (the
+    shell passes its loader's live snapshot)."""
     parts = cmd.strip().split(None, 1)
     command = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
@@ -2297,6 +2301,16 @@ def handle_slash_command(
         for grp in sorted(groups):
             status = "\033[31m OFF\033[0m" if grp in disabled else "\033[32m ON \033[0m"
             print(f"    {status}  \033[1m{grp:<20}\033[0m \033[2m{len(groups[grp])} tools\033[0m")
+        statuses = server_status() if callable(server_status) else server_status
+        if statuses:
+            # Per-server discovery state: a server that is unreachable or
+            # still loading has no group above, which is exactly when the
+            # user needs to see it.
+            print("\n  \033[1;36mMCP servers:\033[0m")
+            colors = {"ready": "\033[32m", "loading": "\033[33m"}
+            for name, srv in statuses.items():
+                color = colors.get(srv.state, "\033[31m")
+                print(f"    {color}{srv.state:<11}\033[0m \033[1m{name:<20}\033[0m \033[2m{srv.describe()}\033[0m")
         print()
         return None
 

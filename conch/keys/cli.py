@@ -951,6 +951,14 @@ def main(argv: Optional[List[str]] = None, *, prog: str = "conch keys",
     except KeyboardInterrupt:
         out.say("\n  interrupted — nothing partially written (saves are atomic)")
         return 130
+    except BrokenPipeError:
+        # `conch keys … | head`: the reader went away; exit quietly instead
+        # of a traceback (saves are already complete and atomic).
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 0
 
 
 # ---------------------------------------------------------------------------

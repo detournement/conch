@@ -14,6 +14,7 @@ and inline secrets; the active provider's key being set at all.
 
 from __future__ import annotations
 
+import calendar
 import os
 import stat
 import sys
@@ -81,7 +82,7 @@ def check_binaries(identity: Dict[str, Any], *,
         label = f"{info.get('shape', '?')}"
         if info.get("version"):
             label += f" {info['version']}"
-            versions.add((info["version"], info.get("commit", "")))
+            versions.add(info["version"])
         if info.get("commit"):
             label += f" {info['commit']}"
         if info.get("error"):
@@ -120,6 +121,8 @@ def check_binaries(identity: Dict[str, Any], *,
             " interpreter; an old uv tool: `uv tool uninstall conch-shell`), or"
             " keep the checkout first on PATH deliberately"
         )
+    else:
+        message += " (all the same version)"
     return [Finding(WARN if len(versions) > 1 else OK, "path.multiple", message, fix, lines)]
 
 
@@ -138,10 +141,16 @@ def check_installed_copies(identity: Dict[str, Any], *, describe=ident.describe_
             installed_at = record.get("installed_at", "")
             older = False
             try:
-                installed_epoch = time.mktime(time.strptime(installed_at[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+                installed_epoch = calendar.timegm(time.strptime(installed_at[:19], "%Y-%m-%dT%H:%M:%S"))
                 older = bool(identity.get("committed_at")) and installed_epoch < float(identity["committed_at"])
             except (ValueError, TypeError):
                 pass
+            recorded_commit = record.get("commit", "")
+            same_commit = bool(recorded_commit) and bool(identity.get("commit")) and recorded_commit.startswith(
+                str(identity["commit"])
+            )
+            if same_commit:
+                continue
             if info.get("version") != identity.get("version") or older:
                 findings.append(Finding(
                     WARN, "install.stale",

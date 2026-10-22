@@ -196,6 +196,8 @@ def identity_line(identity: Optional[Dict[str, Any]] = None) -> str:
     identity = identity or install_identity()
     commit = identity.get("commit") or ""
     if commit:
+        if len(commit) > 12:  # a full sha recorded by the installer
+            commit = commit[:7]
         commit += "+dirty" if identity.get("dirty") else ""
     elif identity.get("installed_at"):
         commit = f"commit unknown; installed {str(identity['installed_at'])[:10]}"

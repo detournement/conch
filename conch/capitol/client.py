@@ -216,6 +216,10 @@ class CapitolRuntime:
         self.org_id = str(org_id or "")
         self.agent_id = str(agent_id or "")
         self._bearer = str(bearer or "")
+        # Where the bearer came from (``env:NAME`` / ``registry:alias``),
+        # so a 401 can say which credential to rotate and how — set by
+        # from_config(); direct constructions leave it empty.
+        self.bearer_source = ""
         self.caller_system = caller_system
         if not caller_version:
             try:
@@ -240,6 +244,18 @@ class CapitolRuntime:
             f"org_id={self.org_id!r}, agent_id={self.agent_id!r})"
         )
 
+    def credential_fix(self, status: int = 401) -> str:
+        """The named remedy for a rejected bearer: ``<NAME> was rejected by
+        capitol (401) — run: conch keys set <NAME>`` when the bearer came
+        from an environment variable; the registry re-bootstrap note when
+        it came from ``~/.capitol-a2a/agents.yaml`` (conch never rotates
+        registry bearers itself). No automatic re-auth either way."""
+        from .credentials import registry_bearer_fix
+
+        return registry_bearer_fix(
+            self.bearer_source, self.org_id, self.agent_id, int(status)
+        )
+
     @classmethod
     def from_config(cls, config: dict, **kwargs) -> "CapitolRuntime":
         """Build a runtime from conch config keys, resolving the bearer
@@ -255,8 +271,10 @@ class CapitolRuntime:
                 "capitol_org, and capitol_agent in the conch config"
             )
         ensure_endpoint_allowed(config, base_url)
-        bearer, _source = resolve_bearer(config, org_id, agent_id, base_url)
-        return cls(base_url, org_id, agent_id, bearer, **kwargs)
+        bearer, source = resolve_bearer(config, org_id, agent_id, base_url)
+        runtime = cls(base_url, org_id, agent_id, bearer, **kwargs)
+        runtime.bearer_source = source
+        return runtime
 
     # -- endpoints ----------------------------------------------------------
 
@@ -320,7 +338,7 @@ class CapitolRuntime:
             if exc.code in (401, 403):
                 raise self._fail(
                     f"Capitol auth failed (HTTP {exc.code}) at {url}: "
-                    f"{detail} — credential needed; no automatic re-auth",
+                    f"{detail} — {self.credential_fix(exc.code)}",
                     CapitolAuthError,
                     http_status=exc.code,
                 ) from None
@@ -853,7 +871,8 @@ class CapitolRuntime:
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise self._fail(
-                    f"Capitol auth failed (HTTP {exc.code}) on stream",
+                    f"Capitol auth failed (HTTP {exc.code}) on stream — "
+                    f"{self.credential_fix(exc.code)}",
                     CapitolAuthError, http_status=exc.code,
                 ) from None
             raise self._fail(

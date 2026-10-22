@@ -429,6 +429,7 @@ On the first interactive launch, Conch prompts for a provider and API key,
 verifies the provider when requested, and stores the key with mode `0600` in
 `~/.config/conch/env`. Conch loads that file itself, so supervised daemons can
 use the same provider configuration without depending on a shell profile.
+`conch keys` manages that file afterwards (see [Rotating API keys](#rotating-api-keys)).
 
 The wizard ends by running the [startup model check](#startup-model-check) on
 the model it just configured, so a first run finishes in a verified-working
@@ -437,6 +438,99 @@ uses.
 
 Set `CONCH_NO_WIZARD=1` to suppress the wizard. Non-interactive contexts never
 show it.
+
+## Rotating API keys
+
+### Your keys rotated? Do this
+
+```sh
+git pull
+./bin/conch keys rotate      # or: conch keys rotate
+```
+
+That is the whole procedure, and it ends green or with the exact remaining
+steps named. It works from any checkout with no PATH setup, from bash, zsh,
+or fish, from a non-login shell, cron, or CI. Fallbacks when `conch` is not
+the copy you just pulled: `python3 -m conch keys rotate` (zero assumptions)
+or `~/.local/bin/conch keys rotate` (the website/uv install).
+
+What `rotate` does, in order:
+
+1. **doctor** — says which conch you are running (first line:
+   `conch <version> (<commit>) from <path> — install: checkout|uv|pip-editable`),
+   lists every other `conch` on PATH with its version, creates or fixes
+   `~/.config/conch/env` (0600) with your confirmation, names stale
+   `export NAME=…` lines in your shell profiles by `file:line`, flags inline
+   secrets in `mcp.json`, and checks the edge daemon.
+2. **check** — verifies every credential live with the cheapest call its
+   service has (provider key → models list, Jira → `/myself`, Composio, E2B,
+   Slack, each MCP server's own handshake, the Capitol agent card) and shows a
+   table with a `shell` column and a `daemon` column.
+3. **rotate** — for each rejected or missing key, prompts for the new value
+   (hidden, never echoed), verifies it, and saves it. Unattended forms:
+   `--from-env` imports whatever the process environment provides
+   (`op run -- ./bin/conch keys rotate --from-env`, direnv, CI),
+   `--stdin` reads `NAME=value` lines, `--yes` answers the confirmations.
+4. **reload + verify** — re-reads the file here, tells the running daemon to
+   do the same over its socket, re-checks, and prints what still needs a
+   human (a profile line to delete, `migrate-mcp --apply`, a daemon restart
+   line, a Capitol registry bearer to re-bootstrap).
+
+`conch keys required` prints the NAMEs the active config needs — what to ask
+the key admin for. `conch keys check` alone exits 0 only when every required
+key is `ok` in both columns.
+
+What the doctor warnings mean:
+
+- *N conch binaries on PATH* — different copies; it says which one `conch`
+  resolves to, which one the daemon runs, and which one you are. Remove or
+  reorder the stale ones, or keep the checkout first deliberately.
+- *installed copy … is older than this checkout* — reinstall with the
+  website one-liner (or `uv tool install --force --reinstall <checkout>`).
+- *key exists only as a shell export* — the daemon, cron, and launchd never
+  see it: `conch keys import --all-configured`.
+- *STALE export at file:line* — a profile still carries an older value; the
+  note says whether it shadows the saved key (hand-added line) or is
+  overridden (conch-managed key). Delete the line either way.
+- *inline secret in mcp.json* — `conch keys migrate-mcp --apply` moves it
+  into the env file and rewrites it as `${NAME}`.
+- *daemon predates conch keys / runs older code* — restart it:
+  `launchctl kickstart -k gui/$(id -u)/com.conch.edge` on macOS,
+  `systemctl --user restart conch-edge` on Linux.
+
+### The precedence rule and the single source of truth
+
+`~/.config/conch/env` is the one place conch credentials live. Conch itself
+loads it, so the interactive shell, `conch-ask`, the edge daemon under
+launchd/systemd, workers, and MCP server launches all see the same keys
+without any profile exports. A key saved through `conch keys` (or first-run
+setup) is recorded as *conch-managed* in `env.manifest.json` next to it and
+**wins over a shell export of the same name** — it was verified live when
+it was saved, and a lingering `export` is the classic stale-key trap after a
+rotation. A line you add to the file by hand keeps the older rule: the
+process environment wins. `conch keys list` always shows which source is
+effective and fingerprints both when they differ; `conch keys set` never
+leaves a saved key silently shadowed.
+
+### Hot reload
+
+Nothing needs a restart to pick up a rotated key: `/keys set NAME` in a
+session takes effect on the next request; `/reload` re-reads the file and
+restarts MCP servers with it; a provider's 401 makes the session re-read
+the file and retry once before reporting; the daemon re-reads the file
+whenever it changes (every tick), on `SIGHUP`, and on the `keys.reload`
+control op that `conch keys set/rotate` send it. Every auth failure names
+the key and the fix — `NAME was rejected by <service> (401) — run:
+conch keys set NAME` — including the daemon's parked-mission reason.
+
+### `${NAME}` in mcp.json
+
+`env`, `headers`, `url`, and `args` values may reference environment
+variables as `${NAME}` (or `$NAME`); they are expanded from the loaded
+environment when the server starts. A reference to an unset variable is a
+per-server configuration error that names the server, the field, and the
+variable — the server is reported as misconfigured, never started with a
+blank header. `conch keys migrate-mcp` converts inline values to this form.
 
 ## Execution and safety
 
@@ -1091,6 +1185,7 @@ groups the same shipped surface.
 | `/checkpoint [list\|diff\|restore\|on\|off]`, `/undo` | Manage automatic Git snapshots |
 | `/schedule`, `/tasks`, `/cancel` | Scheduled prompts |
 | `/install [component]` | List or configure shell, edge, fleet, works, and capture |
+| `/keys [check\|set NAME\|rotate\|doctor\|import\|required\|reload\|migrate-mcp]` | See, verify, and rotate every credential; hot-reloads the session |
 | `/missions`, `/mission ...` | List and manage durable missions |
 | `/approvals`, `/approve`, `/deny` | Decide pending mission actions |
 | `/todo`, `/list <space>` | Local personal items and custom spaces |

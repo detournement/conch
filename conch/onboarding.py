@@ -321,14 +321,18 @@ def run_first_run_wizard() -> bool:
         # store under a conch-specific name and point config at it.
         updates["api_key_env"] = CUSTOM_KEY_ENV
     config_path = set_config_values(updates, header=CONFIG_HEADER)
+    # Same write path as `conch keys set`: the key becomes conch-managed
+    # (authoritative over a stale shell export) and shows up in
+    # `conch keys list` with its provenance.
     if key and env_name:
-        set_env_values({env_name: key})
+        set_env_values({env_name: key}, set_by="first-run setup")
     elif key and provider == "custom":
-        set_env_values({CUSTOM_KEY_ENV: key})
+        set_env_values({CUSTOM_KEY_ENV: key}, set_by="first-run setup")
 
     print(f"\n  {GREEN}✓ You're set.{RST} {DIM}config: {config_path}")
     if key:
-        print(f"  {DIM}key: {get_env_file_path()} (0600){RST}")
+        print(f"  {DIM}key: {get_env_file_path()} (0600) — `conch keys` lists,"
+              f" verifies, and rotates it later{RST}")
     if not key and env_name:
         print(f"  {YELLOW}No key saved{RST} {DIM}— add a line"
               f" `{env_name}=...` to {get_env_file_path()} or export it"

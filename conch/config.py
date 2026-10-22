@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 DEFAULT_CONFIG: Dict[str, str] = {
@@ -134,21 +134,51 @@ def get_env_file_path() -> str:
 
     ``~/.config/conch/env`` holds ``KEY=value`` lines (0600) that
     :func:`load_config` mirrors into the process environment — the
-    canonical home for provider keys written by first-run onboarding.
-    Because conch itself loads it, daemons and launchd/systemd services
-    see the keys without shell-profile exports; a variable already in
-    the real environment always wins.
+    canonical home for every credential conch uses, written by
+    ``conch keys set`` / ``conch keys rotate`` and by first-run
+    onboarding. Because conch itself loads it, daemons and
+    launchd/systemd services see the keys without shell-profile
+    exports.
+
+    Precedence (see :func:`load_env_file`): a key *conch wrote* through
+    ``conch keys`` (recorded in the manifest next to the file) is
+    authoritative and overrides an inherited shell export of the same
+    name — it was verified live when it was saved, and a lingering
+    ``export`` in a profile is the classic stale-key trap after a
+    rotation. A line someone added to the file by hand keeps the older
+    rule: a variable already in the real environment wins.
     """
     config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch"
     return str(config_dir / "env")
 
 
-def load_env_file() -> None:
-    """Mirror the env file into ``os.environ`` (existing values win)."""
-    try:
-        text = Path(get_env_file_path()).read_text()
-    except OSError:
-        return
+ENV_MANIFEST_NAME = "env.manifest.json"
+
+
+def get_env_manifest_path() -> str:
+    """Sidecar of the env file recording which names conch manages,
+    their fingerprints (never values), when they were saved, and the
+    last live verification. 0600 like the env file."""
+    return str(Path(get_env_file_path()).parent / ENV_MANIFEST_NAME)
+
+
+def key_fingerprint(value: str, length: int = 8) -> str:
+    """Irreversible, loggable reference to a secret: ``sha256:`` plus
+    the first *length* hex digits of its digest. Never the bytes."""
+    import hashlib
+
+    if not value:
+        return "-"
+    return "sha256:" + hashlib.sha256(
+        str(value).encode("utf-8")
+    ).hexdigest()[:length]
+
+
+def parse_env_lines(text: str) -> Dict[str, str]:
+    """``NAME=value`` entries of an env file body (``export`` prefix
+    and surrounding quotes tolerated; comments and blanks skipped).
+    Later duplicates win, like a shell would apply them."""
+    entries: Dict[str, str] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -158,18 +188,211 @@ def load_env_file() -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip("'\"")
-        if key and key not in os.environ:
+        if key:
+            entries[key] = value
+    return entries
+
+
+def read_env_file() -> Dict[str, str]:
+    """Entries of the env file without touching ``os.environ``
+    (``{}`` when the file is missing or unreadable)."""
+    try:
+        return parse_env_lines(Path(get_env_file_path()).read_text())
+    except OSError:
+        return {}
+
+
+def read_env_manifest() -> Dict[str, object]:
+    """The manifest as a dict (``{"version": 1, "keys": {}, "checks": {}}``
+    when absent or unreadable — a damaged manifest only means no key
+    counts as conch-managed, never a crash)."""
+    try:
+        import json
+
+        data = json.loads(Path(get_env_manifest_path()).read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("version", 1)
+    keys = data.get("keys")
+    data["keys"] = keys if isinstance(keys, dict) else {}
+    checks = data.get("checks")
+    data["checks"] = checks if isinstance(checks, dict) else {}
+    return data
+
+
+def _write_env_manifest(data: Dict[str, object]) -> None:
+    import json
+
+    _write_private_file(
+        Path(get_env_manifest_path()),
+        json.dumps(data, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def managed_key_names() -> set:
+    """Names the env file holds *and* conch recorded as its own."""
+    return set(read_env_manifest()["keys"]) & set(read_env_file())
+
+
+def record_managed_keys(updates: Dict[str, str], *, set_by: str = "conch keys",
+                        verified: str = "") -> None:
+    """Mark *updates* (name → value) as conch-managed: fingerprint, time,
+    writer, and (when the caller verified live before saving) the
+    verification outcome. Values never reach the manifest."""
+    import time
+
+    data = read_env_manifest()
+    now = time.time()
+    for name, value in updates.items():
+        entry = {
+            "fingerprint": key_fingerprint(value, 16),
+            "set_at": now,
+            "set_by": set_by,
+        }
+        if verified:
+            entry["verified_at"] = now
+            entry["verified"] = verified
+        data["keys"][name] = entry
+    _write_env_manifest(data)
+
+
+def record_key_check(name: str, value: str, status: str, detail: str = "") -> None:
+    """Remember the outcome of a live check for *name* (any source) so
+    ``conch keys list`` can show "last verified" — keyed by fingerprint,
+    so a rotated value never inherits the old verdict."""
+    import time
+
+    data = read_env_manifest()
+    data["checks"][name] = {
+        "fingerprint": key_fingerprint(value, 16),
+        "at": time.time(),
+        "status": status,
+        "detail": str(detail)[:200],
+    }
+    managed = data["keys"].get(name)
+    if isinstance(managed, dict) and managed.get("fingerprint") == key_fingerprint(value, 16):
+        managed["verified_at"] = data["checks"][name]["at"]
+        managed["verified"] = status
+    _write_env_manifest(data)
+
+
+def forget_managed_key(name: str) -> None:
+    data = read_env_manifest()
+    changed = bool(data["keys"].pop(name, None)) | bool(data["checks"].pop(name, None))
+    if changed:
+        _write_env_manifest(data)
+
+
+# What the last load_env_file() did, by name: the values it mirrored from
+# the file (so a later reload can tell "the file changed" from "the user
+# exported something else"), managed names that overrode an inherited
+# export, and unmanaged file entries shadowed by the inherited environment.
+_ENV_LOAD_STATE: Dict[str, object] = {
+    "from_file": {},
+    "overrode": [],
+    "shadowed": [],
+}
+
+
+def env_load_state() -> Dict[str, object]:
+    """Snapshot of the last env-file load: ``overrode`` (managed names
+    that replaced an inherited export), ``shadowed`` (unmanaged file
+    entries the inherited environment won over), ``from_file`` (names
+    whose value in ``os.environ`` came from the file)."""
+    return {
+        "from_file": dict(_ENV_LOAD_STATE["from_file"]),
+        "overrode": list(_ENV_LOAD_STATE["overrode"]),
+        "shadowed": list(_ENV_LOAD_STATE["shadowed"]),
+    }
+
+
+def load_env_file() -> List[str]:
+    """Mirror the env file into ``os.environ``; return the names whose
+    effective value changed.
+
+    Rules, per ``NAME=value`` line:
+
+    * not in the environment → set;
+    * in the environment with the same value → nothing;
+    * conch-managed (written through ``conch keys``/onboarding, see
+      :func:`record_managed_keys`) → the file wins: the inherited value
+      is replaced (recorded in ``env_load_state()["overrode"]``);
+    * the environment still holds the value a *previous* load took from
+      the file → the file changed since (a rotation): take the new value;
+    * otherwise (hand-added line, different inherited export) → the
+      environment wins (recorded in ``env_load_state()["shadowed"]``).
+
+    Safe to call repeatedly; :func:`reload_env_file` is the explicit
+    "re-read now" entry point for hot reloads.
+    """
+    entries = read_env_file()
+    if not entries:
+        return []
+    managed = set(read_env_manifest()["keys"])
+    from_file: Dict[str, str] = _ENV_LOAD_STATE["from_file"]  # type: ignore[assignment]
+    overrode: List[str] = []
+    shadowed: List[str] = []
+    changed: List[str] = []
+    for key, value in entries.items():
+        current = os.environ.get(key)
+        if current is None:
             os.environ[key] = value
+            from_file[key] = value
+            changed.append(key)
+        elif current == value:
+            from_file[key] = value
+        elif key in managed:
+            os.environ[key] = value
+            from_file[key] = value
+            overrode.append(key)
+            changed.append(key)
+        elif from_file.get(key) == current:
+            os.environ[key] = value
+            from_file[key] = value
+            changed.append(key)
+        else:
+            shadowed.append(key)
+    _ENV_LOAD_STATE["overrode"] = overrode
+    _ENV_LOAD_STATE["shadowed"] = shadowed
+    return changed
+
+
+def reload_env_file() -> List[str]:
+    """Re-read the env file now (after ``conch keys set``, on ``/reload``,
+    on an auth failure, on SIGHUP in the daemon) and return the names
+    whose effective value changed. Names removed from the file are left
+    in the environment untouched — a running process never loses a key
+    it was started with."""
+    return load_env_file()
 
 
 def _write_private_file(path: Path, text: str) -> None:
-    """Write *text* to *path* with 0600 perms (0700 parent), atomically
-    enough for single-user config: keys never transit a world-readable
-    state."""
+    """Write *text* to *path* atomically with 0600 perms (0700 parent):
+    a temp file in the same directory, fsync, then rename over the
+    target — so a crash mid-write never leaves a truncated key file, and
+    keys never transit a world-readable state."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(text)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(tmp), 0o600)
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
 
 
 def set_config_values(updates: Dict[str, str], header: str = "") -> str:
@@ -204,10 +427,37 @@ def set_config_values(updates: Dict[str, str], header: str = "") -> str:
     return str(path)
 
 
-def set_env_values(updates: Dict[str, str]) -> str:
+ENV_FILE_HEADER = (
+    "# Conch credentials — loaded into the environment by conch itself"
+    " (shell, conch-ask,\n"
+    "# the edge daemon, workers, MCP server launches). Keep this file"
+    " 0600.\n"
+    "# Manage it with `conch keys` (list / check / set / rotate); keys"
+    " saved that way are\n"
+    "# authoritative over shell exports of the same name."
+)
+
+
+def _env_line_key(line: str) -> str:
+    """The NAME of a ``NAME=…`` / ``export NAME=…`` line ("" otherwise)."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return ""
+    if stripped.startswith("export "):
+        stripped = stripped[len("export "):]
+    return stripped.split("=", 1)[0].strip()
+
+
+def set_env_values(updates: Dict[str, str], *, set_by: str = "conch keys",
+                   verified: str = "", managed: bool = True) -> str:
     """Set ``KEY=value`` lines in the 0600 env file (see
-    :func:`get_env_file_path`) and mirror them into ``os.environ`` so
-    the running process sees them immediately. Returns the env path.
+    :func:`get_env_file_path`), mark them conch-managed in the manifest,
+    and mirror them into ``os.environ`` so the running process sees
+    them immediately. Returns the env path.
+
+    Existing assignments are replaced in place (an ``export`` prefix is
+    preserved; duplicates dropped); comments and other lines are kept
+    byte-for-byte; new keys are appended. The write is atomic.
 
     Values are secrets: callers must never echo them, and this function
     never logs them.
@@ -216,28 +466,55 @@ def set_env_values(updates: Dict[str, str]) -> str:
     try:
         lines = path.read_text().splitlines()
     except OSError:
-        lines = [
-            "# Conch API keys — loaded into the environment by conch itself.",
-            "# Keep this file 0600; real environment variables take precedence.",
-        ]
+        lines = ENV_FILE_HEADER.splitlines()
     remaining = dict(updates)
     output = []
     for line in lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            key = stripped.split("=", 1)[0].strip()
-            if key in remaining:
-                output.append(f"{key}={remaining.pop(key)}")
-                continue
-            if key in updates:
-                continue  # duplicate assignment of an updated key
+        key = _env_line_key(line)
+        if key and key in remaining:
+            prefix = "export " if line.strip().startswith("export ") else ""
+            output.append(f"{prefix}{key}={remaining.pop(key)}")
+            continue
+        if key and key in updates:
+            continue  # duplicate assignment of an updated key
         output.append(line)
     for key, value in remaining.items():
         output.append(f"{key}={value}")
     _write_private_file(path, "\n".join(output).rstrip("\n") + "\n")
+    if managed:
+        record_managed_keys(updates, set_by=set_by, verified=verified)
     for key, value in updates.items():
         os.environ[key] = value
+        _ENV_LOAD_STATE["from_file"][key] = value  # type: ignore[index]
     return str(path)
+
+
+def remove_env_values(names) -> List[str]:
+    """Drop ``NAME=…`` lines for *names* from the env file (comments and
+    other lines untouched, atomic rewrite) and forget them in the
+    manifest. The running process keeps its environment. Returns the
+    names that were actually present."""
+    path = Path(get_env_file_path())
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+    wanted = {str(name) for name in names}
+    removed: List[str] = []
+    output = []
+    for line in lines:
+        key = _env_line_key(line)
+        if key and key in wanted:
+            if key not in removed:
+                removed.append(key)
+            continue
+        output.append(line)
+    if removed:
+        _write_private_file(path, "\n".join(output).rstrip("\n") + "\n")
+        for name in removed:
+            forget_managed_key(name)
+            _ENV_LOAD_STATE["from_file"].pop(name, None)  # type: ignore[union-attr]
+    return removed
 
 
 def resolve_editor(config: Optional[Dict[str, str]] = None) -> str:

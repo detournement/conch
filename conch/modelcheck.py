@@ -309,6 +309,10 @@ def _error_message(payload) -> Tuple[str, str]:
     return "", ""
 
 
+_AUTH_TEXT_MARKERS = (
+    "api key", "api-key", "x-api-key", "unauthorized", "authentication", "forbidden",
+    "credential", "bearer", "token",
+)
 _MODEL_MISSING_MARKERS = (
     "not found", "does not exist", "doesn't exist", "unknown model", "no such",
     "not a valid model", "invalid model", "is not supported", "unsupported model",
@@ -360,9 +364,20 @@ def _classify_http(status: int, payload, model: str) -> Tuple[str, str]:
 
 def cloud_base_url(provider: str, config: dict) -> str:
     """API root for a cloud provider's models-list / completion endpoints.
-    Cerebras and Bedrock honour the same overrides their adapters use."""
+    Cerebras and Bedrock honour the same overrides their adapters use.
+
+    ``CONCH_<PROVIDER>_API_BASE`` (e.g. ``CONCH_ANTHROPIC_API_BASE``)
+    redirects the *probes* only — a hook for test doubles and for
+    checking a key through a proxy; the chat adapters keep their own
+    endpoints.
+    """
     from .providers import OPENROUTER_BASE_URL, get_bedrock_base_url
 
+    override = os.environ.get(
+        f"CONCH_{(provider or '').upper()}_API_BASE", ""
+    ).strip()
+    if override:
+        return override.rstrip("/")
     if provider == "openai":
         return "https://api.openai.com/v1"
     if provider == "anthropic":
@@ -429,19 +444,37 @@ def _minimal_completion_body(provider: str, model: str) -> dict:
     return {"model": model, "messages": messages, "max_tokens": 1}
 
 
+def _no_key_result(provider: str, model: str, key_env: str) -> ProbeResult:
+    from .providers import key_fix_hint
+
+    name = key_env or "api_key_env"
+    return ProbeResult(
+        provider, model, NO_KEY,
+        f"{name} is not set — {key_fix_hint(name)}",
+    )
+
+
+def _named_auth_failure(provider: str, key_env: str, status: int,
+                        detail: str) -> str:
+    """Rewrite a classified 401/403 so it names the key variable and the
+    fix (``<NAME> was rejected by <service> (401) — run: conch keys set
+    <NAME>``) instead of a bare HTTP line."""
+    from .providers import auth_rejected_message
+
+    shown = detail
+    prefix = f"HTTP {status}: "
+    if shown.startswith(prefix):
+        shown = shown[len(prefix):]
+    return auth_rejected_message(provider, key_env, status, shown)
+
+
 def _probe_cloud(provider: str, model: str, config: dict, timeout: float) -> ProbeResult:
     from .providers import KNOWN_MODELS, api_key_env_for, suggest_models
 
     key_env = api_key_env_for(provider, config)
     api_key = os.environ.get(key_env, "").strip() if key_env else ""
     if not api_key:
-        from .config import get_env_file_path
-
-        return ProbeResult(
-            provider, model, NO_KEY,
-            f"{key_env or 'api_key_env'} is not set (set it in"
-            f" {get_env_file_path()} or the environment)",
-        )
+        return _no_key_result(provider, model, key_env)
     if not model:
         return ProbeResult(provider, model, MISCONFIGURED, "no model configured")
     known = KNOWN_MODELS.get(provider)
@@ -469,6 +502,8 @@ def _probe_cloud(provider: str, model: str, config: dict, timeout: float) -> Pro
         # completion decide.
     elif status in (401, 402, 403, 429) or status >= 500:
         klass, detail = _classify_http(status, payload, model)
+        if klass == AUTH_FAILED:
+            detail = _named_auth_failure(provider, key_env, status, detail)
         return ProbeResult(provider, model, klass, detail)
     # A list endpoint that 404s/400s (gateways without one) also falls
     # through to the completion probe.
@@ -481,7 +516,126 @@ def _probe_cloud(provider: str, model: str, config: dict, timeout: float) -> Pro
     if status == 200:
         return ProbeResult(provider, model, OK, "answered a 1-token completion")
     klass, detail = _classify_http(status, payload, model)
+    if klass == AUTH_FAILED:
+        detail = _named_auth_failure(provider, key_env, status, detail)
     return ProbeResult(provider, model, klass, detail)
+
+
+def probe_key(provider: str, config: dict, *,
+              timeout: Optional[float] = None,
+              api_key: Optional[str] = None) -> ProbeResult:
+    """The *credential* verdict for a cloud provider, independent of the
+    configured model: ``ok`` when the key is accepted, ``auth_failed`` on
+    401/403, ``no_key`` when the variable is unset, else the transport
+    or server class. Used by ``conch keys check``; the same request
+    plumbing and classes as :func:`probe_model`, no second probe.
+
+    One models-list request settles it for every provider that has one;
+    an endpoint without a list (404/400) falls back to the 1-token
+    completion against the provider's default model, where a
+    ``model_not_found`` still means the key itself was accepted.
+
+    *api_key* verifies that value instead of the environment's (so
+    ``conch keys check`` can test a stale duplicate next to the
+    effective key without touching ``os.environ``).
+    """
+    from .providers import DEFAULT_CHAT_MODEL_BY_PROVIDER, api_key_env_for
+
+    provider = (provider or "").lower()
+    config = config or {}
+    timeout = model_check_timeout(config) if timeout is None else float(timeout)
+    key_env = api_key_env_for(provider, config)
+    if api_key is None:
+        api_key = os.environ.get(key_env, "").strip() if key_env else ""
+    api_key = (api_key or "").strip()
+    started = time.monotonic()
+    model = (config.get("chat_model") or config.get("model") or "").strip() \
+        or DEFAULT_CHAT_MODEL_BY_PROVIDER.get(provider, "")
+    if provider == "custom":
+        from .providers import _custom_headers, get_custom_base_url
+
+        base = get_custom_base_url(config)
+        if not base:
+            result = ProbeResult(provider, model, MISCONFIGURED,
+                                 "custom_base_url is not configured")
+        else:
+            headers = {k: v for k, v in _custom_headers(config).items()
+                       if k != "Content-Type"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            elif key_env:
+                headers.pop("Authorization", None)
+            try:
+                status, payload = _request(f"{base}/models", headers, timeout)
+                if status == 200:
+                    result = ProbeResult(provider, model, OK,
+                                         f"{base}/models accepted the request"
+                                         + (f" with {key_env}" if key_env else " (no key)"))
+                else:
+                    klass, detail = _classify_http(status, payload, model)
+                    if klass == AUTH_FAILED:
+                        detail = _named_auth_failure(provider, key_env, status, detail)
+                    elif klass == MODEL_NOT_FOUND:
+                        klass, detail = SERVER_ERROR, f"{detail} ({base}/models)"
+                    result = ProbeResult(provider, model, klass, detail)
+            except _Unreachable as exc:
+                result = ProbeResult(provider, model, exc.status,
+                                     f"endpoint {exc.detail} at {base}")
+        result.elapsed = time.monotonic() - started
+        return result
+    if provider not in CLOUD_PROVIDERS:
+        return ProbeResult(provider, model, MISCONFIGURED,
+                           f"{provider or '(none)'} needs no API key")
+    if not api_key:
+        result = _no_key_result(provider, model, key_env)
+        result.elapsed = time.monotonic() - started
+        return result
+    models_url, completions_url, headers = _cloud_endpoints(provider, config, api_key)
+    try:
+        status, payload = _request(models_url, headers, timeout)
+    except _Unreachable as exc:
+        result = ProbeResult(provider, model, exc.status, f"{exc.detail} ({models_url})")
+        result.elapsed = time.monotonic() - started
+        return result
+    if status == 200:
+        count = len(_model_ids(payload))
+        result = ProbeResult(provider, model, OK,
+                             f"{key_env} accepted by {provider}"
+                             + (f" ({count} models listed)" if count else ""))
+    elif status in (401, 402, 403, 429) or status >= 500:
+        klass, detail = _classify_http(status, payload, model)
+        if klass == AUTH_FAILED:
+            detail = _named_auth_failure(provider, key_env, status, detail)
+        result = ProbeResult(provider, model, klass, detail)
+    else:
+        try:
+            status, payload = _request(
+                completions_url, headers, timeout,
+                body=_minimal_completion_body(provider, model),
+            )
+            if status == 200:
+                result = ProbeResult(provider, model, OK,
+                                     f"{key_env} accepted by {provider}"
+                                     " (1-token completion)")
+            else:
+                klass, detail = _classify_http(status, payload, model)
+                if klass == AUTH_FAILED:
+                    detail = _named_auth_failure(provider, key_env, status, detail)
+                elif klass in (MODEL_NOT_FOUND, CONFORMANCE_FAILED) or (
+                    status in (400, 404, 422)
+                    and not any(marker in detail.lower() for marker in _AUTH_TEXT_MARKERS)
+                ):
+                    # The request was authenticated and then rejected on its
+                    # body (model id, parameters): the credential is valid.
+                    klass = OK
+                    detail = (f"{key_env} accepted by {provider}; the probe"
+                              f" request itself was rejected ({detail})")
+                result = ProbeResult(provider, model, klass, detail)
+        except _Unreachable as exc:
+            result = ProbeResult(provider, model, exc.status,
+                                 f"{exc.detail} ({completions_url})")
+    result.elapsed = time.monotonic() - started
+    return result
 
 
 def _probe_ollama(model: str, config: dict, timeout: float) -> ProbeResult:

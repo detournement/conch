@@ -149,6 +149,9 @@ class HttpMcpClient:
         # Extra request headers (e.g. an Authorization bearer for hosted
         # MCP servers); values are used by reference and never logged.
         self.headers = dict(headers or {})
+        # The ``${VAR}`` names the mcp.json entry referenced (set by
+        # create_clients) so a 401 can say which key to rotate.
+        self.credential_names: List[str] = []
         self.connect_timeout = float(
             DEFAULT_CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
         )
@@ -255,6 +258,10 @@ class HttpMcpClient:
             self.last_error = str(message["error"].get("message", "no answer"))
             return False
         if "error" in message:
+            self.last_error = name_rejected_credential(
+                self.name, str(message["error"].get("message", "")),
+                self.credential_names,
+            )
             return True
         result = message.get("result") or {}
         if isinstance(result, dict):
@@ -297,7 +304,11 @@ class HttpMcpClient:
         Returns [] on failure and records why in ``last_error``."""
         response = self._rpc("tools/list")
         if "error" in response:
-            self.last_error = str(response["error"].get("message", "unknown error"))
+            self.last_error = name_rejected_credential(
+                self.name,
+                str(response["error"].get("message", "unknown error")),
+                self.credential_names,
+            )
             return []
         self.last_error = ""
         raw_tools = response.get("result", {}).get("tools", [])
@@ -319,7 +330,10 @@ class HttpMcpClient:
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
         response = self._rpc("tools/call", {"name": tool_name, "arguments": arguments})
         if "error" in response:
-            msg = response["error"].get("message", "unknown")
+            msg = name_rejected_credential(
+                self.name, response["error"].get("message", "unknown"),
+                self.credential_names,
+            )
             return {"content": [{"type": "text", "text": "MCP HTTP error: " + msg}]}
         return response.get("result", {"content": [{"type": "text", "text": "(no result)"}]})
 
@@ -355,12 +369,22 @@ class StdioMcpClient:
         # wrote together (a banner plus the reply) are never stranded in
         # a buffer the way a select() on the raw pipe would leave them.
         self._lines: "queue.Queue[Optional[str]]" = queue.Queue()
+        self.credential_names: List[str] = referenced_env_names(
+            {"env": env or {}, "args": args or []}
+        )
         # Inherit the parent environment so PATH/HOME still resolve, then
         # layer the server's own env (credentials) on top. Without this,
         # stdio servers configured purely via env (Jira, GitHub, ...) start
-        # unauthenticated and advertise zero tools.
+        # unauthenticated and advertise zero tools. A ${VAR} that is unset
+        # is a configuration error naming the variable, never a blank.
         proc_env = dict(os.environ)
-        proc_env.update(_expand_env(env))
+        try:
+            proc_env.update(_expand_env(env, server=client_name))
+            args = _expand_args(args, server=client_name)
+        except McpConfigError as exc:
+            self.unreachable = False
+            self.last_error = str(exc)
+            return
         # stderr -> DEVNULL: these servers emit banners/warnings, and an
         # undrained PIPE fills its buffer and deadlocks the child.
         try:
@@ -434,6 +458,8 @@ class StdioMcpClient:
 
     def _send(self, method: str, params: Optional[dict] = None) -> dict:
         if self._proc is None:
+            if self.last_error.startswith("mcp.json:"):
+                return {"error": {"message": self.last_error}}
             return _transport_error(self.last_error or "stdio server not started")
         if not self._proc.stdin or not self._proc.stdout:
             return {"error": {"message": "stdio client not initialized"}}
@@ -530,25 +556,158 @@ def _load_config() -> dict:
         return {"mcpServers": {}}
 
 
-def _expand_env(values: Optional[dict]) -> Dict[str, str]:
-    """Expand ${VAR} / $VAR in MCP config values from the environment.
+class McpConfigError(ValueError):
+    """An mcp.json entry cannot be used as written (a ``${VAR}`` whose
+    variable is unset, a bad timeout). Carries the server name so the
+    loader can mark exactly that server as failed and leave the others
+    alone."""
 
-    Used for both HTTP ``headers`` and stdio ``env`` blocks, so mcp.json can
-    reference secrets by name instead of storing them in plaintext. Entries
-    whose variables are unset are dropped, so a missing credential surfaces
-    as an auth error rather than a literal "${VAR}".
-    """
+    def __init__(self, server: str, message: str):
+        super().__init__(message)
+        self.server = server
+
+
+_REFERENCE_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+_SECRET_NAME_RE = re.compile(
+    r"(TOKEN|KEY|SECRET|PASSWORD|PASSWD|BEARER|CREDENTIAL|AUTH)", re.IGNORECASE
+)
+
+
+def secret_like_name(name: str) -> bool:
+    """Whether an env/header/query NAME looks like it holds a secret —
+    the heuristic ``conch keys`` uses to flag inline values in
+    mcp.json and to pick which referenced variable a 401 names."""
+    return bool(_SECRET_NAME_RE.search(str(name or "")))
+
+
+def referenced_env_names(value) -> List[str]:
+    """Every ``${VAR}`` / ``$VAR`` name inside *value* (a string, or a
+    dict/list of them), in first-seen order. The names mcp.json
+    *references* — what ``conch keys`` lists as that server's
+    credentials without ever reading the values here."""
+    names: List[str] = []
+
+    def walk(item) -> None:
+        if isinstance(item, str):
+            for match in _REFERENCE_RE.finditer(item):
+                name = match.group(1) or match.group(2)
+                if name and name not in names:
+                    names.append(name)
+        elif isinstance(item, dict):
+            for child in item.values():
+                walk(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                walk(child)
+
+    walk(value)
+    return names
+
+
+def expand_references(value: str, *, server: str, field: str) -> str:
+    """Expand ``${VAR}`` / ``$VAR`` in one mcp.json string from the
+    environment. A referenced variable that is unset or empty raises
+    :class:`McpConfigError` naming the server, the field, the variable,
+    and the fix — a header or env entry is never silently sent blank or
+    with a literal ``${VAR}``."""
+    from .providers import key_fix_hint
+
+    def substitute(match: "re.Match[str]") -> str:
+        name = match.group(1) or match.group(2)
+        current = os.environ.get(name, "")
+        if not current.strip():
+            raise McpConfigError(
+                server,
+                f"mcp.json: server {server!r} {field} references ${{{name}}},"
+                f" which is not set — {key_fix_hint(name)}",
+            )
+        return current
+
+    return _REFERENCE_RE.sub(substitute, value)
+
+
+def _expand_env(values: Optional[dict], *, server: str = "",
+                field: str = "env") -> Dict[str, str]:
+    """Expand ${VAR} / $VAR in an MCP ``env`` or ``headers`` block from
+    the environment, so mcp.json references secrets by name instead of
+    storing them in plaintext (``conch keys migrate-mcp`` rewrites inline
+    values to this form). Raises :class:`McpConfigError` for a reference
+    whose variable is unset: the server is reported as misconfigured,
+    naming the variable, instead of starting unauthenticated."""
     out: Dict[str, str] = {}
     for key, value in (values or {}).items():
         if not isinstance(value, str):
             continue
-        expanded = os.path.expandvars(value)
-        if "$" in expanded and expanded != value:
-            continue
-        if re.fullmatch(r"\$\{?\w+\}?", expanded):
-            continue
-        out[str(key)] = expanded
+        out[str(key)] = expand_references(
+            value, server=server, field=f"{field}.{key}"
+        )
     return out
+
+
+def _expand_args(args, *, server: str) -> List[str]:
+    expanded: List[str] = []
+    for index, arg in enumerate(args or []):
+        if isinstance(arg, str):
+            expanded.append(expand_references(
+                arg, server=server, field=f"args[{index}]"
+            ))
+        else:
+            expanded.append(str(arg))
+    return expanded
+
+
+class MisconfiguredMcpClient:
+    """Stand-in for a server whose mcp.json entry cannot be used
+    (:class:`McpConfigError`). It answers with the exact reason — in
+    ``/tools``, at startup, and in any tool call — and never spawns or
+    connects, so one bad entry costs nothing and hides nothing."""
+
+    def __init__(self, client_name: str, reason: str,
+                 credential_names: Optional[List[str]] = None):
+        self.name = client_name
+        self.last_error = reason
+        self.unreachable = False
+        self.credential_names = list(credential_names or [])
+
+    def list_tools(self) -> List[dict]:
+        return []
+
+    def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        return {"content": [{"type": "text", "text": self.last_error}]}
+
+    def close(self):
+        return None
+
+
+def name_rejected_credential(server: str, message: str,
+                             credential_names: List[str]) -> str:
+    """Turn an MCP server's ``HTTP 401/403`` failure into the named form
+    (``<NAME> was rejected by mcp/<server> (401) — run: conch keys set
+    <NAME>``) when the server's mcp.json entry references credential
+    variables; a server with no references keeps its raw message plus
+    the generic pointer."""
+    from .providers import auth_rejected_message, key_fix_hint
+
+    match = re.search(r"HTTP (401|403)", message or "")
+    if not match:
+        return message
+    status = int(match.group(1))
+    detail = (message or "").strip()
+    if credential_names:
+        ordered = sorted(
+            credential_names, key=lambda name: (not secret_like_name(name), name)
+        )
+        return auth_rejected_message(
+            f"mcp/{server}", ordered[0], status, detail
+        ) + (
+            f" (also referenced: {', '.join(ordered[1:])})"
+            if len(ordered) > 1 else ""
+        )
+    return (
+        f"mcp/{server} rejected its credential ({status}: {detail}) — the"
+        f" entry in mcp.json holds no ${{VAR}} reference to rotate;"
+        f" {key_fix_hint('<NAME>')} after `conch keys migrate-mcp --apply`"
+    )
 
 
 CAPITOL_DOCS_SERVER_NAME = "capitol-docs"
@@ -617,17 +776,29 @@ def create_clients() -> Dict[str, Any]:
     """
     clients: Dict[str, Any] = {}
     for name, cfg in _server_entries():
-        if cfg.get("type") == "http" and cfg.get("url"):
-            clients[name] = HttpMcpClient(
-                name, cfg["url"], _expand_env(cfg.get("headers")),
-                connect_timeout=_timeout_option(name, cfg, "connect_timeout"),
-                timeout=_timeout_option(name, cfg, "timeout"),
-            )
-        elif cfg.get("command"):
-            clients[name] = StdioMcpClient(
-                name, cfg["command"], cfg.get("args", []), cfg.get("env"),
-                read_timeout=_timeout_option(name, cfg, "timeout"),
-            )
+        credential_names = referenced_env_names({
+            key: cfg.get(key) for key in ("headers", "env", "url", "args")
+        })
+        try:
+            if cfg.get("type") == "http" and cfg.get("url"):
+                client = HttpMcpClient(
+                    name,
+                    expand_references(str(cfg["url"]), server=name, field="url"),
+                    _expand_env(cfg.get("headers"), server=name, field="headers"),
+                    connect_timeout=_timeout_option(name, cfg, "connect_timeout"),
+                    timeout=_timeout_option(name, cfg, "timeout"),
+                )
+            elif cfg.get("command"):
+                client = StdioMcpClient(
+                    name, cfg["command"], cfg.get("args", []), cfg.get("env"),
+                    read_timeout=_timeout_option(name, cfg, "timeout"),
+                )
+            else:
+                continue
+        except McpConfigError as exc:
+            client = MisconfiguredMcpClient(name, str(exc), credential_names)
+        client.credential_names = credential_names
+        clients[name] = client
     return clients
 
 

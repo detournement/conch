@@ -3299,8 +3299,9 @@ class ConchConfigClient:
 # tool + skill line) with headroom; the /notes family pushed the report
 # past the old 4000, and the source overview's module map (which must
 # reach conch/runtime.py — see _source_overview) past 5200 once
-# modelcheck.py joined the core modules.
-INTROSPECT_OUTPUT_MAX = 5600
+# modelcheck.py joined the core modules, and past 5600 when config.py and
+# mcp.py grew their credential surfaces (conch keys).
+INTROSPECT_OUTPUT_MAX = 6000
 
 CONCH_INTROSPECT_TOOL = {
     "type": "function",

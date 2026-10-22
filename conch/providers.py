@@ -877,21 +877,68 @@ def api_key_env_for(provider: str, config: Optional[dict] = None) -> str:
     return configured or DEFAULT_API_KEY_ENVS.get(provider, "")
 
 
+def key_fix_hint(key_env: str) -> str:
+    """The one remedy every credential failure points at: the command
+    that prompts for the value (never echoed), verifies it live, saves
+    it 0600, and reloads the consumers. ``conch keys rotate`` is the
+    guided form for several keys at once."""
+    return f"run: conch keys set {key_env}"
+
+
 def missing_api_key_message(provider: str, key_env: str) -> str:
     """Operator-facing explanation for a provider whose key env var is
-    unset: names the variable and both remedies. Worded to register as a
+    unset: names the variable and the remedy. Worded to register as a
     structural (authentication) failure so the runtime does not retry the
     same provider's other models."""
-    from .config import get_env_file_path
-
     key_env = (key_env or "").strip() or DEFAULT_API_KEY_ENVS.get(
         (provider or "").lower(), ""
     ) or "api_key_env"
     return (
-        f"authentication: no {provider} API key — the environment variable "
-        f"{key_env} is not set. Run `conch` interactively to launch the "
-        f"setup wizard, or set {key_env} in {get_env_file_path()}"
+        f"authentication: no {provider} API key — {key_env} is not set"
+        f" — {key_fix_hint(key_env)}"
     )
+
+
+def auth_rejected_message(provider: str, key_env: str, status: int,
+                          detail: str = "") -> str:
+    """``<NAME> was rejected by <service> (401) — run: conch keys set
+    <NAME>``: the text every 401/403 from a provider, an MCP server, the
+    Capitol platform, or the status page surfaces, so a rotated key is
+    never reported as a bare ``401 Unauthorized``. Registers as a
+    structural (authentication) failure for the retry logic."""
+    key_env = (key_env or "").strip() or DEFAULT_API_KEY_ENVS.get(
+        (provider or "").lower(), ""
+    ) or "the configured key"
+    shown = " ".join(str(detail or "").split())
+    if len(shown) > 160:
+        shown = shown[:159] + "…"
+    code = f"{int(status)}" + (f": {shown}" if shown else "")
+    return (
+        f"{key_env} was rejected by {provider} ({code})"
+        f" — {key_fix_hint(key_env)}"
+    )
+
+
+def is_auth_status(status) -> bool:
+    try:
+        return int(status) in (401, 403)
+    except (TypeError, ValueError):
+        return False
+
+
+def http_error_response(provider: str, config: Optional[dict],
+                        exc: BaseException) -> dict:
+    """The :func:`error_response` for an HTTPError from *provider*: a
+    401/403 becomes the named-key auth message (which key, which
+    service, which command fixes it); everything else keeps the
+    provider's own error text."""
+    status = getattr(exc, "code", None)
+    if is_auth_status(status):
+        key_env = api_key_env_for(provider, config)
+        return error_response(auth_rejected_message(
+            provider, key_env, int(status), format_http_api_error(exc)
+        ))
+    return error_response(format_http_api_error(exc))
 
 
 def missing_api_key_response(provider: str, key_env: str) -> dict:
@@ -1321,6 +1368,8 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return http_error_response("cerebras", config, exc)
     except Exception as exc:
         return error_response(str(exc))
     message = (data.get("choices") or [{}])[0].get("message", {})
@@ -1361,7 +1410,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        return error_response(format_http_api_error(exc))
+        return http_error_response("openai", config, exc)
     except Exception as exc:
         return error_response(str(exc))
     if isinstance(data, dict) and data.get("error"):
@@ -1425,7 +1474,7 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         with urllib.request.urlopen(req, timeout=60) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        return error_response(format_http_api_error(exc))
+        return http_error_response("anthropic", config, exc)
     except Exception as exc:
         return error_response(str(exc))
 
@@ -1618,7 +1667,7 @@ def raw_bedrock(config: dict, messages: List[dict], tools: Optional[List[dict]] 
         with urllib.request.urlopen(req, timeout=120) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        return error_response(format_http_api_error(exc))
+        return http_error_response("bedrock", config, exc)
     except Exception as exc:
         return error_response(str(exc))
     if isinstance(data, dict) and data.get("error"):
@@ -1702,6 +1751,7 @@ def stream_bedrock(config: dict, messages: list, tools=None, on_token=None) -> d
         body["model"],
         "bedrock",
         reasoning_filter.feed if reasoning_filter else None,
+        config=config,
     )
     if reasoning_filter:
         reasoning_filter.finish()
@@ -1762,7 +1812,7 @@ def raw_openrouter(config: dict, messages: List[dict], tools: Optional[List[dict
         with urllib.request.urlopen(req, timeout=120) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        return error_response(format_http_api_error(exc))
+        return http_error_response("openrouter", config, exc)
     except Exception as exc:
         return error_response(str(exc))
     if isinstance(data, dict) and data.get("error"):
@@ -1796,6 +1846,7 @@ def stream_openrouter(config: dict, messages: list, tools=None, on_token=None) -
         body["model"],
         "openrouter",
         reasoning_filter.feed if reasoning_filter else None,
+        config=config,
     )
     if reasoning_filter:
         reasoning_filter.finish()
@@ -2047,7 +2098,13 @@ def probe_custom_model(
             )
         )
     except urllib.error.HTTPError as exc:
-        result = (False, format_http_api_error(exc))
+        if is_auth_status(exc.code):
+            result = (False, auth_rejected_message(
+                "custom", (config.get("api_key_env") or "").strip(),
+                exc.code, format_http_api_error(exc),
+            ))
+        else:
+            result = (False, format_http_api_error(exc))
     except Exception as exc:
         result = (False, f"endpoint unreachable at {base_url}: {exc}")
     with _local_model_cache_lock:
@@ -2263,7 +2320,7 @@ def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         ) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        return error_response(format_http_api_error(exc))
+        return http_error_response("custom", config, exc)
     except Exception as exc:
         return error_response(str(exc))
     message = (data.get("choices") or [{}])[0].get("message", {})
@@ -2298,6 +2355,7 @@ def stream_custom(config: dict, messages: list, tools=None, on_token=None) -> di
         "custom",
         on_token,
         timeout=_config_float(config, "custom_timeout", 120.0),
+        config=config,
     )
 
 
@@ -2367,8 +2425,13 @@ def _stream_openai_compat(
     provider: str,
     on_token,
     timeout: float = 120.0,
+    config: Optional[dict] = None,
 ) -> dict:
-    """Shared streaming implementation for OpenAI-compatible APIs."""
+    """Shared streaming implementation for OpenAI-compatible APIs.
+
+    *config* only feeds the auth-failure message (which ``api_key_env``
+    a 401/403 rejected) — the request itself is fully described by
+    *url*/*headers*/*body*."""
     body["stream"] = True
     # Without this, OpenAI-compatible servers (llama.cpp included) send
     # no usage chunk at all and the per-turn token stats line has
@@ -2472,7 +2535,7 @@ def _stream_openai_compat(
                     # exact generation seconds for the tok/s display.
                     _attach_server_timings(usage, chunk)
     except urllib.error.HTTPError as exc:
-        return error_response(format_http_api_error(exc))
+        return http_error_response(provider, config, exc)
     except Exception as exc:
         return error_response(str(exc))
 
@@ -2536,6 +2599,7 @@ def stream_cerebras(
         model,
         "cerebras",
         on_token,
+        config=config,
     )
 
 
@@ -2566,6 +2630,7 @@ def stream_openai(
         model,
         "openai",
         on_token,
+        config=config,
     )
 
 
@@ -2742,7 +2807,7 @@ def stream_anthropic(
                     mu = data.get("usage", {})
                     usage["output_tokens"] = mu.get("output_tokens", 0)
     except urllib.error.HTTPError as exc:
-        return error_response(format_http_api_error(exc))
+        return http_error_response("anthropic", config, exc)
     except Exception as exc:
         return error_response(str(exc))
 

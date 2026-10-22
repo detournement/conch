@@ -1353,6 +1353,11 @@ def chat_loop(new_conversation=False, interactive=True):
                         print(f"\n  \033[31mNo conversation with ID {result[1]}\033[0m\n")
                     continue
                 if result == "reload_tools":
+                    # /reload also re-reads ~/.config/conch/env so a key
+                    # rotated from another terminal reaches this session
+                    # (and the MCP servers restarted below) without a restart.
+                    from .config import reload_env_file
+                    reload_env_file()
                     _reload_tools()
                     continue
                 if result == "agent_mode_changed":
@@ -1660,11 +1665,15 @@ class _ArgumentParser(argparse.ArgumentParser):
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         prog="conch",
-        usage="conch [-n | --new] [--non-interactive] [--] [prompt ...]",
+        usage="conch [-n | --new] [--non-interactive] [--] [prompt ...]\n"
+              "       conch keys [list|check|set NAME|rotate|doctor|...]",
         description=(
             "The LLM-assisted shell. With no arguments, resumes your most"
             " recent\nconversation; any other arguments are sent as a"
-            " one-shot prompt."
+            " one-shot prompt.\n\n"
+            "conch keys manages every credential conch uses (see conch keys"
+            " --help);\n`conch keys rotate` is the one command to run after"
+            " an API key rotation."
         ),
         epilog=(
             "Options are recognised only before the prompt, so words inside"
@@ -1746,8 +1755,20 @@ def session_is_interactive(argv_flag: bool = False, stdin=None) -> bool:
         return False
 
 
+#: First words of argv that are subcommands, not prompts.
+SUBCOMMANDS = {"keys": "conch.keys"}
+
+
 def main():
-    options, argv = parse_argv(sys.argv[1:])
+    raw_argv = sys.argv[1:]
+    if raw_argv and raw_argv[0] in SUBCOMMANDS:
+        # `conch keys …` (and `python3 -m conch keys …`): the credential
+        # manager. Routed before anything loads config so it can see the
+        # environment exactly as the shell handed it over.
+        from .keys import main as keys_main
+
+        sys.exit(keys_main(raw_argv[1:]))
+    options, argv = parse_argv(raw_argv)
     if options.version:
         from . import __version__
         print(f"conch {__version__}")

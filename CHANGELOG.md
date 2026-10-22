@@ -7,6 +7,41 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [0.7.1] - 2026-10-22
+
+### Added
+
+- **`conch keys` — rotate any credential with one command.** `conch keys
+  rotate` (also `/keys` in a session, `conch-keys`, `python3 -m conch keys`)
+  runs a doctor, live-verifies every credential conch uses against its
+  service, prompts (hidden) for what failed or imports it from the
+  environment (`--from-env`, `--stdin`, `--yes`), saves it atomically to
+  `~/.config/conch/env` (0600), and reloads every consumer — shell, conch-ask,
+  the edge daemon, workers, MCP servers. `list` shows consumer, effective
+  source, fingerprint, last verification and flags stale duplicates and inline
+  `mcp.json` secrets; `check` has a `shell` and a `daemon` column and exits 0
+  only when the active config is green in both; `required` prints what to ask
+  the key admin for; `migrate-mcp` moves inline secrets to `${NAME}`
+  references with a backup; `doctor` explains multiple `conch` binaries on
+  PATH, a stale installed copy, env-file problems, stale profile exports by
+  `file:line` (profiles, sourced files, fish, direnv), and a daemon running
+  older code — with the restart line for launchd or systemd. Every command
+  starts with an identity line naming version, commit, path, and install shape.
+- **Precedence rule.** Keys saved through `conch keys` or first-run setup are
+  conch-managed (manifest next to the env file) and override a shell export of
+  the same name; hand-added lines keep the old environment-wins rule.
+- **Hot reload.** Sessions re-read the env file on `/keys set`, `/reload`, and
+  after a provider 401 (one retry); the daemon re-reads it when it changes, on
+  `SIGHUP`, and on the new `keys.reload` control op (`keys.status` reports
+  which keys it sees, fingerprints only).
+- **`${NAME}` references in `mcp.json`** are honoured in `env`, `headers`,
+  `url`, and `args`; an unset variable is a loud per-server error naming the
+  server and the variable instead of a blank header.
+- **Auth failures name the key and the fix** everywhere a 401/403 surfaces:
+  provider adapters (chat, streaming, ask mode), the startup model check and the
+  daemon's parked-mission reason, MCP servers, the Capitol client (registry
+  bearers point at re-bootstrap), and the status-page exporter.
+
 ## [0.7.0] - 2026-09-23
 
 ### Added

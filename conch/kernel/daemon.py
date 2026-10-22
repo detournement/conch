@@ -165,11 +165,21 @@ class EdgeDaemon:
         self._stop = threading.Event()
         self._server: Optional[socket.socket] = None
         self._server_thread: Optional[threading.Thread] = None
+        # The path actually bound by _start_socket_server: shutdown removes
+        # exactly that file, never whatever the environment resolves to at
+        # exit time (a process whose XDG_* changed must not unlink another
+        # daemon's socket).
+        self._bound_socket_path: Optional[Path] = None
         self._started_at = 0.0
         self._tick_count = 0
         self._log_lock = threading.Lock()
         # Report of the startup journal verification (see start()).
         self.journal_verification: Optional[Dict[str, Any]] = None
+        # Credential hot reload: (mtime_ns, size) of ~/.config/conch/env
+        # as of the last load, so every tick can notice a rotation with
+        # one stat() and re-read the file (no restart to hunt for).
+        self._env_file_signature: Optional[tuple] = self._env_file_stat()
+        self._reload_requested = threading.Event()
 
     # -- logging (never secrets) ----------------------------------------------
 
@@ -321,12 +331,14 @@ class EdgeDaemon:
         if self._server_thread is not None:
             self._server_thread.join(timeout=5)
             self._server_thread = None
-        socket_path = self.socket_path
-        try:
-            if socket_path.exists():
-                socket_path.unlink()
-        except OSError:
-            pass
+        socket_path = self._bound_socket_path
+        if socket_path is not None:
+            try:
+                if socket_path.exists():
+                    socket_path.unlink()
+            except OSError:
+                pass
+            self._bound_socket_path = None
         if self.intake is not None and self.store is not None:
             self.intake.release()
             self.intake = None
@@ -344,8 +356,96 @@ class EdgeDaemon:
             self.log(f"signal {signum} received — shutting down gracefully")
             self._stop.set()
 
+        def reload(signum, frame):
+            # SIGHUP = "re-read your credentials" (conch keys set/rotate
+            # send it when the control socket cannot). Handled on the
+            # tick thread, never inside the handler.
+            self._reload_requested.set()
+
         signal.signal(signal.SIGTERM, handle)
         signal.signal(signal.SIGINT, handle)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, reload)
+
+    # -- credential hot reload --------------------------------------------------
+
+    @staticmethod
+    def _env_file_stat() -> Optional[tuple]:
+        from ..config import get_env_file_path
+
+        try:
+            info = os.stat(get_env_file_path())
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size)
+
+    def reload_credentials(self, reason: str = "requested") -> Dict[str, Any]:
+        """Re-read ~/.config/conch/env now; log and return the names whose
+        effective value changed (fingerprints only — never values). Every
+        consumer in this process reads keys from the environment at call
+        time, so a changed provider key, Capitol bearer, status token, or
+        MCP ``${VAR}`` is live from the next session/tick."""
+        from ..config import key_fingerprint, reload_env_file
+
+        self._reload_requested.clear()
+        self._env_file_signature = self._env_file_stat()
+        changed = reload_env_file()
+        report = {
+            name: key_fingerprint(os.environ.get(name, "")) for name in changed
+        }
+        if changed:
+            self.log(
+                f"credentials reloaded ({reason}): "
+                + ", ".join(f"{name} {fp}" for name, fp in report.items())
+            )
+        else:
+            self.log(f"credentials reload ({reason}): no change")
+        return {"changed": report}
+
+    def _maybe_reload_credentials(self) -> None:
+        if self._reload_requested.is_set():
+            self.reload_credentials("SIGHUP")
+            return
+        signature = self._env_file_stat()
+        if signature != self._env_file_signature:
+            self._env_file_signature = signature
+            self.reload_credentials("env file changed")
+
+    def credential_status(self, names) -> Dict[str, Any]:
+        """What this daemon process sees for *names*: presence,
+        fingerprint, and whether the value came from the env file or the
+        inherited process environment — for ``conch keys check``'s daemon
+        column. Values never leave the process."""
+        from .. import __version__
+        from ..config import env_load_state, get_env_file_path, key_fingerprint
+
+        from_file = env_load_state()["from_file"]
+        keys: Dict[str, Any] = {}
+        for name in names or []:
+            name = str(name)
+            value = os.environ.get(name, "")
+            keys[name] = {
+                "present": bool(value.strip()),
+                "fingerprint": key_fingerprint(value) if value.strip() else "",
+                "source": (
+                    "env file" if value and from_file.get(name) == value
+                    else ("process env" if value.strip() else "")
+                ),
+            }
+        try:
+            from ..keys.identity import install_identity
+
+            identity = install_identity()
+        except Exception as exc:  # identity is advisory
+            identity = {"error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "pid": os.getpid(),
+            "version": __version__,
+            "started_at": self._started_at,
+            "env_file": get_env_file_path(),
+            "identity": identity,
+            "keys": keys,
+        }
 
     def run_forever(self) -> None:
         while not self._stop.is_set():
@@ -373,6 +473,7 @@ class EdgeDaemon:
         if self.store is None or self.engine is None:
             raise KernelError("daemon is not started")
         stats = {"fired": 0, "sessions": 0, "delivered": 0}
+        self._maybe_reload_credentials()
         for claim in self.store.claim_due_timers(
             self.holder, lease_seconds=120.0
         ):
@@ -562,6 +663,7 @@ class EdgeDaemon:
             pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(path))
+        self._bound_socket_path = path
         os.chmod(path, 0o600)
         server.listen(8)
         server.settimeout(0.5)
@@ -814,6 +916,12 @@ class EdgeDaemon:
                 )
             self.engine.abort_mission(mission_id)
             return {"ok": True}
+        if op == "keys.status":
+            return self.credential_status(args.get("names") or [])
+        if op == "keys.reload":
+            return self.reload_credentials(
+                str(args.get("reason") or "control socket")
+            )
         if op == "shutdown":
             self._stop.set()
             return {"ok": True}

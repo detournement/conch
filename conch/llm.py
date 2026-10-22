@@ -128,6 +128,30 @@ def build_messages(config: dict, user_request: str, context: dict) -> Tuple[List
     return [{"role": "system", "content": system}, {"role": "user", "content": user_content}], user_content
 
 
+
+def _api_error_text(provider: str, config: dict, exc: BaseException) -> str:
+    """One line for a failed ask-mode call: a 401/403 names the rejected
+    key variable and the ``conch keys set`` fix; anything else keeps the
+    endpoint's own message."""
+    import urllib.error
+
+    from .providers import (
+        api_key_env_for,
+        auth_rejected_message,
+        format_http_api_error,
+        is_auth_status,
+    )
+
+    if isinstance(exc, urllib.error.HTTPError):
+        if is_auth_status(exc.code):
+            return auth_rejected_message(
+                provider, api_key_env_for(provider, config), exc.code,
+                format_http_api_error(exc),
+            )
+        return format_http_api_error(exc)
+    return str(exc)
+
+
 def call_cerebras(config: dict, messages: list) -> str:
     import urllib.request
 
@@ -160,7 +184,7 @@ def call_cerebras(config: dict, messages: list) -> str:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read().decode())
     except Exception as e:
-        print(f"conch: API error: {e}", file=sys.stderr)
+        print(f"conch: API error: {_api_error_text('cerebras', config, e)}", file=sys.stderr)
         sys.exit(1)
     msg = (data.get("choices") or [{}])[0].get("message", {})
     return command_from_tool_calls(msg)
@@ -170,7 +194,7 @@ def call_bedrock(config: dict, messages: list) -> str:
     import urllib.error
     import urllib.request
 
-    from .providers import format_http_api_error, get_bedrock_base_url
+    from .providers import get_bedrock_base_url
 
     api_key = os.environ.get(
         config.get("api_key_env", "AWS_BEARER_TOKEN_BEDROCK"), ""
@@ -200,7 +224,7 @@ def call_bedrock(config: dict, messages: list) -> str:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        print(f"conch: API error: {format_http_api_error(e)}", file=sys.stderr)
+        print(f"conch: API error: {_api_error_text('bedrock', config, e)}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"conch: API error: {e}", file=sys.stderr)
@@ -213,7 +237,7 @@ def call_openrouter(config: dict, messages: list) -> str:
     import urllib.error
     import urllib.request
 
-    from .providers import OPENROUTER_BASE_URL, format_http_api_error
+    from .providers import OPENROUTER_BASE_URL
 
     api_key = os.environ.get(
         config.get("api_key_env", "OPENROUTER_API_KEY"), ""
@@ -248,7 +272,7 @@ def call_openrouter(config: dict, messages: list) -> str:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        print(f"conch: API error: {format_http_api_error(e)}", file=sys.stderr)
+        print(f"conch: API error: {_api_error_text('openrouter', config, e)}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"conch: API error: {e}", file=sys.stderr)
@@ -261,7 +285,7 @@ def call_openai(config: dict, messages: list) -> str:
     import urllib.error
     import urllib.request
 
-    from .providers import build_openai_chat_request_body, format_http_api_error
+    from .providers import build_openai_chat_request_body
 
     api_key = os.environ.get(config.get("api_key_env", "OPENAI_API_KEY"), "").strip()
     if not api_key:
@@ -290,7 +314,7 @@ def call_openai(config: dict, messages: list) -> str:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        print(f"conch: API error: {format_http_api_error(e)}", file=sys.stderr)
+        print(f"conch: API error: {_api_error_text('openai', config, e)}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"conch: API error: {e}", file=sys.stderr)
@@ -350,7 +374,7 @@ def call_anthropic(config: dict, messages: list) -> str:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read().decode())
     except Exception as e:
-        print(f"conch: API error: {e}", file=sys.stderr)
+        print(f"conch: API error: {_api_error_text('anthropic', config, e)}", file=sys.stderr)
         sys.exit(1)
     for b in data.get("content", []):
         if b.get("type") == "tool_use" and b.get("name") == "shell_command":
@@ -417,7 +441,6 @@ def call_custom(config: dict, messages: list) -> str:
     from .providers import (
         _clamp_output_to_context,
         _custom_headers,
-        format_http_api_error,
         get_custom_context_window,
         get_custom_base_url,
         validate_custom_model,
@@ -458,8 +481,9 @@ def call_custom(config: dict, messages: list) -> str:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        # Surfaces the endpoint's own error message (and closes the body).
-        print(f"conch: custom endpoint error: {format_http_api_error(exc)}", file=sys.stderr)
+        # Surfaces the endpoint's own error message (and closes the body);
+        # a 401/403 names the key variable and the fix.
+        print(f"conch: custom endpoint error: {_api_error_text('custom', config, exc)}", file=sys.stderr)
         return ""
     except Exception as exc:
         print(f"conch: custom endpoint error: {exc}", file=sys.stderr)

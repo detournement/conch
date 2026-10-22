@@ -110,7 +110,7 @@ class TestRawOpenRouter(unittest.TestCase):
             result = raw_openrouter({}, [])
         self.assertTrue(result.get("_error"))
         self.assertIn("OPENROUTER_API_KEY", result["content"])
-        self.assertIn("setup wizard", result["content"])
+        self.assertIn("run: conch keys set OPENROUTER_API_KEY", result["content"])
         self.assertIsNone(result["tool_calls"])
 
     def test_request_and_response(self):

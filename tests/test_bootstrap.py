@@ -97,8 +97,7 @@ class TestResolveStartupProvider(BootstrapTestCase):
         self.assertEqual(ctx.exception.code, 2)
         message = str(ctx.exception)
         self.assertIn("ANTHROPIC_API_KEY", message)
-        self.assertIn("setup wizard", message)
-        self.assertIn("/env", message)  # ~/.config/conch/env remedy
+        self.assertIn("run: conch keys set ANTHROPIC_API_KEY", message)  # the one remedy
 
     def test_configured_api_key_env_is_the_one_checked(self):
         env = {k: v for k, v in os.environ.items()

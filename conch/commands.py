@@ -45,7 +45,7 @@ BUILTIN_SLASH_COMMANDS = (
     "/?", "/agent", "/approvals", "/approve", "/apps", "/cancel",
     "/checkpoint", "/clear", "/connect", "/convos", "/cost", "/delete",
     "/deny", "/disable", "/edit", "/enable", "/fact", "/facts", "/find",
-    "/forget", "/grep", "/h", "/help", "/install", "/list", "/llamaidx",
+    "/forget", "/grep", "/h", "/help", "/install", "/keys", "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
     "/models", "/new", "/note", "/notes", "/paste", "/profile", "/profiles",
     "/provider", "/queue", "/registry", "/reload", "/remember", "/reset",
@@ -181,6 +181,8 @@ SLASH_COMMANDS = [
      "Manage a mission; verify checks the journal hash chain"),
     ("/install [component]",
      "List conch components or set one up (edge, fleet, works)"),
+    ("/keys [check|set NAME|rotate|doctor|import|required|reload]",
+     "See, verify, and rotate every credential conch uses (hot-reloads this session)"),
     ("/todo [add|done|due|list|show|work|escalate ...]",
      "Personal todo list (bare /todo = today view)"),
     ("/list <space> [verb ...]",
@@ -1433,6 +1435,7 @@ def handle_slash_command(
             "  \033[1m/missions\033[0m            List durable missions (edge daemon)\n"
             "  \033[1m/mission show|new|pause|resume|abort|input|verify\033[0m  Manage a mission / verify the journal\n"
             "  \033[1m/install [component]\033[0m List or set up components (edge, fleet, works, capture)\n"
+            "  \033[1m/keys [check|set NAME|rotate|doctor]\033[0m  See, verify, rotate credentials (hot-reloads this session)\n"
             "  \033[1m/todo\033[0m                Today's personal todos (due, overdue, most urgent)\n"
             "  \033[1m/todo add <title> [due:...] [p1-5] [#tag] [-- body]\033[0m  Capture a todo\n"
             "  \033[1m/todo done|due|list|show|work|escalate ...\033[0m  Manage personal todos\n"
@@ -2493,6 +2496,15 @@ def handle_slash_command(
 
     if command == "/reload":
         return "reload_tools"
+
+    if command == "/keys":
+        # The credential manager, in-session: same code as `conch keys`,
+        # with the value prompt hidden (getpass) and this process's
+        # environment refreshed on the spot. A saved key that an MCP
+        # server references restarts the servers (reload_tools).
+        from .keys.cli import run_slash
+
+        return run_slash(arg, config)
 
     if command == "/connect":
         if not composio_mod.is_available():

@@ -115,6 +115,14 @@ _TRANSIENT_ERROR_MARKERS = (
 _STRUCTURAL_ERROR_MARKERS = (
     "invalid_request", "invalid request",
     "authentication", "invalid api key", "invalid x-api-key",
+    "was rejected by",
+)
+
+# A credential problem specifically (unset or rejected key) — the one
+# class of error a re-read of ~/.config/conch/env can fix mid-session.
+_AUTH_ERROR_MARKERS = (
+    "was rejected by", "authentication", "invalid api key",
+    "invalid x-api-key", "is not set —",
 )
 
 _CONNECTION_ERROR_MARKERS = (
@@ -156,6 +164,31 @@ def is_structural_error(message: str) -> bool:
 def is_connection_error(message: str) -> bool:
     lower = message.lower()
     return any(marker in lower for marker in _CONNECTION_ERROR_MARKERS)
+
+
+def is_auth_error(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(marker in lower for marker in _AUTH_ERROR_MARKERS)
+
+
+def retry_after_key_reload(provider: str, config: dict, err_detail: str) -> bool:
+    """Hot reload for a rotated key: on an auth failure, re-read
+    ``~/.config/conch/env``; True when the variable the failing provider
+    reads *changed* on disk (a ``conch keys set`` / ``rotate`` landed
+    since this process loaded it), in which case the caller retries the
+    request exactly once. Any other outcome returns False and the usual
+    error handling proceeds — nothing loops on a bad key."""
+    if not is_auth_error(err_detail):
+        return False
+    from .config import reload_env_file
+    from .providers import api_key_env_for
+
+    try:
+        changed = reload_env_file()
+    except Exception:
+        return False
+    key_env = api_key_env_for(provider, config)
+    return bool(key_env) and key_env in changed
 
 
 CHARS_PER_TOKEN = 3.5  # default until calibrated against real usage counts
@@ -2017,9 +2050,37 @@ def chat_turn(
                 record_call_timing(
                     total_usage, usage, time.monotonic() - _call_started
                 )
+            if is_error_response(response) and retry_after_key_reload(
+                provider, config, error_detail(response)
+            ):
+                # A rotated key landed in the env file after this session
+                # started (conch keys set / rotate): one retry with it.
+                from .providers import api_key_env_for
+                print(
+                    f"  \033[33m\u26a0 {api_key_env_for(provider, config)} changed"
+                    " in the conch env file — retrying with the new key\033[0m",
+                    file=sys.stderr,
+                )
+                _call_started = time.monotonic()
+                if stream_fn:
+                    response = stream_fn(config, send_messages, send_tools, on_token)
+                else:
+                    with Spinner("Retrying with the new key"):
+                        response = raw_fn(config, send_messages, send_tools)
+                usage = response.get("_usage", {})
+                total_usage["input_tokens"] += usage.get("input_tokens", 0)
+                total_usage["output_tokens"] += usage.get("output_tokens", 0)
+                total_usage["model"] = response.get("_model", total_usage["model"])
+                record_call_timing(total_usage, usage, time.monotonic() - _call_started)
             if is_error_response(response):
                 err_detail = error_detail(response)
                 print(f"  \033[33m⚠ {err_detail}\033[0m", file=sys.stderr)
+                if is_auth_error(err_detail):
+                    print(
+                        "  \033[2m(in this session: /keys set <NAME> saves and"
+                        " verifies a new key without restarting)\033[0m",
+                        file=sys.stderr,
+                    )
                 from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_fallback_chain
                 # Structural errors (invalid request shape, auth) won't be fixed
                 # by switching to another model on the same provider.

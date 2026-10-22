@@ -305,3 +305,28 @@ def register_daemon_service(factory: Callable[..., Any]) -> None:
 
 def daemon_service_factories() -> List[Callable[..., Any]]:
     return list(_daemon_service_factories)
+
+
+# Credential providers (``conch keys``). A product that holds or resolves
+# credentials of its own (the Capitol registry bearers) registers one;
+# ``conch keys list/check/rotate`` then inventories and live-verifies them
+# next to the provider keys without the foundation importing the product.
+_credential_providers: "List[Any]" = []
+
+
+def register_credential_provider(provider: Any) -> None:
+    """*provider.credentials(config)* returns a list of dicts, one per
+    credential the product needs under *config*, each with: ``name``
+    (display name), ``env_name`` ("" when the value does not live in an
+    environment variable), ``service``, ``consumers`` (list of str),
+    ``required`` (bool), ``source`` (where the value is resolved from,
+    e.g. ``registry:alias``), ``fingerprint`` (never a value), ``verify``
+    (``callable(timeout) -> (status, detail)`` with status one of
+    ``ok``/``rejected``/``missing``/``unreachable``/``skipped``/``error``)
+    and optional ``notes``. Must never raise and never return secret
+    bytes; keep product imports lazy inside the call."""
+    _credential_providers.append(provider)
+
+
+def credential_providers() -> List[Any]:
+    return list(_credential_providers)

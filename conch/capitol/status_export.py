@@ -215,6 +215,15 @@ class StatusExporterService:
             return
         if status >= 300:
             message = f"status export push rejected: HTTP {status}"
+            if status in (401, 403):
+                from ..providers import auth_rejected_message
+
+                env = str(
+                    self.config.get("status_page_token_env") or DEFAULT_TOKEN_ENV
+                ).strip()
+                message = "status export: " + auth_rejected_message(
+                    "the status page", env, status
+                )
             if message != self._last_error:
                 self._last_error = message
                 self.log(message)

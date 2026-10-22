@@ -30,6 +30,8 @@ dependencies = [
 conch = "conch.app:main"
 conch-chat = "conch.app:main"
 conch-ask = "conch.cli:main"
+# Credential manager: `conch keys …` and this standalone alias behave the same.
+conch-keys = "conch.keys:main"
 # Swarm entrypoints, all live. conch-edge (Phase 1) is the personal edge
 # daemon owning the mission kernel, gated on edge_daemon=true.
 # conch-controller is the fleet controller (gated on fleet_controller=true);

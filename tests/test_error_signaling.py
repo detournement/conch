@@ -8,6 +8,7 @@ is never returned as a chat reply, appended to history, or saved to memory.
 
 import io
 import os
+import tempfile
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -91,7 +92,11 @@ class TestMissingApiKeyIsAnError(unittest.TestCase):
     (which the shell used to print as `[no response]`)."""
 
     def _without(self, *names):
+        # Also isolate the conch env file: the runtime re-reads it after an
+        # auth failure, and the developer's real ~/.config/conch/env must
+        # never feed a test (or make a real network call).
         env = {k: v for k, v in os.environ.items() if k not in names}
+        env["XDG_CONFIG_HOME"] = tempfile.mkdtemp(prefix="conch-nokey-")
         return patch.dict(os.environ, env, clear=True)
 
     def _assert_missing_key_error(self, result, env_name, provider):
@@ -99,8 +104,7 @@ class TestMissingApiKeyIsAnError(unittest.TestCase):
         detail = result["content"]
         self.assertIn(env_name, detail)
         self.assertIn(provider, detail)
-        self.assertIn("setup wizard", detail)
-        self.assertIn("/env", detail)
+        self.assertIn(f"run: conch keys set {env_name}", detail)
         self.assertTrue(is_structural_error(detail),
                         "must not retry the same provider's other models")
         self.assertFalse(is_transient_error(detail))

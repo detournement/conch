@@ -16,6 +16,7 @@ from ..plugins import (
     Component,
     SlashCommand,
     register_component,
+    register_credential_provider,
     register_daemon_service,
     register_mission_tool_provider,
     register_session_tool_provider,
@@ -456,6 +457,145 @@ def _status_exporter_service(store, config: dict, log=print, clock=None):
 
 register_folder_handler("pack", _pack_folder_handler)
 register_daemon_service(_status_exporter_service)
+
+
+# ---------------------------------------------------------------------------
+# Credentials (``conch keys``): the Capitol bearers — the configured
+# runtime agent, the eBay agent when set, and the admin token — resolved
+# exactly the way the adapter resolves them (env var first, then the
+# A2Actrl registry), verified with the cheapest authenticated call (the
+# agent card). Values never leave this module; the inventory gets names,
+# sources, and fingerprints.
+# ---------------------------------------------------------------------------
+
+class CapitolCredentialProvider:
+    def credentials(self, config: dict):
+        config = config or {}
+        if not _configured(config):
+            return []
+        entries = []
+        org = str(config.get("capitol_org") or "").strip()
+        base_url = str(config.get("capitol_base_url") or "").strip()
+        agents = []
+        runtime_agent = str(config.get("capitol_agent") or "").strip()
+        if runtime_agent:
+            agents.append(("capitol runtime", runtime_agent))
+        ebay_agent = str(config.get("ebay_agent") or "").strip()
+        if ebay_agent and ebay_agent != runtime_agent:
+            agents.append(("ebay agent", ebay_agent))
+        for label, agent in agents:
+            entries.append(self._bearer_entry(config, label, org, agent, base_url))
+        from ..config import get_bool
+
+        if get_bool(config, "capitol_admin"):
+            entries.append(self._admin_entry(config, org, base_url))
+        return [entry for entry in entries if entry]
+
+    @staticmethod
+    def _short(value: str) -> str:
+        value = str(value or "")
+        return value[:8] + "…" if len(value) > 9 else value
+
+    def _bearer_entry(self, config: dict, label: str, org: str, agent: str,
+                      base_url: str) -> Optional[dict]:
+        from .credentials import (
+            DEFAULT_BEARER_ENV,
+            bearer_fingerprint,
+            resolve_bearer,
+        )
+        from .errors import CapitolAuthError, CapitolError
+
+        env_name = str(config.get("capitol_bearer_env") or DEFAULT_BEARER_ENV).strip()
+        consumer = f"{label} org {self._short(org)} / agent {self._short(agent)} ({base_url})"
+        try:
+            bearer, source = resolve_bearer(config, org, agent, base_url)
+        except CapitolAuthError as exc:
+            return {
+                "name": env_name, "env_name": env_name, "service": "capitol",
+                "consumers": [consumer], "required": True, "source": "",
+                "fingerprint": "", "notes": [str(exc)],
+                "verify": lambda timeout, _m=str(exc): ("missing", _m),
+            }
+        except CapitolError as exc:
+            return {
+                "name": env_name, "env_name": env_name, "service": "capitol",
+                "consumers": [consumer], "required": True, "source": "",
+                "fingerprint": "", "notes": [str(exc)],
+                "verify": lambda timeout, _m=str(exc): ("skipped", _m),
+            }
+        from_env = source.startswith("env:")
+        display = env_name if from_env else f"capitol registry ({source[len('registry:'):]})"
+        fingerprint = "sha256:" + bearer_fingerprint(bearer)[len("sha256:"):][:8]
+
+        def verify(timeout: float, _config=dict(config), _agent=agent,
+                   _source=source) -> Tuple[str, str]:
+            from .client import CapitolRuntime
+
+            merged = dict(_config)
+            merged["capitol_agent"] = _agent
+            try:
+                runtime = CapitolRuntime.from_config(merged, timeout=float(timeout))
+                card = runtime.discover(refresh=True)
+            except CapitolAuthError as exc:
+                return "rejected", str(exc)
+            except CapitolError as exc:
+                text = str(exc)
+                if "unreachable" in text or "timed out" in text:
+                    return "unreachable", text
+                return "error", text
+            except Exception as exc:  # never take the check down
+                return "error", f"{type(exc).__name__}: {exc}"
+            name = str((card or {}).get("name") or "agent card")
+            return "ok", f"agent card answered ({name}) with bearer from {_source}"
+
+        return {
+            "name": display, "env_name": env_name if from_env else "",
+            "service": "capitol", "consumers": [consumer], "required": True,
+            "source": source, "fingerprint": fingerprint,
+            "notes": [] if from_env else [
+                "registry bearer: rotated by re-bootstrapping/re-minting the agent"
+                " (A2Actrl or `/capitol bootstrap`), not by conch keys set"
+            ],
+            "verify": verify,
+        }
+
+    def _admin_entry(self, config: dict, org: str, base_url: str) -> Optional[dict]:
+        from .credentials import (
+            DEFAULT_ADMIN_TOKEN_ENV,
+            bearer_fingerprint,
+            resolve_admin_token,
+        )
+        from .errors import CapitolAuthError
+
+        env_name = str(
+            config.get("capitol_admin_token_env") or DEFAULT_ADMIN_TOKEN_ENV
+        ).strip()
+        platform = str(config.get("capitol_platform_url") or base_url).strip()
+        consumer = f"capitol admin (builder) org {self._short(org)} ({platform})"
+        try:
+            token, source = resolve_admin_token(config, org, platform)
+        except CapitolAuthError as exc:
+            return {
+                "name": env_name, "env_name": env_name, "service": "capitol-admin",
+                "consumers": [consumer], "required": True, "source": "",
+                "fingerprint": "", "notes": [str(exc)],
+                "verify": lambda timeout, _m=str(exc): ("missing", _m),
+            }
+        from_env = source.startswith("env:")
+        display = env_name if from_env else f"capitol admin token ({source[len('registry:'):]})"
+        return {
+            "name": display, "env_name": env_name if from_env else "",
+            "service": "capitol-admin", "consumers": [consumer],
+            "required": True, "source": source,
+            "fingerprint": "sha256:" + bearer_fingerprint(token)[len("sha256:"):][:8],
+            "notes": [],
+            "verify": lambda timeout: (
+                "skipped", "no read-only admin probe; verified on first admin call"
+            ),
+        }
+
+
+register_credential_provider(CapitolCredentialProvider())
 register_slash_command(SlashCommand(
     "/ebay",
     "/ebay <photo...> [-- notes]",

@@ -155,7 +155,10 @@ class TestTolerance(ExportCase):
         svc = self.service()
         self.tick(svc)
         self.assertTrue(
-            any("rejected: HTTP 401" in line for line in self.logged)
+            any("CONCH_STATUS_WRITE_TOKEN was rejected by the status page (401)" in line
+                and "conch keys set CONCH_STATUS_WRITE_TOKEN" in line
+                for line in self.logged),
+            self.logged,
         )
         # digest not recorded on failure: retried after interval
         self.post_status = 200

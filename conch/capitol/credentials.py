@@ -191,6 +191,27 @@ def resolve_bearer(
     )
 
 
+def registry_bearer_fix(source: str, org_id: str, agent_id: str,
+                        status: int = 401) -> str:
+    """Operator text for a rejected Capitol credential, by where it was
+    resolved from (the ``source`` half of :func:`resolve_bearer`)."""
+    source = str(source or "")
+    if source.startswith("env:"):
+        from ..providers import auth_rejected_message
+
+        return auth_rejected_message("capitol", source[len("env:"):], status)
+    where = (
+        f"registry entry {source[len('registry:'):]!r} in {REGISTRY_PATH}"
+        if source.startswith("registry:") else f"the bearer for org {org_id} /"
+        f" agent {agent_id}"
+    )
+    return (
+        f"Capitol rejected {where} ({status}) — re-bootstrap or re-mint that"
+        " agent's bearer (A2Actrl / `/capitol bootstrap`); conch keys cannot"
+        " rotate registry bearers, and there is no automatic re-auth"
+    )
+
+
 def bearer_fingerprint(token: str) -> str:
     """Loggable, irreversible reference to a bearer (never the bytes)."""
     import hashlib

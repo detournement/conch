@@ -286,7 +286,7 @@ class TestCloudProbe(ModelCheckCase):
                                  {"provider": "openai"})
         self.assertEqual(result.status, NO_KEY)
         self.assertIn("OPENAI_API_KEY is not set", result.detail)
-        self.assertIn(str(self.config_dir / "env"), result.detail)
+        self.assertIn("run: conch keys set OPENAI_API_KEY", result.detail)
 
     def test_listed_model_passes_without_spending_a_completion(self):
         model = DEFAULT_CHAT_MODEL_BY_PROVIDER["openai"]

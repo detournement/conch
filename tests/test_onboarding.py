@@ -320,12 +320,21 @@ class TestMaybeRunGate(OnboardingCase):
 
 
 class TestEnvFileLoading(OnboardingCase):
-    def test_env_file_loads_with_environment_precedence(self):
+    def test_env_file_precedence_by_provenance(self):
+        """A key the wizard/`conch keys` wrote is conch-managed and wins over
+        a stale shell export; a hand-added line keeps environment precedence
+        (see conch.config.load_env_file)."""
+        config_mod._ENV_LOAD_STATE["from_file"].clear()
         config_mod.set_env_values({"OPENAI_API_KEY": "sk-from-file"})
         del os.environ["OPENAI_API_KEY"]  # set_env_values mirrors; reset
         config_mod.load_env_file()
         self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-from-file")
         os.environ["OPENAI_API_KEY"] = "sk-real-env"
+        config_mod.load_env_file()
+        self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-from-file")
+        config_mod.forget_managed_key("OPENAI_API_KEY")  # now a hand-added line
+        os.environ["OPENAI_API_KEY"] = "sk-real-env"
+        config_mod._ENV_LOAD_STATE["from_file"].clear()
         config_mod.load_env_file()
         self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-real-env")
 

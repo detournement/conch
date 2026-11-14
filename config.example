@@ -3,11 +3,27 @@
 #   ~/.config/conch/config, ~/.conchrc, then a per-project .conchrc
 #   (nearest file between the current directory and the git root).
 
-# Provider: anthropic, openai, cerebras, bedrock, openrouter, ollama, custom
-provider=anthropic
-model=claude-sonnet-5
-chat_model=claude-sonnet-5
-api_key_env=ANTHROPIC_API_KEY
+# Seat providers: claude-code (Claude), codex (ChatGPT).
+# Explicit API/local alternatives: anthropic, openai, cerebras, bedrock,
+# openrouter, ollama, custom.
+# Install the official CLI, then: conch auth login claude-code
+provider=claude-code
+model=sonnet
+chat_model=sonnet
+api_key_env=
+# Native subprocess deadline (seconds); tokens remain in the CLI's own store.
+#seat_timeout=120
+#
+# ChatGPT seat: conch auth login codex
+#provider=codex
+#model=default
+#chat_model=default
+#
+# Direct API usage is separate billing, not part of a subscription seat:
+#provider=anthropic
+#model=claude-sonnet-5
+#chat_model=claude-sonnet-5
+#api_key_env=ANTHROPIC_API_KEY
 
 # --- AWS Bedrock (Moonshot Kimi) example -------------------------------------
 # Uses Bedrock's OpenAI-compatible endpoint with a long-term Bedrock API key
@@ -105,15 +121,16 @@ api_key_env=ANTHROPIC_API_KEY
 #api_key_env=OPENROUTER_API_KEY
 
 # --- Startup model check -----------------------------------------------------
-# Every start probes the configured model once (catalog + models list for
-# cloud providers, /api/tags + tools capability for Ollama, /v1/models + the
-# tool-call probe for custom endpoints) before the first real call. In a
-# terminal a failure shows the diagnosis and a ranked list of alternatives
+# Every start probes the configured model once: native seat login plus a
+# structured tool response; catalog + models list for API providers; /api/tags
+# + tools capability for Ollama; /v1/models + tool-call probe for custom.
+# In a terminal a failure shows the diagnosis and ranked alternatives
 # to pick from (session only, or saved as the new default — your choice).
 # Non-interactive runs (--non-interactive, pipes, cron, conch-ask, the edge
 # daemon) never prompt: they try fallback_models in order and otherwise fail
 # closed with exit status 69. Nothing is ever switched silently.
 #model_check=on
+# Default: 60 seconds for native seats, 4 for API/local providers.
 #model_check_timeout=4
 # Pre-approved alternatives for non-interactive runs, tried in order.
 # custom/<model> uses custom_base_url; llamaidx/<box>/<model> resolves via
@@ -187,6 +204,8 @@ api_key_env=ANTHROPIC_API_KEY
 # model/rounds/tools instead; skills live in ~/.config/conch/skills/*.md.
 #subagent_model=qwen3-8b
 #subagent_rounds=10
+# Seat-parent/local-child and named OMP examples: docs/LOCAL-SUBAGENTS.md.
+# Conch skills and OMP agents use different configuration files.
 
 # --- Edge daemon and missions (Swarm Phase 1) ----------------------------------
 # Off by default: the shell keeps its classic in-process scheduler and never

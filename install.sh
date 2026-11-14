@@ -58,109 +58,21 @@ fi
 chmod +x "$CONCH_DIR/bin/conch" "$CONCH_DIR/bin/conch-ask" "$CONCH_DIR/bin/conch-chat" "$CONCH_DIR/bin/conch-run-with-timeout" 2>/dev/null || true
 ok "Scripts are executable"
 
-# ── API keys ─────────────────────────────────────────────────────────────────
+# ── Provider setup ────────────────────────────────────────────────────────────
 
+# Keep existing repository-local integration credentials untouched. Model
+# sign-in and new API keys use Conch's shared first-run wizard/key manager.
 ENV_FILE="$CONCH_DIR/.env"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/conch"
 CONFIG_FILE="$CONFIG_DIR/config"
-
-setup_key() {
-    local name="$1" env_var="$2" url="$3" existing=""
-    if [[ -f "$ENV_FILE" ]]; then
-        existing="$(grep "${env_var}=" "$ENV_FILE" 2>/dev/null | sed "s/.*${env_var}=\"\\{0,1\\}\\([^\"]*\\)\"\\{0,1\\}/\\1/" | head -1 || true)"
-    fi
-    [[ -z "$existing" ]] && existing="${!env_var:-}"
-    if [[ -n "$existing" ]]; then
-        local masked="${existing:0:8}...${existing: -4}"
-        ok "${name} API key found: ${masked}"
-        echo "export ${env_var}=\"${existing}\"" >> "$ENV_FILE.tmp"
-        return 0
-    fi
-    printf "  ${DIM}${name}: ${url}${RST}\n"
-    printf "  ${env_var}: "
-    read -r key
-    if [[ -n "$key" ]]; then
-        echo "export ${env_var}=\"${key}\"" >> "$ENV_FILE.tmp"
-        ok "${name} API key saved"
-        return 0
-    fi
-    return 1
-}
-
-printf "\n"
-info "Configure API keys (press Enter to skip any):"
-printf "\n"
-
-# Start fresh env file
-echo "# Conch API keys (do not commit this file)" > "$ENV_FILE.tmp"
-
-CHOSEN_PROVIDER=""
-if setup_key "Anthropic" "ANTHROPIC_API_KEY" "https://console.anthropic.com"; then
-    CHOSEN_PROVIDER="anthropic"
-fi
-if setup_key "OpenAI" "OPENAI_API_KEY" "https://platform.openai.com/api-keys"; then
-    [[ -z "$CHOSEN_PROVIDER" ]] && CHOSEN_PROVIDER="openai"
-fi
-if setup_key "Cerebras" "CEREBRAS_API_KEY" "https://inference.cerebras.ai"; then
-    [[ -z "$CHOSEN_PROVIDER" ]] && CHOSEN_PROVIDER="cerebras"
-fi
-
-# Check for Ollama
-if command -v ollama &>/dev/null || curl -s --connect-timeout 1 http://localhost:11434/api/tags &>/dev/null; then
-    ok "Ollama detected locally"
-    [[ -z "$CHOSEN_PROVIDER" ]] && CHOSEN_PROVIDER="ollama"
-fi
-
-mv "$ENV_FILE.tmp" "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-ok "Keys saved to ${ENV_FILE} (chmod 600)"
-
-# ── Config ───────────────────────────────────────────────────────────────────
-
 mkdir -p "$CONFIG_DIR"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    if [[ -n "$CHOSEN_PROVIDER" ]]; then
-        case "$CHOSEN_PROVIDER" in
-            anthropic)
-                cat > "$CONFIG_FILE" <<'CFGEOF'
-provider=anthropic
-model=claude-sonnet-5
-chat_model=claude-sonnet-5
-api_key_env=ANTHROPIC_API_KEY
-CFGEOF
-                ;;
-            openai)
-                cat > "$CONFIG_FILE" <<'CFGEOF'
-provider=openai
-model=gpt-4o-mini
-chat_model=gpt-4o-mini
-api_key_env=OPENAI_API_KEY
-CFGEOF
-                ;;
-            cerebras)
-                cat > "$CONFIG_FILE" <<'CFGEOF'
-provider=cerebras
-model=gpt-oss-120b
-chat_model=gpt-oss-120b
-api_key_env=CEREBRAS_API_KEY
-CFGEOF
-                ;;
-            ollama)
-                cat > "$CONFIG_FILE" <<'CFGEOF'
-provider=ollama
-model=llama3.3
-chat_model=llama3.3
-api_key_env=
-CFGEOF
-                ;;
-        esac
-        ok "Config created for ${CHOSEN_PROVIDER}: ${CONFIG_FILE}"
-    else
-        cp "$CONCH_DIR/config.example" "$CONFIG_FILE" 2>/dev/null || true
-        ok "Config created: ${CONFIG_FILE}"
-    fi
+
+printf "\n"
+if [[ -f "$CONFIG_FILE" ]]; then
+    ok "Existing provider configuration preserved: ${CONFIG_FILE}"
 else
-    ok "Config exists: ${CONFIG_FILE}"
+    info "Choose Claude/ChatGPT seat sign-in or a local/API provider on first launch."
+    printf "  Run conch in a terminal to start setup; no API key is required for seats.\n"
 fi
 
 # ── Composio MCP tools (optional) ────────────────────────────────────────
@@ -284,25 +196,20 @@ fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 
-PROVIDER_MSG=""
-if [[ -n "$CHOSEN_PROVIDER" ]]; then
-    PROVIDER_MSG=" (${CHOSEN_PROVIDER})"
-fi
-
-printf "\n${BOLD}${GREEN}  ✓ Conch installed!${RST}${PROVIDER_MSG}\n\n"
+printf "\n${BOLD}${GREEN}  ✓ Conch installed!${RST}\n\n"
 printf "  ${BOLD}Open a new terminal${RST}, then:\n\n"
 printf "    ${CYAN}conch${RST}              → multi-turn chat with tools\n"
 printf "    ${CYAN}ask${RST} list files     → inline command generation\n"
 printf "    ${CYAN}Ctrl+G${RST}             → ask for a shell command\n"
 printf "    ${CYAN}Ctrl+X Ctrl+G${RST}      → start chat via shortcut\n\n"
 printf "  ${DIM}Config:  ${CONFIG_FILE}${RST}\n"
-printf "  ${DIM}API key: ${ENV_FILE}${RST}\n"
+printf "  ${DIM}API/integration keys: ${CONFIG_DIR}/env (managed by conch keys)${RST}\n"
 printf "  ${DIM}MCP:     ${MCP_FILE}${RST}\n"
-printf "  ${DIM}Docs:    /help inside chat${RST}\n\n"
-
-if [[ -z "$CHOSEN_PROVIDER" ]]; then
-    printf "  ${YELLOW}No API keys configured.${RST} Set one:\n"
-    printf "    ${DIM}export ANTHROPIC_API_KEY=sk-...${RST}\n"
-    printf "    ${DIM}export OPENAI_API_KEY=sk-...${RST}\n"
-    printf "    ${DIM}Or install Ollama for free local models.${RST}\n\n"
-fi
+printf "  ${DIM}Docs:    README.md → Install and first run; /help inside chat${RST}\n\n"
+printf "  ${BOLD}First run:${RST} conch opens the provider setup wizard when unconfigured.\n"
+printf "  Seats use your own subscription through an official CLI (install it first):\n"
+printf "    ${CYAN}conch auth login claude-code${RST}  → Claude subscription\n"
+printf "    ${CYAN}conch auth login codex${RST}        → ChatGPT subscription\n"
+printf "    ${CYAN}conch auth --help${RST}             → CLI installation and setup steps\n"
+printf "  API keys are optional, separately billed alternatives; existing settings are kept.\n"
+printf "  Local models and optional subagents: docs/LOCAL-SUBAGENTS.md\n\n"

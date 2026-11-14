@@ -573,7 +573,7 @@ class TestConchConfigClient(unittest.TestCase):
 class TestModelCatalog(unittest.TestCase):
     def test_all_known_models_have_pricing(self):
         for provider, models in KNOWN_MODELS.items():
-            if provider == "ollama":
+            if provider in ("ollama", "custom", "claude-code", "codex"):
                 continue
             for model in models:
                 self.assertIn(
@@ -654,8 +654,8 @@ class TestModelVerificationAnnotations(unittest.TestCase):
     annotation in MODEL_VERIFIED (tools/audit_models.py): either the ISO
     date it last passed the existence + forced-tool-call audit, or an
     explicit "unverified YYYY-MM-DD (<reason>)" marker. This makes adding a
-    model without auditing it a conscious, visible act. Ollama/custom are
-    exempt: they have no hardcoded catalog and are verified live at runtime.
+    model without auditing it a conscious, visible act. Local discovery and
+    native seat aliases are verified live at runtime rather than through API keys.
     """
 
     DATE_RE = r"\d{4}-\d{2}-\d{2}"
@@ -668,7 +668,7 @@ class TestModelVerificationAnnotations(unittest.TestCase):
             rf"^({self.DATE_RE}( \(.+\))?|unverified {self.DATE_RE} \(.+\))$"
         )
         for provider, models in KNOWN_MODELS.items():
-            if provider in ("ollama", "custom"):
+            if provider in ("ollama", "custom", "claude-code", "codex"):
                 continue
             for model in models:
                 self.assertIn(

@@ -7,6 +7,38 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [Unreleased]
+
+### Added
+
+- Seat-backed `claude-code` and `codex` providers use the unmodified official
+  CLIs with provider-owned Claude/ChatGPT sign-in and refresh; Conch never
+  collects subscription tokens. `conch auth login/status/logout` manages
+  native sign-in, and successful login selects the keyless provider.
+- Seat-first onboarding and defaults, structured chat/tool/ask responses,
+  native model-access preflight, bounded subprocess cleanup, and seat-aware
+  usage labels. Existing Conch approval gates remain in charge of tool
+  dispatch; seat sessions have no automatic API-key-billed fallback.
+- Explicit API-key providers and existing configured provider selections are
+  retained. Official CLIs and subscription login are required on each runner.
+- New-user setup now includes official CLI installation commands, per-provider
+  login checks, model-access verification, and troubleshooting in the README
+  and `conch auth --help`. The source installer preserves existing credentials
+  and delegates provider setup to the shared seat-first wizard instead of
+  prompting for API keys.
+- `docs/LOCAL-SUBAGENTS.md` documents LAN endpoints, registry discovery,
+  seat-parent/local-child Conch skills, and separate named OMP agent setup.
+
+### Fixed
+
+- Codex subscription startup accepts documented nonfatal diagnostic items
+  instead of misclassifying them as native tool execution. Warnings remain
+  visible and credential-redacted; fatal stream errors and native execution
+  events still fail closed.
+- Seat startup failures distinguish detected sign-in from model/transport
+  errors, strip API-error display brackets from diagnostics, and explain
+  that slash commands require a running Conch session.
+
 ## [0.7.1] - 2026-10-22
 
 ### Added

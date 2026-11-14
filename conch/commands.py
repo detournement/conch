@@ -148,7 +148,7 @@ SLASH_COMMANDS = [
     ("/model <name>", "Switch model"),
     ("/llamaidx", "Fleet status from the llama-idx registry (up/degraded/down boxes)"),
     ("/registry [set <url>|off]", "Show, wire, or remove the llama-idx registry (llamaidx_url)"),
-    ("/provider <name>", "Switch provider (cerebras, openai, anthropic, bedrock, openrouter, ollama, custom)"),
+    ("/provider <name>", "Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)"),
     ("/remember <text>", "Save a persistent memory"),
     ("/memories", "List memories"),
     ("/forget <id>", "Delete a memory"),
@@ -1404,7 +1404,7 @@ def handle_slash_command(
             "  \033[1m/model <name>\033[0m        Switch model\n"
             "  \033[1m/llamaidx\033[0m            Fleet status from the llama-idx registry\n"
             "  \033[1m/registry [set <url>|off]\033[0m  Show, wire, or remove the llama-idx registry\n"
-            "  \033[1m/provider <name>\033[0m     Switch provider (cerebras, openai, anthropic, bedrock, openrouter, ollama)\n"
+            "  \033[1m/provider <name>\033[0m     Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)\n"
             "  \033[1m/remember <text>\033[0m     Save a persistent memory\n"
             "  \033[1m/memories\033[0m            List memories\n"
             "  \033[1m/forget <id>\033[0m         Delete a memory\n"
@@ -2131,8 +2131,8 @@ def handle_slash_command(
             return _switch_to_llamaidx_model(
                 new_model, config, provider, messages
             )
-        new_provider = None
-        for provider_name, models in KNOWN_MODELS.items():
+        new_provider = provider if provider in ("claude-code", "codex") else None
+        for provider_name, models in (() if new_provider else KNOWN_MODELS.items()):
             if provider_name != "ollama" and new_model in models:
                 new_provider = provider_name
                 break
@@ -2207,7 +2207,7 @@ def handle_slash_command(
             probe_model,
         )
 
-        if new_provider in CLOUD_PROVIDERS and model_check_enabled(config):
+        if new_provider in (*CLOUD_PROVIDERS, "claude-code", "codex") and model_check_enabled(config):
             probe_config = dict(config)
             probe_config.update({
                 "provider": new_provider,
@@ -2281,6 +2281,13 @@ def handle_slash_command(
             ok, reason = probe_custom_provider(config)
             if not ok:
                 print(f"\n  \033[31mCustom endpoint probe failed: {reason}\033[0m\n")
+                return None
+        if new_provider in ("claude-code", "codex"):
+            from .seats import status
+
+            ok, detail = status(new_provider)
+            if not ok:
+                print(f"\n  Cannot switch: {detail} — run: conch auth login {new_provider}\n")
                 return None
         config["provider"] = new_provider
         config["api_key_env"] = key_env

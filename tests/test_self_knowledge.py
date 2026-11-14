@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from conch import providers
 from conch.config import get_config_path
+from conch.modelcheck import CLOUD_PROVIDERS
 from conch.prompts import build_self_description
 from conch.providers import (
     MODEL_CONTEXT_WINDOWS,
@@ -88,11 +89,10 @@ class CtxCacheTestCase(unittest.TestCase):
 
 class TestCloudContextWindows(unittest.TestCase):
     def test_known_models_covered(self):
-        # Every non-ollama model in the catalog must have a known window.
-        for provider_name, models in providers.KNOWN_MODELS.items():
-            if provider_name == "ollama":
-                continue
-            for model in models:
+        # Static API model IDs need fixed windows. Native CLI aliases resolve
+        # through provider defaults; local endpoints discover their capacity.
+        for provider_name in CLOUD_PROVIDERS:
+            for model in providers.KNOWN_MODELS[provider_name]:
                 self.assertIn(model, MODEL_CONTEXT_WINDOWS, f"{model} missing a context window")
 
     def test_lookup_uses_table(self):

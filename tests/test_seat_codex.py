@@ -2,15 +2,14 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from conch import seat_codex
 from conch.seat_common import SeatError
 from conch.seats import response_schema
-
 
 _TOOL = {'type': 'function', 'function': {
     'name': 'read_file', 'parameters': {'type': 'object'},
@@ -120,13 +119,12 @@ class CodexTransportTests(unittest.TestCase):
         self.assertNotIn(secret, '\n'.join(logs.output))
 
     def test_nonfatal_diagnostic_cannot_mask_a_failed_turn(self):
-        with self.assertLogs('conch.seat_codex', level='WARNING'):
-            with self.assertRaises(SeatError):
-                self.invoke(events=[
-                    {'type': 'item.completed', 'item': {
-                        'type': 'error', 'message': 'Recoverable warning'}},
-                    {'type': 'turn.failed', 'error': {'message': 'Provider failed'}},
-                ])
+        with self.assertLogs('conch.seat_codex', level='WARNING'), self.assertRaises(SeatError):
+            self.invoke(events=[
+                {'type': 'item.completed', 'item': {
+                    'type': 'error', 'message': 'Recoverable warning'}},
+                {'type': 'turn.failed', 'error': {'message': 'Provider failed'}},
+            ])
 
     def test_rejects_native_tool_events(self):
         for kind in ('command_execution', 'file_change', 'mcp_tool_call',
@@ -155,17 +153,17 @@ class CodexTransportTests(unittest.TestCase):
         self.assertFalse(Path(self.work).exists())
 
     def test_rejects_malformed_event_stream(self):
-        with patch.object(seat_codex, 'run', return_value=
-                          subprocess.CompletedProcess([], 0, 'not JSON', '')):
-            with self.assertRaises(SeatError):
-                seat_codex.invoke('default', 'prompt', response_schema([]), 12)
+        with patch.object(
+            seat_codex, 'run', return_value=subprocess.CompletedProcess([], 0, 'not JSON', ''),
+        ), self.assertRaises(SeatError):
+            seat_codex.invoke('default', 'prompt', response_schema([]), 12)
 
     def test_rejects_missing_output(self):
-        with patch.object(seat_codex, 'run', return_value=
-                          subprocess.CompletedProcess([], 0,
-                                                      _stream({'type': 'turn.completed'}), '')):
-            with self.assertRaises(SeatError):
-                seat_codex.invoke('default', 'prompt', response_schema([]), 12)
+        with patch.object(
+            seat_codex, 'run', return_value=subprocess.CompletedProcess(
+                [], 0, _stream({'type': 'turn.completed'}), ''),
+        ), self.assertRaises(SeatError):
+            seat_codex.invoke('default', 'prompt', response_schema([]), 12)
 
 
 class CodexLoginTests(unittest.TestCase):

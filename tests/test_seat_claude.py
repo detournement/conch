@@ -9,7 +9,6 @@ from unittest.mock import patch
 from conch import seat_claude
 from conch.seat_common import SeatError
 
-
 RESPONSE = {"content": "hello", "tool_calls": []}
 SCHEMA = {
     "type": "object",
@@ -107,7 +106,7 @@ class ClaudeSeatTransportTests(unittest.TestCase):
 
     def test_status_identifies_a_seat_without_claiming_model_verification(self):
         with patch.object(seat_claude, "run", return_value=completed(IDENTITY)):
-            ready, diagnosis = seat_claude.status()
+            ready, _diagnosis = seat_claude.status()
         self.assertTrue(ready)
 
     def test_nonseat_logins_are_refused_before_generation(self):
@@ -145,9 +144,9 @@ class ClaudeSeatTransportTests(unittest.TestCase):
                 return completed(IDENTITY)
             raise SeatError("claude timed out")
 
-        with patch.object(seat_claude, "run", side_effect=native):
-            with self.assertRaisesRegex(SeatError, "timed out"):
-                seat_claude.invoke("sonnet", "conversation", SCHEMA, 20)
+        with patch.object(seat_claude, "run", side_effect=native), \
+                self.assertRaisesRegex(SeatError, "timed out"):
+            seat_claude.invoke("sonnet", "conversation", SCHEMA, 20)
         self.assertEqual(directories[0], directories[1])
         self.assertFalse(os.path.exists(directories[0]))
 

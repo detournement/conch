@@ -10,7 +10,6 @@ from conch.providers import api_key_env_for, get_fallback_chain
 from conch.seat_common import SeatError, run
 from conch.seats import normalize
 
-
 TOOL = {"type": "function", "function": {"name": "local_shell"}}
 
 

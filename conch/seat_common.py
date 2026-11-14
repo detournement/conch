@@ -6,7 +6,6 @@ import math
 import os
 import signal
 import subprocess
-from typing import Optional
 
 
 class SeatError(RuntimeError):
@@ -17,15 +16,15 @@ def environment() -> dict:
     """Keep native credential stores, but never let API credentials select billing."""
     env = dict(os.environ)
     for name in tuple(env):
-        if name.startswith(("ANTHROPIC_", "OPENAI_", "CLAUDE_CODE_", "CODEX_")):
-            if name not in ("CODEX_HOME", "CLAUDE_CODE_USE_SYSTEM_KEYCHAIN"):
-                env.pop(name, None)
+        if (name.startswith(("ANTHROPIC_", "OPENAI_", "CLAUDE_CODE_", "CODEX_"))
+                and name not in ("CODEX_HOME", "CLAUDE_CODE_USE_SYSTEM_KEYCHAIN")):
+            env.pop(name, None)
     # The installed native CLI owns its login and refresh lifecycle.
     return env
 
 
-def run(argv: list, *, prompt: Optional[str] = None, timeout: float = 120,
-        cwd: Optional[str] = None) -> subprocess.CompletedProcess:
+def run(argv: list, *, prompt: str | None = None, timeout: float = 120,
+        cwd: str | None = None) -> subprocess.CompletedProcess:
     """Bound a native client and its children. Prompts never enter process argv."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise SeatError("native client timeout must be a positive finite number")

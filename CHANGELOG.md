@@ -31,6 +31,9 @@ Releases before 0.6.0 predate this changelog.
 
 ### Fixed
 
+- Pin the test matrix to Ubuntu 22.04 so Python 3.9 remains installable after
+  the `ubuntu-latest` runner moves to Ubuntu 26.04.
+
 - Codex subscription startup accepts documented nonfatal diagnostic items
   instead of misclassifying them as native tool execution. Warnings remain
   visible and credential-redacted; fatal stream errors and native execution

@@ -32,7 +32,8 @@ Native installer alternatives: https://code.claude.com/docs/en/setup
 def login(provider: str) -> int:
     """Let the provider own browser sign-in, then select this seat in Conch."""
     try:
-        result = subprocess.run(transport(provider).auth_command("login"), env=environment())
+        result = subprocess.run(transport(provider).auth_command("login"),
+                                env=environment(), check=False)
     except FileNotFoundError:
         print(f"conch: the official CLI for {provider} is not installed or is not on PATH.\n"
               f"{SETUP_HELP}", file=sys.stderr)
@@ -73,7 +74,8 @@ def main(argv=None) -> int:
             failed |= not ok
         return int(failed)
     try:
-        return subprocess.run(transport(args.provider).auth_command("logout"), env=environment()).returncode
+        return subprocess.run(transport(args.provider).auth_command("logout"),
+                              env=environment(), check=False).returncode
     except (OSError, SeatError) as exc:
         print(f"conch: logout failed ({type(exc).__name__})", file=sys.stderr)
         return 1

@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 from .seat_common import SeatError, run
 from .secretguard import redact_credentials

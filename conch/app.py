@@ -1524,7 +1524,10 @@ def chat_loop(new_conversation=False, interactive=True):
                     format_context_gauge,
                     get_context_limit,
                 )
-                cost = estimate_cost(used_model, in_tok, out_tok)
+                seat_billing = provider in ("claude-code", "codex")
+                cost = 0.0 if seat_billing else estimate_cost(used_model, in_tok, out_tok)
+                if seat_billing:
+                    session_usage["seat_turns"] = session_usage.get("seat_turns", 0) + 1
                 session_usage["input_tokens"] += in_tok
                 session_usage["output_tokens"] += out_tok
                 session_usage["cost"] += cost
@@ -1534,7 +1537,8 @@ def chat_loop(new_conversation=False, interactive=True):
                 )
                 ctx_window = get_context_limit(provider, config)
                 gauge = format_context_gauge(ctx_used, ctx_window)
-                cost_str = f"~${cost:.4f}" if cost > 0.0001 else "free"
+                cost_str = ("subscription seat" if seat_billing else
+                            f"~${cost:.4f}" if cost > 0.0001 else "free")
                 stats_line = format_turn_stats_line(
                     turn_usage, cost_str, gauge, used_model, config
                 )
@@ -1629,6 +1633,8 @@ def chat_loop(new_conversation=False, interactive=True):
             turns = session_usage["turns"]
             if total_cost > 0.0001:
                 print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, ~${total_cost:.4f}\033[0m")
+            elif session_usage.get("seat_turns"):
+                print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, subscription seats (plan limits apply)\033[0m")
             else:
                 print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, free\033[0m")
         try:
@@ -1666,14 +1672,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         prog="conch",
         usage="conch [-n | --new] [--non-interactive] [--] [prompt ...]\n"
+              "       conch auth [login|status|logout] [claude-code|codex]\n"
               "       conch keys [list|check|set NAME|rotate|doctor|...]",
         description=(
             "The LLM-assisted shell. With no arguments, resumes your most"
             " recent\nconversation; any other arguments are sent as a"
             " one-shot prompt.\n\n"
-            "conch keys manages every credential conch uses (see conch keys"
-            " --help);\n`conch keys rotate` is the one command to run after"
-            " an API key rotation."
+            "conch auth signs into Claude or ChatGPT seats through their"
+            " official CLIs.\nconch keys manages API and integration keys"
+            " (see conch keys --help)."
         ),
         epilog=(
             "Options are recognised only before the prompt, so words inside"
@@ -1756,18 +1763,17 @@ def session_is_interactive(argv_flag: bool = False, stdin=None) -> bool:
 
 
 #: First words of argv that are subcommands, not prompts.
-SUBCOMMANDS = {"keys": "conch.keys"}
+SUBCOMMANDS = {"keys": "conch.keys", "auth": "conch.auth"}
 
 
 def main():
     raw_argv = sys.argv[1:]
     if raw_argv and raw_argv[0] in SUBCOMMANDS:
-        # `conch keys …` (and `python3 -m conch keys …`): the credential
-        # manager. Routed before anything loads config so it can see the
-        # environment exactly as the shell handed it over.
-        from .keys import main as keys_main
+        # Credential commands run before configuration or inference startup.
+        import importlib
 
-        sys.exit(keys_main(raw_argv[1:]))
+        command = importlib.import_module(SUBCOMMANDS[raw_argv[0]])
+        sys.exit(command.main(raw_argv[1:]))
     options, argv = parse_argv(raw_argv)
     if options.version:
         from . import __version__

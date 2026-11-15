@@ -138,7 +138,7 @@ class TestWizardFlow(OnboardingCase):
         return out.getvalue()
 
     def test_writes_provider_config_and_0600_key_file(self):
-        output = self._run(["1", "y"], [SECRET])
+        output = self._run(["anthropic", "y"], [SECRET])
         config_path = Path(config_mod.get_config_path())
         env_path = Path(config_mod.get_env_file_path())
         self.assertIn("provider = anthropic", config_path.read_text())
@@ -153,7 +153,7 @@ class TestWizardFlow(OnboardingCase):
         self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), SECRET)
 
     def test_ollama_path_needs_no_key(self):
-        answers = iter(["4", "n"])
+        answers = iter(["ollama", "n"])
         with patch("conch.onboarding.detect_ollama",
                    return_value=["llama3.3:latest"]), \
              patch("conch.onboarding.ensure_working_model", _verified), \
@@ -165,13 +165,13 @@ class TestWizardFlow(OnboardingCase):
         self.assertFalse(Path(config_mod.get_env_file_path()).exists())
 
     def test_skipped_key_still_writes_provider(self):
-        output = self._run(["2"], [""])
+        output = self._run(["openai"], [""])
         config = Path(config_mod.get_config_path()).read_text()
         self.assertIn("provider = openai", config)
         self.assertIn("OPENAI_API_KEY", output)  # the how-to hint
 
     def test_config_written_by_wizard_loads(self):
-        self._run(["1", "n"], [SECRET])
+        self._run(["anthropic", "n"], [SECRET])
         loaded = config_mod.load_config()
         self.assertEqual(loaded["provider"], "anthropic")
         self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), SECRET)
@@ -200,9 +200,8 @@ class TestCustomEndpointFlow(OnboardingCase):
         return out.getvalue(), discover
 
     def test_persists_custom_model_and_base_url_without_key(self):
-        # answers: provider 5, base URL, verify? n
         output, discover = self._run(
-            ["5", "http://127.0.0.1:18080/v1", "n"], [""]
+            ["custom", "http://127.0.0.1:18080/v1", "n"], [""]
         )
         text = Path(config_mod.get_config_path()).read_text()
         self.assertIn("custom_base_url = http://127.0.0.1:18080/v1", text)
@@ -213,7 +212,7 @@ class TestCustomEndpointFlow(OnboardingCase):
         discover.assert_called_once_with("http://127.0.0.1:18080/v1", "")
 
     def test_loaded_config_is_complete_and_keyless(self):
-        self._run(["5", "http://127.0.0.1:18080/v1", "n"], [""])
+        self._run(["custom", "http://127.0.0.1:18080/v1", "n"], [""])
         loaded = config_mod.load_config()
         self.assertEqual(loaded["provider"], "custom")
         self.assertEqual(loaded["custom_model"], "stub-model")
@@ -224,7 +223,7 @@ class TestCustomEndpointFlow(OnboardingCase):
 
     def test_key_is_stored_under_conch_name_and_referenced(self):
         output, discover = self._run(
-            ["5", "http://10.0.0.5:8000/v1", "n"], ["vllm-secret-1"]
+            ["custom", "http://10.0.0.5:8000/v1", "n"], ["vllm-secret-1"]
         )
         text = Path(config_mod.get_config_path()).read_text()
         self.assertIn("api_key_env = CONCH_CUSTOM_API_KEY", text)
@@ -237,7 +236,7 @@ class TestCustomEndpointFlow(OnboardingCase):
 
     def test_multiple_models_offer_a_choice(self):
         output, _ = self._run(
-            ["5", "http://127.0.0.1:18080/v1", "n", "2"], [""],
+            ["custom", "http://127.0.0.1:18080/v1", "n", "2"], [""],
             models=(["alpha", "beta"], True),
         )
         text = Path(config_mod.get_config_path()).read_text()
@@ -246,7 +245,7 @@ class TestCustomEndpointFlow(OnboardingCase):
 
     def test_unreachable_endpoint_leaves_model_unset_with_hint(self):
         output, _ = self._run(
-            ["5", "http://127.0.0.1:1/v1", "n"], [""], models=(None, False)
+            ["custom", "http://127.0.0.1:1/v1", "n"], [""], models=(None, False)
         )
         text = Path(config_mod.get_config_path()).read_text()
         self.assertNotIn("custom_model", text)
@@ -255,7 +254,7 @@ class TestCustomEndpointFlow(OnboardingCase):
 
     def test_no_conformant_model_warns_but_still_persists(self):
         output, _ = self._run(
-            ["5", "http://127.0.0.1:18080/v1", "n"], [""],
+            ["custom", "http://127.0.0.1:18080/v1", "n"], [""],
             models=(["plain-model"], False),
         )
         text = Path(config_mod.get_config_path()).read_text()

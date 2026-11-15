@@ -760,6 +760,43 @@ def _probe_custom(model: str, config: dict, timeout: float) -> ProbeResult:
     return ProbeResult("custom", model, CONFORMANCE_FAILED, reason or "no native tool call returned")
 
 
+def _probe_seat(provider: str, model: str, config: dict, timeout: float) -> ProbeResult:
+    from .seats import complete, status
+
+    started = time.monotonic()
+    ok, detail = status(provider, timeout=timeout)
+    if not ok:
+        return ProbeResult(provider, model, AUTH_FAILED,
+                           f"{detail} — run: conch auth login {provider}")
+    if not model:
+        return ProbeResult(provider, model, MISCONFIGURED, "no model configured")
+    probe_tool = {
+        "type": "function",
+        "function": {
+            "name": "conch_probe", "description": "Verify the Conch tool response path",
+            "parameters": {"type": "object", "properties": {
+                "ok": {"type": "boolean"}}, "required": ["ok"]},
+        },
+    }
+    remaining = timeout - (time.monotonic() - started)
+    if remaining <= 0:
+        return ProbeResult(provider, model, TIMEOUT, "native authentication check exhausted the probe deadline")
+    probe_config = dict(config, provider=provider, model=model, chat_model=model,
+                        seat_timeout=str(remaining))
+    response = complete(probe_config, [
+        {"role": "user", "content": "Call conch_probe with ok=true. Do not return a text answer."},
+    ], [probe_tool])
+    if response.get("_error"):
+        from .runtime import error_detail
+
+        return ProbeResult(provider, model, ERROR, error_detail(response))
+    for call in response.get("tool_calls") or []:
+        if call["function"]["name"] == "conch_probe":
+            if json.loads(call["function"]["arguments"]).get("ok") is True:
+                return ProbeResult(provider, model, OK, "seat authenticated; structured tool response verified")
+    return ProbeResult(provider, model, CONFORMANCE_FAILED, "native client did not return the probe tool call")
+
+
 def probe_model(provider: str, model: str, config: dict, *,
                 timeout: Optional[float] = None) -> ProbeResult:
     """One bounded probe of *provider*/*model* using *config* for
@@ -777,7 +814,9 @@ def probe_model(provider: str, model: str, config: dict, *,
     timeout = model_check_timeout(config) if timeout is None else float(timeout)
     started = time.monotonic()
     try:
-        if provider == "ollama":
+        if provider in ("claude-code", "codex"):
+            result = _probe_seat(provider, model, config, timeout)
+        elif provider == "ollama":
             result = _probe_ollama(model, config, timeout)
         elif provider == "custom":
             result = _probe_custom(model, config, timeout)
@@ -885,6 +924,14 @@ def discover_alternatives(config: dict, provider: str, model: str,
     candidates: List[Candidate] = []
     notes: List[str] = []
     provider_level = failure.status in PROVIDER_LEVEL
+    if provider in ("claude-code", "codex"):
+        # Seat failures never offer unrequested API billing as recovery.
+        if failure.status in (NO_KEY, AUTH_FAILED):
+            return [], [f"sign in with: conch auth login {provider}"]
+        return [], [
+            "native sign-in was detected, but model execution failed; resolve"
+            " the diagnostic above and restart conch (no automatic API-key fallback)"
+        ]
     local_only = local_only_enabled(config, provider)
 
     if provider_level:
@@ -1069,7 +1116,7 @@ def candidate_from_fallback(entry: str, config: dict) -> Tuple[Optional[Candidat
     if provider not in RAW_FNS:
         return None, f"'{entry}' names an unknown provider"
     current = (config.get("provider") or "").lower()
-    if provider in CLOUD_PROVIDERS and local_only_enabled(config, current):
+    if provider not in ("ollama", "custom") and local_only_enabled(config, current):
         return None, f"'{entry}' skipped by local_only={config.get('local_only', 'auto')}"
     overrides: Dict[str, str] = {}
     if provider == current:
@@ -1252,8 +1299,12 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
     if not candidates:
         say("\033[31m  No alternatives found.\033[0m")
         say(
-            f"\033[2m  Fix the configured model, set fallback_models in"
-            f" {get_config_path()}, or /provider once an endpoint is up.\033[0m"
+            f"\033[2m  Fix the configured model or fallback_models in"
+            f" {get_config_path()}, then restart conch.\033[0m"
+        )
+        say(
+            "\033[2m  /models, /model, and /provider work only inside a running"
+            " Conch session, not at your system shell prompt.\033[0m"
         )
         raise _startup_error(
             f"conch: no working model — {failure.label} {failure.describe()} and no alternative"

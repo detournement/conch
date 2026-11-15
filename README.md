@@ -22,6 +22,10 @@ private-venv install, and never needs `sudo`. Native Windows is not supported;
 WSL2 follows the Linux path. The public installer currently installs the
 maintained GitHub `edge` tarball—not a PyPI package—and re-running it upgrades
 the installation.
+New here? Start with [seat sign-in and verification](#first-launch), then see
+[optional local models and subagents](docs/LOCAL-SUBAGENTS.md). No API key is
+required for Claude or ChatGPT seats; subscription limits still apply.
+
 
 ## Quick tour
 
@@ -36,8 +40,8 @@ conch-ask "compress this folder but skip node_modules"
 # tar --exclude=node_modules -czf archive.tgz .
 ```
 
-It reads the same provider and key configuration as `conch` — every cloud
-provider, Ollama, and custom OpenAI-compatible endpoints (llama.cpp, vLLM,
+It reads the same provider authentication as `conch` — Claude/ChatGPT seats,
+API providers, Ollama, and custom OpenAI-compatible endpoints (llama.cpp, vLLM,
 LM Studio) — runs the same startup model check, and never prompts: a model
 that fails its probe is replaced only by a pre-approved `fallback_models`
 entry, otherwise the run exits 69 (see [Non-interactive runs](#non-interactive-runs)).
@@ -420,24 +424,95 @@ cd conch
 ./install.sh
 ```
 
-The source installer also wires the repository's shell integration. It is the
-developer path; the website one-liner is the end-user path.
+The source installer wires the repository's shell integration and preserves
+existing credentials/configuration. New installs choose a provider through
+the same first-launch wizard below; the installer does not ask for API keys.
+It is the developer path; the website one-liner is the end-user path.
 
 ### First launch
 
-On the first interactive launch, Conch prompts for a provider and API key,
-verifies the provider when requested, and stores the key with mode `0600` in
-`~/.config/conch/env`. Conch loads that file itself, so supervised daemons can
-use the same provider configuration without depending on a shell profile.
-`conch keys` manages that file afterwards (see [Rotating API keys](#rotating-api-keys)).
+The first interactive launch offers **Claude seats** (default) and **ChatGPT
+seats** before API-key providers. Choose **one** of the following paths.
+With Node.js and npm available, install the official CLI and sign in:
 
-The wizard ends by running the [startup model check](#startup-model-check) on
-the model it just configured, so a first run finishes in a verified-working
-state — or in the same approved pick-an-alternative flow every later start
-uses.
+| Subscription | Install official CLI | Sign in and select it | Verify native login |
+| --- | --- | --- | --- |
+| Claude | `npm install -g @anthropic-ai/claude-code` | `conch auth login claude-code` | `conch auth status claude-code` |
+| ChatGPT | `npm install -g @openai/codex` | `conch auth login codex` | `conch auth status codex` |
 
-Set `CONCH_NO_WIZARD=1` to suppress the wizard. Non-interactive contexts never
-show it.
+Prefer a native installer? Follow the official
+[Claude Code setup](https://code.claude.com/docs/en/setup) or
+[Codex CLI setup](https://developers.openai.com/codex/cli).
+Conch does not install either CLI automatically.
+
+After sign-in, verify actual model access and ask-mode command generation:
+
+```bash
+conch "Reply with ready."
+conch-ask "print the current directory"  # prints a command; does not execute it
+```
+
+The chat startup probe should pass and return an answer; ask mode should print
+a command such as `pwd`. `conch auth status <provider>` checks login only, not
+model entitlement. Plain `conch auth status` checks **both** providers and exits
+nonzero if either is unavailable, so use the provider-specific form when you
+have only one seat. `conch auth --help` repeats the installation steps.
+`conch auth logout codex` (or `claude-code`) signs out of the official CLI
+without deleting Conch's configuration.
+
+Each successful login selects that provider as Conch's saved default. Existing
+`.conchrc` or `CONCH_*` overrides still take precedence. Credentials and refresh
+remain entirely with the provider's CLI: Conch does not collect, read, copy, or
+store seat tokens. `claude-code` defaults to `sonnet`; `codex` uses the native
+CLI's default model (`model = default`). Native model names may be configured
+explicitly; availability is verified by the startup probe, not an API-key catalog.
+
+Chat, one-shots, and `conch-ask` use schema-constrained responses from the
+unmodified native client. Conch dispatches requested tools through its existing
+approval policy. Native user hooks, plugins, MCP configuration, command execution,
+and search are disabled or isolated; Codex's residual patch tool is denied by
+read-only/never-approval policy. Enterprise-managed Codex MCP configurations are
+not supported by this isolation boundary. Output is buffered, not token-streamed.
+Subscription limits still apply; token statistics label seat usage rather than
+estimating API charges. Seat sessions do not automatically fall back to API-key
+billing. An explicitly configured startup `fallback_models` list remains prior consent.
+
+Sign-in runs through the provider's own flow, consistent with
+[Anthropic's native-CLI credential rules](https://code.claude.com/docs/en/legal-and-compliance)
+and [Codex authentication](https://developers.openai.com/codex/auth/).
+Native CLIs must already be installed on each machine that runs Conch, including
+headless workers; unattended runs never initiate browser login.
+
+API-key providers (`anthropic`, `openai`, OpenRouter, and others) remain explicit
+options. Their hidden-input wizard stores keys in `~/.config/conch/env` with mode
+`0600`; Conch loads that file itself. [`conch keys`](#rotating-api-keys) manages
+API and integration credentials, not subscription tokens.
+
+The wizard ends with the [startup model check](#startup-model-check).
+`CONCH_NO_WIZARD=1` suppresses it; non-interactive contexts never show it.
+
+#### Setup troubleshooting
+
+- **CLI not installed / not on PATH:** install the matching official CLI above,
+  open a new terminal, and retry login. Do not paste a token or API key into Conch.
+- **Login succeeds but the model check fails:** sign-in and model execution are
+  separate checks. Resolve the reported runtime/model error; repeating login
+  does not fix a transport failure. Confirm model entitlement and remaining
+  quota. Do not configure API fallback unless you intend separate API billing.
+- **Codex says its Code Mode host is disabled:** this is a nonfatal native
+  diagnostic, not a tool call or a failed login. Conch intentionally disables
+  native execution and retains its own approval gates; you do not need to
+  enable the Code Mode host to use Conch.
+- **`zsh: no such file or directory: /models`:** slash commands run only inside
+  a running Conch chat session. If startup exited, fix the reported error and
+  run `conch` again before using `/models`, `/model`, or `/provider`.
+- **Still using the old provider:** successful login saves the primary config,
+  but `~/.conchrc`, a project `.conchrc`, or `CONCH_*` variables may override it.
+  Review those overrides; `/status` shows the session's active provider.
+- **Pipes, cron, or workers:** sign in interactively as the same OS user on
+  each runner before launching unattended work. No browser login is initiated
+  in a non-interactive run.
+
 
 ## Rotating API keys
 
@@ -678,14 +753,14 @@ for the active configuration, and `/model <name>` validates before switching.
 ### Startup model check
 
 Every start — the interactive shell, a one-shot `conch "…"`, `conch-ask`, the
-first-run wizard, and each `conch-edge` mission session — begins with one
-cheap, bounded probe of the configured model, before the first real call and
-without asking anything. Cloud providers are checked against Conch's verified
-catalog and then the provider's models-list endpoint (a 1-token completion
-only when the list cannot settle it); Ollama via `/api/tags` plus the
-advertised `tools` capability; custom endpoints via `/v1/models` plus the same
-forced tool-call probe the catalog uses. A pass costs a sub-second request
-and shows as `✓ verified` in the banner. A failure is classified — `no API
+first-run wizard, and each `conch-edge` mission session — begins with a bounded
+probe of the configured model before the first real call. Seat providers check
+native login and generate a structured probe-tool response (consuming plan
+usage); their default deadline is 60 seconds. API providers use Conch's verified
+catalog and the models-list endpoint (a 1-token completion only when needed);
+Ollama uses `/api/tags` plus advertised `tools`; custom endpoints use
+`/v1/models` plus a forced tool-call probe. A pass shows `✓ verified`.
+A failure is classified — `no API
 key`, `unreachable`, `authentication failed`, `model not found`, `timed out`,
 `failed tool-call conformance`, `rate limited`, `quota/billing exhausted`,
 `server error` — and what happens next depends on whether anyone can answer:
@@ -711,7 +786,7 @@ unavailable…; using Y`) — is gone.
 
 ```ini
 model_check = on            # off: skip the probe entirely (nothing is switched)
-model_check_timeout = 4     # seconds per probe request (0.5–60)
+model_check_timeout = 4     # API/local default; seat default is 60 (range 0.5–60)
 fallback_models = ollama/qwen2.5:7b, anthropic/claude-sonnet-5
 ```
 
@@ -830,6 +905,12 @@ The model can delegate a bounded subtask into a fresh context with
 `delegate_task`; recursive delegation and self-management tools are excluded.
 Markdown files in `~/.config/conch/commands/` become custom slash commands,
 with `$ARGUMENTS` interpolation.
+
+For copyable endpoint, registry, and local-delegation examples, see
+[Local models and optional subagents](docs/LOCAL-SUBAGENTS.md). That guide
+separates Conch's `delegate_task` skills from OMP's named coding-assistant agents;
+their configuration files are not interchangeable.
+
 
 ### Input and scheduling
 
@@ -1064,10 +1145,10 @@ variable, never in `.conchrc`.
 Example:
 
 ```ini
-provider = anthropic
-model = claude-sonnet-5
-chat_model = claude-sonnet-5
-api_key_env = ANTHROPIC_API_KEY
+provider = claude-code
+model = sonnet
+chat_model = sonnet
+api_key_env =
 permission_mode = prompt_all
 ```
 
@@ -1090,14 +1171,15 @@ network sandbox for tools you explicitly enable or approve.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `provider` | `anthropic` | `anthropic`, `openai`, `cerebras`, `bedrock`, `openrouter`, `ollama`, or `custom` |
+| `provider` | `claude-code` | `claude-code`/`codex` seats, or `anthropic`, `openai`, `cerebras`, `bedrock`, `openrouter`, `ollama`, `custom` |
 | `model`, `chat_model` | provider default | Ask-mode and chat model |
-| `api_key_env` | provider-specific | Name of the environment variable holding the provider key |
+| `api_key_env` | provider-specific | API-key variable name; ignored by seat providers |
+| `seat_timeout` | `120` | Positive finite native-inference deadline in seconds; `CONCH_SEAT_TIMEOUT` overrides it |
 | `agent_mode` | `false` | Auto-execute ordinary shell commands for the session |
 | `permission_mode` | `prompt_all` | `prompt_all`, `safe_auto`, or `yolo` |
 | `local_only` | `auto` | Prevent cloud fallback for local-provider sessions |
 | `model_check` | `on` | Probe the configured model at every start; `off` skips it |
-| `model_check_timeout` | `4` | Seconds per startup-probe request (0.5–60) |
+| `model_check_timeout` | `60` seats; `4` otherwise | Seconds per startup probe (0.5–60) |
 | `fallback_models` | unset | Ordered `provider/model` list a non-interactive run may switch to |
 | `tool_profile` | automatic | Built-in or custom tool profile |
 | `show_token_stats` | `true` | Per-reply token, cost, context, and throughput line |

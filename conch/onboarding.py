@@ -1,15 +1,11 @@
 """First-run onboarding: the interactive provider/key wizard.
 
-Runs once, on an interactive `conch` launch that has no configuration
-at all — no config file, no ~/.conchrc, no project rc, no key file, no
-provider key in the environment. It asks for a provider, collects the
-API key with :mod:`getpass` (never echoed, never in argv), optionally
-verifies it with one live read-only probe, and writes:
-
-- ``~/.config/conch/config`` — provider selection (0600);
-- ``~/.config/conch/env`` — the key as ``KEY=value`` (0600), loaded
-  into the environment by :func:`conch.config.load_config` so the
-  shell, one-shots, and daemons all see it without profile exports.
+Runs once on a truly unconfigured interactive launch. The default path
+uses provider sign-in through the official Claude Code or Codex CLI.
+API-key providers remain explicit alternatives; their keys use hidden
+input and the private ``~/.config/conch/env`` file. Subscription tokens
+remain entirely in the native CLI's credential store. Conch writes only
+the provider/model selection to ``~/.config/conch/config`` (0600).
 
 Non-interactive contexts (pipes, daemons, workers, CI) never see the
 wizard: it requires a real TTY on stdin and stdout, and honors
@@ -47,9 +43,10 @@ RST = "\033[0m"
 
 # (provider, key env, label, one-line pitch). The wizard's menu order.
 WIZARD_PROVIDERS = (
-    ("anthropic", "ANTHROPIC_API_KEY", "Anthropic",
-     "Claude models — conch's default"),
-    ("openai", "OPENAI_API_KEY", "OpenAI", "GPT models"),
+    ("claude-code", "", "Claude seat", "sign in with Claude Code — no API key"),
+    ("codex", "", "ChatGPT seat", "sign in with Codex — no API key"),
+    ("anthropic", "ANTHROPIC_API_KEY", "Anthropic API", "separately billed API usage"),
+    ("openai", "OPENAI_API_KEY", "OpenAI API", "separately billed API usage"),
     ("openrouter", "OPENROUTER_API_KEY", "OpenRouter",
      "one key, many models"),
     ("ollama", "", "Ollama", "local models, no API key"),
@@ -167,6 +164,9 @@ def _choose_provider() -> Tuple[str, str, Optional[List[str]]]:
     print(f"\n{BOLD}{CYAN}  🐚 Welcome to conch{RST}")
     print(f"  {DIM}One-time setup — pick a model provider. Everything can"
           f" be changed later in {get_config_path()}.{RST}\n")
+    print("  Claude/ChatGPT seats use your subscription through an official CLI;"
+          " API keys are optional and billed separately.")
+    print("  Install/sign-in steps: conch auth --help\n")
     for index, (provider, _env, label, pitch) in enumerate(
         WIZARD_PROVIDERS, start=1
     ):
@@ -279,6 +279,16 @@ def _choose_custom_model(base_url: str, api_key: str) -> str:
 def run_first_run_wizard() -> bool:
     """The interactive flow. Returns True when config was written."""
     provider, env_name, _ollama_models = _choose_provider()
+    from .seats import PROVIDERS
+
+    if provider in PROVIDERS:
+        from .auth import login
+
+        if login(provider):
+            print(f"  Sign-in did not complete; run: conch auth login {provider}")
+            return False
+        verify_configured_model()
+        return True
     base_url = ""
     key = ""
     if provider == "custom":

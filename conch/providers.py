@@ -16,6 +16,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from .seats import PROVIDERS as SEAT_PROVIDERS, complete as seat_complete
+
 logger = logging.getLogger("conch.providers")
 
 # Content-block types conch's Anthropic path knows how to turn into either a
@@ -34,6 +36,9 @@ ANTHROPIC_KNOWN_BLOCK_TYPES = frozenset(
 # (TestModelVerificationAnnotations): adding a model without an audit
 # annotation fails the suite.
 KNOWN_MODELS = {
+    # Native CLI aliases, not API model IDs; entitlement is checked on use.
+    "claude-code": ["sonnet", "opus", "haiku"],
+    "codex": ["default"],
     # UNVERIFIED as of the 2026-09-14 audit: no CEREBRAS_API_KEY was
     # available on the audit machine, so this catalog is carried forward
     # from earlier live checks rather than re-blessed. Re-audit with a key
@@ -197,6 +202,8 @@ MODEL_VERIFIED = {
 }
 
 DEFAULT_API_KEY_ENVS = {
+    "claude-code": "",
+    "codex": "",
     "cerebras": "CEREBRAS_API_KEY",
     # Long-term Bedrock API key (IAM service-specific credential); the env
     # var name is AWS's documented standard for Bedrock bearer auth.
@@ -224,6 +231,8 @@ PROVIDER_TOOL_LIMITS = {
 # The ollama entry is only a *preference*: it is used when the model actually
 # exists on the configured server (see get_fallback_model).
 DEFAULT_CHAT_MODEL_BY_PROVIDER = {
+    "claude-code": "sonnet",
+    "codex": "default",
     "cerebras": "gpt-oss-120b",
     "bedrock": "moonshotai.kimi-k2.5",
     "openrouter": "moonshotai/kimi-k3",
@@ -287,6 +296,8 @@ MODEL_CONTEXT_WINDOWS = {
 # derive from the num_ctx sent on requests instead — see get_ollama_num_ctx;
 # the entry here documents the server's own default when num_ctx is omitted.)
 PROVIDER_DEFAULT_CONTEXT_WINDOWS = {
+    "claude-code": 200000,
+    "codex": 128000,
     "cerebras": 131072,
     "bedrock": 131072,
     "openrouter": 131072,
@@ -785,6 +796,9 @@ def validate_model_for_provider(provider: str, model: str, config: Optional[dict
     model = (model or "").strip()
     if not model:
         return False, "no model given"
+    if provider in SEAT_PROVIDERS:
+        # Native clients own their model aliases and subscription entitlements.
+        return True, ""
     if provider == "ollama":
         return validate_ollama_model(model, config)
     if provider == "custom":
@@ -871,6 +885,8 @@ def api_key_env_for(provider: str, config: Optional[dict] = None) -> str:
     """The environment variable a cloud provider reads its key from
     ("" for keyless providers: ollama, and custom unless configured)."""
     provider = (provider or "").lower()
+    if provider in SEAT_PROVIDERS:
+        return ""
     configured = str((config or {}).get("api_key_env") or "").strip()
     if provider in ("ollama", "custom"):
         return configured if provider == "custom" else ""
@@ -1265,6 +1281,9 @@ def get_fallback_chain(current_provider: str, current_model: str, config: Option
     tool-capable models) simply contributes no candidates.
     """
     chain = []
+    if current_provider in SEAT_PROVIDERS:
+        # Seat selection never silently changes billing to an API key.
+        return []
 
     # Step 1: same-provider model fallbacks
     same_models = _provider_models(current_provider, config)
@@ -2386,6 +2405,8 @@ def probe_custom_provider(config: Optional[dict] = None, *, timeout: float = 10.
 
 
 RAW_FNS = {
+    "claude-code": seat_complete,
+    "codex": seat_complete,
     "cerebras": raw_cerebras,
     "bedrock": raw_bedrock,
     "openrouter": raw_openrouter,
@@ -2983,6 +3004,8 @@ def stream_ollama(
 
 
 STREAM_FNS = {
+    "claude-code": seat_complete,
+    "codex": seat_complete,
     "cerebras": stream_cerebras,
     "bedrock": stream_bedrock,
     "openrouter": stream_openrouter,

@@ -9,10 +9,11 @@ from typing import Dict, List, Optional
 
 
 DEFAULT_CONFIG: Dict[str, str] = {
-    "provider": "anthropic",
-    "model": "claude-sonnet-5",
-    "chat_model": "claude-sonnet-5",
-    "api_key_env": "ANTHROPIC_API_KEY",
+    "provider": "claude-code",
+    "model": "sonnet",
+    "chat_model": "sonnet",
+    "api_key_env": "",
+    "seat_timeout": "120",
     # Agent mode off by default: shell commands require confirmation unless
     # the user opts in with agent_mode=true in the config file.
     "agent_mode": "false",
@@ -50,6 +51,7 @@ ENV_CONFIG_KEYS = {
     "CONCH_MODEL": "model",
     "CONCH_CHAT_MODEL": "chat_model",
     "CONCH_API_KEY_ENV": "api_key_env",
+    "CONCH_SEAT_TIMEOUT": "seat_timeout",
     "CONCH_BASE_URL": "base_url",
     "CONCH_OLLAMA_BASE_URL": "ollama_base_url",
     "CONCH_OLLAMA_NUM_CTX": "ollama_num_ctx",
@@ -618,6 +620,8 @@ def load_config() -> Dict[str, str]:
     provider = config.get("provider", DEFAULT_CONFIG["provider"]).lower()
     config["provider"] = provider
     provider_defaults = {
+        "claude-code": ("", "sonnet"),
+        "codex": ("", "default"),
         "cerebras": ("CEREBRAS_API_KEY", "gpt-oss-120b"),
         "bedrock": ("AWS_BEARER_TOKEN_BEDROCK", "moonshotai.kimi-k2.5"),
         "openrouter": ("OPENROUTER_API_KEY", "moonshotai/kimi-k3"),
@@ -633,6 +637,10 @@ def load_config() -> Dict[str, str]:
             config["model"] = default_model
         if "chat_model" not in explicit or not config.get("chat_model"):
             config["chat_model"] = config["model"]
+    if provider in ("claude-code", "codex"):
+        config["api_key_env"] = ""
+        if "model_check_timeout" not in explicit:
+            config["model_check_timeout"] = "60"
 
     if provider == "ollama":
         # base_url is shared across providers; remember it as the Ollama
@@ -658,8 +666,8 @@ def load_config() -> Dict[str, str]:
         if "chat_model" not in explicit or not config.get("chat_model"):
             config["chat_model"] = model
     elif provider not in provider_defaults:
-        config.setdefault("api_key_env", "ANTHROPIC_API_KEY")
-        config.setdefault("model", "claude-sonnet-5")
+        config.setdefault("api_key_env", "")
+        config.setdefault("model", "sonnet")
         config.setdefault("chat_model", config["model"])
     return config
 

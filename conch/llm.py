@@ -492,7 +492,21 @@ def call_custom(config: dict, messages: list) -> str:
     return command_from_tool_calls(message)
 
 
+def call_seat(config: dict, messages: list) -> str:
+    from .seats import complete
+
+    request_config = dict(config)
+    request_config["chat_model"] = config.get("model") or config.get("chat_model")
+    response = complete(request_config, messages, [SHELL_COMMAND_TOOL])
+    if response.get("_error"):
+        print(f"conch: {response['content']}", file=sys.stderr)
+        sys.exit(1)
+    return command_from_tool_calls(response)
+
+
 _ASK_CALLERS = {
+    "claude-code": call_seat,
+    "codex": call_seat,
     "cerebras": call_cerebras,
     "bedrock": call_bedrock,
     "openrouter": call_openrouter,

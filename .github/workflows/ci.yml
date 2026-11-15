@@ -18,7 +18,8 @@ jobs:
         run: ruff check conch tests
 
   test:
-    runs-on: ubuntu-latest
+    # setup-python does not provide Python 3.9 binaries for Ubuntu 26.04.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:

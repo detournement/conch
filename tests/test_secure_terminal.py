@@ -1,10 +1,10 @@
 """Security tests for direct, non-recording terminal handoff."""
 
 import io
+import os
 import unittest
 from unittest.mock import patch
 
-from conch.app import TypeaheadBuffer
 from conch.secure_terminal import (
     DirectTerminalRunner,
     TerminalHandoffPolicy,
@@ -49,77 +49,26 @@ class _FakeProcess:
         pass
 
 
-class _StuckReaderThread:
-    def __init__(self):
-        self.joined = False
+@unittest.skipUnless(os.name == "posix", "POSIX pty support required")
+class TestTerminalUIHandoffBoundary(unittest.TestCase):
+    def test_nested_discard_and_exception_restore_input_without_old_draft(self):
+        from tests.test_multiline_pty import PtySession
 
-    def join(self, timeout=None):
-        self.joined = True
-
-    def is_alive(self):
-        return True
-
-
-class TestTypeaheadHandoffBoundary(unittest.TestCase):
-    def test_handoff_fails_closed_if_reader_thread_does_not_stop(self):
-        reader = TypeaheadBuffer()
-        thread = _StuckReaderThread()
-        reader._thread = thread
-        with self.assertRaisesRegex(RuntimeError, "handoff refused"):
-            reader.stop_for_handoff()
-        self.assertTrue(thread.joined)
-        self.assertTrue(reader.is_running())
-
-    def test_suspend_fails_closed_and_drops_latch_with_stuck_reader(self):
-        reader = TypeaheadBuffer()
-        reader._thread = _StuckReaderThread()
-        with self.assertRaisesRegex(RuntimeError, "handoff refused"):
-            reader.suspend_for_handoff()
-        # The latch must not stay raised after a refused handoff, or
-        # typeahead would never work again once the zombie exits.
-        self.assertFalse(reader._suspended)
-
-    def test_start_is_structurally_impossible_while_suspended(self):
-        reader = TypeaheadBuffer()
-        reader.suspend_for_handoff()
-        stdin = _TTYBuffer(0)
-        with patch("conch.app.sys.stdin", stdin), patch(
-            "conch.app.termios.tcgetattr"
-        ) as tcgetattr, patch("conch.app.threading.Thread") as thread_cls:
-            reader.start()
-        tcgetattr.assert_not_called()
-        thread_cls.assert_not_called()
-        self.assertFalse(reader.is_running())
-        reader.resume_after_handoff()
-
-    def test_handoff_window_captures_are_purged_never_queued_or_echoed(self):
-        reader = TypeaheadBuffer()
-        reader.suspend_for_handoff()
-        # Plant bytes as if something had reached the buffers while the
-        # child owned the terminal (i.e. credential-adjacent input).
-        reader._buffer = "hunter2"
-        reader._queued.append("hunter2")
-        with patch("sys.stdout", io.StringIO()) as out, patch(
-            "sys.stderr", io.StringIO()
-        ) as err:
-            reader.resume_after_handoff()
-        self.assertEqual(reader.get_queued(), [])
-        self.assertEqual(reader.stop(), "")
-        self.assertNotIn("hunter2", out.getvalue())
-        self.assertNotIn("hunter2", err.getvalue())
-
-    def test_handoff_guard_discards_prehandoff_input_with_notice(self):
-        reader = TypeaheadBuffer()
-        reader._buffer = "typed-before"
-        reader._queued.append("queued-before")
-        notices = []
-        with reader.handoff_guard(notify=lambda: notices.append(True)):
-            self.assertTrue(reader._suspended)
-            self.assertEqual(reader.get_queued(), [])
-        self.assertEqual(notices, [True])
-        self.assertFalse(reader._suspended)
-        self.assertEqual(reader.get_queued(), [])
-        self.assertEqual(reader.stop(), "")
+        session = PtySession("nested-handoff")
+        self.addCleanup(session.close)
+        self.assertTrue(session.wait_for("READY"), session.transcript())
+        session.send(b"queued-before\rdraft-before")
+        self.assertTrue(session.wait_for("RESUMED-INPUT"), session.transcript())
+        session.send(b"normal-after\rquit\r")
+        self.assertTrue(session.wait_for("DONE"), session.transcript())
+        self.assertEqual(
+            session.parsed("ACTIVE="), [[True, False, False, False, True]],
+            session.transcript(),
+        )
+        self.assertEqual(
+            session.parsed("QUEUED="), [["normal-after"]],
+            session.transcript(),
+        )
 
 
 class TestDirectTerminalRunner(unittest.TestCase):

@@ -1178,6 +1178,59 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return (input_tokens * rate[0] + output_tokens * rate[1]) / 1_000_000
 
 
+_BILLING_LABELS = {
+    "seat": "subscription seat",
+    "local": "local",
+    "unknown": "price unknown",
+}
+
+
+def _billing_kind(provider: str, model: str, config: Optional[dict] = None) -> str:
+    if provider in ("claude-code", "codex"):
+        return "seat"
+    if provider == "ollama" or (
+        provider == "custom" and is_local_inference_url(get_custom_base_url(config))
+    ):
+        return "local"
+    return "api" if model in MODEL_PRICING else "unknown"
+
+
+def record_session_usage(
+    usage: dict, provider: str, model: str, input_tokens: int, output_tokens: int,
+    config: Optional[dict] = None,
+) -> str:
+    """Accumulate a completed turn, returning its honestly labelled cost."""
+    kind = _billing_kind(provider, model, config)
+    cost = estimate_cost(model, input_tokens, output_tokens) if kind == "api" else 0.0
+    usage["input_tokens"] = usage.get("input_tokens", 0) + input_tokens
+    usage["output_tokens"] = usage.get("output_tokens", 0) + output_tokens
+    usage["cost"] = usage.get("cost", 0.0) + cost
+    usage["turns"] = usage.get("turns", 0) + 1
+    key = f"{kind}_turns"
+    usage[key] = usage.get(key, 0) + 1
+    return f"~${cost:.4f}" if kind == "api" else _BILLING_LABELS[kind]
+
+
+def format_session_cost(
+    usage: dict, provider: str = "", model: str = "", config: Optional[dict] = None,
+) -> str:
+    """Known API spend plus non-metered or unpriced portions of this process."""
+    kinds = {kind for kind in ("api", "seat", "local", "unknown")
+             if usage.get(f"{kind}_turns")}
+    cost = usage.get("cost", 0.0)
+    if cost:
+        kinds.add("api")
+    if not usage.get("turns"):
+        kinds.add(_billing_kind(provider, model, config))
+    elif not kinds:
+        # Usage without billing provenance must never be presented as free.
+        kinds.add("unknown")
+    parts = [f"~${cost:.4f}"] if "api" in kinds else []
+    parts.extend(_BILLING_LABELS[kind] for kind in ("unknown", "seat", "local")
+                 if kind in kinds)
+    return " + ".join(parts)
+
+
 def _attach_server_timings(target: dict, data: dict) -> None:
     """Record server-reported generation time onto a usage dict.
 

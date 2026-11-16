@@ -13,7 +13,7 @@ from unittest.mock import patch
 from conch.app import format_turn_stats_line
 from conch.commands import handle_slash_command, slash_command_names
 from conch.config import DEFAULT_CONFIG
-from conch.providers import _normalize_usage
+from conch.providers import _normalize_usage, record_session_usage
 from conch.runtime import format_token_speed, record_call_timing
 
 
@@ -223,6 +223,58 @@ class TestTksToggle(unittest.TestCase):
 
     def test_registered_in_slash_commands(self):
         self.assertIn("/tks", slash_command_names())
+
+
+class TestSessionCostAccounting(unittest.TestCase):
+    def test_api_spend_accumulates_across_models_with_stats_off(self):
+        usage = {}
+        config = {"show_token_stats": "false"}
+        first_cost = record_session_usage(usage, "openai", "gpt-4o", 1000, 2000, config)
+        self.assertAlmostEqual(usage["cost"], 0.0225)
+        self.assertEqual(format_turn_stats_line(TURN, first_cost, "", "gpt-4o", config), "")
+        record_session_usage(usage, "openai", "gpt-4o-mini", 2000, 1000, config)
+        self.assertAlmostEqual(usage["cost"], 0.0234)
+        self.assertEqual(usage["input_tokens"], 3000)
+        self.assertEqual(usage["output_tokens"], 3000)
+        self.assertEqual(usage["turns"], 2)
+        self.assertEqual(usage["api_turns"], 2)
+
+    def test_seats_and_local_endpoints_do_not_accrue_cloud_model_rates(self):
+        for provider, config, kind in (
+            ("claude-code", {}, "seat"),
+            ("codex", {}, "seat"),
+            ("ollama", {}, "local"),
+            ("custom", {"custom_base_url": "http://127.0.0.1:8080/v1"}, "local"),
+            ("custom", {"custom_base_url": "http://inference.lan:8080/v1"}, "local"),
+        ):
+            with self.subTest(provider=provider, config=config):
+                usage = {}
+                record_session_usage(usage, provider, "gpt-4o", 1000, 2000, config)
+                self.assertEqual(usage["cost"], 0)
+                self.assertEqual(usage[f"{kind}_turns"], 1)
+                self.assertNotIn("api_turns", usage)
+                self.assertEqual(usage["input_tokens"], 1000)
+                self.assertEqual(usage["output_tokens"], 2000)
+
+    def test_mixed_billing_retains_spend_and_each_unpriced_portion(self):
+        usage = {}
+        record_session_usage(usage, "openai", "gpt-4o", 1000, 2000)
+        record_session_usage(usage, "openai", "unlisted-model", 1000, 2000)
+        record_session_usage(usage, "codex", "gpt-4o", 1000, 2000)
+        record_session_usage(usage, "ollama", "gpt-4o", 1000, 2000)
+        self.assertAlmostEqual(usage["cost"], 0.0225)
+        self.assertEqual(usage["turns"], 4)
+        self.assertEqual(usage["input_tokens"], 4000)
+        self.assertEqual(usage["output_tokens"], 8000)
+        for kind in ("api", "unknown", "seat", "local"):
+            self.assertEqual(usage[f"{kind}_turns"], 1)
+
+    def test_known_zero_price_is_not_unknown_pricing(self):
+        usage = {}
+        record_session_usage(usage, "bedrock", "zai-glm-4.7", 1000, 2000)
+        self.assertEqual(usage["cost"], 0)
+        self.assertEqual(usage["api_turns"], 1)
+        self.assertNotIn("unknown_turns", usage)
 
 
 if __name__ == "__main__":

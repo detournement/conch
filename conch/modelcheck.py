@@ -35,10 +35,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import get_config_path, local_only_enabled, set_config_values
+from .render import Spinner
 
 # Exit status for a run that fails closed on the model check (sysexits
 # EX_UNAVAILABLE: "a service is unavailable"). Distinct from the config
@@ -1203,7 +1205,8 @@ def ensure_working_model(config: dict, *, interactive: bool,
     if not model_check_enabled(config):
         return ModelCheckOutcome(provider, model, None, checked=False)
     timeout = model_check_timeout(config)
-    result = probe_model(provider, model, config, timeout=timeout)
+    with Spinner("Verifying configured model") if interactive else nullcontext():
+        result = probe_model(provider, model, config, timeout=timeout)
     if result.ok:
         return ModelCheckOutcome(provider, model, result)
     if interactive:
@@ -1290,10 +1293,12 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
 
     say(f"\033[33m  ⚠ {failure.label} is not usable: {failure.describe()}\033[0m")
     say("\033[2m  Looking for alternatives…\033[0m")
-    candidates, notes = discover_alternatives(
-        config, failure.provider, failure.model, failure, timeout=timeout
-    )
-    probe_candidates(candidates, config, timeout=timeout)
+    with Spinner("Discovering alternative models"):
+        candidates, notes = discover_alternatives(
+            config, failure.provider, failure.model, failure, timeout=timeout
+        )
+    with Spinner("Verifying alternative models"):
+        probe_candidates(candidates, config, timeout=timeout)
     for note in notes:
         say(f"\033[2m  ({note})\033[0m")
     if not candidates:
@@ -1349,7 +1354,8 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
             continue
         if pick.result is None or not pick.result.ok:
             say(f"\033[2m  Verifying {pick.label}…\033[0m")
-            probe_candidate(pick, config, timeout)
+            with Spinner("Verifying selected model"):
+                probe_candidate(pick, config, timeout)
         if pick.result is not None and pick.result.ok:
             chosen = pick
             break

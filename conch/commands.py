@@ -2458,16 +2458,13 @@ def handle_slash_command(
             session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
         total_in = session_usage.get("input_tokens", 0)
         total_out = session_usage.get("output_tokens", 0)
-        total_cost = session_usage.get("cost", 0.0)
+        from .providers import format_session_cost
         turns = session_usage.get("turns", 0)
         print("\n  \033[1;36mSession usage:\033[0m")
         print(f"    Turns:         {turns}")
         print(f"    Input tokens:  {total_in:,}")
         print(f"    Output tokens: {total_out:,}")
-        if total_cost > 0.0001:
-            print(f"    Est. cost:     ${total_cost:.4f}")
-        else:
-            print("    Est. cost:     free")
+        print(f"    Est. cost:     {format_session_cost(session_usage, provider, model_name, config)}")
         print()
         return None
 

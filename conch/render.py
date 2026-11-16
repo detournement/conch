@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import re
 import shutil
 import sys
@@ -98,13 +99,17 @@ def highlight(text: str) -> str:
     return "\n".join(output)
 
 
+def _get_active_ui():
+    """Consult the interactive surface without importing it in plain sessions."""
+    module = sys.modules.get(f"{__package__}.terminal_ui")
+    return module.get_active_ui() if module is not None else None
+
+
 class StreamPrinter:
     """Incrementally render streamed LLM output with formatting.
 
-    Buffers code blocks until complete so they can be syntax-highlighted.
-    Applies inline markdown formatting to regular lines as they arrive.
-    Partial lines are shown immediately (raw) then re-drawn with
-    formatting once a newline arrives.
+    The interactive surface owns mutable text and final transcript commits.
+    Plain terminals retain incremental line formatting and code buffering.
     """
 
     def __init__(self, show_waiting: bool = True):
@@ -116,7 +121,9 @@ class StreamPrinter:
         self._partial_written = 0
         self._started = False
         self._spinner = None
-        if show_waiting and sys.stderr.isatty():
+        self._ui = _get_active_ui()
+        self._ui_committed = 0
+        if show_waiting and (self._ui is not None or sys.stderr.isatty()):
             self._spinner = Spinner("Waiting for response")
             self._spinner.__enter__()
 
@@ -144,6 +151,9 @@ class StreamPrinter:
                 self._spinner.__exit__(None, None, None)
                 self._spinner = None
         self._full_text += chunk
+        if self._ui is not None:
+            self._ui.update_response(self._full_text[self._ui_committed:])
+            return
         self._line_buf += chunk
 
         while "\n" in self._line_buf:
@@ -164,6 +174,12 @@ class StreamPrinter:
     def flush(self) -> str:
         """Flush remaining buffer and return accumulated full text."""
         self.end_waiting()
+        if self._ui is not None:
+            pending = self._full_text[self._ui_committed:]
+            if pending:
+                self._ui.finish_response(highlight(pending))
+                self._ui_committed = len(self._full_text)
+            return self._full_text
         self._clear_partial()
         if self._line_buf:
             self._emit_line(self._line_buf)
@@ -178,6 +194,11 @@ class StreamPrinter:
         return self._full_text
 
     def reset(self):
+        if self._ui is not None:
+            # A tool boundary or failed request must never discard its prose.
+            self.flush()
+            self._ui_committed = 0
+            self._started = False
         self._in_code = False
         self._code_lang = ""
         self._code_buf.clear()
@@ -219,45 +240,74 @@ def clear_active_spinners():
 
 
 class Spinner:
-    """Minimal terminal spinner used while waiting on remote work."""
+    """ASCII shell activity indicator, bridged to the active terminal UI."""
 
     def __init__(self, label: str):
         self.label = label
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._registered = False
+        self._ui = None
+        self._activity = None
+        self._drawn = False
+        self._started = 0.0
 
     def _clear_line(self):
-        clear_width = len(self.label) + 6
-        sys.stderr.write("\r" + " " * clear_width + "\r")
-        sys.stderr.flush()
+        if self._ui is not None:
+            if self._activity is not None:
+                self._ui.end_activity(self._activity)
+                self._activity = None
+            return
+        if _get_active_ui() is not None:
+            return
+        if self._drawn and sys.stderr.isatty():
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+            self._drawn = False
 
     def __enter__(self):
-        if not sys.stderr.isatty():
+        self._ui = _get_active_ui()
+        if self._ui is not None:
+            self._activity = self._ui.start_activity(self.label)
+            _active_spinners.append(self)
+            self._registered = True
+            return self
+        if not sys.stderr.isatty() or os.environ.get("TERM") == "dumb":
             return self
 
         _active_spinners.append(self)
         self._registered = True
 
-        def _run():
-            for frame in itertools.cycle("\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"):
-                if self._stop.is_set():
-                    break
-                sys.stderr.write(
-                    "\r\033[36m" + frame + "\033[0m \033[2m"
-                    + self.label + "\033[0m  "
-                )
-                sys.stderr.flush()
-                time.sleep(0.08)
+        self._stop.clear()
+        self._started = time.monotonic()
+        frames = itertools.cycle(("(@)>", "(@)v", "<(@)", "^(@)"))
 
+        def _draw():
+            elapsed = int(time.monotonic() - self._started)
+            width = max(0, shutil.get_terminal_size().columns - 1)
+            line = f"{next(frames)} {elapsed}s {self.label}"[:width]
+            # Erase, rather than pad, so elapsed growth and terminal resizing
+            # never leave stale characters or wrap into the following prompt.
+            # No color/style escapes are needed, including under NO_COLOR.
+            sys.stderr.write("\r\033[K" + line)
+            sys.stderr.flush()
+            self._drawn = True
+
+        def _run():
+            while not self._stop.wait(0.12):
+                _draw()
+
+        _draw()
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if self._ui is not None:
+            self._clear_line()
         if self._thread:
             self._stop.set()
-            self._thread.join(timeout=0.2)
+            self._thread.join()
             self._clear_line()
         if self._registered:
             try:

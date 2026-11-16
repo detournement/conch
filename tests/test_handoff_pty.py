@@ -1,7 +1,7 @@
 """Pty-driven regression tests for the terminal-handoff input handshake.
 
 Reproduces the reported failure: an interactive sudo-style handoff while the
-typeahead reader is active. The child must receive only the bytes typed after
+live composer is active. The child must receive only the bytes typed after
 the handoff begins (three clean credential entries), Conch must print nothing
 between the handoff banner and the resume banner, buffered Conch output must
 be flushed before the child owns the terminal, and nothing captured around
@@ -15,6 +15,7 @@ from tests.test_multiline_pty import HAVE_PTY, PtySession
 
 HANDOFF_BANNER = "[Conch terminal handoff]"
 RESUME_BANNER = "[Conch resumed]"
+DISCARD_NOTICE = "Discarded queued input and draft before terminal handoff."
 
 
 @unittest.skipUnless(HAVE_PTY, "POSIX pty support required")
@@ -23,9 +24,11 @@ class HandoffPtyTests(unittest.TestCase):
         s = PtySession("handoff")
         self.addCleanup(s.close)
         self.assertTrue(s.wait_for("READY"), s.transcript())
-        # Typed while the typeahead reader is capturing, before the handoff:
-        # must be discarded, never delivered to the child, never re-echoed.
-        s.send(b"stolen-secret\r")
+        # Both a submitted message and an unsubmitted draft must disappear.
+        session_input = b"stolen-secret\rprivate-draft"
+        s.send(session_input)
+        self.assertTrue(s.wait_for("Hand off?", timeout=20.0), s.transcript())
+        s.send(b"y\r")
         passwords = [b"pw-first\r", b"pw-second\r", b"pw-third\r"]
         for count, password in enumerate(passwords, start=1):
             self.assertTrue(
@@ -35,7 +38,9 @@ class HandoffPtyTests(unittest.TestCase):
             time.sleep(0.05)
             s.send(password)
         self.assertTrue(s.wait_for("SUDOCHILD-END", timeout=20.0), s.transcript())
-        self.assertTrue(s.wait_for("PARTIAL=", timeout=10.0), s.transcript())
+        self.assertTrue(s.wait_for("RESUMED-INPUT", timeout=10.0), s.transcript())
+        s.send(b"normal-after\rquit\r")
+        self.assertTrue(s.wait_for("DONE", timeout=10.0), s.transcript())
         return s
 
     def test_sudo_like_child_receives_only_post_handoff_bytes(self):
@@ -50,10 +55,16 @@ class HandoffPtyTests(unittest.TestCase):
         s = self._run_handoff_session()
         transcript = s.transcript()
 
-        # Pre-handoff typeahead was discarded with a notice and never queued.
-        self.assertIn("DISCARD-NOTICE", transcript)
-        self.assertEqual(s.parsed("QUEUED="), [[]], transcript)
-        self.assertEqual(s.parsed("PARTIAL="), [""], transcript)
+        # Neither queued chat nor an unsubmitted draft survives handoff.
+        self.assertIn(DISCARD_NOTICE, transcript)
+        self.assertEqual(s.parsed("QUEUED="), [["normal-after"]], transcript)
+        history = s.parsed("HIST=")[0]
+        self.assertIn("normal-after", history)
+        for discarded in ("stolen-secret", "private-draft", "pw-first",
+                          "pw-second", "pw-third"):
+            self.assertFalse(
+                any(discarded in message for message in history), transcript
+            )
 
         # The unflushed Conch fragment was quiesced before the child ran:
         # it appears before the handoff banner, and the window between the
@@ -67,7 +78,8 @@ class HandoffPtyTests(unittest.TestCase):
         self.assertNotIn("ERRFRAG:", window)
         self.assertNotIn("(queued:", window)
         self.assertNotIn("stolen-secret", window)
-        self.assertNotIn("DISCARD-NOTICE", window)
+        self.assertNotIn("private-draft", window)
+        self.assertNotIn(DISCARD_NOTICE, window)
         # The child's own markers are the only structured output inside.
         self.assertIn("SUDOCHILD-START", window)
         self.assertIn("SUDOCHILD-END", window)

@@ -44,14 +44,21 @@ ok "Shell: ${USER_SHELL}"
 
 # ── Install Python package ───────────────────────────────────────────────────
 
-info "Installing conch package..."
-if python3 -m pip install -e "$CONCH_DIR" --quiet 2>/dev/null; then
-    ok "Installed conch package (editable)"
-elif python3 -m pip install -e "$CONCH_DIR" 2>/dev/null; then
-    ok "Installed conch package (editable)"
-else
-    warn "pip install failed — falling back to PATH-based setup"
+info "Installing conch in the checkout's virtual environment..."
+VENV="$CONCH_DIR/.venv"
+if [[ ! -x "$VENV/bin/python" ]]; then
+    python3 -m venv "$VENV"
 fi
+PYTHON="$VENV/bin/python"
+if command -v uv &>/dev/null; then
+    uv pip install --python "$PYTHON" -e "$CONCH_DIR"
+else
+    if ! "$PYTHON" -m pip --version &>/dev/null; then
+        "$PYTHON" -m ensurepip --upgrade
+    fi
+    "$PYTHON" -m pip install -e "$CONCH_DIR"
+fi
+ok "Installed conch and terminal dependencies in ${VENV}"
 
 # ── Make scripts executable ──────────────────────────────────────────────────
 
@@ -75,65 +82,9 @@ else
     printf "  Run conch in a terminal to start setup; no API key is required for seats.\n"
 fi
 
-# ── Composio MCP tools (optional) ────────────────────────────────────────
-
+# Optional integrations should not interrupt provider setup on first launch.
 MCP_FILE="$CONFIG_DIR/mcp.json"
-if [[ -f "$MCP_FILE" ]] && grep -q 'composio' "$MCP_FILE" 2>/dev/null; then
-    ok "Composio already configured in ${MCP_FILE}"
-else
-    printf "\n"
-    info "Composio adds 100+ tools to chat: web search, news, code execution, and more."
-    info "Enter your Composio API key (or press Enter to skip):"
-    printf "  ${DIM}Get one at https://composio.dev${RST}\n"
-    printf "  Key: "
-    read -r COMPOSIO_KEY
-    if [[ -n "$COMPOSIO_KEY" ]]; then
-        info "Creating Composio MCP server..."
-        COMPOSIO_RESP="$(curl -s -X POST "https://backend.composio.dev/api/v3/mcp/servers" \
-            -H "x-api-key: ${COMPOSIO_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{"name": "conch-tools", "auth_config_ids": [], "no_auth_apps": ["serpapi", "composio_search", "codeinterpreter", "firecrawl", "tavily"], "managed_auth_via_composio": true}' 2>/dev/null || true)"
-
-        COMPOSIO_ID="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
-        if [[ -n "$COMPOSIO_ID" ]]; then
-            COMPOSIO_URL="https://backend.composio.dev/v3/mcp/${COMPOSIO_ID}/mcp?user_id=default"
-            if [[ -f "$MCP_FILE" ]]; then
-                python3 -c "
-import json
-with open('$MCP_FILE') as f:
-    cfg = json.load(f)
-cfg.setdefault('mcpServers', {})['composio'] = {'type': 'http', 'url': '$COMPOSIO_URL'}
-with open('$MCP_FILE', 'w') as f:
-    json.dump(cfg, f, indent=2)
-"
-            else
-                cat > "$MCP_FILE" <<MCPEOF
-{
-  "mcpServers": {
-    "composio": {
-      "type": "http",
-      "url": "${COMPOSIO_URL}"
-    }
-  }
-}
-MCPEOF
-            fi
-            chmod 600 "$MCP_FILE"
-            TOOL_COUNT="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("allowed_tools",[])))' 2>/dev/null || echo "100+")"
-            ok "Composio configured: ${TOOL_COUNT} tools available"
-            if ! grep -q 'COMPOSIO_API_KEY' "$ENV_FILE" 2>/dev/null; then
-                echo "export COMPOSIO_API_KEY=\"${COMPOSIO_KEY}\"" >> "$ENV_FILE"
-                ok "Composio API key saved to ${ENV_FILE}"
-            fi
-        else
-            COMPOSIO_ERR="$(echo "$COMPOSIO_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error","unknown error"))' 2>/dev/null || echo "could not create server")"
-            warn "Composio setup failed: ${COMPOSIO_ERR}"
-            echo "  You can configure it manually later. See README."
-        fi
-    else
-        warn "Skipped Composio. You can add it later — see README."
-    fi
-fi
+info "Optional MCP tools can be configured later in ${MCP_FILE}"
 
 # ── .gitignore ───────────────────────────────────────────────────────────────
 
@@ -146,7 +97,7 @@ fi
 CONCH_BLOCK="
 # Conch: LLM-assisted shell (Ctrl+G = ask, Ctrl+X Ctrl+G = chat)
 export CONCH_DIR=\"${CONCH_DIR}\"
-export PATH=\"\${CONCH_DIR}/bin:\$PATH\"
+export PATH=\"\${CONCH_DIR}/bin:\${CONCH_DIR}/.venv/bin:\$PATH\"
 [[ -f \"\${CONCH_DIR}/.env\" ]] && source \"\${CONCH_DIR}/.env\"
 source \"\${CONCH_DIR}/shell/conch.zsh\"
 conch-setup"
@@ -154,7 +105,7 @@ conch-setup"
 BASH_BLOCK="
 # Conch: LLM-assisted shell
 export CONCH_DIR=\"${CONCH_DIR}\"
-export PATH=\"\${CONCH_DIR}/bin:\$PATH\"
+export PATH=\"\${CONCH_DIR}/bin:\${CONCH_DIR}/.venv/bin:\$PATH\"
 [[ -f \"\${CONCH_DIR}/.env\" ]] && source \"\${CONCH_DIR}/.env\"
 source \"\${CONCH_DIR}/shell/conch.bash\"
 conch-setup"
@@ -188,10 +139,11 @@ info "Testing conch..."
 export PATH="${CONCH_DIR}/bin:$PATH"
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
-if python3 -c "import conch; print(f'conch v{conch.__version__}')" 2>/dev/null; then
-    ok "Package loads correctly"
+if "$PYTHON" -c "import conch, prompt_toolkit; print(f'conch v{conch.__version__}')"; then
+    ok "Package and terminal editor load correctly"
 else
-    warn "Package import failed — check Python path"
+    err "Package import failed — installation is incomplete"
+    exit 1
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────

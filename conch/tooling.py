@@ -866,6 +866,8 @@ class LocalShellClient:
         import select
         import errno
         import re as _re
+        from .render import _get_active_ui
+        stream_output = _get_active_ui() is None
         effective_timeout = timeout if timeout > 0 else 60
 
         # A PTY preserves useful terminal-formatted output, but stdin is
@@ -923,8 +925,9 @@ class LocalShellClient:
                             break
                         chunk = data.decode("utf-8", errors="replace")
                         capture(chunk)
-                        sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
-                        sys.stderr.flush()
+                        if stream_output:
+                            sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
+                            sys.stderr.flush()
                     if proc.poll() is not None:
                         try:
                             while True:
@@ -2974,6 +2977,7 @@ class ConchConfigClient:
             MODEL_PRICING,
             DEFAULT_API_KEY_ENVS,
             get_fallback_model,
+            format_session_cost,
             get_custom_base_url,
             get_ollama_base_url,
             list_custom_models,
@@ -3011,9 +3015,7 @@ class ConchConfigClient:
                 lines.append(f"session_turns: {u['turns']}")
                 lines.append(f"session_input_tokens: {u.get('input_tokens', 0):,}")
                 lines.append(f"session_output_tokens: {u.get('output_tokens', 0):,}")
-                cost = u.get("cost", 0)
-                label = (f"${cost:.4f}" if cost > 0.0001 else
-                         "subscription seats" if u.get("seat_turns") else "free")
+                label = format_session_cost(u, self._provider, self._model, self._config)
                 lines.append(f"session_cost: {label}")
             return self._text("\n".join(lines))
 

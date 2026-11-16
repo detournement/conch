@@ -15,7 +15,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from . import mcp as mcp_mod
-from .render import Spinner, StreamPrinter, clear_active_spinners
+from .render import Spinner, StreamPrinter, _get_active_ui, clear_active_spinners
 
 logger = logging.getLogger("conch.runtime")
 
@@ -39,8 +39,8 @@ def _summarize_args(arguments: dict) -> str:
     """One-line summary of tool arguments for display."""
     if not arguments:
         return ""
-    if "command" in arguments and len(arguments) == 1 or (
-        len(arguments) == 2 and "timeout" in arguments
+    if "command" in arguments and (
+        len(arguments) == 1 or (len(arguments) == 2 and "timeout" in arguments)
     ):
         cmd = str(arguments["command"])
         cmd = cmd.replace("\n", " \u23ce ")
@@ -52,6 +52,31 @@ def _summarize_args(arguments: dict) -> str:
     if len(raw) > 79:
         raw = raw[:79] + "\u2026"
     return raw
+
+
+def _safe_tool_summary(arguments: dict) -> str:
+    """Redact before truncating, using the credential inventory's name rules."""
+    from .secretguard import redact_credentials
+
+    def scrub(value):
+        if isinstance(value, dict):
+            return {
+                key: "[redacted]" if mcp_mod.secret_like_name(key) else scrub(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, str):
+            # Shell/header strings need the same caution as structured keys:
+            # quoted assignments and positional auth flags evade token scans.
+            if mcp_mod.secret_like_name(value) or re.search(
+                r"://[^/\s]*@|(?:^|\s)(?:-u|--user|-p)(?:\s|=)", value
+            ):
+                return "[redacted]"
+            return redact_credentials(value, "[redacted]")[0]
+        return value
+
+    return _summarize_args(scrub(arguments))
 
 
 def _summarize_result(
@@ -73,8 +98,11 @@ def _summarize_result(
 
 def _print_tool_preview(
     name: str, arguments: dict, *, verbose: bool = True
-) -> None:
-    """Print tool name (and optionally args) to stderr."""
+):
+    """Start a surface tool row, or retain the legacy stderr preview."""
+    ui = _get_active_ui()
+    if ui is not None:
+        return ui, ui.tool_started(name, _safe_tool_summary(arguments))
     clear_active_spinners()
     summary = _summarize_args(arguments)
     if verbose and summary:
@@ -84,9 +112,13 @@ def _print_tool_preview(
 
 
 def _print_tool_result(
-    text: str, *, verbose: bool = True, error: bool = False
+    text: str, *, verbose: bool = True, error: bool = False, activity=None
 ) -> None:
-    """Print a summarized tool result to stderr when verbose or on errors."""
+    """Settle a surface tool row, or retain the legacy result summary."""
+    if activity is not None:
+        ui, token = activity
+        ui.tool_finished(token, text, error=error, verbose=verbose)
+        return
     if error:
         summary = _summarize_result(text, max_lines=3, max_chars=200)
         print(f"    \033[31m\u2717 {summary}\033[0m", file=sys.stderr)
@@ -1881,6 +1913,12 @@ def chat_turn(
     """
     from .providers import STREAM_FNS, PROVIDER_TOOL_LIMITS
 
+    stream_printer = getattr(on_token, "__self__", None)
+    ui_stream = (
+        stream_printer
+        if isinstance(stream_printer, StreamPrinter) and stream_printer._ui is not None
+        else None
+    )
     total_usage = {"input_tokens": 0, "output_tokens": 0, "model": ""}
     # Optional per-turn token budget alongside the round budget (plan 2.6)
     try:
@@ -2023,6 +2061,8 @@ def chat_turn(
             sp = getattr(on_token, "__self__", None)
             if isinstance(sp, StreamPrinter):
                 sp.end_waiting()
+                if ui_stream is not None:
+                    ui_stream.reset()
         if is_error_response(response):
             # Retry once on same provider with 1s backoff (transient errors:
             # rate limits, 5xx, connection refused/timeout, missing model)
@@ -2050,6 +2090,8 @@ def chat_turn(
                 record_call_timing(
                     total_usage, usage, time.monotonic() - _call_started
                 )
+                if is_error_response(response) and ui_stream is not None:
+                    ui_stream.reset()
             if is_error_response(response) and retry_after_key_reload(
                 provider, config, error_detail(response)
             ):
@@ -2072,6 +2114,8 @@ def chat_turn(
                 total_usage["output_tokens"] += usage.get("output_tokens", 0)
                 total_usage["model"] = response.get("_model", total_usage["model"])
                 record_call_timing(total_usage, usage, time.monotonic() - _call_started)
+                if is_error_response(response) and ui_stream is not None:
+                    ui_stream.reset()
             if is_error_response(response):
                 err_detail = error_detail(response)
                 print(f"  \033[33m⚠ {err_detail}\033[0m", file=sys.stderr)
@@ -2305,6 +2349,13 @@ def chat_turn(
             run_hook("on_turn_end", {"reply": reply}, config)
             return reply, total_usage
 
+        if ui_stream is not None:
+            # Commit this round before approvals and tool output. Raw fallback
+            # responses may carry prose even though no stream callback ran.
+            if not ui_stream._full_text and response.get("content"):
+                ui_stream.feed(response["content"])
+            ui_stream.reset()
+
         fingerprint = _tool_batch_fingerprint(tool_calls)
         if fingerprint == previous_batch:
             identical_batches += 1
@@ -2409,106 +2460,140 @@ def chat_turn(
                 )
                 add_result(tool_call, result_text)
                 continue
-            _print_tool_preview(name, arguments, verbose=_verbose_tools)
-            # Required policy (Swarm Phase 0): in-code deterministic checks
-            # that FAIL CLOSED (deny on exception/timeout/invalid decision),
-            # unlike the user pre_tool_use hook below which stays fail-open.
-            from .policy import evaluate_required_policy
-
-            decision = evaluate_required_policy(
-                "pre_tool_use", {"tool": name, "arguments": arguments}
-            )
-            if not decision.allowed:
-                result_text = (
-                    "Denied by required policy: "
-                    f"{decision.reason or decision.check or 'no reason given'}"
-                )
-                print(
-                    f"  \033[33m⚠ {name} denied by required policy\033[0m",
-                    file=sys.stderr,
-                )
-                add_result(tool_call, result_text)
-                continue
-            # pre_tool_use hook (plan 2.2): deterministic gate around the
-            # loop — non-zero exit blocks, JSON stdout rewrites arguments.
-            allowed, hook_out = run_hook(
-                "pre_tool_use", {"tool": name, "arguments": arguments}, config
-            )
-            if not allowed:
-                reason = hook_out or "blocked by pre_tool_use hook"
-                result_text = f"Blocked by pre_tool_use hook: {reason}"
-                print(f"  \033[33m⚠ {name} blocked by hook\033[0m", file=sys.stderr)
-                add_result(tool_call, result_text)
-                continue
-            if hook_out:
-                try:
-                    rewritten = json.loads(hook_out)
-                except json.JSONDecodeError:
-                    rewritten = None
-                if not isinstance(rewritten, dict):
-                    add_result(
-                        tool_call,
-                        f"Rejected tool call {name}: pre_tool_use hook returned "
-                        "invalid replacement arguments.",
-                    )
-                    continue
-                rewrite_error = _validate_schema_value(
-                    rewritten,
-                    tool_definitions[name]
-                    .get("function", {})
-                    .get("parameters", {}),
-                )
-                if rewrite_error:
-                    add_result(
-                        tool_call,
-                        f"Rejected rewritten arguments for {name}: "
-                        f"{rewrite_error}",
-                    )
-                    continue
-                arguments = rewritten
-                print("  \033[2m(arguments rewritten by pre_tool_use hook)\033[0m",
-                      file=sys.stderr)
+            activity = _print_tool_preview(name, arguments, verbose=_verbose_tools)
+            result_text = "Tool execution interrupted."
+            is_error = True
             try:
-                if name in builtin_clients:
-                    raw_result = builtin_clients[name].call_tool(name, arguments)
-                    content_blocks = raw_result.get("content", [])
-                    if isinstance(content_blocks, list):
-                        result_text = "\n".join(
-                            str(
-                                block.get("text", block.get("content", ""))
-                                if isinstance(block, dict)
-                                else block
-                            )
-                            for block in content_blocks
-                        ).strip()
-                    else:
-                        result_text = str(content_blocks)
-                elif name in tool_map:
-                    with Spinner(f"Running {name}"):
-                        result_text = mcp_mod.execute_tool(tool_map, name, arguments)
-                else:
+                # Required policy fails closed; the optional user hook retains
+                # its existing fail-open behavior.
+                from .policy import evaluate_required_policy
+
+                decision = evaluate_required_policy(
+                    "pre_tool_use", {"tool": name, "arguments": arguments}
+                )
+                if not decision.allowed:
                     result_text = (
-                        f"Error: {name} is no longer connected. Refresh tools "
-                        "and try again."
+                        "Denied by required policy: "
+                        f"{decision.reason or decision.check or 'no reason given'}"
                     )
+                    if activity is None:
+                        print(
+                            f"  \033[33m⚠ {name} denied by required policy\033[0m",
+                            file=sys.stderr,
+                        )
+                    add_result(tool_call, result_text)
+                    continue
+                allowed, hook_out = run_hook(
+                    "pre_tool_use", {"tool": name, "arguments": arguments}, config
+                )
+                if not allowed:
+                    reason = hook_out or "blocked by pre_tool_use hook"
+                    result_text = f"Blocked by pre_tool_use hook: {reason}"
+                    if activity is None:
+                        print(f"  \033[33m⚠ {name} blocked by hook\033[0m", file=sys.stderr)
+                    add_result(tool_call, result_text)
+                    continue
+                if hook_out:
+                    try:
+                        rewritten = json.loads(hook_out)
+                    except json.JSONDecodeError:
+                        rewritten = None
+                    if not isinstance(rewritten, dict):
+                        result_text = (
+                            f"Rejected tool call {name}: pre_tool_use hook returned "
+                            "invalid replacement arguments."
+                        )
+                        add_result(tool_call, result_text)
+                        continue
+                    rewrite_error = _validate_schema_value(
+                        rewritten,
+                        tool_definitions[name]
+                        .get("function", {})
+                        .get("parameters", {}),
+                    )
+                    if rewrite_error:
+                        result_text = (
+                            f"Rejected rewritten arguments for {name}: "
+                            f"{rewrite_error}"
+                        )
+                        add_result(tool_call, result_text)
+                        continue
+                    arguments = rewritten
+                    print("  \033[2m(arguments rewritten by pre_tool_use hook)\033[0m",
+                          file=sys.stderr)
+                tool_failed = False
+                try:
+                    if name in builtin_clients:
+                        raw_result = builtin_clients[name].call_tool(name, arguments)
+                        tool_failed = bool(raw_result.get("isError"))
+                        content_blocks = raw_result.get("content", [])
+                        if isinstance(content_blocks, list):
+                            result_text = "\n".join(
+                                str(
+                                    block.get("text", block.get("content", ""))
+                                    if isinstance(block, dict)
+                                    else block
+                                )
+                                for block in content_blocks
+                            ).strip()
+                        else:
+                            result_text = str(content_blocks)
+                    elif name in tool_map:
+                        if activity is not None:
+                            result_text = mcp_mod.execute_tool(tool_map, name, arguments)
+                        else:
+                            with Spinner(f"Running {name}"):
+                                result_text = mcp_mod.execute_tool(tool_map, name, arguments)
+                    else:
+                        result_text = (
+                            f"Error: {name} is no longer connected. Refresh tools "
+                            "and try again."
+                        )
+                except KeyboardInterrupt:
+                    tool_failed = True
+                    result_text = "Tool execution cancelled by user."
+                    if activity is None:
+                        print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
+                except Exception as exc:
+                    tool_failed = True
+                    result_text = f"Error executing {name}: {exc}"
+                    if activity is None:
+                        print(
+                            f"  \033[31m✗ {name} failed: {exc}\033[0m",
+                            file=sys.stderr,
+                        )
+                result_text = str(result_text or "(no output)")
+                run_hook(
+                    "post_tool_use",
+                    {"tool": name, "arguments": arguments, "result": result_text},
+                    config,
+                )
+                is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
+                if activity is None:
+                    _print_tool_result(result_text, verbose=_verbose_tools, error=is_error)
+                else:
+                    is_error = (
+                        is_error
+                        or tool_failed
+                        or result_text.startswith((
+                            "User declined", "User did not approve", "Refused:",
+                            "Command interrupted", "Background tasks cannot prompt",
+                        ))
+                        or "was interrupted by the user" in result_text[:100]
+                    )
+                add_result(tool_call, result_text)
             except KeyboardInterrupt:
                 result_text = "Tool execution cancelled by user."
-                print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
-            except Exception as exc:
-                result_text = f"Error executing {name}: {exc}"
-                print(
-                    f"  \033[31m✗ {name} failed: {exc}\033[0m",
-                    file=sys.stderr,
-                )
-            result_text = str(result_text or "(no output)")
-            run_hook(
-                "post_tool_use",
-                {"tool": name, "arguments": arguments, "result": result_text},
-                config,
-            )
-            is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
-            _print_tool_result(result_text, verbose=_verbose_tools, error=is_error)
-            add_result(tool_call, result_text)
+                is_error = True
+                raise
+            except BaseException:
+                is_error = True
+                raise
+            finally:
+                if activity is not None:
+                    _print_tool_result(
+                        result_text, verbose=_verbose_tools, error=is_error, activity=activity
+                    )
         if provider == "anthropic":
             append_results_anthropic(messages, response, results)
         else:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import re
 import shutil
 import sys
@@ -239,7 +240,7 @@ def clear_active_spinners():
 
 
 class Spinner:
-    """Minimal terminal spinner used while waiting on remote work."""
+    """ASCII shell activity indicator, bridged to the active terminal UI."""
 
     def __init__(self, label: str):
         self.label = label
@@ -248,6 +249,8 @@ class Spinner:
         self._registered = False
         self._ui = None
         self._activity = None
+        self._drawn = False
+        self._started = 0.0
 
     def _clear_line(self):
         if self._ui is not None:
@@ -257,9 +260,10 @@ class Spinner:
             return
         if _get_active_ui() is not None:
             return
-        clear_width = len(self.label) + 6
-        sys.stderr.write("\r" + " " * clear_width + "\r")
-        sys.stderr.flush()
+        if self._drawn and sys.stderr.isatty():
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+            self._drawn = False
 
     def __enter__(self):
         self._ui = _get_active_ui()
@@ -268,23 +272,32 @@ class Spinner:
             _active_spinners.append(self)
             self._registered = True
             return self
-        if not sys.stderr.isatty():
+        if not sys.stderr.isatty() or os.environ.get("TERM") == "dumb":
             return self
 
         _active_spinners.append(self)
         self._registered = True
 
-        def _run():
-            for frame in itertools.cycle("\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"):
-                if self._stop.is_set():
-                    break
-                sys.stderr.write(
-                    "\r\033[36m" + frame + "\033[0m \033[2m"
-                    + self.label + "\033[0m  "
-                )
-                sys.stderr.flush()
-                time.sleep(0.08)
+        self._stop.clear()
+        self._started = time.monotonic()
+        frames = itertools.cycle(("(@)>", "(@)v", "<(@)", "^(@)"))
 
+        def _draw():
+            elapsed = int(time.monotonic() - self._started)
+            width = max(0, shutil.get_terminal_size().columns - 1)
+            line = f"{next(frames)} {elapsed}s {self.label}"[:width]
+            # Erase, rather than pad, so elapsed growth and terminal resizing
+            # never leave stale characters or wrap into the following prompt.
+            # No color/style escapes are needed, including under NO_COLOR.
+            sys.stderr.write("\r\033[K" + line)
+            sys.stderr.flush()
+            self._drawn = True
+
+        def _run():
+            while not self._stop.wait(0.12):
+                _draw()
+
+        _draw()
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
         return self
@@ -294,7 +307,7 @@ class Spinner:
             self._clear_line()
         if self._thread:
             self._stop.set()
-            self._thread.join(timeout=0.2)
+            self._thread.join()
             self._clear_line()
         if self._registered:
             try:

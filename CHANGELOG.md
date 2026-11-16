@@ -9,8 +9,16 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-16
+
 ### Added
 
+- A rotating ASCII shell with phase labels and elapsed time makes startup model
+  checks and tool loading visible without interfering with setup prompts.
+- The terminal status line shows cumulative session cost independently of token
+  statistics, preserving totals across conversation/model changes and explicitly
+  distinguishing API estimates, subscription seats, local inference, and unknown
+  pricing. `/cost`, introspection, and the exit summary use the same accounting.
 - An inline `prompt_toolkit` chat interface keeps native scrollback alongside a
   live multiline composer, model/permission/session status, elapsed activity,
   and compact tool results. Search commands with Ctrl+P, models with `/model`,

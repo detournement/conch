@@ -313,7 +313,7 @@ class TerminalUI:
                                  Condition(lambda: bool(self._response))),
             ConditionalContainer(self._text_window(self._activity_text, 4),
                                  Condition(lambda: bool(self._busy or self._activities or self._tools))),
-            self._text_window(self._status_text, 1),
+            self._text_window(self._status_text, 3),
             self._editor,
             self._text_window(self._hints, 1),
         ])
@@ -435,6 +435,15 @@ class TerminalUI:
             count = sum(isinstance(item, str) for item in self._messages)
         if count:
             parts.append(f"{count} queued")
+        width = self._output.get_size().columns
+        if fields.get("session_cost"):
+            parts.append(f"cost {fields['session_cost']}")
+            if get_cwidth(_safe(" · ".join(parts))) > width - 1:
+                # Keep billing, permissions and queue visible before spending
+                # scarce columns on the model and conversation title.
+                priority = " · ".join(parts[:-1])
+                text = f"{priority}\n{parts[-1]}" if priority else parts[-1]
+                return [("class:status", _safe(text))]
         model = "/".join(str(fields[key]) for key in ("provider", "model") if fields.get(key))
         if model:
             parts.append(model)
@@ -442,7 +451,6 @@ class TerminalUI:
             parts.append(str(fields["conversation"]))
         if fields.get("tools") is not None:
             parts.append(f"tools: {fields['tools']}")
-        width = self._output.get_size().columns
         visible, used = [], 0
         for char in _safe(" · ".join(parts)):
             cells = get_cwidth(char)

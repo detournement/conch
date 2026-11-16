@@ -32,6 +32,7 @@ from .config import (
     set_env_values,
 )
 from .modelcheck import ModelCheckOutcome, ensure_working_model
+from .render import Spinner
 
 CYAN = "\033[1;36m"
 GREEN = "\033[1;32m"
@@ -160,7 +161,8 @@ def should_offer_wizard() -> bool:
 
 def _choose_provider() -> Tuple[str, str, Optional[List[str]]]:
     """(provider, key_env, ollama_models) from the interactive menu."""
-    ollama_models = detect_ollama()
+    with Spinner("Detecting local models"):
+        ollama_models = detect_ollama()
     print(f"\n{BOLD}{CYAN}  Welcome to Conch{RST}")
     print("  Choose a provider → connect your account → verify a model.")
     print("  Ctrl+C exits setup. You can return by running conch again.\n")
@@ -240,7 +242,8 @@ def _choose_custom_model(base_url: str, api_key: str) -> str:
     (an empty custom_model otherwise warns on every start). Returns ""
     when nothing could be discovered — the user is told how to set it."""
     print(f"  {DIM}Looking up models at {base_url} …{RST}")
-    models, tool_capable = discover_custom_models(base_url, api_key)
+    with Spinner("Discovering custom models"):
+        models, tool_capable = discover_custom_models(base_url, api_key)
     if models is None:
         print(f"  {YELLOW}! Endpoint unreachable{RST} {DIM}— add"
               f" `custom_model = <name>` to {get_config_path()} once it is"
@@ -310,7 +313,8 @@ def run_first_run_wizard() -> Optional[ModelCheckOutcome]:
     if key or provider in ("ollama", "custom"):
         answer = input("  Verify with one live request? [Y/n]: ").strip().lower()
         if answer in ("", "y", "yes"):
-            ok, detail = probe_provider(provider, key, base_url)
+            with Spinner("Verifying provider reachability"):
+                ok, detail = probe_provider(provider, key, base_url)
             if ok:
                 print(f"  {GREEN}✓ {detail}{RST}")
             else:
@@ -319,7 +323,8 @@ def run_first_run_wizard() -> Optional[ModelCheckOutcome]:
                     "  Re-enter the key? [y/N]: "
                 ).strip().lower() in ("y", "yes"):
                     key = _collect_key(env_name)
-                    ok, detail = probe_provider(provider, key, base_url)
+                    with Spinner("Verifying provider reachability"):
+                        ok, detail = probe_provider(provider, key, base_url)
                     print(f"  {GREEN}✓ {detail}{RST}" if ok
                           else f"  {YELLOW}! {detail} — keeping it anyway;"
                                f" fix it later in {get_env_file_path()}{RST}")

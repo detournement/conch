@@ -33,8 +33,8 @@ from .config import get_bool, load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
 from .modelcheck import ensure_working_model
-from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS
-from .render import highlight, StreamPrinter
+from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS, format_session_cost, record_session_usage
+from .render import highlight, StreamPrinter, Spinner
 from .runtime import sanitize_anthropic_messages
 from .session import AgentSession
 from .tooling import (
@@ -391,7 +391,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
     _ui = None
     if not interactive:
         print(_NON_INTERACTIVE_NOTICE, file=sys.stderr)
-    config = load_config()
+    with Spinner("Starting Conch") if interactive else contextlib.nullcontext():
+        config = load_config()
     agent_mode_from_config = apply_agent_mode_from_config(config)
     try:
         provider, raw_fn = resolve_startup_provider(config)
@@ -612,7 +613,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
         from .bootstrap import swap_tool_state
         swap_tool_state(chat_state, _tool_loader.builtin_state)
         if not _tool_loader.ready.is_set():
-            from .render import Spinner
             with Spinner("Loading tools"):
                 _tool_loader.wait(timeout=TOOL_LOAD_WAIT_SECONDS)
         if _attach_loaded_tools(announce=False):
@@ -695,7 +695,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
     # needed). When it expires the session starts on the builtin tools and
     # the loader's result is attached between turns once it arrives.
     if not _tool_loader.ready.is_set():
-        from .render import Spinner
         with Spinner("Loading tools"):
             _tool_loader.wait(timeout=TOOL_LOAD_WAIT_SECONDS)
     session.attach_clients(
@@ -814,6 +813,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                 permission=session.permissions.get_permission_mode(),
                 conversation=current_conv.title, cwd=os.getcwd(),
                 tools=f"{len(chat_state.tools)}/{len(chat_state.all_tools)}",
+                session_cost=format_session_cost(session_usage, provider, model_name, config),
             )
 
     def _set_foreground_policies():
@@ -858,7 +858,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
             return "/provider " + selected if selected else None
         if head in ("/model", "/models") and not argument.strip():
             from .providers import KNOWN_MODELS, list_custom_models, list_ollama_models
-            from .render import Spinner
             with Spinner("Loading model choices"):
                 if provider == "ollama":
                     candidates = list_ollama_models(config, force_refresh=True) or []
@@ -1212,7 +1211,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
             # against a dead server — check first and offer a clean retry.
             if _backend_failed and provider == "ollama":
                 from .providers import check_ollama_health, get_ollama_base_url
-                from .render import Spinner
                 with Spinner("Checking Ollama server"):
                     healthy = check_ollama_health(config)
                 if not healthy:
@@ -1340,28 +1338,21 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                     speed_estimated=True,
                 )
             if in_tok or out_tok:
-                from .providers import estimate_cost
                 from .runtime import (
                     calibration_key,
                     estimate_tokens,
                     format_context_gauge,
                     get_context_limit,
                 )
-                seat_billing = provider in ("claude-code", "codex")
-                cost = 0.0 if seat_billing else estimate_cost(used_model, in_tok, out_tok)
-                if seat_billing:
-                    session_usage["seat_turns"] = session_usage.get("seat_turns", 0) + 1
-                session_usage["input_tokens"] += in_tok
-                session_usage["output_tokens"] += out_tok
-                session_usage["cost"] += cost
-                session_usage["turns"] += 1
+                cost_str = record_session_usage(
+                    session_usage, provider, used_model, in_tok, out_tok, config
+                )
+                _sync_ui_context()
                 ctx_used = estimate_tokens(
                     messages, key=calibration_key(provider, config)
                 )
                 ctx_window = get_context_limit(provider, config)
                 gauge = format_context_gauge(ctx_used, ctx_window)
-                cost_str = ("subscription seat" if seat_billing else
-                            f"~${cost:.4f}" if cost > 0.0001 else "free")
                 stats_line = format_turn_stats_line(
                     turn_usage, cost_str, gauge, used_model, config
                 )
@@ -1453,14 +1444,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
         if session_usage["turns"] > 0:
             total_in = session_usage["input_tokens"]
             total_out = session_usage["output_tokens"]
-            total_cost = session_usage["cost"]
             turns = session_usage["turns"]
-            if total_cost > 0.0001:
-                print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, ~${total_cost:.4f}\033[0m")
-            elif session_usage.get("seat_turns"):
-                print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, subscription seats (plan limits apply)\033[0m")
-            else:
-                print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, free\033[0m")
+            cost_label = format_session_cost(session_usage, provider, model_name, config)
+            print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, {cost_label}\033[0m")
         try:
             _summarize_and_save_bounded(messages, config, raw_fn, memory)
         except KeyboardInterrupt:
@@ -1623,7 +1609,8 @@ def main():
               "prompt", file=sys.stderr)
         sys.exit(2)
     if argv:
-        config = load_config()
+        with Spinner("Starting Conch") if interactive else contextlib.nullcontext():
+            config = load_config()
         apply_agent_mode_from_config(config)
         try:
             provider, raw_fn = resolve_startup_provider(config)

@@ -1,8 +1,8 @@
 """`conch --new` / `-n`: start the shell with a fresh conversation.
 
-Covers the argv wiring in main() and the conversation selection helper it
-feeds (_startup_conversation), including the corruption fall-through: a
-quarantined most-recent conversation must not stop startup.
+Covers invalid flag combinations and conversation selection, including
+corruption fall-through: a quarantined most-recent conversation must not
+stop startup. Argument parsing is covered in test_cli_args.
 """
 
 import contextlib
@@ -14,33 +14,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from conch.app import _USAGE, _startup_conversation, main
+from conch.app import _startup_conversation, main
 from conch.conversations import ConversationManager, _state_dir
 
 FIXTURES = Path(__file__).parent / "fixtures" / "corrupt_conversations"
 
 
-class TestMainArgvWiring(unittest.TestCase):
-    def _run_main(self, argv):
-        calls = []
-
-        def fake_chat_loop(new_conversation=False, interactive=True):
-            calls.append(new_conversation)
-
-        with mock.patch("conch.app.chat_loop", fake_chat_loop), \
-                mock.patch("sys.argv", ["conch"] + argv):
-            main()
-        return calls
-
-    def test_new_flag_requests_fresh_conversation(self):
-        self.assertEqual(self._run_main(["--new"]), [True])
-
-    def test_short_flag_requests_fresh_conversation(self):
-        self.assertEqual(self._run_main(["-n"]), [True])
-
-    def test_no_args_resumes_most_recent(self):
-        self.assertEqual(self._run_main([]), [False])
-
+class TestNewFlagBoundary(unittest.TestCase):
     def test_new_flag_rejects_trailing_prompt(self):
         stderr = io.StringIO()
         with mock.patch("sys.argv", ["conch", "--new", "hello"]), \
@@ -50,14 +30,6 @@ class TestMainArgvWiring(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("--new", stderr.getvalue())
 
-    def test_help_documents_new_flag(self):
-        stdout = io.StringIO()
-        with mock.patch("sys.argv", ["conch", "--help"]), \
-                contextlib.redirect_stdout(stdout):
-            main()
-        self.assertIn("--new", stdout.getvalue())
-        self.assertIn("fresh conversation", stdout.getvalue())
-        self.assertIn("--new", _USAGE)
 
 
 class TestStartupConversation(unittest.TestCase):

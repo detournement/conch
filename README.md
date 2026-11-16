@@ -71,6 +71,10 @@ multiline composer and a compact model/permission/session status line.
 You can keep editing while a response streams. Activity shows what is
 running and elapsed time, not invented completion percentages or hidden reasoning.
 
+Startup shows a rotating ASCII shell, phase label, and elapsed time while models
+and tools load. It clears before setup questions, sign-in, or the chat prompt.
+Animation is disabled for non-TTY output and `TERM=dumb`.
+
 | Key or command | Action |
 | --- | --- |
 | Enter | Send; queue another message while Conch is working |
@@ -885,6 +889,13 @@ and exact or marked-estimated throughput. Toggle it for the session with:
 ```
 
 Persist the choice with `show_token_stats=true|false`.
+
+The live status line always shows the running session cost, even with `/tks off`.
+It updates after each completed turn and survives `/new`, `/clear`, and model or
+conversation switches. API amounts use `~$` to indicate estimates; subscription
+seats, local inference, and unknown pricing are labelled explicitly. Mixed
+sessions retain known API spend alongside those labels. `/cost` shows the same
+total; restarting Conch starts a new session total.
 
 ## Shell capabilities
 

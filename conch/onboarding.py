@@ -31,7 +31,7 @@ from .config import (
     set_config_values,
     set_env_values,
 )
-from .modelcheck import ensure_working_model
+from .modelcheck import ModelCheckOutcome, ensure_working_model
 
 CYAN = "\033[1;36m"
 GREEN = "\033[1;32m"
@@ -161,12 +161,12 @@ def should_offer_wizard() -> bool:
 def _choose_provider() -> Tuple[str, str, Optional[List[str]]]:
     """(provider, key_env, ollama_models) from the interactive menu."""
     ollama_models = detect_ollama()
-    print(f"\n{BOLD}{CYAN}  🐚 Welcome to conch{RST}")
-    print(f"  {DIM}One-time setup — pick a model provider. Everything can"
-          f" be changed later in {get_config_path()}.{RST}\n")
+    print(f"\n{BOLD}{CYAN}  Welcome to Conch{RST}")
+    print("  Choose a provider → connect your account → verify a model.")
+    print("  Ctrl+C exits setup. You can return by running conch again.\n")
     print("  Claude/ChatGPT seats use your subscription through an official CLI;"
           " API keys are optional and billed separately.")
-    print("  Install/sign-in steps: conch auth --help\n")
+    print("  You can change providers later with /provider.\n")
     for index, (provider, _env, label, pitch) in enumerate(
         WIZARD_PROVIDERS, start=1
     ):
@@ -257,6 +257,11 @@ def _choose_custom_model(base_url: str, api_key: str) -> str:
     else:
         print(f"  {YELLOW}! No model passed the native tool-call check"
               f"{RST} {DIM}— tool use may not work with this endpoint.{RST}")
+    return _choose_model(models)
+
+
+def _choose_model(models: List[str]) -> str:
+    """Select an installed/discovered model before the startup capability check."""
     if len(models) == 1:
         print(f"  {DIM}model: {models[0]}{RST}")
         return models[0]
@@ -276,9 +281,9 @@ def _choose_custom_model(base_url: str, api_key: str) -> str:
               f" {min(len(models), 12)}.{RST}")
 
 
-def run_first_run_wizard() -> bool:
-    """The interactive flow. Returns True when config was written."""
-    provider, env_name, _ollama_models = _choose_provider()
+def run_first_run_wizard() -> Optional[ModelCheckOutcome]:
+    """Configure a provider and return its startup verification outcome."""
+    provider, env_name, ollama_models = _choose_provider()
     from .seats import PROVIDERS
 
     if provider in PROVIDERS:
@@ -286,9 +291,8 @@ def run_first_run_wizard() -> bool:
 
         if login(provider):
             print(f"  Sign-in did not complete; run: conch auth login {provider}")
-            return False
-        verify_configured_model()
-        return True
+            return None
+        return verify_configured_model()
     base_url = ""
     key = ""
     if provider == "custom":
@@ -321,6 +325,9 @@ def run_first_run_wizard() -> bool:
                                f" fix it later in {get_env_file_path()}{RST}")
 
     updates = {"provider": provider}
+    if provider == "ollama" and ollama_models:
+        selected_model = _choose_model(ollama_models)
+        updates.update(model=selected_model, chat_model=selected_model)
     if provider == "custom" and base_url:
         updates["custom_base_url"] = base_url
         custom_model = _choose_custom_model(base_url, key)
@@ -339,7 +346,7 @@ def run_first_run_wizard() -> bool:
     elif key and provider == "custom":
         set_env_values({CUSTOM_KEY_ENV: key}, set_by="first-run setup")
 
-    print(f"\n  {GREEN}✓ You're set.{RST} {DIM}config: {config_path}")
+    print(f"\n  {DIM}Configuration saved: {config_path}{RST}")
     if key:
         print(f"  {DIM}key: {get_env_file_path()} (0600) — `conch keys` lists,"
               f" verifies, and rotates it later{RST}")
@@ -347,13 +354,10 @@ def run_first_run_wizard() -> bool:
         print(f"  {YELLOW}No key saved{RST} {DIM}— add a line"
               f" `{env_name}=...` to {get_env_file_path()} or export it"
               f" in your shell before chatting.{RST}")
-    verify_configured_model()
-    print(f"  {DIM}Try: conch \"what can you do?\"  ·  /help lists"
-          f" commands  ·  /install lists components{RST}\n")
-    return True
+    return verify_configured_model()
 
 
-def verify_configured_model() -> None:
+def verify_configured_model() -> ModelCheckOutcome:
     """Run the startup model check on the configuration the wizard just
     wrote, so first run ends in a verified-working state — or in the same
     approved alternatives flow the shell uses. Because the wizard is the
@@ -370,24 +374,26 @@ def verify_configured_model() -> None:
         detail = outcome.result.detail if outcome.result is not None else ""
         print(f"  {GREEN}✓ {outcome.label} verified{RST}"
               + (f" {DIM}— {detail}{RST}" if detail else ""))
+    return outcome
 
 
-def maybe_run_first_run_wizard() -> bool:
-    """Gatekeeper called from the CLI entry point: run the wizard when —
-    and only when — it should run; never raise into startup."""
+def maybe_run_first_run_wizard() -> Optional[ModelCheckOutcome]:
+    """Return the first-run check, skip configured users, or exit cancelled setup."""
     try:
         if not should_offer_wizard():
-            return False
+            return None
     except Exception:
-        return False
+        return None
     from .bootstrap import StartupError
 
     try:
-        return run_first_run_wizard()
+        outcome = run_first_run_wizard()
+        if outcome is None:
+            sys.exit(1)
+        return outcome
     except (KeyboardInterrupt, EOFError):
-        print(f"\n  {DIM}Setup skipped — run `conch` again anytime, or"
-              f" create {get_config_path()} yourself.{RST}")
-        return False
+        print(f"\n  {DIM}Setup cancelled. Run `conch` again when ready.{RST}")
+        sys.exit(0)
     except StartupError as exc:
         # The post-setup model check found nothing working (or the user
         # declined every alternative): the config is saved; exit cleanly

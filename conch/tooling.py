@@ -866,6 +866,8 @@ class LocalShellClient:
         import select
         import errno
         import re as _re
+        from .render import _get_active_ui
+        stream_output = _get_active_ui() is None
         effective_timeout = timeout if timeout > 0 else 60
 
         # A PTY preserves useful terminal-formatted output, but stdin is
@@ -923,8 +925,9 @@ class LocalShellClient:
                             break
                         chunk = data.decode("utf-8", errors="replace")
                         capture(chunk)
-                        sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
-                        sys.stderr.flush()
+                        if stream_output:
+                            sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
+                            sys.stderr.flush()
                     if proc.poll() is not None:
                         try:
                             while True:

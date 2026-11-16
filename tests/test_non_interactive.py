@@ -72,7 +72,7 @@ class TestMainWiring(unittest.TestCase):
     def _run_shell(self, argv, tty):
         calls = []
 
-        def fake_chat_loop(new_conversation=False, interactive=True):
+        def fake_chat_loop(new_conversation=False, interactive=True, startup_check=None):
             calls.append((new_conversation, interactive))
 
         wizard = mock.Mock(return_value=False)

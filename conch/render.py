@@ -98,13 +98,17 @@ def highlight(text: str) -> str:
     return "\n".join(output)
 
 
+def _get_active_ui():
+    """Consult the interactive surface without importing it in plain sessions."""
+    module = sys.modules.get(f"{__package__}.terminal_ui")
+    return module.get_active_ui() if module is not None else None
+
+
 class StreamPrinter:
     """Incrementally render streamed LLM output with formatting.
 
-    Buffers code blocks until complete so they can be syntax-highlighted.
-    Applies inline markdown formatting to regular lines as they arrive.
-    Partial lines are shown immediately (raw) then re-drawn with
-    formatting once a newline arrives.
+    The interactive surface owns mutable text and final transcript commits.
+    Plain terminals retain incremental line formatting and code buffering.
     """
 
     def __init__(self, show_waiting: bool = True):
@@ -116,7 +120,9 @@ class StreamPrinter:
         self._partial_written = 0
         self._started = False
         self._spinner = None
-        if show_waiting and sys.stderr.isatty():
+        self._ui = _get_active_ui()
+        self._ui_committed = 0
+        if show_waiting and (self._ui is not None or sys.stderr.isatty()):
             self._spinner = Spinner("Waiting for response")
             self._spinner.__enter__()
 
@@ -144,6 +150,9 @@ class StreamPrinter:
                 self._spinner.__exit__(None, None, None)
                 self._spinner = None
         self._full_text += chunk
+        if self._ui is not None:
+            self._ui.update_response(self._full_text[self._ui_committed:])
+            return
         self._line_buf += chunk
 
         while "\n" in self._line_buf:
@@ -164,6 +173,12 @@ class StreamPrinter:
     def flush(self) -> str:
         """Flush remaining buffer and return accumulated full text."""
         self.end_waiting()
+        if self._ui is not None:
+            pending = self._full_text[self._ui_committed:]
+            if pending:
+                self._ui.finish_response(highlight(pending))
+                self._ui_committed = len(self._full_text)
+            return self._full_text
         self._clear_partial()
         if self._line_buf:
             self._emit_line(self._line_buf)
@@ -178,6 +193,11 @@ class StreamPrinter:
         return self._full_text
 
     def reset(self):
+        if self._ui is not None:
+            # A tool boundary or failed request must never discard its prose.
+            self.flush()
+            self._ui_committed = 0
+            self._started = False
         self._in_code = False
         self._code_lang = ""
         self._code_buf.clear()
@@ -226,13 +246,28 @@ class Spinner:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._registered = False
+        self._ui = None
+        self._activity = None
 
     def _clear_line(self):
+        if self._ui is not None:
+            if self._activity is not None:
+                self._ui.end_activity(self._activity)
+                self._activity = None
+            return
+        if _get_active_ui() is not None:
+            return
         clear_width = len(self.label) + 6
         sys.stderr.write("\r" + " " * clear_width + "\r")
         sys.stderr.flush()
 
     def __enter__(self):
+        self._ui = _get_active_ui()
+        if self._ui is not None:
+            self._activity = self._ui.start_activity(self.label)
+            _active_spinners.append(self)
+            self._registered = True
+            return self
         if not sys.stderr.isatty():
             return self
 
@@ -255,6 +290,8 @@ class Spinner:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if self._ui is not None:
+            self._clear_line()
         if self._thread:
             self._stop.set()
             self._thread.join(timeout=0.2)

@@ -64,6 +64,37 @@ only before the prompt, so words inside a prompt are never read as options;
 put `--` before a prompt whose first word starts with a dash. Unknown options
 are rejected with a usage error.
 
+### Interactive terminal
+
+Conch keeps the conversation in normal terminal scrollback, with a live
+multiline composer and a compact model/permission/session status line.
+You can keep editing while a response streams. Activity shows what is
+running and elapsed time, not invented completion percentages or hidden reasoning.
+
+| Key or command | Action |
+| --- | --- |
+| Enter | Send; queue another message while Conch is working |
+| Alt+Enter (or Escape, then Enter) | Insert a newline |
+| Tab | Complete slash commands with descriptions |
+| Ctrl+P, `/help` | Search commands; selecting one fills the composer without executing it |
+| `/model`, `/models` | Search models for the current provider |
+| `/provider` | Choose a provider |
+| `/convos`, `/switch` | Search and resume conversations |
+| Ctrl+C | Stop active work; when idle, clear/cancel input (twice to exit) |
+| Ctrl+D | Exit with an empty composer |
+
+Tool activity is compact by default; `/verbose on` shows full returned results.
+Approval prompts use a separate input buffer: queued chat and unfinished drafts
+cannot approve a command. `/queue off` keeps the draft editable but disables
+submission during a turn. Multiline paste stays one message and Enter sends it.
+
+The editor uses `prompt_toolkit` on a real terminal. Pipes, one-shot commands,
+`--non-interactive`, and `TERM=dumb` retain the plain input/output path.
+Existing readline history is imported once into `chat_history.composer` beside
+the original history file under `$XDG_STATE_HOME/conch` (default
+`~/.local/state/conch`). Approval answers and external-program input are not
+written to composer history.
+
 ### Edit code with a sandbox and undo
 
 Start `conch` from a Git repository, then:
@@ -424,15 +455,29 @@ cd conch
 ./install.sh
 ```
 
-The source installer wires the repository's shell integration and preserves
-existing credentials/configuration. New installs choose a provider through
-the same first-launch wizard below; the installer does not ask for API keys.
-It is the developer path; the website one-liner is the end-user path.
+The source installer creates or updates `.venv`, installs Conch and its terminal
+dependencies there, and wires the repository's shell integration. The source
+`bin/conch` and `bin/conch-chat` launchers use that environment when present,
+without requiring shell activation or modifying system Python.
+Existing credentials/configuration are preserved. New installs choose a provider
+through the same first-launch wizard below; the installer does not ask for model
+API keys. This is the developer path; the website one-liner is the end-user path.
 
 ### First launch
 
 The first interactive launch offers **Claude seats** (default) and **ChatGPT
 seats** before API-key providers. Choose **one** of the following paths.
+
+Setup walks through provider selection, sign-in or a hidden API-key prompt,
+and model verification before opening chat. Ollama and custom endpoints offer
+their available models. The successful verification is reused when chat opens,
+so setup does not immediately repeat the same model check. The first chat screen
+shows example requests, model/command discovery, and the active approval policy.
+
+Ctrl+C cancels setup without starting a broken session. Missing provider CLIs
+show installation/sign-in instructions; existing configuration skips the wizard.
+The installer does not ask for optional integration credentials.
+
 With Node.js and npm available, install the official CLI and sign in:
 
 | Subscription | Install official CLI | Sign in and select it | Verify native login |
@@ -725,6 +770,10 @@ read, capture, log, or return the handoff's input or output. Never place a
 credential in a chat message, command argument, slash command, or insecure
 forwarder such as `sudo -S` or `sshpass`.
 
+The live editor is suspended before a credential handoff. Conch discards any
+queued messages and unfinished draft, with a notice, so previously typed input
+cannot become credentials or leak into the conversation after the program exits.
+
 ## Models, local inference, and token stats
 
 Conch requires native structured tool calling. It rejects unsupported models
@@ -747,8 +796,10 @@ The cloud catalog was live-audited on 2026-09-23:
 <!-- markdownlint-enable MD013 -->
 
 Responses-only models are not advertised because Conch currently uses Chat
-Completions for OpenAI-compatible tools. `/models` shows the usable catalog
-for the active configuration, and `/model <name>` validates before switching.
+Completions for OpenAI-compatible tools. In the interactive editor, `/model`
+and `/models` open the current provider's searchable catalog; `/provider`
+selects another provider. `/model <name>` accepts an explicit model ID and
+validates it before switching. Plain sessions retain the textual catalog.
 
 ### Startup model check
 
@@ -917,8 +968,9 @@ their configuration files are not interchangeable.
 - Multiline paste is one message, not one command per line.
 - `/paste` reads literally until `.` or Ctrl+D.
 - `/edit` composes in the configured editor.
-- Fenced blocks and backslash continuations stay together.
-- `/queue` controls typeahead while the model is working.
+- In the live composer, Alt+Enter inserts newlines; Enter sends the whole draft.
+  Plain input retains fenced-block and backslash continuation handling.
+- `/queue on` and `/queue off` control submission while the model is working.
 - `/schedule 10m check disk usage`, `/tasks`, and `/cancel` manage recurring
   prompts.
 
@@ -1251,7 +1303,7 @@ groups the same shipped surface.
 
 | Commands | Purpose |
 | --- | --- |
-| `/help` | Show all commands |
+| `/help` | Search commands in the live editor; list commands in plain sessions |
 | `/models`, `/model <name>`, `/provider <name>` | Inspect or switch the validated model/provider |
 | `/registry [set <url>\|off]`, `/llamaidx` | Configure and inspect llama-idx |
 | `/remember`, `/memories`, `/forget`, `/fact`, `/facts` | Persistent memory and always-loaded facts |
@@ -1380,6 +1432,7 @@ accepted.
 ```text
 conch/
 ├── app.py, commands.py, runtime.py   interactive shell and agent loop
+├── terminal_ui.py, render.py         live composer, pickers, and scrollback rendering
 ├── tooling.py, mcp.py, skills.py     tools, MCP, profiles, and skills
 ├── providers.py, llm.py              provider adapters and ask mode
 ├── kernel/                           event-sourced missions and capture

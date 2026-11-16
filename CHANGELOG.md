@@ -11,6 +11,21 @@ Releases before 0.6.0 predate this changelog.
 
 ### Added
 
+- An inline `prompt_toolkit` chat interface keeps native scrollback alongside a
+  live multiline composer, model/permission/session status, elapsed activity,
+  and compact tool results. Search commands with Ctrl+P, models with `/model`,
+  providers with `/provider`, and conversations with `/convos`.
+- Chat drafts remain editable during streaming; queued multiline messages stay
+  intact. Approval inputs are isolated from drafts and queues, and credential
+  handoffs suspend the editor and discard pending input before releasing the
+  terminal. Existing readline history is imported without overwriting it.
+- Source installation uses a checkout-local virtual environment, including the
+  terminal dependency, and stops on dependency failures instead of claiming a
+  working PATH-only install.
+- First launch explains provider/sign-in/model setup, lets local users select
+  a model, and opens chat with example requests and approval guidance. Successful
+  setup verification is reused rather than repeated. Cancellation and failed
+  sign-in exit cleanly; optional integration keys no longer interrupt installation.
 - Seat-backed `claude-code` and `codex` providers use the unmodified official
   CLIs with provider-owned Claude/ChatGPT sign-in and refresh; Conch never
   collects subscription tokens. `conch auth login/status/logout` manages

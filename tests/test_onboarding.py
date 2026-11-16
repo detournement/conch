@@ -153,15 +153,16 @@ class TestWizardFlow(OnboardingCase):
         self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), SECRET)
 
     def test_ollama_path_needs_no_key(self):
-        answers = iter(["ollama", "n"])
+        answers = iter(["ollama", "n", "2"])
         with patch("conch.onboarding.detect_ollama",
-                   return_value=["llama3.3:latest"]), \
+                   return_value=["qwen2.5:7b", "llama3.3:latest"]), \
              patch("conch.onboarding.ensure_working_model", _verified), \
              patch("builtins.input", side_effect=lambda *_: next(answers)), \
              patch("sys.stdout", io.StringIO()):
             self.assertTrue(onboarding.run_first_run_wizard())
         config = Path(config_mod.get_config_path()).read_text()
         self.assertIn("provider = ollama", config)
+        self.assertEqual(config_mod.load_config()["chat_model"], "llama3.3:latest")
         self.assertFalse(Path(config_mod.get_env_file_path()).exists())
 
     def test_skipped_key_still_writes_provider(self):
@@ -309,13 +310,26 @@ class TestMaybeRunGate(OnboardingCase):
             self.assertFalse(onboarding.maybe_run_first_run_wizard())
         self.assertFalse(Path(config_mod.get_config_path()).exists())
 
-    def test_ctrl_c_skips_cleanly(self):
-        with patch.multiple(
-            "conch.onboarding.sys", stdin=_Tty(), stdout=_Tty()
-        ), patch("conch.onboarding.run_first_run_wizard",
-                 side_effect=KeyboardInterrupt), \
-             patch("sys.stdout", io.StringIO()):
-            self.assertFalse(onboarding.maybe_run_first_run_wizard())
+    def test_cancelled_setup_exits_without_starting_chat_or_saving_config(self):
+        with patch("conch.onboarding.should_offer_wizard", return_value=True), \
+             patch("conch.onboarding.detect_ollama", return_value=None), \
+             patch("builtins.input", side_effect=KeyboardInterrupt), \
+             patch("sys.stdout", io.StringIO()), \
+             self.assertRaises(SystemExit) as caught:
+            onboarding.maybe_run_first_run_wizard()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertFalse(Path(config_mod.get_config_path()).exists())
+
+    def test_failed_seat_sign_in_exits_without_default_provider_fallthrough(self):
+        with patch("conch.onboarding.should_offer_wizard", return_value=True), \
+             patch("conch.onboarding.detect_ollama", return_value=None), \
+             patch("builtins.input", return_value="codex"), \
+             patch("conch.auth.login", return_value=1), \
+             patch("sys.stdout", io.StringIO()), \
+             self.assertRaises(SystemExit) as caught:
+            onboarding.maybe_run_first_run_wizard()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertFalse(Path(config_mod.get_config_path()).exists())
 
 
 class TestEnvFileLoading(OnboardingCase):

@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "pygments>=2.0",
+    "prompt-toolkit>=3.0.50,<4",
 ]
 
 [project.scripts]

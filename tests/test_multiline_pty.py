@@ -1,14 +1,14 @@
 """Pty-driven integration tests for multiline input.
 
-These spawn tests/multiline_pty_driver.py inside a real pseudo-terminal so
-readline/libedit, the termios paste drain, and the raw /paste reader run
-exactly as in an interactive session. The bracketed-paste test only runs
-where the backend actually supports it (GNU readline 8.1+) and skips
-cleanly on libedit (macOS system Pythons).
+These spawn tests/multiline_pty_driver.py inside a real pseudo-terminal.
+Legacy helpers exercise readline/libedit and the /paste reader; TerminalUI
+coverage uses prompt_toolkit's real input lifecycle, including bracketed
+paste, queued submissions, and isolated approval input.
 """
 
 import ast
 import os
+import re
 import select
 import struct
 import subprocess
@@ -39,7 +39,12 @@ class PtySession:
     def __init__(self, mode):
         self.master, slave = os.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        env = dict(os.environ, TERM="xterm-256color", PYTHONUNBUFFERED="1")
+        # This byte-level harness has no screen emulator to answer cursor
+        # position queries; real-emulator UI smoke coverage exercises CPR.
+        env = dict(
+            os.environ, TERM="xterm-256color", PYTHONUNBUFFERED="1",
+            PROMPT_TOOLKIT_NO_CPR="1",
+        )
         # start_new_session keeps pty keyboard signals (^C) inside the
         # driver's own session; the driver then claims the pty as its
         # controlling terminal so SIGINT delivery works like a real shell.
@@ -101,9 +106,14 @@ class PtySession:
 
     def parsed(self, tag):
         values = []
-        for line in self.transcript().splitlines():
-            if line.startswith(tag):
-                values.append(ast.literal_eval(line[len(tag):]))
+        # prompt_toolkit may precede a committed output line with cursor or
+        # erase controls. Strip terminal controls, not message whitespace.
+        transcript = re.sub(
+            r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]",
+            "", self.transcript(),
+        )
+        for match in re.finditer(re.escape(tag) + r"([^\r\n]*)", transcript):
+            values.append(ast.literal_eval(match.group(1)))
         return values
 
     def close(self):
@@ -282,40 +292,46 @@ class PasteCommandTests(PtyTestCase):
         self.assertIsNone(s.parsed("PASTE=")[0])
 
 
-class TypeaheadCoalesceTests(PtyTestCase):
+class TerminalUIQueueTests(PtyTestCase):
+    def finish_queue(self, session):
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"quit\r")
+        self.assertTrue(session.wait_for("DONE"), session.transcript())
+        return session.parsed("QUEUED=")[0]
+
     def test_paste_during_stream_queues_one_block(self):
-        s = self.session("typeahead")
-        s.send(b"x\ry\r")  # pasted block, trailing newline
-        time.sleep(0.3)
-        s.send(b"solo\r")  # separately typed line
-        self.assertTrue(s.wait_for("PARTIAL="), s.transcript())
-        self.assertEqual(s.parsed("QUEUED=")[0], ["x\ny", "solo"])
-        self.assertEqual(s.parsed("PARTIAL=")[0], "")
+        session = self.session("typeahead")
+        session.send(b"\x1b[200~x\ny\n\x1b[201~\r")
+        time.sleep(0.15)
+        session.send(b"solo\r")
+        self.assertEqual(self.finish_queue(session), ["x\ny\n", "solo"])
 
-    def test_unterminated_paste_stays_partial_block(self):
-        s = self.session("typeahead")
-        s.send(b"a\rb")  # pasted block without trailing newline
-        self.assertTrue(s.wait_for("PARTIAL="), s.transcript())
-        self.assertEqual(s.parsed("QUEUED=")[0], [])
-        self.assertEqual(s.parsed("PARTIAL=")[0], "a\nb")
+    def test_unsubmitted_paste_remains_editable_after_busy_turn(self):
+        session = self.session("typeahead")
+        session.send(b"\x1b[200~a\nb\x1b[201~")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"-tail\r")
+        self.assertEqual(self.finish_queue(session), ["a\nb-tail"])
 
-    def test_long_queued_message_intact_and_preview_marked(self):
-        # Regression: a long message typed mid-turn was echoed as a bare
-        # 60-char prefix, so it looked like the rest was lost even though
-        # the full text was queued. The queued content must stay
-        # byte-identical, and the on-screen preview must carry an explicit
-        # truncation marker with the captured tally.
-        message = " ".join("word%03d" % i for i in range(50))  # 399 chars
-        s = self.session("typeahead")
-        s.send(message.encode() + b"\r")
-        self.assertTrue(s.wait_for("PARTIAL="), s.transcript())
-        self.assertEqual(s.parsed("QUEUED=")[0], [message])
-        preview_lines = [
-            line for line in s.transcript().splitlines() if "(queued:" in line
-        ]
-        self.assertEqual(len(preview_lines), 1, s.transcript())
-        self.assertIn("more chars queued)", preview_lines[0])
-        self.assertNotIn(message, preview_lines[0])  # preview was actually cut
+    def test_long_queued_message_remains_exact_in_message_and_history(self):
+        message = " ".join("word%03d" % i for i in range(50))
+        session = self.session("typeahead")
+        session.send(message.encode() + b"\r")
+        self.assertEqual(self.finish_queue(session), [message])
+        self.assertIn(message, session.parsed("HIST=")[0])
+
+    def test_approval_does_not_consume_queued_message_or_draft(self):
+        session = self.session("approval")
+        session.send(b"chat-before\rdraft-before")
+        self.assertTrue(session.wait_for("APPROVAL-ONLY:"), session.transcript())
+        session.send(b"approved\r")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\r")  # Submit the draft restored after the overlay.
+        self.assertEqual(
+            self.finish_queue(session), ["chat-before", "draft-before"]
+        )
+        self.assertEqual(session.parsed("ANSWER="), ["approved"])
+        self.assertNotIn("approved", session.parsed("HIST=")[0])
 
 
 if __name__ == "__main__":

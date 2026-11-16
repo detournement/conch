@@ -3,17 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import codecs
 import contextlib
 import datetime
 import os
 import readline
-import select
-import shutil
 import sys
-import termios
 import threading
-import tty
 import urllib.request
 from typing import List, Optional
 
@@ -73,17 +68,6 @@ AGENT_MODE_CONFIG_NOTICE = (
 )
 
 
-CONCH_SHELL_ART = [
-    "      ,/",
-    "     //",
-    "    //  .-~~~-.",
-    "   //  /  (•)  \\",
-    "  //  |   /~~\\  |",
-    " //   |  | __ | |",
-    " \\    \\ \\____/ /",
-    "  \\    '------'",
-    "   \\___________)",
-]
 
 
 def _detect_location() -> str:
@@ -354,232 +338,8 @@ def _conversation_title(conv: Conversation, messages: List[dict]) -> str:
     return "New conversation"
 
 
-def _print_conch_shell_art():
-    """Print a small conch-like shell aligned to the right."""
-    if not sys.stdout.isatty():
-        return
-    width = shutil.get_terminal_size(fallback=(80, 24)).columns
-    art_width = max(len(line) for line in CONCH_SHELL_ART)
-    pad = max(0, width - art_width - 2)
-    prefix = " " * pad
-    for line in CONCH_SHELL_ART:
-        print(f"{prefix}\033[2;36m{line}\033[0m")
 
 
-class TypeaheadBuffer:
-    """Capture keystrokes in cbreak mode while the LLM is working.
-
-    Uses a single reader thread with select() + cbreak so there is never
-    a second thread blocked on stdin.  Readline's input() owns stdin at
-    all other times.
-    """
-
-    def __init__(self):
-        self._buffer = ""
-        self._queued: list[str] = []
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._old_settings = None
-        self._suspended = False
-        # Self-pipe: stop() writes one byte so the reader's select() wakes
-        # immediately instead of finishing a 100ms tick, and the loop exits
-        # without ever touching the stdin fd again.
-        self._wake_r, self._wake_w = os.pipe()
-        # Newlines with more input already pending are interior to a paste;
-        # coalesce them so a block pasted mid-turn queues as one message.
-        self.coalesce_pastes = True
-
-    def start(self):
-        if self._suspended:
-            # A terminal handoff owns stdin: restarting capture here would
-            # race the child for keystrokes (credential prompts included).
-            return
-        if not sys.stdin.isatty():
-            return
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._thread = None
-        self._stop.clear()
-        self._buffer = ""
-        try:
-            self._old_settings = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-        except termios.error:
-            self._old_settings = None
-            return
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> str:
-        """Stop capturing and restore terminal. Returns un-entered partial text."""
-        self._stop.set()
-        try:
-            os.write(self._wake_w, b"\0")
-        except OSError:
-            pass
-        if self._thread:
-            self._thread.join(timeout=1.0)
-            if not self._thread.is_alive():
-                self._thread = None
-        if self._old_settings is not None:
-            try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
-            except termios.error:
-                pass
-            self._old_settings = None
-        partial = self._buffer
-        self._buffer = ""
-        return partial
-
-    def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def stop_for_handoff(self) -> str:
-        partial = self.stop()
-        if self.is_running():
-            raise RuntimeError(
-                "Conch input reader did not stop; terminal handoff refused"
-            )
-        return partial
-
-    def suspend_for_handoff(self) -> tuple[str, list[str]]:
-        """Park capture before a terminal handoff, or refuse the handoff.
-
-        The latch is raised first so any concurrent ``start()`` becomes a
-        no-op, then the reader is stopped and joined — if it cannot be
-        proven parked, the latch is dropped and the handoff is refused.
-        Returns the (partial, queued) input captured *before* the handoff
-        so the caller can discard it explicitly.
-        """
-        self._suspended = True
-        try:
-            partial = self.stop()
-        except BaseException:
-            self._suspended = False
-            raise
-        if self.is_running():
-            self._suspended = False
-            raise RuntimeError(
-                "Conch input reader did not stop; terminal handoff refused"
-            )
-        return partial, self.get_queued()
-
-    def resume_after_handoff(self) -> None:
-        """Purge the handoff window and lift the latch.
-
-        Anything that reached these buffers while a child owned the terminal
-        is credential-adjacent by definition: it is discarded, never echoed,
-        and never queued as a message. The caller decides whether to
-        ``start()`` capture again.
-        """
-        self._buffer = ""
-        self._queued.clear()
-        self._suspended = False
-
-    @contextlib.contextmanager
-    def handoff_guard(self, notify=None):
-        """Bracket a terminal handoff with the full input/output handshake.
-
-        Entry parks the reader (fail-closed), reports discarded pre-handoff
-        input through ``notify``, and flushes Conch's stdout/stderr so no
-        buffered text can surface inside the child's session. Exit purges
-        anything captured during the window and lifts the suspension latch.
-        """
-        partial, queued = self.suspend_for_handoff()
-        if (partial or queued) and notify is not None:
-            notify()
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except (AttributeError, OSError, ValueError):
-                pass
-        try:
-            yield
-        finally:
-            self.resume_after_handoff()
-
-    def get_queued(self) -> list[str]:
-        lines = list(self._queued)
-        self._queued.clear()
-        return lines
-
-    def _loop(self):
-        # Read whole chunks at the fd level: sys.stdin.read(1) would slurp a
-        # pasted block into Python's userspace buffer, after which select()
-        # on the fd never fires and the rest of the paste is stranded.
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        fd = sys.stdin.fileno()
-        wake = self._wake_r
-        prev_cr = False
-        while not self._stop.is_set():
-            try:
-                ready, _, _ = select.select([fd, wake], [], [], 0.1)
-                if wake in ready:
-                    # stop() poked the self-pipe: drain it and exit at the
-                    # loop check without touching the stdin fd again.
-                    try:
-                        os.read(wake, 64)
-                    except OSError:
-                        pass
-                    continue
-                if not ready or self._stop.is_set():
-                    continue
-                try:
-                    data = os.read(fd, 4096)
-                except OSError:
-                    break
-                if not data:
-                    break
-                if self._suspended:
-                    # Handoff window: these bytes belong to the child's
-                    # session (possibly credentials). Drop them unprocessed —
-                    # never buffered, never queued, never echoed.
-                    continue
-                text = decoder.decode(data)
-                idx = 0
-                while idx < len(text):
-                    ch = text[idx]
-                    idx += 1
-                    if ch == "\n" and prev_cr:
-                        prev_cr = False
-                        continue  # CRLF: the CR already ended this line
-                    prev_cr = ch == "\r"
-                    if ch in ("\r", "\n"):
-                        pending = idx < len(text) or bool(
-                            select.select([fd], [], [], 0.02)[0]
-                        )
-                        if self.coalesce_pastes and pending:
-                            self._buffer += "\n"  # mid-paste newline: one block
-                        elif self._buffer:
-                            self._queued.append(self._buffer)
-                            # Budget the preview to the terminal minus the
-                            # "  (queued: )" chrome; format_queued_preview
-                            # adds an explicit "… (+N …)" marker when it has
-                            # to cut, so a long capture never looks lost.
-                            # A stopping reader stays silent: printing while
-                            # the main thread hands the terminal to a child
-                            # (or to input()) would interleave with it.
-                            if not self._stop.is_set():
-                                cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-                                preview = multiline.format_queued_preview(
-                                    self._buffer, max(20, cols - 12)
-                                )
-                                sys.stderr.write(
-                                    f"\r\033[K  \033[2m(queued: {preview})\033[0m\n"
-                                )
-                                sys.stderr.flush()
-                            self._buffer = ""
-                    elif ch in ("\x7f", "\x08"):
-                        if self._buffer:
-                            self._buffer = self._buffer[:-1]
-                    elif ch == "\x03":
-                        self._buffer = ""
-                        self._stop.set()
-                        break
-                    elif ch >= " " or ch == "\t":
-                        self._buffer += ch
-            except (EOFError, OSError, ValueError):
-                break
 
 
 def _startup_conversation(conv_mgr, model_name, provider, system_prompt,
@@ -615,7 +375,7 @@ def _startup_conversation(conv_mgr, model_name, provider, system_prompt,
     return current_conv, messages
 
 
-def chat_loop(new_conversation=False, interactive=True):
+def chat_loop(new_conversation=False, interactive=True, startup_check=None):
     # Startup wiring lives in conch.bootstrap so headless modes can reuse it;
     # this function owns only the interactive composition (warnings printed
     # to stderr, startup failures become process exits).
@@ -624,6 +384,11 @@ def chat_loop(new_conversation=False, interactive=True):
     # the loop reading commands but makes every approval-gated tool refuse
     # instead of prompt: a pipe cannot answer an approval question.
     interactive = bool(interactive)
+    _use_terminal_ui = (
+        interactive and sys.stdin.isatty() and sys.stdout.isatty()
+        and os.environ.get("TERM") != "dumb"
+    )
+    _ui = None
     if not interactive:
         print(_NON_INTERACTIVE_NOTICE, file=sys.stderr)
     config = load_config()
@@ -643,7 +408,7 @@ def chat_loop(new_conversation=False, interactive=True):
     # walks the pre-approved fallback_models list (non-interactive); it
     # never swaps a model silently. Fails closed when nothing works.
     try:
-        model_check = ensure_working_model(config, interactive=interactive)
+        model_check = startup_check or ensure_working_model(config, interactive=interactive)
     except StartupError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(exc.code)
@@ -708,19 +473,20 @@ def chat_loop(new_conversation=False, interactive=True):
 
     history_file = _history_path()
     os.makedirs(os.path.dirname(history_file), exist_ok=True)
-    try:
-        readline.read_history_file(history_file)
-    except (FileNotFoundError, OSError):
-        pass
-    readline.set_history_length(500)
+    if not _use_terminal_ui:
+        try:
+            readline.read_history_file(history_file)
+        except (FileNotFoundError, OSError):
+            pass
+        readline.set_history_length(500)
 
     # Completion list comes from the shared command registry, plus
     # user-defined commands (~/.config/conch/commands/*.md).
-    from .commands import load_user_commands, slash_command_names
-    _SLASH_COMMANDS = list(dict.fromkeys(slash_command_names()))
-    _SLASH_COMMANDS += sorted(
-        "/" + name for name in load_user_commands() if "/" + name not in _SLASH_COMMANDS
-    )
+    from .commands import all_slash_commands, load_user_commands
+    _command_choices = all_slash_commands() + [
+        ("/" + name, "Personal prompt command") for name in sorted(load_user_commands())
+    ] + [("/q", "Exit Conch")]
+    _SLASH_COMMANDS = list(dict.fromkeys(spec.split()[0] for spec, _ in _command_choices))
 
     def _completer(text, state):
         if text.startswith("/"):
@@ -729,16 +495,18 @@ def chat_loop(new_conversation=False, interactive=True):
             matches = []
         return matches[state] if state < len(matches) else None
 
-    readline.set_completer(_completer)
-    readline.set_completer_delims(" ")
-    readline.parse_and_bind("tab: complete")
+    if not _use_terminal_ui:
+        readline.set_completer(_completer)
+        readline.set_completer_delims(" ")
+        readline.parse_and_bind("tab: complete")
 
     # Multiline input (README "Multiline input & paste"): GNU readline 8.1+
     # gets true bracketed paste; libedit (macOS system Pythons) ignores the
     # directive, so read_user_message's pending-input drain reassembles
     # pastes there instead. multiline_paste=false disables paste coalescing
     # (fences, backslash continuation, /paste, and /edit keep working).
-    multiline.enable_bracketed_paste()
+    if not _use_terminal_ui:
+        multiline.enable_bracketed_paste()
     _paste_coalesce = get_bool(config, "multiline_paste", True)
     _drain_fn = multiline.drain_pending_input if _paste_coalesce else (lambda: "")
 
@@ -855,7 +623,6 @@ def chat_loop(new_conversation=False, interactive=True):
             print()
 
     def _print_banner():
-        _print_conch_shell_art()
         from . import __version__
         if not model_check.checked:
             check_note = ", model check off"
@@ -863,6 +630,25 @@ def chat_loop(new_conversation=False, interactive=True):
             check_note = " ✓ verified, switched with approval"
         else:
             check_note = " ✓ verified"
+        if _ui:
+            print(f"\n\033[1;36mConch\033[0m \033[2mv{__version__}{check_note}\033[0m")
+            print(f"\033[2m{os.getcwd()}\033[0m")
+            resumed = any(message.get("role") == "user" for message in messages)
+            if resumed:
+                print(f"\033[2mResumed: {current_conv.title} · /new starts fresh\033[0m")
+            else:
+                print("Describe what you want to do. For example:")
+                print('  "Explain this project" or "Help me understand a failing command".')
+                print("Use /model to choose a model; Ctrl+P finds commands.")
+                if session.permissions.get_permission_mode() == "prompt_all":
+                    print("Shell commands require your approval before they run.")
+            _print_tool_notices()
+            if agent_mode_from_config:
+                print(f"\033[1;33m{AGENT_MODE_CONFIG_NOTICE}\033[0m")
+            if sched_kind == "kernel" and not sched.daemon_running():
+                print("\033[33mEdge is enabled but not running; scheduled missions will not fire.\033[0m")
+            print()
+            return
         print(
             f"\033[1;36mConch chat\033[0m \033[2mv{__version__} "
             f"({provider}/{model_name}{check_note})\033[0m"
@@ -958,13 +744,6 @@ def chat_loop(new_conversation=False, interactive=True):
     builtin_clients["conch_introspect"].bind(provider, model_name, config, chat_state)
     builtin_clients["search_conversations"].bind(conv_mgr, memory=memory)
 
-    _print_banner()
-
-    _typeahead = TypeaheadBuffer()
-    _typeahead.coalesce_pastes = _paste_coalesce
-    _typeahead_enabled = True
-    _typeahead_queued: list[str] = []
-    _typeahead_partial = ""
     _handoff_depth = 0
 
     # Turn-level git checkpoints (plan: maximally use local git when
@@ -1004,51 +783,38 @@ def chat_loop(new_conversation=False, interactive=True):
         if hasattr(builtin_clients.get(_hooked), "set_before_run"):
             builtin_clients[_hooked].set_before_run(_before_mutation)
 
-    def _pause_typeahead():
-        nonlocal _typeahead_partial
-        partial = _typeahead.stop_for_handoff()
-        queued = _typeahead.get_queued()
-        if partial:
-            _typeahead_partial += partial
-        _typeahead_queued.extend(queued)
-
     def _safe_input(prompt):
-        """Pause typeahead so input() can read stdin normally."""
-        if _handoff_depth:
-            return input(prompt)
-        _pause_typeahead()
-        try:
-            return input(prompt)
-        finally:
-            if _typeahead_enabled:
-                _typeahead.start()
-
-    def _discard_notice():
-        print(
-            "  \033[2m(discarded pre-handoff typeahead for credential "
-            "safety)\033[0m"
-        )
+        """Approval input is isolated from the composer and queued requests."""
+        if _ui and not _handoff_depth:
+            return _ui.ask(prompt)
+        return input(prompt)
 
     @contextlib.contextmanager
-    def _terminal_handoff_context():
-        """Suspend every Conch stdin reader while a child owns the terminal.
-
-        The guard parks the reader fail-closed, discards pre-handoff
-        typeahead with a visible notice, flushes Conch's own output so
-        nothing buffered leaks into the child's session, and purges anything
-        that reached the capture buffers during the window before capture is
-        allowed to restart.
-        """
-
+    def _suspend_ui(discard=False):
+        """Legacy prompts and external programs get exclusive terminal ownership."""
         nonlocal _handoff_depth
-        with _typeahead.handoff_guard(notify=_discard_notice):
+        context = _ui.handoff(discard=discard) if _ui else contextlib.nullcontext()
+        with context:
             _handoff_depth += 1
             try:
                 yield
             finally:
                 _handoff_depth -= 1
-        if _typeahead_enabled:
-            _typeahead.start()
+
+    @contextlib.contextmanager
+    def _terminal_handoff_context():
+        # Credential-sensitive handoffs discard draft/queue before releasing stdin.
+        with _suspend_ui(discard=True):
+            yield
+
+    def _sync_ui_context():
+        if _ui:
+            _ui.set_context(
+                provider=provider, model=model_name,
+                permission=session.permissions.get_permission_mode(),
+                conversation=current_conv.title, cwd=os.getcwd(),
+                tools=f"{len(chat_state.tools)}/{len(chat_state.all_tools)}",
+            )
 
     def _set_foreground_policies():
         standard = LocalShellPolicy(
@@ -1068,6 +834,59 @@ def chat_loop(new_conversation=False, interactive=True):
         builtin_clients["skill_manage"].configure(
             interactive=interactive, input_fn=_safe_input
         )
+
+    def _interactive_command(command):
+        """Picker selections still pass through the existing validated dispatcher."""
+        head, _, argument = command.partition(" ")
+        head = head.lower()
+        if head in ("/help", "/h", "/?"):
+            needle = argument.strip().casefold()
+            options = [
+                (spec.split()[0], spec, description)
+                for spec, description in _command_choices
+                if not needle or needle in (spec + " " + description).casefold()
+            ]
+            selected = _ui.choose("Commands · select to edit, Enter to send", options)
+            if selected:
+                _ui.prefill(selected + " ")
+            return None
+        if head == "/provider" and not argument.strip():
+            selected = _ui.choose("Provider", [
+                (name, name, "Current provider" if name == provider else "Switch provider")
+                for name in RAW_FNS
+            ])
+            return "/provider " + selected if selected else None
+        if head in ("/model", "/models") and not argument.strip():
+            from .providers import KNOWN_MODELS, list_custom_models, list_ollama_models
+            from .render import Spinner
+            with Spinner("Loading model choices"):
+                if provider == "ollama":
+                    candidates = list_ollama_models(config, force_refresh=True) or []
+                elif provider == "custom":
+                    candidates = list_custom_models(config, force_refresh=True) or []
+                else:
+                    candidates = KNOWN_MODELS.get(provider, [])
+            options = [
+                (name, name, "Current model" if name == model_name else provider)
+                for name in dict.fromkeys([model_name, *candidates])
+            ]
+            selected = _ui.choose(
+                f"Models · {provider} · /model ID accepts other models", options
+            )
+            return "/model " + selected if selected else None
+        if head in ("/convos", "/switch") and not argument.strip():
+            options = [
+                (
+                    conversation["id"], conversation.get("title") or "Untitled",
+                    ("Current · " if conversation["id"] == current_conv.id else "")
+                    + f"{conversation.get('message_count', 0)} messages · "
+                    + conversation.get("updated_at", "")[:16],
+                )
+                for conversation in conv_mgr.list_all()
+            ]
+            selected = _ui.choose("Conversations · resume a session", options)
+            return "/switch " + selected if selected else None
+        return command
 
     def _run_slash_builtin(tool_name: str, arguments: dict):
         """Run a direct-user builtin through the same lifecycle hooks."""
@@ -1150,57 +969,41 @@ def chat_loop(new_conversation=False, interactive=True):
     last_interrupt = 0.0
     _backend_failed = False  # preflight the server after a failed turn (plan 3.3)
     try:
+        if _use_terminal_ui:
+            from .terminal_ui import TerminalUI
+            from .runtime import set_verbose_tools
+            _ui = TerminalUI(lambda: _command_choices, history_file)
+            _ui.start()
+            set_verbose_tools(False)
+            _sync_ui_context()
+        _print_banner()
         while True:
             # MCP tools that finished loading since the last turn attach
             # here, before the prompt (and again after input is read, for
             # a message typed while they were still loading).
             _attach_loaded_tools()
-            if _typeahead_partial and "\n" in _typeahead_partial:
-                # A block pasted while the model was streaming: libedit's
-                # insert_text silently drops text containing newlines
-                # (verified on macOS 3.9–3.14), so it can't be prefilled —
-                # queue the whole block as one message instead.
-                _typeahead_queued.append(_typeahead_partial)
-                _typeahead_partial = ""
-            if _typeahead_queued:
-                user_input = _typeahead_queued.pop(0)
-                multiline.echo_message_block(user_input, "\033[1;33myou:\033[0m ")
-            else:
-                if _typeahead_partial:
-                    prefill = _typeahead_partial
-                    _typeahead_partial = ""
-                    readline.set_startup_hook(lambda: readline.insert_text(prefill))
-
-                def _prompt_input(prompt):
-                    # The typeahead prefill must ride on the first physical
-                    # line only, not re-insert on every continuation read.
-                    try:
-                        return input(prompt)
-                    finally:
-                        readline.set_startup_hook()
-
-                try:
+            _sync_ui_context()
+            try:
+                if _ui:
+                    user_input = _ui.read_message()
+                else:
                     user_input = multiline.read_user_message(
-                        "\033[1;33myou:\033[0m ",
-                        input_fn=_prompt_input,
-                        drain_fn=_drain_fn,
+                        "\033[1;33myou:\033[0m ", drain_fn=_drain_fn,
                     )
-                except EOFError:
-                    print("\n")
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                now = datetime.datetime.now().timestamp()
+                if now - last_interrupt < 1.5:
+                    print()
                     break
-                except KeyboardInterrupt:
-                    now = datetime.datetime.now().timestamp()
-                    if now - last_interrupt < 1.5:
-                        print("\n")
-                        break
-                    last_interrupt = now
-                    print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
-                    continue
-                finally:
-                    readline.set_startup_hook()
-                if user_input is None:
-                    print("  \033[2m(cancelled — nothing sent)\033[0m\n")
-                    continue
+                last_interrupt = now
+                print("\n  \033[2m(Ctrl+C again to exit)\033[0m\n")
+                continue
+            if user_input is None:
+                print("  \033[2m(cancelled — nothing sent)\033[0m\n")
+                continue
 
             stripped = user_input.strip()
             if not stripped:
@@ -1231,7 +1034,8 @@ def chat_loop(new_conversation=False, interactive=True):
                                 " block without the editor.\033[0m\n"
                             )
                             continue
-                        block = multiline.edit_in_editor(config)
+                        with _suspend_ui(discard=True):
+                            block = multiline.edit_in_editor(config)
                         if block:
                             multiline.echo_message_block(
                                 block, "\033[1;33myou:\033[0m "
@@ -1241,7 +1045,8 @@ def chat_loop(new_conversation=False, interactive=True):
                             "  \033[2mPaste now — end with a line that is "
                             "exactly '.' or Ctrl+D; Ctrl+C cancels.\033[0m"
                         )
-                        block = multiline.read_paste_block()
+                        with _suspend_ui():
+                            block = multiline.read_paste_block()
                     if not block or not block.strip():
                         print("  \033[2m(nothing to send)\033[0m\n")
                         continue
@@ -1255,22 +1060,28 @@ def chat_loop(new_conversation=False, interactive=True):
             _set_foreground_policies()
 
             if not _literal_block and multiline.is_slash_command(user_input):
-                result = handle_slash_command(
-                    stripped,
-                    config,
-                    provider,
-                    model_name,
-                    set_agent_mode,
-                    memory=memory,
-                    all_tools=chat_state.all_tools,
-                    tool_map=chat_state.tool_map,
-                    sched=sched,
-                    conv_mgr=conv_mgr,
-                    current_conv=current_conv,
-                    session_usage=session_usage,
-                    messages=messages,
-                    server_status=lambda: _tool_loader.statuses(),
-                )
+                if _ui:
+                    stripped = _interactive_command(stripped)
+                    if stripped is None:
+                        continue
+                credential_command = stripped.split()[0].lower() in ("/keys", "/connect")
+                with _suspend_ui(discard=credential_command):
+                    result = handle_slash_command(
+                        stripped,
+                        config,
+                        provider,
+                        model_name,
+                        set_agent_mode,
+                        memory=memory,
+                        all_tools=chat_state.all_tools,
+                        tool_map=chat_state.tool_map,
+                        sched=sched,
+                        conv_mgr=conv_mgr,
+                        current_conv=current_conv,
+                        session_usage=session_usage,
+                        messages=messages,
+                        server_status=lambda: _tool_loader.statuses(),
+                    )
                 # User-defined slash command: the rendered template becomes
                 # this turn's user message (handled by the normal flow below).
                 _custom_prompt = None
@@ -1373,9 +1184,11 @@ def chat_loop(new_conversation=False, interactive=True):
                     status = "\033[1;32mON\033[0m" if get_verbose_tools() else "\033[31mOFF\033[0m"
                     print(f"\n  Verbose tool output: {status}\n")
                 elif result == "queue_on":
-                    _typeahead_enabled = True
+                    if _ui:
+                        _ui.set_queue_enabled(True)
                 elif result == "queue_off":
-                    _typeahead_enabled = False
+                    if _ui:
+                        _ui.set_queue_enabled(False)
                 elif isinstance(result, int):
                     session.budgets.max_tool_rounds = result
                 elif result is not None:
@@ -1409,7 +1222,8 @@ def chat_loop(new_conversation=False, interactive=True):
                         f"  \033[2m(message not sent — press Enter to retry it "
                         f"when the server is back)\033[0m\n",
                     )
-                    _typeahead_partial = user_input  # prefill for easy retry
+                    if _ui:
+                        _ui.prefill(user_input)
                     continue
                 _backend_failed = False
                 print("  \033[2m(server back online)\033[0m")
@@ -1423,13 +1237,14 @@ def chat_loop(new_conversation=False, interactive=True):
             mem_context = memory.build_context(user_input)
             messages.append({"role": "user", "content": _augment_user_message(user_input, mem_context)})
 
-            if _typeahead_enabled:
-                _typeahead.start()
+            if _ui:
+                _sync_ui_context()
+                _ui.set_busy(True)
 
-            _use_streaming = sys.stdout.isatty()
+            _use_streaming = bool(_ui) or sys.stdout.isatty()
             _printer = StreamPrinter() if _use_streaming else None
 
-            if _use_streaming:
+            if _use_streaming and not _ui:
                 print("\n\033[1;36massistant:\033[0m")
 
             # Cheap pre-turn worktree fingerprint; a changed fingerprint
@@ -1446,13 +1261,20 @@ def chat_loop(new_conversation=False, interactive=True):
                     input_fn=_safe_input,
                 )
             except KeyboardInterrupt:
-                if _printer and _printer._spinner:
-                    _printer._spinner.__exit__(None, None, None)
-                    _printer._spinner = None
-                _typeahead.stop()
+                if _printer:
+                    _printer.flush()
+                if _ui:
+                    _ui.clear_activities()
                 print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
                 _save_current()
                 continue
+            except BaseException:
+                if _printer:
+                    _printer.flush()
+                raise
+            finally:
+                if _ui:
+                    _ui.set_busy(False)
 
             _backend_failed = bool(turn_usage.get("error"))
 
@@ -1472,16 +1294,17 @@ def chat_loop(new_conversation=False, interactive=True):
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = system_prompt
 
-            _typeahead_partial = _typeahead.stop()
-            _typeahead_queued.extend(_typeahead.get_queued())
 
             if reply:
                 messages.append({"role": "assistant", "content": reply})
                 if _printer:
                     streamed = _printer.flush()
                     if not streamed.strip():
-                        print(highlight(reply))
-                        print()
+                        if _ui:
+                            _ui.finish_response(highlight(reply))
+                        else:
+                            print(highlight(reply))
+                            print()
                 else:
                     print(f"\n\033[1;36massistant:\033[0m\n{highlight(reply)}\n")
             else:
@@ -1624,7 +1447,8 @@ def chat_loop(new_conversation=False, interactive=True):
 
             _save_current()
     finally:
-        _typeahead.stop()
+        if _ui:
+            _ui.close()
         _save_current()
         if session_usage["turns"] > 0:
             total_in = session_usage["input_tokens"]
@@ -1644,10 +1468,11 @@ def chat_loop(new_conversation=False, interactive=True):
         sched.stop()
         if _remote_loop is not None:
             _remote_loop.stop()
-        try:
-            readline.write_history_file(history_file)
-        except OSError:
-            pass
+        if not _use_terminal_ui:
+            try:
+                readline.write_history_file(history_file)
+            except OSError:
+                pass
         session.mcp_clients = mcp_clients
         session.close()
         conv_mgr.close()
@@ -1784,6 +1609,7 @@ def main():
         return
     new_conversation = options.new
     interactive = session_is_interactive(options.non_interactive)
+    initial_check = None
     # First-run onboarding: on a truly unconfigured interactive launch
     # (real TTY, no config anywhere, no provider key), walk through
     # provider + key setup before anything else loads config. Pipes,
@@ -1791,7 +1617,7 @@ def main():
     if interactive:
         from .onboarding import maybe_run_first_run_wizard
 
-        maybe_run_first_run_wizard()
+        initial_check = maybe_run_first_run_wizard()
     if new_conversation and argv:
         print("conch: --new starts the interactive shell and takes no "
               "prompt", file=sys.stderr)
@@ -1809,7 +1635,7 @@ def main():
         # may ask the user to pick an alternative; a piped/--non-interactive
         # one-shot walks fallback_models or fails closed. No silent swap.
         try:
-            model_check = ensure_working_model(config, interactive=interactive)
+            model_check = initial_check or ensure_working_model(config, interactive=interactive)
         except StartupError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(exc.code)
@@ -1851,7 +1677,8 @@ def main():
         finally:
             session.close()
     else:
-        chat_loop(new_conversation=new_conversation, interactive=interactive)
+        chat_loop(new_conversation=new_conversation, interactive=interactive,
+                  startup_check=initial_check)
 
 
 _NON_INTERACTIVE_NOTICE = (

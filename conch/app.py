@@ -70,6 +70,46 @@ AGENT_MODE_CONFIG_NOTICE = (
     "Agent mode is on: shell commands run without asking. /agent off changes it."
 )
 
+# The startup banner's conch: spire, knobbed shoulder, aperture, flared lip,
+# and siphonal canal.
+CONCH_SHELL_ART = r"""
+               /\
+              /  \
+             /`--'\
+            / .--. \
+           /`'    `'\
+          /  .----.  \
+     _.-^^  .'    '.  ^^-._
+    <_   ^ /  .--.  \ ^   _>-._
+      `-. |  /    \  |  .-'    `-.
+         ||  |    |  | /          \
+         ||  |    |  |/            |
+         ||  \    /  |            /
+         | \  '--'  /           .'
+          \ '.____.'         .-'
+           \               .'
+            \          _.-'
+             \     _.-'
+              \_.-'
+               V
+""".strip("\n").splitlines()
+
+
+def _print_conch_shell_art() -> None:
+    """The conch above the startup banner, on a real terminal with room for
+    it: never in pipes, and skipped when it would crowd a small window."""
+    if not sys.stdout.isatty():
+        return
+    columns, rows = shutil.get_terminal_size(fallback=(80, 24))
+    width = max(len(line) for line in CONCH_SHELL_ART)
+    if columns < width + 4 or rows < len(CONCH_SHELL_ART) + 12:
+        return
+    plain = "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb"
+    start, end = ("", "") if plain else ("\033[38;5;216m", "\033[0m")
+    print()
+    for line in CONCH_SHELL_ART:
+        print(f"  {start}{line}{end}")
+
 
 def _display_path(path: str, width: int) -> str:
     """Home-relative path, middle-truncated to fit on one terminal row."""
@@ -670,6 +710,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
 
     def _print_banner():
         from . import __version__
+        _print_conch_shell_art()
         if not model_check.checked:
             check_note = ", model check off"
         elif model_check.switched:
@@ -909,24 +950,67 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 for name in sorted(RAW_FNS, key=lambda name: name != provider)
             ])
             return "/provider " + selected if selected else None
-        if head in ("/model", "/models") and not argument.strip():
-            from .providers import KNOWN_MODELS, list_custom_models, list_ollama_models
-            with Spinner("Loading model choices"):
-                if provider == "ollama":
-                    candidates = list_ollama_models(config, force_refresh=True) or []
-                elif provider == "custom":
-                    candidates = list_custom_models(config, force_refresh=True) or []
-                else:
-                    candidates = KNOWN_MODELS.get(provider, [])
-            options = [
-                (name, name, "Current model" if name == model_name else provider)
-                for name in dict.fromkeys([model_name, *candidates])
-            ]
-            selected = _ui.choose(
-                f"Models · {provider} · /model ID accepts other models", options
-            )
-            return "/model " + selected if selected else None
         return command
+
+    # Read-only reports that may print while a turn runs: they only read
+    # session state and never prompt.
+    _LIVE_REPORTS = ("/status", "/cost", "/tools", "/profiles", "/skills",
+                     "/facts", "/memories", "/mem", "/tasks")
+
+    def _live_command(command):
+        """A panel or report typed during a turn opens now, on its own thread,
+        instead of waiting for the turn: the /help palette, the /model(s) and
+        /provider pickers, the conversations page (/convos, /switch with no
+        id), and the read-only reports above. A pick that changes the session
+        (model, provider, conversation) is queued to run when the turn ends.
+        None for everything else, which still waits for the turn."""
+        head, _, argument = command.partition(" ")
+        head, argument = head.lower(), argument.strip()
+        if head in ("/help", "/h", "/?") or (head == "/provider" and not argument):
+            def pick():
+                chosen = _interactive_command(command)
+                if chosen:
+                    _ui.queue_command(chosen)
+            return pick
+        if head in ("/model", "/models", "/ls") and not argument:
+            return _live_models
+        if head in ("/convos", "/switch") and not argument:
+            return _live_conversations
+        if head in _LIVE_REPORTS and not argument:
+            def report():
+                handle_slash_command(
+                    command, config, provider, model_name, set_agent_mode,
+                    memory=memory, all_tools=chat_state.all_tools,
+                    tool_map=chat_state.tool_map, sched=sched,
+                    current_conv=current_conv, session_usage=session_usage,
+                    messages=messages, server_status=lambda: _tool_loader.statuses(),
+                )
+            return report
+        return None
+
+    def _live_conversations():
+        """The conversations page during a turn: its own store connection
+        (the turn's thread owns conv_mgr), browse-only, and Enter queues the
+        switch for when the turn ends."""
+        from .convo_browser import browse_during_turn
+
+        manager = ConversationManager()
+        current_id = current_conv.id
+        try:
+            chosen = _ui.run_panel(lambda: browse_during_turn(manager, current_id))
+        finally:
+            manager.close()
+        if chosen and chosen != current_id:
+            _ui.queue_command(f"/switch {chosen}")
+
+    def _live_models():
+        """The model picker during a turn: role changes save at once; a new
+        chat model is queued for when the turn ends."""
+        from .model_picker import pick_model_during_turn
+
+        chosen = _ui.run_panel(lambda: pick_model_during_turn(config, provider, model_name))
+        if chosen is not None and chosen.key != (provider, model_name):
+            _ui.queue_command(chosen.switch_command())
 
     def _run_slash_builtin(tool_name: str, arguments: dict):
         """Run a direct-user builtin through the same lifecycle hooks."""
@@ -1017,7 +1101,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         if _use_terminal_ui:
             from .terminal_ui import TerminalUI
             from .runtime import set_verbose_tools
-            _ui = TerminalUI(lambda: _command_choices, history_file)
+            _ui = TerminalUI(lambda: _command_choices, history_file,
+                             live_command=_live_command)
             _ui.start()
             set_verbose_tools(False)
             _sync_ui_context()

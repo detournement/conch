@@ -94,6 +94,33 @@ the same estimates as `/cost`: API spend in dollars, subscription seats and loca
 models labelled as such. Conversations saved before this tracking existed show
 `—`.
 
+### Model picker
+
+`/models` (or `/model` with no name) opens every model Conch can run in one
+full-screen list, grouped by provider: the built-in cloud catalogs, Claude and
+ChatGPT seats, your Ollama server, a custom endpoint, the llama-idx registry,
+and models you added. Rows show context window, price per million tokens
+(in/out), tier, and roles: ● the chat model, F fan-out workers, T side tasks
+(titles, summaries, compaction). Each provider row says whether it is usable (key
+set, signed in, reachable, `local_only`); local servers and seats fill in as they
+answer.
+
+| Key | Action |
+| --- | --- |
+| Type | Filter by provider, model, tier, or billing |
+| Enter | Make it the chat model (verified first, as `/model` does) |
+| Ctrl+F | Fan-out workers use it (again: back to the session model) |
+| Ctrl+T | Side tasks use it (again: back to the chat model) |
+| Ctrl+A | Add a model the catalog lacks: `provider/model-id` (`openrouter/vendor/model` keeps its slash) |
+| Ctrl+X | Remove a model you added; roles pointing at it reset |
+| Ctrl+R | Ask local servers, the registry, and seats again |
+| Esc | Clear the filter, then quit |
+
+Added models are saved as `extra_models` in the config file and switching to one
+still runs the live model check. Role changes are saved as `fanout_model`,
+`weak_model`, and `weak_provider`. `/model <id> --provider <name>` switches to an
+exact provider when the same id exists under several.
+
 ### Interactive terminal
 
 Conch keeps the conversation in normal terminal scrollback, with a live
@@ -103,7 +130,9 @@ running and elapsed time, not fabricated completion percentages or reasoning.
 
 Startup shows a rotating ASCII shell, phase label, and elapsed time while models
 and tools load. It clears before setup questions, sign-in, or the chat prompt.
-Animation is disabled for non-TTY output and `TERM=dumb`.
+Animation is disabled for non-TTY output and `TERM=dumb`. Once loaded, a large
+ASCII conch heads the banner when the terminal has room for it (at least 40
+columns by 31 rows); pipes and smaller windows skip it.
 
 | Key or command | Action |
 | --- | --- |
@@ -114,7 +143,7 @@ Animation is disabled for non-TTY output and `TERM=dumb`.
 | Alt+Enter (or Escape, then Enter) | Insert a newline |
 | Tab | Complete slash commands with descriptions |
 | Ctrl+P, `/help` | Search commands; selecting one fills the composer without executing it |
-| `/model`, `/models` | Search models for the current provider |
+| `/model`, `/models` | Open the [model picker](#model-picker): every model, roles, add your own |
 | `/provider` | Choose a provider |
 | `/fanout` | Show or set the model [fan-out](#fan-out) workers use |
 | `/convos`, `/switch` | Open the [conversations page](#conversations-page): search, read, resume, and see cost |
@@ -134,6 +163,15 @@ history, and the model replans using your guidance. A running command is never
 silently interrupted or rolled back. Slash commands and exit requests wait until
 the turn ends; they are not injected into the model as guidance. Existing turn
 and token budgets still apply.
+
+Panels open right away during a turn instead of waiting: `/models`, `/provider`,
+`/help`, `/convos` (and `/switch` with no id), plus the read-only reports
+`/status`, `/cost`, `/tools`, `/profiles`, `/skills`, `/facts`, `/memories`, and
+`/tasks`. The turn keeps running behind a full-screen panel and its output appears
+when the panel closes. A pick that changes the session (a chat model, provider,
+or conversation) is queued and runs as soon as the turn ends; the conversations
+page holds back rename, fork, and delete until then. Model roles chosen in the
+picker apply at once.
 
 In the pending-message editor, Enter saves, Alt+Enter inserts a newline, and
 Escape restores the original. Your composer draft is preserved. A message being
@@ -1478,7 +1516,7 @@ groups the same shipped surface.
 | Commands | Purpose |
 | --- | --- |
 | `/help` | Search commands in the live editor; list commands in plain sessions |
-| `/models`, `/model <name>`, `/provider <name>` | Inspect or switch the validated model/provider |
+| `/models`, `/model <name> [--provider <name>]`, `/provider <name>` | Open the model picker, or switch the validated model/provider |
 | `/registry [set <url>\|off]`, `/llamaidx` | Configure and inspect llama-idx |
 | `/remember`, `/memories`, `/forget`, `/fact`, `/facts` | Persistent memory and always-loaded facts |
 | `/skills`, `/skill <name> [task]` | List or run skills |

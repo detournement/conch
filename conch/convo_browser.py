@@ -92,6 +92,18 @@ def browse(manager: ConversationManager, current_id: Optional[str] = None,
     return ConversationsPage(manager, current_id).run(input=input, output=output)
 
 
+async def browse_during_turn(manager: ConversationManager,
+                             current_id: Optional[str] = None) -> Optional[str]:
+    """The page opened while a turn is still running, on the live shell's
+    own event loop (inside its terminal suspension, using its input and
+    output). Browsing, searching, reading, and exporting work; rename,
+    fork, and delete wait for the turn, and Enter picks the conversation to
+    switch to once the turn ends."""
+    page = ConversationsPage(manager, current_id, busy=True)
+    await page.build().run_async(handle_sigint=False)
+    return page.result
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """``conch convos``: the page standalone; Enter resumes in the shell."""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -359,9 +371,12 @@ class _Row:
 class ConversationsPage:
     """State, rendering, and keys for one run of the page."""
 
-    def __init__(self, manager: ConversationManager, current_id: Optional[str] = None):
+    def __init__(self, manager: ConversationManager, current_id: Optional[str] = None,
+                 busy: bool = False):
         self.manager = manager
         self.current_id = current_id
+        # A turn is running in the shell: the store is not ours to change.
+        self.busy = busy
         self.entries: List[Dict[str, Any]] = manager.list_all()
         self.rows: List[_Row] = []
         self.selected = 0
@@ -510,9 +525,17 @@ class ConversationsPage:
             self.result = row.id
             self.app.exit()
 
+    def _store_locked(self) -> bool:
+        """Changing the store waits for the running turn to end (the shell
+        saves the conversation it is working in when the turn finishes)."""
+        if self.busy:
+            self.notice = ("Rename, fork, and delete open up when the current "
+                           "turn finishes.")
+        return self.busy
+
     def ask_delete(self):
         row = self.current_row()
-        if row is None:
+        if row is None or self._store_locked():
             return
         if row.id == self.current_id:
             self.notice = "That is the conversation you are in; switch to another before deleting it."
@@ -551,7 +574,7 @@ class ConversationsPage:
 
     def start_rename(self):
         row = self.current_row()
-        if row is None:
+        if row is None or self._store_locked():
             return
         conversation = self._conversation(row.id)
         title = (conversation.title if conversation else row.entry.get("title")) or ""
@@ -582,7 +605,7 @@ class ConversationsPage:
     def fork(self):
         """Copy the selected conversation into a new one and select it."""
         row = self.current_row()
-        if row is None:
+        if row is None or self._store_locked():
             return
         conversation = self._conversation(row.id)
         forked = self._quiet(self.manager.fork, conversation) if conversation else None
@@ -838,6 +861,10 @@ class ConversationsPage:
             "search": ["type to filter", "Enter keep filter", "Esc clear", "↑↓ move"],
             "view": ["Enter resume", "Esc back", "↑↓ PgUp PgDn scroll", "g/G top/end"],
         }[self.mode]
+        if self.busy:
+            hints = ["Enter switches after this turn" if hint == "Enter resume" else hint
+                     for hint in hints
+                     if hint not in ("r rename", "f fork", "d delete")]
         return [[("class:muted", " " + _fit_hints(hints, width - 1))]]
 
     # --- application --------------------------------------------------------------

@@ -208,5 +208,82 @@ class ChoiceRowTests(_DirectUI):
         self.assertLess(get_cwidth(rows[-1]), 30)
 
 
+class LiveCommandTests(_DirectUI):
+    """Panels and reports typed during a turn start at once; anything that
+    changes the session still waits for the turn."""
+
+    def setUp(self):
+        super().setUp()
+        import threading
+
+        self.started = threading.Event()
+        self.asked = []
+
+        def live(command):
+            self.asked.append(command)
+            if command.split()[0] in ("/models", "/convos"):
+                return self.started.set
+            return None
+
+        self.ui._live_command = live
+        self.ui._busy = True
+
+    def submit(self, text):
+        self.ui._editor.text = text
+        self.ui._send()
+
+    def test_panel_runs_now_instead_of_queueing(self):
+        self.submit("/models")
+        self.assertTrue(self.started.wait(5), "panel runner never started")
+        self.assertEqual(len(self.ui._messages), 0)
+        self.assertIn("> /models\n", self.published)
+        self.assertEqual(self.ui._editor.text, "")
+
+    def test_session_changing_command_still_waits_for_the_turn(self):
+        self.submit("/model gpt-5")
+        self.assertFalse(self.started.is_set())
+        self.assertEqual([(m.text, m.kind) for m in self.ui._messages],
+                         [("/model gpt-5", "follow-up")])
+
+    def test_chat_and_multiline_never_reach_the_router(self):
+        self.submit("make it shorter")
+        self.submit("/models\nand more")
+        self.assertEqual(self.asked, [])
+        self.assertEqual([m.kind for m in self.ui._messages], ["steering", "steering"])
+
+    def test_panels_open_even_with_the_queue_off(self):
+        self.ui._queue_enabled = False
+        self.submit("/convos")
+        self.assertTrue(self.started.wait(5))
+        self.assertEqual(len(self.ui._messages), 0)
+
+    def test_a_pick_queues_its_command_for_after_the_turn(self):
+        self.ui.queue_command("/switch abc123")
+        self.assertEqual([(m.text, m.kind) for m in self.ui._messages],
+                         [("/switch abc123", "follow-up")])
+        self.assertIn("/switch abc123", self.ui._notice)
+
+
+class CaptureThreadTests(unittest.TestCase):
+    def test_partial_lines_from_two_threads_never_splice(self):
+        import threading
+        import types
+
+        from conch.terminal_ui import _Capture
+
+        published = []
+        ui = types.SimpleNamespace(
+            _routing=threading.RLock(), _direct=False, _stopped=threading.Event(),
+            _enqueue_output=lambda text, trusted: published.append(text),
+        )
+        capture = _Capture(ui, original=None)
+        capture.write("turn: half")
+        other = threading.Thread(target=lambda: capture.write("panel line\n"))
+        other.start()
+        other.join()
+        capture.write(" done\n")
+        self.assertEqual(published, ["panel line\n", "turn: half done\n"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -80,11 +80,14 @@ class _Capture:
     Unlike StdoutProxy's asynchronous flush, the explicit barrier makes it
     possible to hand the terminal to a credential reader without pending writes.
     Ordinary output keeps the editor's input attached and in raw mode.
+
+    Partial lines are buffered per thread: a panel command printing while a
+    turn streams must not splice its half-written line into the turn's.
     """
     def __init__(self, ui, original):
         self.ui = ui
         self.original = original
-        self.pending = ""
+        self.pending = {}
 
     def write(self, text):
         if not isinstance(text, str):
@@ -93,17 +96,20 @@ class _Capture:
         with self.ui._routing:
             if self.ui._direct or self.ui._stopped.is_set():
                 return self.original.write(text)
-            self.pending += text
-            if "\n" in self.pending:
-                end = self.pending.rfind("\n") + 1
-                text, self.pending = self.pending[:end], self.pending[end:]
+            thread = threading.get_ident()
+            pending = self.pending.pop(thread, "") + text
+            if "\n" in pending:
+                end = pending.rfind("\n") + 1
+                text, pending = pending[:end], pending[end:]
                 self.ui._enqueue_output(text, trusted=True)
+            if pending:
+                self.pending[thread] = pending
         return written
 
     def flush(self):
         with self.ui._routing:
-            if self.pending:
-                text, self.pending = self.pending, ""
+            pending, self.pending = self.pending, {}
+            for text in pending.values():
                 if self.ui._direct or self.ui._stopped.is_set():
                     self.original.write(text)
                 else:
@@ -154,8 +160,16 @@ class _PendingMessage:
 
 
 class TerminalUI:
-    def __init__(self, commands: Callable, history_file: str):
+    def __init__(self, commands: Callable, history_file: str,
+                 live_command: Optional[Callable[[str], Optional[Callable[[], None]]]] = None):
         self._commands = commands
+        # Panels and read-only commands typed during a turn: given the
+        # command, returns a runner to start now (on its own thread) or None
+        # to queue the command for when the turn ends, as before.
+        self._live_command = live_command
+        # True while a full-screen panel owns the terminal mid-turn: turn
+        # output waits in the queue instead of painting over the panel.
+        self._holding_output = False
         self._history = _composer_history(history_file)
         self._owner = threading.get_ident()
         self._routing = threading.RLock()
@@ -599,6 +613,8 @@ class TerminalUI:
         if not text.strip():
             self._editor.buffer.reset()
             return
+        if self._busy and not followup and self._start_live(text):
+            return
         if self._busy and not self._queue_enabled:
             self._notice = "Queue off — draft kept until this turn finishes · Ctrl+Q pending"
             return
@@ -609,6 +625,65 @@ class TerminalUI:
                     else "follow-up")
             self._messages.append(_PendingMessage(text, kind))
             self._condition.notify_all()
+
+    def _start_live(self, text) -> bool:
+        """Run a panel or read-only command now instead of after the turn.
+        Only single-line slash commands qualify (multiline is always chat)."""
+        command = text.strip()
+        if self._live_command is None or "\n" in command or not command.startswith("/"):
+            return False
+        runner = self._live_command(command)
+        if runner is None:
+            return False
+        self._notice = ""
+        self._editor.buffer.reset()
+        self._accept_messages([command])
+
+        def run():
+            try:
+                runner()
+            except (EOFError, KeyboardInterrupt):
+                pass  # the UI closed or the panel was cancelled
+            except Exception as exc:
+                print(f"  \033[31m✗ {command.split()[0]} failed: {exc}\033[0m")
+
+        threading.Thread(target=run, name="conch-panel", daemon=True).start()
+        return True
+
+    def queue_command(self, command: str):
+        """Queue *command* to run between turns: right away when idle, after
+        the running turn otherwise (a panel's pick that changes the session)."""
+        def queue():
+            with self._condition:
+                self._messages.append(_PendingMessage(command, "follow-up"))
+                self._condition.notify_all()
+            if self._busy:
+                self._notice = f"{command} runs when this turn ends · Ctrl+Q pending"
+        self._change(queue)
+
+    def run_panel(self, panel):
+        """Give the terminal to a full-screen panel while a turn may still be
+        running. *panel* is an async callable that runs a prompt_toolkit
+        Application on this UI's loop (its input and output are the session
+        defaults). The composer is suspended, turn output is held and
+        published when the panel closes, and an approval prompt arriving
+        meanwhile is shown then. Call from any thread but the UI's."""
+        async def suspended():
+            async with in_terminal():
+                self._holding_output = True
+                try:
+                    return await panel()
+                finally:
+                    self._holding_output = False
+                    self._flush_input()
+
+        async def run():
+            try:
+                return await suspended()
+            finally:
+                self._schedule_publish()
+
+        return self._call(run).result()
 
     def read_message(self) -> str:
         with self._condition:
@@ -957,18 +1032,24 @@ class TerminalUI:
     def _enqueue_output(self, text, trusted=False):
         def schedule():
             self._output_queue.append((text, trusted))
-            if self._write_task is None:
-                task = self._loop.create_task(self._publish_output())
-                self._write_task = task
-
-                def done(completed):
-                    if not completed.cancelled() and completed.exception() is not None:
-                        self._loop_error(self._loop, {"exception": completed.exception()})
-                task.add_done_callback(done)
+            self._schedule_publish()
         if threading.get_ident() == self._thread.ident:
             schedule()
         else:
             self._loop.call_soon_threadsafe(schedule, context=self._ui_context.copy())
+
+    def _schedule_publish(self):
+        """Start publishing queued output unless a write is in flight or a
+        panel owns the terminal (UI thread only)."""
+        if self._write_task is not None or self._holding_output or not self._output_queue:
+            return
+        task = self._loop.create_task(self._publish_output())
+        self._write_task = task
+
+        def done(completed):
+            if not completed.cancelled() and completed.exception() is not None:
+                self._loop_error(self._loop, {"exception": completed.exception()})
+        task.add_done_callback(done)
 
     async def _publish_output(self):
         try:
@@ -977,6 +1058,8 @@ class TerminalUI:
             # arrives meanwhile into one erase/write/redraw transaction.
             if self._output.responds_to_cpr:
                 await self._app.renderer.wait_for_cpr_responses()
+            if self._holding_output:
+                return  # a panel took the terminal meanwhile; it republishes
             self._app.renderer.erase()
             try:
                 fragments = []

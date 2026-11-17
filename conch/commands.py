@@ -145,8 +145,8 @@ def render_user_command(template: str, arguments: str) -> str:
 
 SLASH_COMMANDS = [
     ("/help", "Show all commands"),
-    ("/models", "List available models"),
-    ("/model <name>", "Switch model"),
+    ("/models", "Model picker: every model, roles (fan-out, side tasks), add your own"),
+    ("/model <name>", "Switch model (no name: open the model picker)"),
     ("/llamaidx", "Fleet status from the llama-idx registry (up/degraded/down boxes)"),
     ("/registry [set <url>|off]", "Show, wire, or remove the llama-idx registry (llamaidx_url)"),
     ("/provider <name>", "Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)"),
@@ -1462,8 +1462,8 @@ def handle_slash_command(
         )
         print(
             "\n\033[1;36mSlash commands:\033[0m\n"
-            "  \033[1m/models\033[0m              List available models\n"
-            "  \033[1m/model <name>\033[0m        Switch model\n"
+            "  \033[1m/models\033[0m              Model picker: every model, roles, add your own\n"
+            "  \033[1m/model <name>\033[0m        Switch model (no name: open the model picker)\n"
             "  \033[1m/llamaidx\033[0m            Fleet status from the llama-idx registry\n"
             "  \033[1m/registry [set <url>|off]\033[0m  Show, wire, or remove the llama-idx registry\n"
             "  \033[1m/provider <name>\033[0m     Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)\n"
@@ -2171,6 +2171,19 @@ def handle_slash_command(
             print(f"\n  \033[31mNo memory with ID #{entry_id}\033[0m\n")
         return None
 
+    if command in ("/models", "/ls", "/model") and not arg:
+        from .convo_browser import can_browse
+
+        if can_browse():
+            # The model picker; its pick switches through /model below with
+            # the provider named exactly.
+            from .model_picker import pick_model
+
+            chosen = pick_model(config, provider, model_name)
+            if chosen is None or chosen.key == (provider, model_name):
+                return None
+            command, arg = "/model", chosen.switch_command().split(" ", 1)[1]
+
     if command in ("/models", "/ls"):
         print()
         for provider_name, models in KNOWN_MODELS.items():
@@ -2274,19 +2287,32 @@ def handle_slash_command(
                 "supports only available native tool-calling models.\033[0m\n"
             )
             return None
-        new_model = arg
+        tokens = arg.split()
+        explicit_provider = None
+        if "--provider" in tokens:
+            # The model picker names the provider outright: the same id can
+            # exist under several providers.
+            at = tokens.index("--provider")
+            explicit_provider = tokens[at + 1].lower() if at + 1 < len(tokens) else ""
+            tokens = tokens[:at] + tokens[at + 2:]
+            if explicit_provider not in RAW_FNS:
+                print(f"\n  \033[31mUnknown provider '{explicit_provider}'\033[0m\n")
+                return None
+        new_model = " ".join(tokens)
         if not new_model:
-            print("\n  \033[2mUsage: /model <verified-name>\033[0m\n")
+            print("\n  \033[2mUsage: /model <verified-name> [--provider <name>]\033[0m\n")
             return None
         if new_model.startswith("llamaidx/"):
             return _switch_to_llamaidx_model(
                 new_model, config, provider, messages
             )
-        new_provider = provider if provider in ("claude-code", "codex") else None
-        for provider_name, models in (() if new_provider else KNOWN_MODELS.items()):
-            if provider_name != "ollama" and new_model in models:
-                new_provider = provider_name
-                break
+        new_provider = explicit_provider or (
+            provider if provider in ("claude-code", "codex") else None
+        )
+        if new_provider is None:
+            from .model_catalog import provider_for
+
+            new_provider = provider_for(new_model, config)
         if new_provider is None:
             ollama_models = list_ollama_models(config, force_refresh=True)
             if ollama_models and ollama_model_matches(new_model, ollama_models):

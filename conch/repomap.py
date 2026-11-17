@@ -18,6 +18,9 @@ from typing import Dict, List, Optional, Tuple
 REPO_MAP_BUDGET_CHARS = 4000  # ~1.1k tokens
 MAX_SYMBOL_FILES = 40         # only read this many files for symbols
 MAX_FILE_BYTES = 200_000      # skip huge files when extracting symbols
+# Symbol text per file line: one module with many public names must not
+# eat the room every later module needs to be named at all.
+MAX_SYMBOL_LINE_CHARS = 100
 
 # Extension weight: how interesting a file is for orientation.
 _EXT_WEIGHTS = {
@@ -163,7 +166,17 @@ def build_map_for_root(root: Path, budget_chars: int = REPO_MAP_BUDGET_CHARS) ->
     listed = set()
     for i, (_, path) in enumerate(ranked):
         symbols = _symbols(root, path) if i < MAX_SYMBOL_FILES else []
-        line = f"  {path}: {', '.join(symbols)}" if symbols else f"  {path}"
+        shown: List[str] = []
+        for name in symbols:
+            if len(", ".join(shown + [name])) > MAX_SYMBOL_LINE_CHARS:
+                break
+            shown.append(name)
+        more = f", +{len(symbols) - len(shown)}" if len(shown) < len(symbols) else ""
+        line = f"  {path}: {', '.join(shown)}{more}" if shown else f"  {path}"
+        if shown and used + len(line) + 1 > budget_chars:
+            # Out of room for symbols: keep naming files rather than stop,
+            # so a growing early module cannot hide every later one.
+            line = f"  {path}"
         if used + len(line) + 1 > budget_chars:
             break
         lines.append(line)

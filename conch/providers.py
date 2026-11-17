@@ -834,6 +834,11 @@ def validate_model_for_provider(provider: str, model: str, config: Optional[dict
     known = KNOWN_MODELS.get(provider)
     if known is None:
         return None, f"unknown provider '{provider}'"
+    # Models the user added in the picker (config extra_models) count as
+    # catalog entries; switching still runs the live model check.
+    from .model_catalog import added_for
+
+    known = list(known) + added_for(config, provider)
     if model in known:
         return True, ""
     suggestions = suggest_models(model, known)

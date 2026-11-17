@@ -54,6 +54,18 @@ Releases before 0.6.0 predate this changelog.
 - `/rename`, `/export` (Markdown, credentials redacted), `/retry`, `/fork`, and
   `/compact [focus]`. The conversations page gains `r` rename, `e` export, and
   `f` fork.
+- Model picker (`/models`, or `/model` with no name): every model across
+  providers, seats, local servers, the llama-idx registry, and your additions
+  in one type-to-filter list with context, price, tier, and roles. Enter switches
+  the chat model; Ctrl+F and Ctrl+T assign fan-out workers and side tasks;
+  Ctrl+A adds a model the catalog lacks (`extra_models`), Ctrl+X removes it.
+  `/model <id> --provider <name>` switches to an exact provider.
+- Panels open during a running turn: `/models`, `/provider`, `/help`, `/convos`,
+  and read-only reports (`/status`, `/cost`, `/tools`, ...) no longer wait for
+  the turn. Turn output is held behind a full-screen panel and shown when it
+  closes; picks that change the session run as soon as the turn ends.
+- A large ASCII conch heads the startup banner again on terminals with room for
+  it; pipes and small windows skip it.
 
 ### Changed
 
@@ -73,6 +85,9 @@ Releases before 0.6.0 predate this changelog.
 - Local models (Ollama, custom endpoints) are offered up to 16 tools per
   request instead of 12: the file tools and `web_fetch` joined the always-on
   set, and the 4 slots for tools picked by relevance are kept.
+- The repository map in `conch_introspect` and the system prompt caps each
+  file's symbol list (with a `+N` count) and keeps naming files once symbols no
+  longer fit, so one large module cannot hide the rest.
 - Ctrl+C during a turn returns pending guidance and follow-ups to the composer
   instead of letting them start new work after the stop.
 - When first-run model verification fails, setup offers another provider and

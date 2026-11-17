@@ -120,6 +120,21 @@ class ConversationsPageTests(unittest.TestCase):
         self.assertEqual(forked.usage, {})
         self.assertEqual(len(page.rows), 3)
 
+    def test_during_a_turn_the_page_never_changes_the_store(self):
+        """Opened mid-turn, the page browses and picks but leaves rename,
+        fork, and delete to after the turn: the shell's own manager would
+        otherwise write a stale index over the change."""
+        keep = self.seed("keep", "x")
+        self.seed("other", "y")
+        page = ConversationsPage(self.manager, current_id=keep.id, busy=True)
+        page.selected = self.titles(page).index("other")
+        before = [(e["id"], e["title"]) for e in self.manager.list_all()]
+        for action in (page.ask_delete, page.start_rename, page.fork):
+            action()
+            self.assertEqual(page.mode, "list", action.__name__)
+            self.assertIn("turn finishes", page.notice)
+        self.assertEqual([(e["id"], e["title"]) for e in self.manager.list_all()], before)
+
     def test_export_writes_a_private_file_without_overwriting(self):
         self.seed("notes", "hello there")
         out = tempfile.TemporaryDirectory()

@@ -25,6 +25,29 @@ _ISOLATION = (
     "--settings", '{"disableAllHooks":true,"forceLoginMethod":"claudeai"}',
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--safe-mode",
 )
+# System events that mean the CLI executed something itself (hooks, local
+# commands, native tasks or subagents, tool permission decisions). Conch owns
+# all execution, so these fail closed. Every other system event is the CLI
+# reporting on itself (notices, model fallback, thinking progress, UI and
+# session state); those are shown as progress or ignored, so a newer CLI's
+# status events never break a turn.
+_NATIVE_EXECUTION_EVENTS = frozenset({
+    "local_command", "permission_denied", "background_tasks_changed", "tool_host_result",
+})
+_NATIVE_EXECUTION_PREFIXES = ("hook_", "task_")
+_MODEL_FALLBACK_EVENTS = frozenset({
+    "model_fallback", "model_refusal_fallback", "model_consent_fallback",
+})
+_NOTICE_EVENTS = frozenset({"informational", "notification", "model_refusal_no_fallback"})
+_NOTICE_CHARS = 160
+
+
+def _notice(value) -> str:
+    """One bounded line of CLI notice text, control characters removed."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join("".join(char if char.isprintable() else " " for char in value).split())
+    return text if len(text) <= _NOTICE_CHARS else text[:_NOTICE_CHARS - 1] + "…"
 
 
 def auth_command(action: str) -> list[str]:
@@ -205,13 +228,7 @@ class _Events:
                 raise SeatError("Claude returned multiple final results")
             self.result = event
         elif kind == "system":
-            subtype = event.get("subtype")
-            if subtype == "init":
-                self.detail("progress", "Claude session started")
-            elif subtype in ("status", "compact_boundary"):
-                self.detail("progress", "Claude updating session context")
-            else:
-                raise SeatError("Claude returned an unsupported system event")
+            self._system(event)
         elif kind == "assistant":
             self._message(event.get("message"))
         elif kind == "user":
@@ -228,6 +245,25 @@ class _Events:
             self.detail("progress", "Claude rate limit update")
         else:
             raise SeatError("Claude returned an unsupported event; update Conch or the official CLI")
+
+    def _system(self, event):
+        subtype = event.get("subtype")
+        subtype = subtype if isinstance(subtype, str) else ""
+        if subtype in _NATIVE_EXECUTION_EVENTS or subtype.startswith(_NATIVE_EXECUTION_PREFIXES):
+            raise SeatError("Claude reported native execution; Conch must own all tool execution")
+        if subtype == "init":
+            self.detail("progress", "Claude session started")
+        elif subtype in ("status", "compact_boundary"):
+            self.detail("progress", "Claude updating session context")
+        elif subtype in _MODEL_FALLBACK_EVENTS:
+            original = _notice(event.get("originalModel") or event.get("fromModel"))
+            fallback = _notice(event.get("fallbackModel") or event.get("toModel"))
+            switch = f" from {original} to {fallback}" if original and fallback else ""
+            self.detail("progress", f"Claude switched models{switch}")
+        elif subtype in _NOTICE_EVENTS:
+            text = _notice(event.get("content") or event.get("text"))
+            if text:
+                self.detail("progress", f"Claude: {text}")
 
     def _partial(self, event):
         if not isinstance(event, dict):

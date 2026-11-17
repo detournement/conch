@@ -315,6 +315,31 @@ class ClaudeLiveDetailTests(unittest.TestCase):
         self.assertEqual({kind for kind, _ in details}, {"progress"})
         self.assertNotIn("overloaded", repr(details))
 
+    def test_cli_status_events_are_progress_not_failures(self):
+        """A newer CLI's notices, model fallbacks, and internal status events
+        must not abort a turn (they did: 'unsupported system event')."""
+        details = []
+        events = [
+            {"type": "system", "subtype": "informational", "content": "Opus usage\x1b[31m is high",
+             "level": "notice"},
+            {"type": "system", "subtype": "model_fallback", "originalModel": "claude-opus-5-5",
+             "fallbackModel": "claude-sonnet-5", "level": "warning"},
+            {"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 40},
+            {"type": "system", "subtype": "turn_duration", "duration_ms": 900},
+            RESULT,
+        ]
+        result = self.invoke(events, lambda kind, text: details.append((kind, text)))
+        self.assertEqual(result["response"], RESPONSE)
+        texts = [text for _, text in details]
+        self.assertIn("Claude: Opus usage [31m is high", texts)
+        self.assertIn("Claude switched models from claude-opus-5-5 to claude-sonnet-5", texts)
+
+    def test_native_execution_system_events_fail_closed(self):
+        for subtype in ("hook_started", "task_started", "permission_denied", "local_command",
+                        "background_tasks_changed"):
+            with self.subTest(subtype=subtype), self.assertRaisesRegex(SeatError, "native execution"):
+                self.invoke([{"type": "system", "subtype": subtype}, RESULT], lambda *args: None)
+
     def test_nonzero_stream_exit_never_echoes_native_stderr(self):
         details = []
         with self.assertRaisesRegex(SeatError, "exit 1") as caught:

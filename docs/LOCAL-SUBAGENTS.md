@@ -108,6 +108,28 @@ it cannot supply a second independent base URL. An unusable skill model preferen
 can fall back to the parent's model with a warning, so check the delegation output
 rather than assuming it ran locally.
 
+## Keep a seat parent and fan out to a local model
+
+[Fan-out](../README.md#fan-out) runs several independent subtasks at once in
+separate worker processes. With the custom endpoint above configured, keep the
+seat as your default and send the parallel work to the local model:
+
+```text
+/fanout custom/qwen3.8:27b
+```
+
+That checks the model and saves `fanout_model`. `/fanout` on its own lists the
+models usable right now and what `/fanout auto` would pick per task. Then ask
+for work that splits cleanly:
+
+```text
+Use fan_out to summarize README.md, CHANGELOG.md and docs/ in parallel.
+```
+
+Workers on one local server run one at a time unless `fanout_concurrency` says
+the server can take more, so the gain there is a clean context per task rather
+than wall-clock time. Seat and API workers run in parallel.
+
 ## Optional: make both endpoints named OMP subagents
 
 This section applies to **OMP users**, not Conch runtime configuration. Keep your

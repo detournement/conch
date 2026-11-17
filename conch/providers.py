@@ -1198,15 +1198,21 @@ def _billing_kind(provider: str, model: str, config: Optional[dict] = None) -> s
 
 def record_session_usage(
     usage: dict, provider: str, model: str, input_tokens: int, output_tokens: int,
-    config: Optional[dict] = None,
+    config: Optional[dict] = None, *, count_turn: bool = True,
 ) -> str:
-    """Accumulate a completed turn, returning its honestly labelled cost."""
+    """Accumulate a completed turn, returning its honestly labelled cost.
+
+    ``count_turn=False`` adds work done on the turn's behalf by another model
+    (fan-out workers): its tokens, cost and kind of billing count, but it is
+    not a conversation turn.
+    """
     kind = _billing_kind(provider, model, config)
     cost = estimate_cost(model, input_tokens, output_tokens) if kind == "api" else 0.0
     usage["input_tokens"] = usage.get("input_tokens", 0) + input_tokens
     usage["output_tokens"] = usage.get("output_tokens", 0) + output_tokens
     usage["cost"] = usage.get("cost", 0.0) + cost
-    usage["turns"] = usage.get("turns", 0) + 1
+    if count_turn:
+        usage["turns"] = usage.get("turns", 0) + 1
     key = f"{kind}_turns"
     usage[key] = usage.get(key, 0) + 1
     return f"~${cost:.4f}" if kind == "api" else _BILLING_LABELS[kind]

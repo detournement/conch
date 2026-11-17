@@ -22,6 +22,13 @@ Releases before 0.6.0 predate this changelog.
 - First-run setup shows whether each Claude/ChatGPT seat is signed in, installed,
   or missing its CLI, and defaults to the first usable one. A signed-in seat is
   selected without a second browser login.
+- Fan-out: the `fan_out` tool runs 2 to 8 independent subtasks in parallel
+  worker processes and returns one summary per task. `fanout_model` gives
+  workers a different model from the session's, and `fanout_model=auto` picks
+  one per task from the models usable right now, matched to the task's effort
+  and never on a costlier kind of billing than the session's. `/fanout` shows
+  and sets it. Workers cannot prompt: an ask-first session confirms once, then
+  workers run read-only commands and refuse the rest.
 
 ### Changed
 

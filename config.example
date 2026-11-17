@@ -207,6 +207,19 @@ api_key_env=
 # Seat-parent/local-child and named OMP examples: docs/LOCAL-SUBAGENTS.md.
 # Conch skills and OMP agents use different configuration files.
 
+# Fan-out (fan_out tool): independent subtasks in parallel worker processes.
+# The session model stays your default; fanout_model picks the workers' model:
+#   unset/default   the session's model (or subagent_model when that is set)
+#   <model> or <provider>/<model>   that model
+#   auto            chosen per task from the models usable right now, by the
+#                   task's effort; never a costlier kind of billing than the
+#                   session's (a seat or local session never reaches API billing)
+# /fanout shows what is available and sets this.
+#fanout_model=auto
+#fanout_concurrency=4   # default 4; workers on one local server run one at a time
+#fanout_rounds=10
+#fanout_timeout=600     # seconds per task
+
 # --- Edge daemon and missions (Swarm Phase 1) ----------------------------------
 # Off by default: the shell keeps its classic in-process scheduler and never
 # loads the mission kernel. Setting edge_daemon=true moves scheduled tasks

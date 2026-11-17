@@ -66,7 +66,7 @@ class AuthorityError(KernelError):
 #: and again on the worker at tool-build time (defense in depth).
 HARD_EXCLUDED_TOOLS = frozenset({
     "conch_config", "manage_tools", "skill_manage", "interactive_terminal",
-    "ssh_remote", "fleet_delegate",
+    "ssh_remote", "fleet_delegate", "fan_out",
 })
 
 #: The default (ungranted) tool set every ACTIVE worker may receive.

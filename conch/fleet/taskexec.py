@@ -40,7 +40,7 @@ from ..swarm.protocol import FailureClass, TaskEnvelope, new_id
 #: is allowed but rebound to the brokered client.
 WORKER_TOOL_DENYLIST = frozenset({
     "conch_config", "manage_tools", "interactive_terminal", "ssh_remote",
-    "skill_manage", "fleet_delegate",
+    "skill_manage", "fleet_delegate", "fan_out",
 })
 
 #: Files a task leaves under ``<workspace>/out`` are published as

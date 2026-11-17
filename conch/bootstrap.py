@@ -49,6 +49,7 @@ from .tooling import (
     set_agent_mode,
 )
 from . import mcp as mcp_mod
+from .fanout import FanOutClient
 
 DEFAULT_MAX_TOOL_ROUNDS = 25
 
@@ -227,6 +228,7 @@ def make_builtin_clients(
         # capture is a design goal; the sender allowlists gate access.
         "personal_items": PersonalItemsClient(),
         "delegate_task": DelegateTaskClient(),
+        "fan_out": FanOutClient(),
         "skill_manage": SkillManageClient(),
         "conch_introspect": ConchIntrospectClient(),
     }
@@ -547,6 +549,7 @@ def build_agent_session(
     )
     session.attach_clients(builtins, chat_state=state, mcp_clients=mcp_clients)
     builtins["delegate_task"].bind_session(session)
+    builtins["fan_out"].bind_session(session)
     builtins["conch_introspect"].bind(
         session.provider, session.model, config, state
     )

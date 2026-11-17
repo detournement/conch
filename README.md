@@ -86,6 +86,7 @@ Animation is disabled for non-TTY output and `TERM=dumb`.
 | Ctrl+P, `/help` | Search commands; selecting one fills the composer without executing it |
 | `/model`, `/models` | Search models for the current provider |
 | `/provider` | Choose a provider |
+| `/fanout` | Show or set the model [fan-out](#fan-out) workers use |
 | `/convos`, `/switch` | Search and resume conversations |
 | Ctrl+C | Stop active work and return pending messages to the composer; when idle, clear/cancel input (twice to exit) |
 | Ctrl+D | Exit with an empty composer |
@@ -1009,6 +1010,56 @@ The model can delegate a bounded subtask into a fresh context with
 Markdown files in `~/.config/conch/commands/` become custom slash commands,
 with `$ARGUMENTS` interpolation.
 
+#### Fan-out
+
+With `fan_out` the model runs 2 to 8 independent subtasks in parallel, each in
+a fresh worker process with a clean context, and gets one summary back per
+task. It suits work that splits cleanly: searching several areas, reading
+several files, comparing options.
+
+The session's model stays your default. `fanout_model` chooses what workers
+use:
+
+| `fanout_model` | Workers use |
+| --- | --- |
+| unset or `default` | The session's model |
+| `<model>` or `<provider>/<model>` | That model, checked before it is saved |
+| `auto` | A model chosen per task from what is usable right now |
+
+`/fanout` shows the current setting, the models available now with their tier,
+and what `auto` would pick; `/fanout auto`, `/fanout default`, or
+`/fanout <provider/model>` sets and saves it.
+
+`auto` matches each task's effort (`light`, `standard`, `heavy`, set by the
+model or inferred from the task) to a model tier, preferring the session's own
+provider. Tiers come from seat aliases, the catalog's price bands, and the
+parameter count in a local model's name. It only considers models that cost no
+more to reach than the session's own: a local session stays local, a
+subscription seat never moves work to API billing, and `local_only` keeps
+everything local. Other providers appear only when already usable: a key in the
+environment, a signed-in seat, a reachable local server. An explicit
+`fanout_model` is your own choice and is not limited this way.
+
+A key that is set is treated as usable without being tested first. If an
+auto-chosen model then fails, that task is retried once on the session's model
+and its result says so. A model you configured yourself is never swapped: its
+failure is reported.
+
+Workers never exceed the session's authority and cannot ask you anything:
+
+- In the default ask-first mode Conch asks once before a fan-out starts.
+  Workers then run read-only commands (`ls`, `cat`, `grep`, ...) without
+  asking and refuse everything else, reporting what they could not do.
+- In `safe_auto` and agent mode workers follow the same mode without a prompt.
+  Destructive commands are always refused.
+- Workers get the session's active built-in tools, minus self-management,
+  memory writes, recursion, the terminal handoff and SSH. MCP tools are not
+  loaded in workers. A sandboxed session withholds the shell from workers.
+
+Workers on a local model server run one at a time unless you set
+`fanout_concurrency`. Ctrl+C stops every worker. Worker tokens are added to
+the session's cost under the model that produced them.
+
 For copyable endpoint, registry, and local-delegation examples, see
 [Local models and optional subagents](docs/LOCAL-SUBAGENTS.md). That guide
 separates Conch's `delegate_task` skills from OMP's named coding-assistant agents;
@@ -1293,6 +1344,9 @@ network sandbox for tools you explicitly enable or approve.
 | `weak_model`, `weak_provider` | unset | Small model for summaries, compaction, and mission reviews |
 | `session_summary_min_turns` | `3` | User turns before a session is summarized into memory (tool use also qualifies); `0` disables |
 | `subagent_model`, `subagent_rounds` | parent, `10` | Defaults for delegated subtasks |
+| `fanout_model` | session model | Model for parallel fan-out workers: a model, `provider/model`, or `auto` |
+| `fanout_concurrency` | `4`; `1` on a local server | Fan-out workers running at once |
+| `fanout_rounds`, `fanout_timeout` | `subagent_rounds`, `600` | Tool rounds and seconds allowed per fan-out task |
 | `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds |
 
 <!-- markdownlint-enable MD013 -->

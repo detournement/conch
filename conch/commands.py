@@ -44,7 +44,7 @@ from .tooling import (
 BUILTIN_SLASH_COMMANDS = (
     "/?", "/agent", "/approvals", "/approve", "/apps", "/cancel",
     "/checkpoint", "/clear", "/connect", "/convos", "/cost", "/delete",
-    "/deny", "/disable", "/edit", "/enable", "/fact", "/facts", "/find",
+    "/deny", "/disable", "/edit", "/enable", "/fact", "/facts", "/fanout", "/find",
     "/forget", "/grep", "/h", "/help", "/install", "/keys", "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
     "/models", "/new", "/note", "/notes", "/paste", "/profile", "/profiles",
@@ -168,6 +168,8 @@ SLASH_COMMANDS = [
     ("/ssh <action>", "Connect, execute, open a shell, show status, or disconnect"),
     ("/verbose", "Toggle showing tool args and results"),
     ("/tks [on|off]", "Toggle the per-message token stats line (tokens, cost, tok/s)"),
+    ("/fanout [auto|default|<provider/model>]",
+     "Show or set the model parallel fan-out workers use"),
     ("/sandbox [docker [image]|e2b|off]",
      "Run approved shell commands in a sandbox instead of locally"),
     ("/checkpoint [list|diff <#>|restore <#>|on|off]",
@@ -1366,6 +1368,59 @@ def _undo_last_turn(ckpt) -> None:
     print()
 
 
+def _fanout_command(arg: str, config: dict) -> None:
+    """``/fanout``: show the fan-out worker model and what is available, or
+    set it. A setting is checked before it is saved, so a typo cannot leave
+    every later fan-out silently falling back to the session model."""
+    from . import fanout
+    from .config import display_path, set_config_values
+    from .providers import _BILLING_LABELS
+    from .render import Spinner
+
+    with Spinner("Finding available models"):
+        inventory = fanout.available_models(config)
+    if arg:
+        setting = "" if arg.lower() == "default" else arg
+        candidate = dict(config, fanout_model=setting or "default")
+        choice, warning = fanout.resolve_model(candidate, "standard", lambda: inventory)
+        if warning:
+            print(f"\n  \033[33m{warning.replace('; using', '. Still using')}\033[0m\n")
+            return
+        path = set_config_values({"fanout_model": setting})
+        config["fanout_model"] = setting
+        shown = ("chosen per task from the available models"
+                 if setting.lower() == "auto" else choice.label)
+        print(f"\n  \033[1;32m\u2713 Fan-out workers use {shown}\033[0m"
+              f" \033[2m({display_path(path)})\033[0m\n")
+        return
+    setting = fanout.fanout_setting(config)
+    session = fanout.session_choice(config)
+    if setting.lower() == "auto":
+        worker = "auto, chosen per task"
+    else:
+        choice, warning = fanout.resolve_model(config, "standard", lambda: inventory)
+        worker = choice.label + (" (session model)" if not setting else "")
+        if warning:
+            worker += f"  \033[33m{warning}\033[0m"
+    workers = fanout.worker_limit(config)
+    print("\n  \033[1;36mFan-out\033[0m")
+    print(f"    Worker model:   {worker}")
+    print(f"    Session model:  {session.label}")
+    print(f"    Parallel:       up to {workers} workers")
+    print("    Available now:")
+    width = max(len(item.label) for item in inventory)
+    for item in inventory:
+        billing = (f"${item.price:.2f}/M out" if item.price is not None
+                   else _BILLING_LABELS.get(item.billing, item.billing))
+        print(f"      {item.label:<{width}}  {item.tier:<8}  \033[2m{billing}\033[0m")
+    print("    Auto picks:")
+    for effort in fanout.EFFORTS:
+        pick = fanout.choose_auto(inventory, effort, session.provider)
+        print(f"      {effort:<8}  {pick.label}")
+    print("  \033[2mSet with /fanout auto, /fanout default, or /fanout"
+          " <provider/model>.\033[0m\n")
+
+
 def handle_slash_command(
     cmd: str,
     config: dict,
@@ -1426,6 +1481,7 @@ def handle_slash_command(
             "  \033[1m/ssh status|disconnect\033[0m  Inspect or close the active connection\n"
             "  \033[1m/verbose\033[0m             Toggle showing tool args + output\n"
             "  \033[1m/tks [on|off]\033[0m        Toggle the per-message token stats line (tok/s)\n"
+            "  \033[1m/fanout [model|auto]\033[0m Show or set the model parallel fan-out workers use\n"
             "  \033[1m/sandbox [docker|e2b|off]\033[0m Run approved commands in a sandbox, not locally\n"
             "  \033[1m/checkpoint [verb]\033[0m    List/diff/restore turn-level git checkpoints\n"
             "  \033[1m/undo\033[0m                Revert the last turn that ran commands\n"
@@ -1572,6 +1628,10 @@ def handle_slash_command(
         if arg in ("off", "false", "0"):
             return "verbose_off"
         return "verbose_toggle"
+
+    if command == "/fanout":
+        _fanout_command(arg, config)
+        return None
 
     if command == "/tks":
         # Session-scoped flip of the per-message token-stats line

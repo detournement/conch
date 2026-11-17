@@ -2517,6 +2517,7 @@ class DelegateTaskClient:
     # self-management tools that belong to the parent session.
     EXCLUDED_TOOLS = {
         "delegate_task",
+        "fan_out",
         "conch_config",
         "manage_tools",
         "todo_list",
@@ -2852,6 +2853,10 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(PERSONAL_ITEMS_TOOL)
     if "delegate_task" in clients:
         builtin.append(DELEGATE_TASK_TOOL)
+    if "fan_out" in clients:
+        from .fanout import FAN_OUT_TOOL
+
+        builtin.append(FAN_OUT_TOOL)
     # Product tools (capitol_control, fleet_delegate, ...) advertise
     # their schemas through the session-tool seam. Only sessions whose
     # config gate passed carry the client (bootstrap), so only they pay

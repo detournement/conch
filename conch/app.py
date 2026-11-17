@@ -731,6 +731,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
 
     # Subagent delegation reads live config/tool state (plan 3.1)
     builtin_clients["delegate_task"].bind_session(session)
+    # Fan-out workers may run other models; their use joins the session cost.
+    builtin_clients["fan_out"].bind_session(session, usage=session_usage)
     # skill_manage action='use' activates a skill's declared tools the
     # same way /skill does (and reports the ones this session lacks).
     builtin_clients["skill_manage"].bind_state(chat_state)

@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "conch-shell"
-version = "0.3.0"
+dynamic = ["version"]
 description = "LLM-assisted shell with chat, MCP tools, memory, and scheduling."
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -23,21 +24,59 @@ classifiers = [
 ]
 dependencies = [
     "pygments>=2.0",
+    "prompt-toolkit>=3.0.50,<4",
 ]
-
-[project.optional-dependencies]
-slack = ["slack-bolt>=1.18", "slack-sdk>=3.21"]
 
 [project.scripts]
 conch = "conch.app:main"
 conch-chat = "conch.app:main"
 conch-ask = "conch.cli:main"
-conch-slack = "conch.slack:main"
+# Credential manager: `conch keys …` and this standalone alias behave the same.
+conch-keys = "conch.keys:main"
+# Swarm entrypoints, all live. conch-edge (Phase 1) is the personal edge
+# daemon owning the mission kernel, gated on edge_daemon=true.
+# conch-controller is the fleet controller (gated on fleet_controller=true);
+# conch-worker and conch-hostctl (Phase 2) are the bounded worker supervisor
+# and the stdlib-only on-host control utility.
+conch-controller = "conch.entrypoints:controller_main"
+conch-edge = "conch.entrypoints:edge_main"
+conch-worker = "conch.entrypoints:worker_main"
+conch-hostctl = "conch.entrypoints:hostctl_main"
+# Browser-capture satellite: the native messaging host Chrome launches
+# (conch/satellites/browser_capture). Gated on capture_enabled+capture_browser.
+conch-capture-host = "conch.entrypoints:capture_host_main"
 
 [project.urls]
 Homepage = "https://github.com/detournement/conch"
 Repository = "https://github.com/detournement/conch"
 
+[tool.setuptools.dynamic]
+version = {attr = "conch.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["conch*"]
+
+[tool.setuptools.package-data]
+# Browser-capture satellite: the MV3 extension's static files ship as
+# package data so pip/uv/pipx installs carry them (/install capture
+# browser copies them to a stable user-data dir for load-unpacked).
+"conch.satellites.browser_capture" = [
+    "extension/*",
+    "README.md",
+]
+# Flow packs shipped with conch (declarative Capitol use cases; the
+# manifests are data the pack engine validates and executes).
+"conch.capitol.packs" = [
+    "data/*/pack.json",
+    "data/*/README.md",
+    "data/*/assets/*",
+]
+# Skills shipped with conch (SKILL.md + companion reference/cookbook
+# documents, discovered by the skill loader; user skills win by name)
+# plus the asset trees a skill scaffolds from (templates/**: html, js,
+# css, json, sh — copied verbatim by the model, so every file must ship).
+"conch" = [
+    "skills_data/*/*.md",
+    "skills_data/*/templates/**/*",
+]

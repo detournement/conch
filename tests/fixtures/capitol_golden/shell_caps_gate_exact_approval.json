@@ -1,0 +1,303 @@
+{
+  "idempotency_keys": [
+    "conch-ebay:<shell-session-1>:r1:draft",
+    "conch-ebay:<shell-session-1>:r1:publish"
+  ],
+  "prompts": [
+    "  approval: "
+  ],
+  "result": {
+    "listing": {
+      "listing_id": "110590300001",
+      "listing_url": "https://sandbox.ebay.com/itm/110590300001",
+      "offer_id": "11448000001",
+      "sku": "cap-conch-ebay-test",
+      "state": "PUBLISHED"
+    },
+    "published": true
+  },
+  "said": [
+    "  listing session <shell-session-1> (intake: typed)",
+    "  uploading front.jpg \u2026",
+    "  draft run run-1 started",
+    "\n  Draft revision r1 (<sha-1>)\n    Title:     Used Reference Book with Light Shelf Wear\n    Category:  377\n    Condition: USED_GOOD\n    Price:     19.95 USD\n    Quantity:  1\n    Media:     1 photo(s)\n    Shipping:  fulfillment 6244379000, returns 6244378000\n    About:     An honest sandbox test listing.",
+    "\n  Policy: exact approval required \u2014",
+    "    \u00b7 price 19.95 USD is above the 10.00 ceiling",
+    "  To approve, type exactly: proceed to post",
+    "  publish run run-2 started",
+    "\n  Publish effect: PUBLISHED \u2014 listing 110590300001\n  https://sandbox.ebay.com/itm/110590300001"
+  ],
+  "state": {
+    "sessions": {
+      "<shell-session-1>": {
+        "context_id": "ctx-fake-1",
+        "created_at": 0,
+        "intake": "typed",
+        "listing": {
+          "listing_id": "110590300001",
+          "listing_url": "https://sandbox.ebay.com/itm/110590300001",
+          "offer_id": "11448000001",
+          "sku": "cap-conch-ebay-test",
+          "state": "PUBLISHED"
+        },
+        "media": [
+          {
+            "artifact_id": "art-1",
+            "digest": "<sha-3>",
+            "filename": "front.jpg",
+            "order": 0
+          }
+        ],
+        "revisions": [
+          {
+            "draft_hash": "<sha-1>",
+            "revision": 1,
+            "status": "draft_review"
+          }
+        ],
+        "runs": [
+          {
+            "idempotency_key": "conch-ebay:<shell-session-1>:r1:draft",
+            "kind": "draft",
+            "last_sequence": 0,
+            "run_id": "run-1",
+            "started_at": 0,
+            "status": "success"
+          },
+          {
+            "idempotency_key": "conch-ebay:<shell-session-1>:r1:publish",
+            "kind": "publish",
+            "last_sequence": 0,
+            "run_id": "run-2",
+            "started_at": 0,
+            "status": "success"
+          }
+        ],
+        "updated_at": 0,
+        "workflows": {
+          "draft": "draft-wf",
+          "publish": "publish-wf"
+        }
+      }
+    },
+    "version": 1
+  },
+  "stream_requests": [
+    {
+      "run_id": "run-1",
+      "since": 1
+    },
+    {
+      "run_id": "run-2",
+      "since": 1
+    }
+  ],
+  "uploads": {
+    "art-1": {
+      "content_type": "image/jpeg",
+      "sha256": "c91819eb4386a9aa2e1bef24b07590450d463d259a89543c120d89bba96e1ef6",
+      "size_bytes": 21
+    }
+  },
+  "wire": [
+    {
+      "context_id": null,
+      "data": {},
+      "method": "SendMessage",
+      "skill": "list_workflows"
+    },
+    {
+      "context_id": null,
+      "data": {
+        "caller": {
+          "system": "conch-tests",
+          "version": "<caller-version>"
+        }
+      },
+      "method": "SendMessage",
+      "skill": "handshake"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "filename": "front.jpg",
+        "mime_type": "image/jpeg",
+        "size_bytes": 21
+      },
+      "method": "SendMessage",
+      "skill": "request_upload_url"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "workflow_id": "draft-wf"
+      },
+      "method": "SendMessage",
+      "skill": "get_workflow_details"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "idempotency_key": "conch-ebay:<shell-session-1>:r1:draft",
+        "inputs": {
+          "node-json-input.value": {
+            "account_ref": "org-ebay-sandbox",
+            "actor_principal_id": "9e000000-0000-0000-0000-000000000001",
+            "app_id": "conch-ebay",
+            "channel": "a2a",
+            "expected_revision": 1,
+            "item_context": "Image-only listing request; no user-supplied listing metadata.",
+            "listing_session_id": "<shell-session-1>",
+            "media": [
+              {
+                "artifact_id": "art-1",
+                "order": 0
+              }
+            ],
+            "mode": "initial",
+            "schema": "ebay.draft_request.v1",
+            "seller_policies": {
+              "fulfillment_policy_id": "6244379000",
+              "merchant_location_key": "sandbox-location",
+              "payment_policy_id": "6244377000",
+              "return_policy_id": "6244378000"
+            },
+            "thread_id": "<shell-session-1>:shell"
+          }
+        },
+        "workflow_id": "draft-wf"
+      },
+      "method": "SendMessage",
+      "skill": "call_workflow"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "run_id": "run-1",
+        "since_sequence": 1
+      },
+      "method": "SendStreamingMessage",
+      "skill": "subscribe_workflow_events"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "run_id": "run-1"
+      },
+      "method": "SendMessage",
+      "skill": "get_workflow_status"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "run_id": "run-1"
+      },
+      "method": "SendMessage",
+      "skill": "get_workflow_output"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "workflow_id": "publish-wf"
+      },
+      "method": "SendMessage",
+      "skill": "get_workflow_details"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "idempotency_key": "conch-ebay:<shell-session-1>:r1:publish",
+        "inputs": {
+          "node-json-input.value": {
+            "actor_principal_id": "9e000000-0000-0000-0000-000000000001",
+            "app_id": "conch-ebay",
+            "challenge": "POST r1 <sha-1-tail>",
+            "channel": "a2a",
+            "confirmation": "proceed to post",
+            "current_revision": {
+              "account_ref": "org-ebay-sandbox",
+              "actor_principal_id": "9e000000-0000-0000-0000-000000000001",
+              "app_id": "conch-ebay",
+              "channel": "a2a",
+              "draft_hash": "<sha-1>",
+              "environment": "sandbox",
+              "listing": {
+                "aspects": {
+                  "Type": [
+                    "Book"
+                  ]
+                },
+                "category_id": "377",
+                "condition": "USED_GOOD",
+                "description": "An honest sandbox test listing.",
+                "policies": {
+                  "fulfillment_policy_id": "6244379000",
+                  "merchant_location_key": "sandbox-location",
+                  "payment_policy_id": "6244377000",
+                  "return_policy_id": "6244378000"
+                },
+                "price": {
+                  "currency": "USD",
+                  "value": "19.95"
+                },
+                "quantity": 1,
+                "title": "Used Reference Book with Light Shelf Wear"
+              },
+              "listing_session_id": "<shell-session-1>",
+              "marketplace_id": "EBAY_US",
+              "media": [
+                {
+                  "artifact_id": "art-1",
+                  "digest": "<sha-2>",
+                  "order": 0
+                }
+              ],
+              "open_questions": [],
+              "parent_draft_hash": null,
+              "revision": 1,
+              "schema": "ebay.listing_revision.v1",
+              "status": "draft_review",
+              "thread_id": "<shell-session-1>:shell",
+              "warnings": []
+            },
+            "draft_hash": "<sha-1>",
+            "idempotency_key": "conch-ebay:<shell-session-1>:r1:publish",
+            "listing_session_id": "<shell-session-1>",
+            "presentation_id": "<presentation-1>",
+            "revision": 1,
+            "schema": "ebay.publish_request.v1",
+            "thread_id": "<shell-session-1>:shell"
+          }
+        },
+        "workflow_id": "publish-wf"
+      },
+      "method": "SendMessage",
+      "skill": "call_workflow"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "run_id": "run-2",
+        "since_sequence": 1
+      },
+      "method": "SendStreamingMessage",
+      "skill": "subscribe_workflow_events"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "run_id": "run-2"
+      },
+      "method": "SendMessage",
+      "skill": "get_workflow_status"
+    },
+    {
+      "context_id": "ctx-fake-1",
+      "data": {
+        "run_id": "run-2"
+      },
+      "method": "SendMessage",
+      "skill": "get_workflow_output"
+    }
+  ]
+}

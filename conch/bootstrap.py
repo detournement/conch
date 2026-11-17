@@ -1,0 +1,783 @@
+"""Reusable startup wiring shared by the interactive shell and headless modes.
+
+Swarm Phase 0: everything here used to live inside ``app.chat_loop``. The
+interactive shell now composes these functions with its readline/typeahead
+UI on top; headless entrypoints (controller, edge, worker — later phases)
+call them directly without importing any terminal machinery.
+
+Nothing in this module prompts, reads stdin, or requires a TTY. Startup
+problems are reported by raising :class:`StartupError` (carrying a CLI exit
+code) or by returning warning strings for the caller to display however it
+wants.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+from typing import Any, Dict, List, Optional
+
+from .config import get_bool, local_only_enabled
+from .memory import MemoryStore
+from .session import AgentSession
+from .tooling import (
+    ApiLayerClient,
+    ConchConfigClient,
+    ConchIntrospectClient,
+    DelegateTaskClient,
+    InteractiveTerminalClient,
+    LlamaidxRegistryClient,
+    LocalShellClient,
+    LocalShellPolicy,
+    ManageToolsClient,
+    PersonalItemsClient,
+    PublicApiClient,
+    SSHRemoteClient,
+    SaveMemoryClient,
+    SearchConversationsClient,
+    SkillManageClient,
+    TodoListClient,
+    ToolRuntimeState,
+    apply_filter,
+    auto_disable_oversized_groups,
+    cap_tools,
+    default_permissions,
+    inject_builtin_tools,
+    load_tool_prefs,
+    save_tool_prefs,
+    set_agent_mode,
+)
+from . import mcp as mcp_mod
+from .fanout import FanOutClient
+
+DEFAULT_MAX_TOOL_ROUNDS = 25
+
+
+class StartupError(Exception):
+    """Startup cannot proceed. ``code`` is the process exit status for CLIs."""
+
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+def apply_agent_mode_from_config(config: dict) -> bool:
+    """Enable agent mode when the config file asks for it.
+
+    Returns True only when agent mode was turned on by the config default,
+    so the caller knows to show the startup notice (manual /agent toggles
+    mid-session never go through here).
+    """
+    from .tooling import set_permission_mode
+    set_permission_mode(config.get("permission_mode", ""))
+    if get_bool(config, "agent_mode"):
+        set_agent_mode(True)
+        return True
+    return False
+
+
+def resolve_startup_provider(config: dict) -> tuple:
+    """(provider, raw_fn) for a validated startup provider.
+
+    Raises StartupError with the exact message and exit code the CLI has
+    always used, so interactive and headless callers fail identically.
+    """
+    from .providers import RAW_FNS
+
+    provider = (config.get("provider") or "openai").lower()
+    if local_only_enabled(config, provider) and provider not in (
+        "ollama",
+        "custom",
+    ):
+        raise StartupError(
+            "conch: local_only=true requires provider=ollama or provider=custom",
+            code=2,
+        )
+    raw_fn = RAW_FNS.get(provider)
+    if raw_fn is None:
+        raise StartupError(f"conch: unknown provider {provider}", code=1)
+    missing = missing_api_key_startup_error(provider, config)
+    if missing is not None:
+        raise missing
+    return provider, raw_fn
+
+
+def missing_api_key_startup_error(provider: str,
+                                  config: dict) -> Optional[StartupError]:
+    """A StartupError naming the unset key variable and the remedy when
+    *provider* needs an API key that is not in the environment; None when
+    the provider is keyless or the key is present. Checked at startup so a
+    misconfigured install fails with one clear message instead of a bare
+    `[no response]` on every turn."""
+    from .providers import api_key_env_for, missing_api_key_message
+
+    key_env = api_key_env_for(provider, config)
+    if not key_env or os.environ.get(key_env, "").strip():
+        return None
+    return StartupError(f"conch: {missing_api_key_message(provider, key_env)}",
+                        code=2)
+
+
+def warn_unknown_cloud_model(provider: str, model_name: str) -> str:
+    """Catalog scrutiny for a cloud model name: "" when the model is in
+    conch's verified tool-capable catalog, otherwise a diagnosis with
+    close-match suggestions and the catalog default. Purely advisory —
+    nothing is substituted here; the startup model check
+    (:mod:`conch.modelcheck`) decides what happens next, with the user."""
+    from .providers import (
+        KNOWN_MODELS,
+        get_fallback_model,
+        suggest_models,
+    )
+
+    provider = (provider or "").lower()
+    if provider in ("ollama", "custom"):
+        return ""  # local providers are resolved from live services
+    known = KNOWN_MODELS.get(provider)
+    if not known or not model_name or model_name in known:
+        return ""
+    suggestions = suggest_models(model_name, known)
+    hint = f" — did you mean {', '.join(suggestions)}?" if suggestions else ""
+    default = get_fallback_model(provider)
+    return (
+        f"Configured model '{model_name}' isn't in conch's {provider} "
+        f"catalog of tool-capable models{hint} (catalog default: '{default}')"
+    )
+
+
+def resolve_startup_model(config: dict, provider: str) -> tuple:
+    """The configured model name for *provider* at startup.
+
+    Returns (model_name, warnings). This is pure normalization: it makes
+    no network calls and never substitutes a different model. Whether
+    the model actually works is decided by the startup model check in
+    :mod:`conch.modelcheck`, which either verifies it silently or puts
+    the alternatives in front of the user (interactive) / walks the
+    pre-approved ``fallback_models`` list (non-interactive). The silent
+    "model X unavailable; using Y" swap that used to live here is gone
+    on purpose: nothing switches without approval.
+    """
+    model_name = (config.get("chat_model") or config.get("model") or "").strip()
+    return model_name, []
+
+
+def make_builtin_clients(
+    memory: MemoryStore,
+    config: dict,
+    interactive: bool = True,
+    permissions=None,
+) -> Dict[str, Any]:
+    """Construct the built-in tool clients for one session."""
+    perms = permissions if permissions is not None else default_permissions()
+    local_shell = LocalShellClient(permissions=perms)
+    local_shell.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=perms.get_agent_mode()))
+    # Scale shell-output budget to the active model's context window (plan 1.5)
+    from .runtime import tool_result_char_budget
+
+    result_budget = tool_result_char_budget(
+        (config.get("provider") or "").lower(), config
+    )
+    local_shell.set_result_budget(result_budget)
+    interactive_terminal = InteractiveTerminalClient()
+    interactive_terminal.set_policy(
+        LocalShellPolicy(interactive=interactive, allow_auto_execute=False)
+    )
+    try:
+        ssh_persist = int(config.get("ssh_control_persist", 600) or 600)
+    except (TypeError, ValueError):
+        ssh_persist = 600
+    from .ssh_control import SSHControlManager
+
+    ssh_remote = SSHRemoteClient(
+        manager=SSHControlManager(persist_seconds=ssh_persist)
+    )
+    ssh_remote.bind_permissions(perms)
+    ssh_remote.set_policy(
+        LocalShellPolicy(
+            interactive=interactive,
+            allow_auto_execute=perms.get_agent_mode(),
+        )
+    )
+    ssh_remote.set_result_budget(result_budget)
+    # Seed the always-allow prefix list from config (plan 2.1)
+    allow = (config.get("allow_prefixes") or "").strip()
+    if allow:
+        prefixes = [p.strip() for p in allow.split(",") if p.strip()]
+        local_shell.allow_prefixes(prefixes)
+        ssh_remote.allow_prefixes(prefixes)
+    # File tools (one client behind read_file/edit_file/write_file) and
+    # web_fetch share local_shell's policy defaults and result budget.
+    from .filetools import FILE_TOOL_NAMES, FileToolsClient
+    from .webfetch import WebFetchClient
+
+    files = FileToolsClient(permissions=perms)
+    files.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=perms.get_agent_mode()))
+    files.set_result_budget(result_budget)
+    web = WebFetchClient(permissions=perms, config=config)
+    web.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=perms.get_agent_mode()))
+    web.set_result_budget(result_budget)
+    manage_tools = ManageToolsClient()
+    save_memory = SaveMemoryClient()
+    save_memory.bind(memory)
+    conch_config = ConchConfigClient()
+    conch_config.bind_permissions(perms)
+    # Settings that widen what runs unattended ask the user; a session that
+    # cannot ask (pipes, schedules) refuses them.
+    conch_config.set_policy(LocalShellPolicy(interactive=interactive))
+    public_api = PublicApiClient()
+    search_convos = SearchConversationsClient()
+    clients: Dict[str, Any] = {
+        "local_shell": local_shell,
+        "interactive_terminal": interactive_terminal,
+        "ssh_remote": ssh_remote,
+        "manage_tools": manage_tools,
+        "save_memory": save_memory,
+        "conch_config": conch_config,
+        "public_api": public_api,
+        "search_conversations": search_convos,
+        "todo_list": TodoListClient(),
+        # The user's durable personal store (todo/recipes/papers spaces).
+        # Deliberately available to remote/channel sessions too — channel
+        # capture is a design goal; the sender allowlists gate access.
+        "personal_items": PersonalItemsClient(),
+        "delegate_task": DelegateTaskClient(),
+        "fan_out": FanOutClient(),
+        "skill_manage": SkillManageClient(),
+        "conch_introspect": ConchIntrospectClient(),
+        "web_fetch": web,
+    }
+    clients.update({name: files for name in FILE_TOOL_NAMES})
+    clients["skill_manage"].configure(interactive=interactive)
+    # Product tools plug in through the session-tool seam: each provider
+    # owns its config gate (capitol_control needs capitol_base_url,
+    # fleet_delegate needs fleet_controller) and lazy-imports its product
+    # code, so unconfigured sessions never load the adapters. Mission
+    # sessions swap these clients out for envelope-scoped ones (kernel
+    # engine); remote turns swap capitol_control for an origin-bound
+    # variant whose start proposes an approval.
+    from .plugins import load_builtin_plugins, session_tool_providers
+
+    load_builtin_plugins()
+    for name, provider in session_tool_providers():
+        client = provider.build_session_client(config)
+        if client is not None:
+            clients[name] = client
+    backend_kind = str(config.get("exec_backend") or "").strip().lower()
+    if backend_kind and backend_kind != "local":
+        # Startup default for the sandbox exec backend (/sandbox flips it
+        # per session). Construction only validates config (docker on
+        # PATH, API key env present); the sandbox itself starts lazily on
+        # the first command. Fail soft: a broken backend config degrades
+        # to local execution with a visible warning, never a dead shell.
+        from .execbackend import SandboxError, build_exec_backend
+
+        try:
+            backend = build_exec_backend(backend_kind, config)
+        except SandboxError as exc:
+            print(f"  \033[33m\u26a0 exec_backend disabled: {exc}\033[0m")
+            backend = None
+        if backend is not None:
+            local_shell.set_exec_backend(backend)
+    if str(config.get("llamaidx_url") or "").strip():
+        # The llama-idx registry as a chat-queryable data source (fleet
+        # status + selectable models). Read-only against the registry;
+        # unset llamaidx_url = tool absent, zero new traffic. Stays
+        # foundation-wired (not a product plugin): llamaidx.py is a
+        # foundation module like public_apis.
+        clients["llamaidx_registry"] = LlamaidxRegistryClient(config)
+    import os
+
+    api_layer_key = config.get("API_LAYER_KEY", "") or os.environ.get("API_LAYER_KEY", "")
+    if api_layer_key:
+        api_layer = ApiLayerClient()
+        api_layer.bind(api_layer_key)
+        clients["api_layer"] = api_layer
+    return clients
+
+
+def assemble_tool_state(
+    all_tools: List[dict],
+    tool_map: Dict[str, Any],
+    builtin_clients: Dict[str, Any],
+    server_status: Optional[Dict[str, Any]] = None,
+) -> ToolRuntimeState:
+    """The session tool state for the MCP tools discovered so far plus the
+    builtin and user tools, filtered by the saved prefs. *all_tools* and
+    *tool_map* are extended in place (builtins are injected last, as they
+    always were). Binding ``manage_tools`` is the caller's job: the
+    interactive shell keeps one live state object for the whole session.
+    """
+    inject_builtin_tools(all_tools, tool_map, builtin_clients)
+    prefs = load_tool_prefs()
+    prefs, auto_disabled = auto_disable_oversized_groups(all_tools, tool_map, prefs)
+    if auto_disabled:
+        save_tool_prefs(prefs)
+        for group_name, count in auto_disabled:
+            print(
+                f"\033[33m  Auto-disabled {group_name} ({count} tools — exceeds 200 limit). Use /enable {group_name} to override.\033[0m",
+                file=sys.stderr,
+            )
+    tools = cap_tools(apply_filter(all_tools, tool_map, prefs))
+    return ToolRuntimeState(
+        all_tools=all_tools, tool_map=tool_map, tools=tools,
+        server_status=dict(server_status or {}),
+    )
+
+
+def builtin_tool_state(builtin_clients: Dict[str, Any]) -> ToolRuntimeState:
+    """The tool state a session can use before any MCP server has answered:
+    the builtin clients (local_shell, ...) and user tools, nothing deferred."""
+    return assemble_tool_state([], {}, builtin_clients)
+
+
+def load_runtime_tools(builtin_clients: Dict[str, Any], use_cache: bool = False,
+                       config: Optional[dict] = None):
+    """Create MCP clients and assemble the session tool state (blocking;
+    bounded by each client's own timeouts, servers discovered in parallel).
+
+    ``config`` is the conch config; it contributes config-keyed MCP
+    endpoints (``capitol_docs_url``) on top of ``mcp.json``.
+    """
+    if use_cache:
+        cached = mcp_mod.load_cached_tools()
+        if cached is not None:
+            mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
+            # Map cached tools to clients by server name
+            _live, tool_map = mcp_mod.collect_tools(mcp_clients)
+            all_tools = [
+                tool
+                for tool in cached
+                if tool.get("function", {}).get("name", "") in tool_map
+            ]
+            state = assemble_tool_state(
+                all_tools, tool_map, builtin_clients,
+                server_status=mcp_mod.server_statuses(mcp_clients, tool_map),
+            )
+            builtin_clients["manage_tools"].bind(state)
+            return mcp_clients, state
+    mcp_clients = mcp_mod.mount_config_servers(mcp_mod.create_clients(), config)
+    all_tools, tool_map = mcp_mod.collect_tools(mcp_clients)
+    mcp_mod.save_tool_cache(all_tools)
+    state = assemble_tool_state(
+        all_tools, tool_map, builtin_clients,
+        server_status=mcp_mod.server_statuses(mcp_clients, tool_map),
+    )
+    builtin_clients["manage_tools"].bind(state)
+    return mcp_clients, state
+
+
+# How long the interactive shell waits for MCP discovery before starting
+# on builtin tools alone (the loader keeps running and attaches later).
+TOOL_LOAD_WAIT_SECONDS = 30.0
+
+
+def swap_tool_state(live: ToolRuntimeState, loaded: ToolRuntimeState) -> None:
+    """Rebind *live*'s tool collections to *loaded*'s.
+
+    *live* is the one state object the session, ``manage_tools``,
+    ``skill_manage`` and ``conch_introspect`` all hold, so they see the
+    new tools without rebinding; ``needs_tool_refresh`` makes a turn that
+    is already in its tool loop re-read the list at its next request.
+    Only ever called from the thread that runs turns (between them).
+    """
+    live.all_tools = loaded.all_tools
+    live.tool_map = loaded.tool_map
+    live.tools = loaded.tools
+    live.server_status = dict(loaded.server_status)
+    live.needs_tool_refresh = True
+
+
+def tool_status_lines(statuses: Dict[str, Any], ready_count: int,
+                      already_reported=()) -> List[str]:
+    """Plain one-line notices about MCP discovery for the shell to print:
+    one per server that failed (with the reason; servers in
+    *already_reported* are skipped so each is named once) and one naming
+    the servers still loading — the state that used to be silent."""
+    lines: List[str] = []
+    for name, status in statuses.items():
+        if status.state in ("unreachable", "error") and name not in already_reported:
+            lines.append(
+                f"tools: MCP server {name} {status.state}: {status.detail}"
+                " (/tools for status, /reload to retry)"
+            )
+    pending = [name for name, status in statuses.items() if status.state == "loading"]
+    if pending:
+        lines.append(
+            f"tools: {ready_count} builtin ready; {len(pending)} MCP server(s) "
+            f"still loading: {', '.join(pending)} — they attach when ready"
+        )
+    return lines
+
+
+class ToolLoader:
+    """Background MCP discovery for one session, with a usable builtin-only
+    state from the first moment and a safe hand-off of the full state.
+
+    The interactive shell waits a bounded time (:meth:`wait`); when that
+    expires it keeps running on :attr:`builtin_state` and calls
+    :meth:`adopt` at safe points (between turns, on its own thread) until
+    the loaded state has been swapped in. The loader thread never touches
+    a live ``ToolRuntimeState``, so a request in flight never has its tool
+    list change under it. Discovery failures are recorded, never hidden:
+    :attr:`error` for a loader crash, :meth:`statuses` per server.
+    """
+
+    def __init__(self, builtin_clients: Dict[str, Any], config: Optional[dict]):
+        self.builtin_clients = builtin_clients
+        self.config = config
+        self.server_names = mcp_mod.configured_server_names(config)
+        self.builtin_state = builtin_tool_state(builtin_clients)
+        self.builtin_state.server_status = self._placeholder_statuses()
+        self.ready = threading.Event()
+        self.error: Optional[BaseException] = None
+        self._lock = threading.Lock()
+        self._discovery: Optional[mcp_mod.ToolDiscovery] = None
+        self._mcp_clients: Optional[Dict[str, Any]] = None
+        self._state: Optional[ToolRuntimeState] = None
+        self._adopted = False
+        self._superseded = False
+        self._thread: Optional[threading.Thread] = None
+
+    def _placeholder_statuses(self) -> Dict[str, Any]:
+        return {name: mcp_mod.ServerStatus(name) for name in self.server_names}
+
+    def start(self) -> "ToolLoader":
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="conch-tool-loader"
+        )
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            mcp_clients = mcp_mod.mount_config_servers(
+                mcp_mod.create_clients(), self.config
+            )
+            discovery = mcp_mod.ToolDiscovery(mcp_clients)
+            with self._lock:
+                self._discovery = discovery
+            all_tools, tool_map = discovery.run()
+            mcp_mod.save_tool_cache(all_tools)
+            state = assemble_tool_state(
+                all_tools, tool_map, self.builtin_clients,
+                server_status=discovery.statuses(),
+            )
+            with self._lock:
+                self._mcp_clients = mcp_clients
+                self._state = state
+                superseded = self._superseded
+            if superseded:
+                # A /reload replaced this loader while it ran.
+                mcp_mod.close_all(mcp_clients)
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.ready.set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return self.ready.wait(timeout)
+
+    def statuses(self) -> Dict[str, Any]:
+        """Per-server status right now (loading entries for servers
+        discovery has not reached yet)."""
+        with self._lock:
+            discovery, state = self._discovery, self._state
+        if self.error is not None:
+            return {
+                name: mcp_mod.ServerStatus(
+                    name, "error", f"discovery failed: {self.error}"
+                )
+                for name in self.server_names
+            }
+        if state is not None:
+            return dict(state.server_status)
+        if discovery is not None:
+            return discovery.statuses()
+        return self._placeholder_statuses()
+
+    def pending(self) -> List[str]:
+        return [n for n, s in self.statuses().items() if s.state == "loading"]
+
+    def notice_lines(self, ready_count: int, already_reported=()) -> List[str]:
+        if self.error is not None:
+            return [
+                f"tools: MCP discovery failed: {self.error} — builtin tools "
+                "only (/reload to retry)"
+            ]
+        return tool_status_lines(self.statuses(), ready_count, already_reported)
+
+    def adopt(self, live: ToolRuntimeState) -> Optional[Dict[str, Any]]:
+        """Swap the loaded tools into *live* if discovery has finished and
+        this is the first call to do so. Returns the MCP clients on the
+        swap, None while still loading, after a crash, when superseded,
+        or once already adopted."""
+        if not self.ready.is_set():
+            return None
+        with self._lock:
+            if self._adopted or self._superseded or self._state is None:
+                return None
+            self._adopted = True
+            state, clients = self._state, self._mcp_clients
+        swap_tool_state(live, state)
+        return clients
+
+    def supersede(self) -> None:
+        """Discard this loader's result (a /reload replaced it). Clients it
+        already created are closed now; ones still being created are closed
+        by the loader thread when it finishes."""
+        with self._lock:
+            self._superseded = True
+            clients = None if self._adopted else self._mcp_clients
+        if clients is not None:
+            mcp_mod.close_all(clients)
+
+
+def build_agent_session(
+    config: dict,
+    *,
+    interactive: bool = False,
+    permissions=None,
+    memory: Optional[MemoryStore] = None,
+    use_cached_tools: bool = False,
+    cwd=None,
+) -> AgentSession:
+    """Construct a fully wired AgentSession without any UI.
+
+    Builds tool clients, loads MCP/tool state, and binds delegate_task and
+    conch_introspect. The caller owns the session and must ``close()`` it.
+    """
+    if memory is None:
+        memory = MemoryStore()
+    session = AgentSession(
+        config,
+        interactive=interactive,
+        permissions=permissions,
+        memory=memory,
+        cwd=cwd,
+    )
+    builtins = make_builtin_clients(
+        memory, config, interactive=interactive,
+        permissions=session.permissions,
+    )
+    mcp_clients, state = load_runtime_tools(
+        builtins, use_cache=use_cached_tools, config=config
+    )
+    session.attach_clients(builtins, chat_state=state, mcp_clients=mcp_clients)
+    builtins["delegate_task"].bind_session(session)
+    builtins["fan_out"].bind_session(session)
+    builtins["conch_introspect"].bind(
+        session.provider, session.model, config, state
+    )
+    return session
+
+
+def route_scheduled_output(config: dict, task, reply: str, usage: dict) -> None:
+    """Deliver a scheduled task's result over the notify channel (plan 4.3).
+    No configured channel = old behavior (output discarded). Never raises."""
+    try:
+        if not (config.get("notify_channel") or "").strip():
+            return
+        from .channels import ChannelManager
+        from .runtime import truncate_middle
+        if usage.get("error"):
+            body = ("the model backend was unreachable "
+                    f"({truncate_middle(str(usage['error']), 200)})")
+        else:
+            body = truncate_middle(reply or "(no output)", 2500)
+        task_id = getattr(task, "id", "?")
+        task_prompt = getattr(task, "prompt", "")
+        ok, detail = ChannelManager(config).notify(
+            f"[conch scheduled #{task_id}] {task_prompt}\n\n{body}"
+        )
+        if not ok:
+            print(f"  \033[33m⚠ scheduled notify failed: {detail}\033[0m", file=sys.stderr)
+    except Exception as exc:
+        print(f"  \033[33m⚠ scheduled notify failed: {exc}\033[0m", file=sys.stderr)
+
+
+def make_scheduled_executor(
+    config: dict,
+    get_system_prompt,
+    *,
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+    route_output=route_scheduled_output,
+):
+    """Executor for the task scheduler: each run gets a fresh session.
+
+    ``get_system_prompt`` is called per run so mid-session provider/model
+    switches keep flowing into scheduled turns (the interactive shell passes
+    a closure over its live system prompt). Scheduled runs share the
+    process-default permission state, so a /agent toggle applies to them
+    exactly as it always has.
+    """
+
+    def _scheduled_executor(prompt: str, task):
+        session = build_agent_session(
+            config, interactive=False, permissions=default_permissions()
+        )
+        try:
+            messages = [
+                {"role": "system", "content": get_system_prompt()},
+                {"role": "user", "content": prompt},
+            ]
+            reply, usage = session.run_turn(
+                messages, max_tool_rounds=max_tool_rounds
+            )
+            # Route scheduled output over the notify channel (plan 4.3)
+            # instead of discarding it.
+            if route_output is not None:
+                route_output(config, task, reply, usage)
+            return reply, usage
+        finally:
+            session.close()
+
+    return _scheduled_executor
+
+
+def start_scheduler(executor):
+    """Start the recurring-task scheduler with *executor*."""
+    from .scheduler import Scheduler
+
+    sched = Scheduler()
+    sched.set_executor(executor)
+    sched.start()
+    return sched
+
+
+def start_task_backend(config: dict, get_system_prompt, *,
+                       max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS):
+    """Select the scheduled-task backend for one interactive session.
+
+    Returns ``(sched, kind)`` where kind is ``"legacy"`` or ``"kernel"``.
+
+    The no-daemon invariant is enforced here: with ``edge_daemon`` unset or
+    false, this starts the classic in-process scheduler over tasks.json and
+    never imports ``conch.kernel`` at all — interactive behavior is exactly
+    what it has always been. With ``edge_daemon=true``, `/schedule` is
+    backed by the mission kernel through the same Scheduler-shaped surface
+    (over the daemon's socket when it runs, else directly against the
+    kernel database), and execution belongs to the ``conch-edge`` daemon —
+    the shell never runs scheduled work in kernel mode.
+    """
+    if get_bool(config, "edge_daemon"):
+        from .kernel.client import KernelSchedulerAdapter
+
+        return KernelSchedulerAdapter(config), "kernel"
+    sched = start_scheduler(
+        make_scheduled_executor(
+            config, get_system_prompt, max_tool_rounds=max_tool_rounds
+        )
+    )
+    return sched, "legacy"
+
+
+class _ShellIntakeGate:
+    """Channel-intake lease for a shell-hosted remote loop in kernel mode.
+
+    The same ``channel_intake`` lease the daemon's intake takes: whoever
+    holds it is the single channel consumer, no matter what each process's
+    config says. Kernel imports stay inside the methods so nothing kernel-
+    related loads before the loop actually polls. Fails closed: no
+    reachable kernel means no polling.
+    """
+
+    def __init__(self, config: dict):
+        import os
+        import socket as socket_mod
+
+        self._config = config
+        self.holder = f"shell-{socket_mod.gethostname()}-{os.getpid()}"
+
+    def _lease_seconds(self) -> float:
+        from .kernel.intake import intake_lease_seconds
+
+        return intake_lease_seconds(
+            self._config.get("remote_poll_interval", 60) or 60
+        )
+
+    def _with_client(self, fn):
+        from .kernel.client import attach_kernel
+        from .kernel.model import KernelError
+
+        try:
+            client = attach_kernel(self._config)
+        except KernelError:
+            return None
+        try:
+            return fn(client)
+        except KernelError:
+            return None
+        finally:
+            client.close()
+
+    def acquire(self) -> bool:
+        granted = self._with_client(
+            lambda client: client.intake_acquire(
+                self.holder, self._lease_seconds()
+            )
+        )
+        return bool(granted)
+
+    def release(self) -> None:
+        self._with_client(
+            lambda client: client.intake_release(self.holder)
+        )
+
+    def mission_input(self, mission_id: str, text: str, message) -> str:
+        source = f"{message.channel}:{message.sender}"
+        result = self._with_client(
+            lambda client: client.provide_input(
+                mission_id, text, source=source
+            )
+        )
+        if result is None:
+            return f"Mission input failed: no kernel answered for {mission_id}."
+        if result.get("woken"):
+            return (
+                f"Input delivered to {mission_id} — it wakes now and will"
+                " run at the next session slot."
+            )
+        return (
+            f"Input recorded for {mission_id}; its state is unchanged and"
+            " the input will be visible at its next session."
+        )
+
+
+def start_remote_loop(config: dict, conv_mgr=None, session=None) -> tuple:
+    """Start the opt-in remote channel loop.
+
+    Returns (loop, "") when running, (None, "disabled") when remote_enabled
+    is off, (None, "daemon-hosted") when the edge daemon owns channel
+    intake (the default whenever ``edge_daemon`` is enabled — set
+    ``remote_host=shell`` to keep the loop in the shell), and (None, "no
+    channel configured") when it is on but no channel is usable — the
+    caller decides how (or whether) to surface each case.
+    """
+    if not get_bool(config, "remote_enabled"):
+        return None, "disabled"
+    kernel_mode = get_bool(config, "edge_daemon")
+    remote_host = str(config.get("remote_host") or "daemon").strip().lower()
+    if kernel_mode and remote_host != "shell":
+        # Daemon-when-enabled default: the daemon answers channels 24/7;
+        # a second consumer here would double-answer every message.
+        return None, "daemon-hosted"
+    from .remote import RemoteLoop
+
+    intake_gate = None
+    mission_input = None
+    if kernel_mode:
+        # remote_host=shell: the shell hosts the loop but holds the same
+        # kernel channel-intake lease the daemon would, so exactly one
+        # consumer polls either way; mission-addressed input routes into
+        # the kernel and wakes the mission immediately.
+        gate = _ShellIntakeGate(config)
+        intake_gate = gate
+        mission_input = gate.mission_input
+    loop = RemoteLoop(
+        config, conv_mgr=conv_mgr, session=session,
+        intake_gate=intake_gate, mission_input=mission_input,
+    )
+    if loop.start():
+        return loop, ""
+    return None, "no channel configured"

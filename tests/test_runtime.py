@@ -46,8 +46,9 @@ class TestCompressContext(unittest.TestCase):
         for i in range(100):
             msgs.append({"role": "user", "content": "x" * 10000})
             msgs.append({"role": "assistant", "content": "y" * 10000})
+        before = estimate_tokens(msgs)
         result = compress_context(msgs, None, "ollama")
-        self.assertLess(len(result), len(msgs))
+        self.assertLess(estimate_tokens(result), before)
 
     def test_keeps_system_and_recent(self):
         msgs = [{"role": "system", "content": "sys"}]
@@ -63,16 +64,32 @@ class TestNormalizeMessagesForProvider(unittest.TestCase):
     def test_anthropic_passthrough(self):
         msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         result = normalize_messages_for_provider(msgs, "anthropic")
-        self.assertIs(result, msgs)
+        self.assertEqual(result, msgs)
 
-    def test_drops_tool_role(self):
+    def test_anthropic_strips_openai_tool_messages(self):
+        msgs = [
+            {"role": "user", "content": "create a ticket"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "jira", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "done"},
+            {"role": "assistant", "content": "Created the ticket."},
+        ]
+        result = normalize_messages_for_provider(msgs, "anthropic")
+        roles = [m["role"] for m in result]
+        self.assertNotIn("tool", roles)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["content"], "create a ticket")
+        self.assertEqual(result[1]["content"], "Created the ticket.")
+
+    def test_keeps_openai_tool_role(self):
         msgs = [
             {"role": "user", "content": "hi"},
             {"role": "tool", "tool_call_id": "1", "content": "result"},
         ]
         result = normalize_messages_for_provider(msgs, "openai")
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["content"], "hi")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[1]["role"], "tool")
 
     def test_drops_empty_tool_use_blocks(self):
         msgs = [
@@ -93,12 +110,14 @@ class TestNormalizeMessagesForProvider(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["content"], "Here is the answer")
 
-    def test_drops_empty_assistant_with_tool_calls(self):
+    def test_keeps_assistant_with_tool_calls(self):
         msgs = [
             {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
         ]
         result = normalize_messages_for_provider(msgs, "openai")
-        self.assertEqual(len(result), 0)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["content"], "")
+        self.assertIn("tool_calls", result[0])
 
 
 class TestNormalizeMessagesOnSwitch(unittest.TestCase):
@@ -150,11 +169,20 @@ class TestExtractTextualToolUse(unittest.TestCase):
     def test_returns_none_for_plain_text(self):
         self.assertIsNone(extract_textual_tool_use_blocks("just text"))
 
-    def test_parses_xml_format(self):
+    def test_xml_format_no_longer_recovered(self):
+        # Plan 0.5: the regex/XML recovery path was removed; only guarded
+        # JSON recovery remains (see tests/test_ollama.py).
         text = '<tool_called name="local_shell" args=\'{"command": "ls"}\'  />'
-        result = extract_textual_tool_use_blocks(text)
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0]["name"], "local_shell")
+        self.assertIsNone(extract_textual_tool_use_blocks(text))
+
+    def test_python_literal_tool_use_no_longer_recovered(self):
+        # The ast.literal_eval path was removed with plan 0.5.
+        text = "{'type': 'tool_use', 'name': 'local_shell', 'input': {'command': 'ls'}}"
+        self.assertIsNone(extract_textual_tool_use_blocks(text))
+
+    def test_quoted_tool_call_in_prose_not_executed(self):
+        text = 'To call a tool the model would emit {"type": "tool_use", "name": "x"} as text.'
+        self.assertIsNone(extract_textual_tool_use_blocks(text))
 
     def test_returns_none_for_empty(self):
         self.assertIsNone(extract_textual_tool_use_blocks(""))

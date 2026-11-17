@@ -4,7 +4,6 @@ import unittest
 
 from conch.tooling import (
     BUILTIN_PROFILES,
-    PINNED_TOOL_NAMES,
     cap_tools,
     group_tools,
     list_profiles,

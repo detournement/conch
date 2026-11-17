@@ -1,0 +1,179 @@
+"""Tests for cloud-provider model validation on switches (bug: `/model
+ogooaboog` on anthropic used to succeed) and startup scrutiny of config-file
+model values."""
+
+import contextlib
+import io
+import unittest
+from unittest.mock import patch
+
+from conch.bootstrap import warn_unknown_cloud_model
+from conch.providers import (
+    KNOWN_MODELS,
+    suggest_models,
+    validate_model_for_provider,
+)
+from conch.tooling import ConchConfigClient
+
+
+class TestValidateModelForProvider(unittest.TestCase):
+    def test_valid_cloud_model_accepted(self):
+        ok, reason = validate_model_for_provider("anthropic", "claude-sonnet-4-6")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_gibberish_rejected(self):
+        ok, reason = validate_model_for_provider("anthropic", "ogooaboog")
+        self.assertFalse(ok)
+        self.assertIn("unknown anthropic model 'ogooaboog'", reason)
+        self.assertIn("Known anthropic models:", reason)
+
+    def test_typo_gets_suggestions(self):
+        ok, reason = validate_model_for_provider("anthropic", "claude-sonet-4-6")
+        self.assertFalse(ok)
+        self.assertIn("Did you mean:", reason)
+        self.assertIn("claude-sonnet-4-6", reason)
+
+    def test_openai_typo_suggestion(self):
+        ok, reason = validate_model_for_provider("openai", "gpt4o-mini")
+        self.assertFalse(ok)
+        self.assertIn("gpt-4o-mini", reason)
+
+    def test_ollama_delegates_to_live_validation(self):
+        with patch("conch.providers.validate_ollama_model",
+                   return_value=(False, "not installed")) as mock_validate:
+            ok, reason = validate_model_for_provider("ollama", "qwen9", {"provider": "ollama"})
+        self.assertFalse(ok)
+        mock_validate.assert_called_once()
+
+    def test_custom_requires_live_verification(self):
+        with patch(
+            "conch.providers.validate_custom_model",
+            return_value=(False, "not exposed"),
+        ):
+            ok, reason = validate_model_for_provider(
+                "custom", "whatever-model"
+            )
+        self.assertFalse(ok)
+        self.assertIn("not exposed", reason)
+
+    def test_empty_model_rejected(self):
+        ok, _ = validate_model_for_provider("anthropic", "  ")
+        self.assertFalse(ok)
+
+    def test_suggest_models_helper(self):
+        self.assertIn("claude-sonnet-4-6",
+                      suggest_models("claude-sonet-46", KNOWN_MODELS["anthropic"]))
+        self.assertEqual(suggest_models("zzzzz", KNOWN_MODELS["anthropic"]), [])
+
+
+class TestModelSwitchValidation(unittest.TestCase):
+    def _run(self, cmd, provider="anthropic", model="claude-sonnet-4-6"):
+        from conch import modelcheck
+        from conch.commands import handle_slash_command
+        config = {"provider": provider}
+        out = io.StringIO()
+        # The /model switch now re-probes the new cloud model (modelcheck);
+        # these unit tests have no network, so stub the probe to a pass. The
+        # rejection tests reject before the probe, so this never masks them.
+        ok = modelcheck.ProbeResult(provider, model, modelcheck.OK, "stubbed")
+        with contextlib.redirect_stdout(out), \
+             patch("conch.commands.list_ollama_models", return_value=None), \
+             patch("conch.modelcheck.probe_model", return_value=ok):
+            result = handle_slash_command(cmd, config, provider, model, lambda v: None)
+        return result, out.getvalue(), config
+
+    def test_gibberish_rejected_on_anthropic(self):
+        result, output, config = self._run("/model ogooaboog")
+        self.assertIsNone(result, "switch must be rejected")
+        self.assertIn("unknown anthropic model 'ogooaboog'", output)
+        self.assertIn("/models", output)
+        self.assertNotIn("model", config, "config must be untouched")
+
+    def test_typo_suggests_close_match(self):
+        result, output, _ = self._run("/model claude-sonnet-46")
+        self.assertIsNone(result)
+        self.assertIn("Did you mean:", output)
+        self.assertIn("claude-sonnet-4-6", output)
+
+    def test_valid_cloud_switch_still_works(self):
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            result, output, config = self._run("/model claude-haiku-4-5")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[:2], ("anthropic", "claude-haiku-4-5"))
+        self.assertEqual(config["model"], "claude-haiku-4-5")
+
+    def test_cross_provider_switch_still_works(self):
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
+            result, output, config = self._run("/model gpt-4o-mini")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[:2], ("openai", "gpt-4o-mini"))
+
+    def test_force_cannot_bypass_validation(self):
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            result, output, config = self._run("/model claude-brand-new-9 --force")
+        self.assertIsNone(result)
+        self.assertIn("cannot be bypassed", output)
+        self.assertNotIn("model", config)
+
+    def test_force_alone_is_rejected(self):
+        result, output, _ = self._run("/model --force")
+        self.assertIsNone(result)
+        self.assertIn("cannot be bypassed", output)
+
+
+class TestConchConfigSuggestions(unittest.TestCase):
+    def test_set_model_unknown_gets_suggestions(self):
+        client = ConchConfigClient()
+        client.bind("anthropic", "claude-sonnet-4-6", {}, {"provider": "anthropic"})
+        with patch(
+            "conch.providers.validate_model_for_provider",
+            return_value=(False, "unreachable"),
+        ):
+            result = client.call_tool("conch_config", {
+                "action": "set_model", "value": "claude-sonet-4-6",
+            })
+        text = result["content"][0]["text"]
+        self.assertIn("Unknown model", text)
+        self.assertIn("Did you mean:", text)
+        self.assertIn("claude-sonnet-4-6", text)
+        self.assertEqual(client.pending_actions, [])
+
+    def test_set_model_gibberish_rejected(self):
+        client = ConchConfigClient()
+        client.bind("anthropic", "claude-sonnet-4-6", {}, {"provider": "anthropic"})
+        with patch(
+            "conch.providers.validate_model_for_provider",
+            return_value=(False, "unreachable"),
+        ):
+            result = client.call_tool("conch_config", {
+                "action": "set_model", "value": "ogooaboog",
+            })
+        self.assertIn("Unknown model", result["content"][0]["text"])
+        self.assertEqual(client.pending_actions, [])
+
+
+class TestStartupModelScrutiny(unittest.TestCase):
+    def test_known_model_no_warning(self):
+        self.assertEqual(warn_unknown_cloud_model("anthropic", "claude-sonnet-4-6"), "")
+
+    def test_unknown_model_warns_and_names_catalog_default_without_switching(self):
+        warning = warn_unknown_cloud_model("anthropic", "claude-sonet-4-6")
+        self.assertIn("isn't in conch's anthropic catalog", warning)
+        self.assertIn("did you mean claude-sonnet-4-6", warning)
+        self.assertIn("catalog default: 'claude-sonnet-5'", warning)
+        # Advisory only: the wording must not claim a silent substitution.
+        self.assertNotIn("using", warning)
+
+    def test_gibberish_warns_without_suggestions(self):
+        warning = warn_unknown_cloud_model("openai", "ogooaboog")
+        self.assertIn("catalog", warning)
+        self.assertNotIn("did you mean", warning)
+
+    def test_ollama_and_custom_skipped(self):
+        self.assertEqual(warn_unknown_cloud_model("ollama", "anything"), "")
+        self.assertEqual(warn_unknown_cloud_model("custom", "anything"), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

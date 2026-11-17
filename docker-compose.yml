@@ -1,0 +1,74 @@
+services:
+  conch:
+    build:
+      context: .
+      target: dev
+      args:
+        CONCH_UID: ${CONCH_UID:-1000}
+        CONCH_GID: ${CONCH_GID:-1000}
+    tty: true
+    stdin_open: true
+    working_dir: /workspace
+    environment:
+      CONCH_PROVIDER: ${CONCH_PROVIDER:-ollama}
+      CONCH_MODEL: ${CONCH_MODEL:-}
+      CONCH_LOCAL_ONLY: ${CONCH_LOCAL_ONLY:-true}
+      CONCH_DETECT_LOCATION: ${CONCH_DETECT_LOCATION:-false}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      CONCH_CUSTOM_BASE_URL: ${CONCH_CUSTOM_BASE_URL:-}
+      CONCH_CUSTOM_MODEL: ${CONCH_CUSTOM_MODEL:-}
+    volumes:
+      - ${CONCH_WORKSPACE:-.}:/workspace:rw
+      - conch-state:/home/conch/.local/state/conch:rw
+      - conch-config:/home/conch/.config/conch:rw
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 10s
+    healthcheck:
+      test: [CMD, docker-entrypoint.sh, health]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [ollama-sidecar]
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: [CMD, ollama, list]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    profiles: [llamacpp-sidecar]
+    command:
+      - -m
+      - /models/${LLAMACPP_MODEL_FILE:-model.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --jinja
+    volumes:
+      - ${LLAMACPP_MODEL_DIR:-./models}:/models:ro
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  conch-state:
+  conch-config:
+  ollama-data:

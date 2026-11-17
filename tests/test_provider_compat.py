@@ -1,0 +1,1025 @@
+"""Tests for provider compatibility: OpenAI model support, tool schema
+sanitization, message normalization, fallback behavior, and conch_config
+model switching.
+
+Covers the failure modes fixed in the openai-models work:
+- o-series request shaping (max_completion_tokens, no temperature)
+- Tool schema sanitization (missing array items)
+- Tool capping per provider limit
+- content:null in messages
+- Reasoning token separation
+- Fallback structural-error detection
+- conch_config queued-switch semantics
+- HTTP error body parsing
+"""
+
+import io
+import json
+import unittest
+from unittest.mock import patch
+
+from conch import providers
+from conch.providers import (
+    KNOWN_MODELS,
+    MODEL_PRICING,
+    MODEL_VERIFIED,
+    PROVIDER_TOOL_LIMITS,
+    DEFAULT_CHAT_MODEL_BY_PROVIDER,
+    _anthropic_max_tokens,
+    _openai_is_strict_reasoning_model,
+    _fix_tool_schema,
+    _sanitize_tools_for_openai,
+    build_openai_chat_request_body,
+    format_http_api_error,
+    get_fallback_chain,
+    get_fallback_model,
+    estimate_cost,
+    stream_anthropic,
+)
+from conch.runtime import (
+    append_results_openai,
+    normalize_messages_for_provider,
+    normalize_messages_on_switch,
+)
+from conch.tooling import (
+    PINNED_TOOL_NAMES,
+    cap_tools,
+    ConchConfigClient,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_tool(name: str) -> dict:
+    return {"function": {"name": name, "parameters": {"type": "object", "properties": {}}}}
+
+
+def _make_tools(n: int, pinned_names=()) -> list:
+    tools = [_make_tool(name) for name in pinned_names]
+    for i in range(n - len(tools)):
+        tools.append(_make_tool(f"mcp_tool_{i}"))
+    return tools
+
+
+# ---------------------------------------------------------------------------
+# o-series request shaping
+# ---------------------------------------------------------------------------
+
+class TestReasoningModelDetection(unittest.TestCase):
+    def test_o_series_detected(self):
+        for model in ("o3", "o3-mini", "o4-mini", "o1", "o1-pro", "o3-pro"):
+            self.assertTrue(
+                _openai_is_strict_reasoning_model(model),
+                f"{model} should be detected as strict reasoning model",
+            )
+
+    def test_gpt5_reasoning_family_detected(self):
+        # Verified live 2026-09-14: these reject non-default temperature.
+        for model in ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.5"):
+            self.assertTrue(
+                _openai_is_strict_reasoning_model(model),
+                f"{model} should be detected as strict reasoning model",
+            )
+
+    def test_gpt_not_detected(self):
+        # gpt-5.4* and gpt-5.6* accept custom temperature (verified live).
+        for model in (
+            "gpt-4o", "gpt-4o-mini", "gpt-5.4", "gpt-5.4-mini",
+            "gpt-5.6-sol", "gpt-4.1-nano",
+        ):
+            self.assertFalse(
+                _openai_is_strict_reasoning_model(model),
+                f"{model} should NOT be detected as strict reasoning model",
+            )
+
+    def test_other_not_detected(self):
+        self.assertFalse(_openai_is_strict_reasoning_model("claude-sonnet-4-6"))
+        self.assertFalse(_openai_is_strict_reasoning_model("llama3.3"))
+
+
+class TestBuildOpenAIRequestBody(unittest.TestCase):
+    def test_gpt_includes_temperature(self):
+        body = build_openai_chat_request_body(
+            "gpt-4o", [{"role": "user", "content": "hi"}],
+            temperature=0.7, max_completion_tokens=1024,
+        )
+        self.assertIn("temperature", body)
+        self.assertEqual(body["temperature"], 0.7)
+
+    def test_o_series_omits_temperature(self):
+        body = build_openai_chat_request_body(
+            "o3-mini", [{"role": "user", "content": "hi"}],
+            temperature=0.7, max_completion_tokens=1024,
+        )
+        self.assertNotIn("temperature", body)
+
+    def test_uses_max_completion_tokens(self):
+        body = build_openai_chat_request_body(
+            "gpt-4o", [{"role": "user", "content": "hi"}],
+            temperature=0.7, max_completion_tokens=2048,
+        )
+        self.assertEqual(body["max_completion_tokens"], 2048)
+        self.assertNotIn("max_tokens", body)
+
+    def test_gpt56_tools_force_no_reasoning(self):
+        """gpt-5.6-{sol,terra,luna} reject function tools on chat completions
+        unless reasoning_effort="none" (verified live 2026-09-14)."""
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            body = build_openai_chat_request_body(
+                model, [{"role": "user", "content": "hi"}],
+                temperature=0.7, max_completion_tokens=1024,
+                tools=[_make_tool("t")],
+            )
+            self.assertEqual(body.get("reasoning_effort"), "none", model)
+
+    def test_gpt56_without_tools_keeps_reasoning(self):
+        body = build_openai_chat_request_body(
+            "gpt-5.6-sol", [{"role": "user", "content": "hi"}],
+            temperature=0.7, max_completion_tokens=1024,
+        )
+        self.assertNotIn("reasoning_effort", body)
+
+    def test_other_models_never_get_reasoning_effort(self):
+        for model in ("gpt-4o", "gpt-5.5", "o3-mini"):
+            body = build_openai_chat_request_body(
+                model, [{"role": "user", "content": "hi"}],
+                temperature=0.7, max_completion_tokens=1024,
+                tools=[_make_tool("t")],
+            )
+            self.assertNotIn("reasoning_effort", body, model)
+
+    def test_tools_sanitized(self):
+        tools = [{"function": {"name": "t", "parameters": {
+            "type": "object",
+            "properties": {"arr": {"type": "array"}},  # missing items
+        }}}]
+        body = build_openai_chat_request_body(
+            "gpt-4o", [], temperature=0.7, max_completion_tokens=1024,
+            tools=tools,
+        )
+        param = body["tools"][0]["function"]["parameters"]["properties"]["arr"]
+        self.assertIn("items", param)
+
+    def test_tools_sanitization_does_not_mutate_original(self):
+        tools = [{"function": {"name": "t", "parameters": {
+            "type": "object",
+            "properties": {"arr": {"type": "array"}},
+        }}}]
+        build_openai_chat_request_body(
+            "gpt-4o", [], temperature=0.7, max_completion_tokens=1024,
+            tools=tools,
+        )
+        self.assertNotIn("items", tools[0]["function"]["parameters"]["properties"]["arr"])
+
+
+# ---------------------------------------------------------------------------
+# Tool schema sanitization
+# ---------------------------------------------------------------------------
+
+class TestFixToolSchema(unittest.TestCase):
+    def test_adds_items_to_bare_array(self):
+        schema = {"type": "array"}
+        _fix_tool_schema(schema)
+        self.assertEqual(schema["items"], {})
+
+    def test_preserves_existing_items(self):
+        schema = {"type": "array", "items": {"type": "string"}}
+        _fix_tool_schema(schema)
+        self.assertEqual(schema["items"], {"type": "string"})
+
+    def test_fixes_nested_array_in_properties(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array"},
+            },
+        }
+        _fix_tool_schema(schema)
+        self.assertEqual(schema["properties"]["tags"]["items"], {})
+
+    def test_fixes_array_in_anyof(self):
+        """Reproduces the GOOGLECALENDAR_BATCH_EVENTS failure pattern."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "body": {
+                    "additionalProperties": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array"},
+                        ]
+                    }
+                }
+            },
+        }
+        _fix_tool_schema(schema)
+        array_entry = schema["properties"]["body"]["additionalProperties"]["anyOf"][1]
+        self.assertEqual(array_entry["items"], {})
+
+    def test_deeply_nested(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "ops": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "nested": {"type": "array"},
+                        },
+                    },
+                }
+            },
+        }
+        _fix_tool_schema(schema)
+        nested = schema["properties"]["ops"]["items"]["properties"]["nested"]
+        self.assertEqual(nested["items"], {})
+
+    def test_non_dict_input_passthrough(self):
+        self.assertEqual(_fix_tool_schema("hello"), "hello")
+        self.assertIsNone(_fix_tool_schema(None))
+
+    def test_no_type_field_untouched(self):
+        schema = {"description": "just a desc"}
+        result = _fix_tool_schema(schema)
+        self.assertNotIn("items", result)
+
+
+class TestSanitizeToolsForOpenAI(unittest.TestCase):
+    def test_returns_deep_copy(self):
+        tools = [{"function": {"name": "t", "parameters": {"type": "object", "properties": {
+            "x": {"type": "array"}
+        }}}}]
+        sanitized = _sanitize_tools_for_openai(tools)
+        self.assertIn("items", sanitized[0]["function"]["parameters"]["properties"]["x"])
+        self.assertNotIn("items", tools[0]["function"]["parameters"]["properties"]["x"])
+
+
+# ---------------------------------------------------------------------------
+# Tool capping & pinning
+# ---------------------------------------------------------------------------
+
+class TestToolCapping(unittest.TestCase):
+    def test_under_limit_unchanged(self):
+        tools = _make_tools(50)
+        result = cap_tools(tools, max_tools=128)
+        self.assertEqual(len(result), 50)
+
+    def test_capped_to_limit(self):
+        tools = _make_tools(200)
+        result = cap_tools(tools, max_tools=128)
+        self.assertEqual(len(result), 128)
+
+    def test_pinned_tools_survive_cap(self):
+        pinned = list(PINNED_TOOL_NAMES)
+        tools = _make_tools(200, pinned_names=pinned)
+        result = cap_tools(tools, max_tools=128)
+        result_names = {t["function"]["name"] for t in result}
+        for name in PINNED_TOOL_NAMES:
+            self.assertIn(name, result_names, f"pinned tool {name} was dropped")
+
+    def test_local_always_on_set_stays_small(self):
+        self.assertEqual(
+            PINNED_TOOL_NAMES,
+            {
+                "local_shell",
+                "interactive_terminal",
+                "ssh_remote",
+                "manage_tools",
+                "todo_list",
+                "delegate_task",
+                "skill_manage",
+                "conch_introspect",
+                "conch_config",
+                "read_file",
+                "edit_file",
+                "write_file",
+                "web_fetch",
+            },
+        )
+
+    def test_provider_tool_limits_defined(self):
+        self.assertEqual(PROVIDER_TOOL_LIMITS.get("openai"), 128)
+        self.assertEqual(PROVIDER_TOOL_LIMITS.get("cerebras"), 128)
+        self.assertIn("ollama", PROVIDER_TOOL_LIMITS)
+        self.assertIn("custom", PROVIDER_TOOL_LIMITS)
+        self.assertIsNone(PROVIDER_TOOL_LIMITS.get("anthropic"))
+
+
+# ---------------------------------------------------------------------------
+# content:null in messages
+# ---------------------------------------------------------------------------
+
+class TestNullContent(unittest.TestCase):
+    def test_append_results_openai_stores_empty_string(self):
+        messages = []
+        response = {"content": "", "tool_calls": [{"id": "1"}]}
+        append_results_openai(messages, response, [{"id": "1", "content": "ok"}])
+        assistant_msg = messages[0]
+        self.assertEqual(assistant_msg["content"], "")
+        self.assertIsNotNone(assistant_msg["content"])
+
+    def test_append_results_openai_none_content_becomes_empty(self):
+        messages = []
+        response = {"content": None, "tool_calls": [{"id": "1"}]}
+        append_results_openai(messages, response, [{"id": "1", "content": "ok"}])
+        self.assertEqual(messages[0]["content"], "")
+
+    def test_normalize_for_openai_fixes_none_content_on_tool_call(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "tool_call_id": "1", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+        ]
+        result = normalize_messages_for_provider(msgs, "openai")
+        for msg in result:
+            self.assertIsNotNone(msg["content"])
+            self.assertIsInstance(msg["content"], str)
+        # Tool call messages should be preserved for multi-turn tool use
+        self.assertEqual(len(result), 4)
+        self.assertEqual(result[1]["content"], "")
+        self.assertIn("tool_calls", result[1])
+
+    def test_normalize_for_anthropic_fixes_none_content(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None},
+        ]
+        result = normalize_messages_for_provider(msgs, "anthropic")
+        for msg in result:
+            self.assertIsNotNone(msg["content"])
+
+    def test_openai_multi_turn_tool_use_preserved(self):
+        """After a tool call, assistant+tool_calls and tool results must
+        remain in the message list so the model sees them on the next round."""
+        msgs = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "make a map"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "web_search", "arguments": '{"q":"map"}'}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "search results here"},
+            {"role": "assistant", "content": "Here's step 1. Now doing step 2.", "tool_calls": [
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "web_search", "arguments": '{"q":"step2"}'}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "more results"},
+        ]
+        result = normalize_messages_for_provider(msgs, "openai")
+        roles = [m["role"] for m in result]
+        self.assertEqual(roles.count("tool"), 2, "tool results must be kept")
+        self.assertEqual(roles.count("assistant"), 2, "tool-call assistants must be kept")
+        tc_msgs = [m for m in result if m.get("tool_calls")]
+        self.assertEqual(len(tc_msgs), 2, "tool_calls must be preserved")
+
+    def test_normalize_on_switch_drops_none_content(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+            {"role": "assistant", "content": "done"},
+        ]
+        normalize_messages_on_switch(msgs, "openai")
+        for msg in msgs:
+            self.assertIsNotNone(msg["content"])
+            self.assertIsInstance(msg["content"], str)
+
+    def test_normalize_on_switch_drops_empty_messages(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "hi"},
+        ]
+        normalize_messages_on_switch(msgs, "openai")
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(msgs[1]["content"], "hi")
+
+
+# ---------------------------------------------------------------------------
+# Fallback chain & structural error detection
+# ---------------------------------------------------------------------------
+
+class TestFallbackChain(unittest.TestCase):
+    def setUp(self):
+        # Ollama model discovery is live; keep these tests network-free by
+        # simulating an unreachable server.
+        patcher = patch("conch.providers.list_ollama_models", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_same_provider_models_first(self):
+        chain = get_fallback_chain("openai", "gpt-5.4")
+        same_provider = [(p, m) for p, m, _ in chain if p == "openai"]
+        cross_provider = [(p, m) for p, m, _ in chain if p != "openai"]
+        self.assertTrue(len(same_provider) > 0)
+        if same_provider and cross_provider:
+            last_same = max(i for i, (p, m, _) in enumerate(chain) if p == "openai")
+            first_cross = min(i for i, (p, m, _) in enumerate(chain) if p != "openai")
+            self.assertLess(last_same, first_cross)
+
+    def test_unknown_model_tries_all(self):
+        chain = get_fallback_chain("openai", "nonexistent-model")
+        models = [m for p, m, _ in chain if p == "openai"]
+        self.assertEqual(len(models), len(KNOWN_MODELS["openai"]))
+
+    def test_cross_provider_needs_context_switch(self):
+        chain = get_fallback_chain("openai", "gpt-5.4")
+        cross = [(p, m, s) for p, m, s in chain if p != "openai"]
+        for p, m, needs_switch in cross:
+            self.assertTrue(needs_switch)
+
+
+class TestGetFallbackModel(unittest.TestCase):
+    def test_returns_stable_default(self):
+        self.assertEqual(get_fallback_model("openai"), "gpt-4o-mini")
+        self.assertEqual(get_fallback_model("anthropic"), "claude-sonnet-5")
+        self.assertEqual(get_fallback_model("cerebras"), "gpt-oss-120b")
+
+    def test_unknown_provider_empty(self):
+        self.assertEqual(get_fallback_model("nonexistent"), "")
+
+
+class TestDefaultChatModelByProvider(unittest.TestCase):
+    def test_openai_default_is_gpt4o_mini(self):
+        self.assertEqual(DEFAULT_CHAT_MODEL_BY_PROVIDER["openai"], "gpt-4o-mini")
+
+    def test_all_providers_have_default(self):
+        for provider in KNOWN_MODELS:
+            self.assertIn(provider, DEFAULT_CHAT_MODEL_BY_PROVIDER)
+
+
+# ---------------------------------------------------------------------------
+# HTTP error body parsing
+# ---------------------------------------------------------------------------
+
+class TestFormatHttpApiError(unittest.TestCase):
+    def test_non_http_error_passthrough(self):
+        self.assertEqual(format_http_api_error(ValueError("oops")), "oops")
+
+    def test_openai_json_error_body(self):
+        import urllib.error
+        body = json.dumps({
+            "error": {
+                "message": "The model 'gpt-99' does not exist",
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        }).encode()
+        exc = urllib.error.HTTPError(
+            "https://api.openai.com/v1/chat/completions",
+            404, "Not Found", {}, io.BytesIO(body),
+        )
+        result = format_http_api_error(exc)
+        self.assertIn("gpt-99", result)
+        self.assertIn("invalid_request_error", result)
+        self.assertIn("model_not_found", result)
+
+    def test_anthropic_json_error_body(self):
+        import urllib.error
+        body = json.dumps({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "messages.5.content: must be a string",
+            }
+        }).encode()
+        exc = urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages",
+            400, "Bad Request", {}, io.BytesIO(body),
+        )
+        result = format_http_api_error(exc)
+        self.assertIn("must be a string", result)
+
+    def test_non_json_body_fallback(self):
+        import urllib.error
+        exc = urllib.error.HTTPError(
+            "https://example.com", 500, "Internal Server Error",
+            {}, io.BytesIO(b"not json"),
+        )
+        result = format_http_api_error(exc)
+        self.assertIn("500", result)
+
+
+# ---------------------------------------------------------------------------
+# conch_config tool: queued switch semantics
+# ---------------------------------------------------------------------------
+
+class TestConchConfigClient(unittest.TestCase):
+    def setUp(self):
+        self.client = ConchConfigClient()
+        self.client.bind("anthropic", "claude-sonnet-4-6", {})
+
+    def test_set_model_queues_action(self):
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
+            self.client.call_tool("conch_config", {
+                "action": "set_model", "value": "gpt-4o",
+            })
+        self.assertEqual(len(self.client.pending_actions), 1)
+        self.assertEqual(self.client.pending_actions[0], ("set_model", "openai", "gpt-4o"))
+
+    def test_set_model_response_says_queued(self):
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
+            result = self.client.call_tool("conch_config", {
+                "action": "set_model", "value": "gpt-4o",
+            })
+        text = result["content"][0]["text"]
+        self.assertIn("queued", text.lower())
+        self.assertIn("NEXT", text)
+        self.assertIn("anthropic", text)
+
+    def test_set_model_already_current(self):
+        result = self.client.call_tool("conch_config", {
+            "action": "set_model", "value": "claude-sonnet-4-6",
+        })
+        text = result["content"][0]["text"]
+        self.assertIn("Already", text)
+        self.assertEqual(len(self.client.pending_actions), 0)
+
+    def test_set_provider_queues_default_model(self):
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
+            self.client.call_tool("conch_config", {
+                "action": "set_provider", "value": "openai",
+            })
+        self.assertEqual(len(self.client.pending_actions), 1)
+        action = self.client.pending_actions[0]
+        self.assertEqual(action[1], "openai")
+        self.assertEqual(action[2], "gpt-4o-mini")
+
+    def test_set_provider_already_current(self):
+        result = self.client.call_tool("conch_config", {
+            "action": "set_provider", "value": "anthropic",
+        })
+        text = result["content"][0]["text"]
+        self.assertIn("Already", text)
+        self.assertEqual(len(self.client.pending_actions), 0)
+
+    def test_set_model_unknown(self):
+        result = self.client.call_tool("conch_config", {
+            "action": "set_model", "value": "gpt-99-turbo",
+        })
+        text = result["content"][0]["text"]
+        self.assertIn("Unknown", text)
+        self.assertEqual(len(self.client.pending_actions), 0)
+
+    def test_get_returns_current_state(self):
+        result = self.client.call_tool("conch_config", {"action": "get"})
+        text = result["content"][0]["text"]
+        self.assertIn("anthropic", text)
+        self.assertIn("claude-sonnet-4-6", text)
+
+
+# ---------------------------------------------------------------------------
+# Model catalog consistency
+# ---------------------------------------------------------------------------
+
+class TestModelCatalog(unittest.TestCase):
+    def test_all_known_models_have_pricing(self):
+        for provider, models in KNOWN_MODELS.items():
+            if provider in ("ollama", "custom", "claude-code", "codex"):
+                continue
+            for model in models:
+                self.assertIn(
+                    model, MODEL_PRICING,
+                    f"{provider}/{model} missing from MODEL_PRICING",
+                )
+
+    def test_pricing_values_are_tuples(self):
+        for model, price in MODEL_PRICING.items():
+            self.assertIsInstance(price, tuple, f"{model} pricing should be a tuple")
+            self.assertEqual(len(price), 2, f"{model} pricing should have 2 values")
+            self.assertGreaterEqual(price[0], 0)
+            self.assertGreaterEqual(price[1], 0)
+
+    def test_estimate_cost_known_model(self):
+        cost = estimate_cost("gpt-4o-mini", 1_000_000, 1_000_000)
+        self.assertAlmostEqual(cost, 0.15 + 0.60)
+
+    def test_estimate_cost_unknown_model_is_zero(self):
+        cost = estimate_cost("nonexistent-model", 1_000_000, 1_000_000)
+        self.assertEqual(cost, 0.0)
+
+    def test_default_models_exist_in_catalog(self):
+        for provider, model in DEFAULT_CHAT_MODEL_BY_PROVIDER.items():
+            if provider in ("ollama", "custom"):
+                continue  # discovered live (ollama) / defined by config (custom)
+            self.assertIn(
+                model, KNOWN_MODELS[provider],
+                f"default {provider} model '{model}' not in KNOWN_MODELS",
+            )
+
+    def test_openai_has_current_models(self):
+        openai_models = KNOWN_MODELS["openai"]
+        self.assertIn("gpt-4o", openai_models)
+        self.assertIn("gpt-4o-mini", openai_models)
+        self.assertIn("o3", openai_models)
+        self.assertIn("o4-mini", openai_models)
+        self.assertIn("gpt-5.4", openai_models)
+        self.assertIn("gpt-5.5", openai_models)
+        self.assertIn("gpt-5.6-sol", openai_models)
+        self.assertIn("gpt-5.6-terra", openai_models)
+        self.assertIn("gpt-5.6-luna", openai_models)
+
+    def test_openai_pruned_models_stay_out(self):
+        """Pruned/quarantined 2026-09-14: bare gpt-5.6 does not exist, and
+        the pro/codex models are v1/responses-only — conch's chat-completions
+        path cannot tool-call them."""
+        openai_models = KNOWN_MODELS["openai"]
+        for model in ("gpt-5.6", "gpt-5.3-codex", "gpt-5.4-pro", "o3-pro", "o1-pro"):
+            self.assertNotIn(model, openai_models)
+            self.assertNotIn(model, MODEL_PRICING)
+
+    def test_anthropic_has_current_models(self):
+        anthropic_models = KNOWN_MODELS["anthropic"]
+        self.assertIn("claude-opus-5", anthropic_models)
+        self.assertIn("claude-sonnet-5", anthropic_models)
+        self.assertIn("claude-opus-4-8", anthropic_models)
+        self.assertIn("claude-opus-4-7", anthropic_models)
+        self.assertIn("claude-sonnet-4-6", anthropic_models)
+        self.assertIn("claude-haiku-4-5", anthropic_models)
+
+    def test_anthropic_pruned_models_stay_out(self):
+        """Pruned 2026-09-14: absent from /v1/models and 404 on direct probe."""
+        anthropic_models = KNOWN_MODELS["anthropic"]
+        for model in ("claude-fable-5", "claude-sonnet-4-7"):
+            self.assertNotIn(model, anthropic_models)
+            self.assertNotIn(model, MODEL_PRICING)
+
+    def test_cerebras_has_current_models(self):
+        cerebras_models = KNOWN_MODELS["cerebras"]
+        self.assertIn("gpt-oss-120b", cerebras_models)
+        self.assertIn("gemma-4-31b", cerebras_models)
+        self.assertIn("zai-glm-4.7", cerebras_models)
+
+
+class TestModelVerificationAnnotations(unittest.TestCase):
+    """Every hardcoded cloud catalog entry must carry a live-audit
+    annotation in MODEL_VERIFIED (tools/audit_models.py): either the ISO
+    date it last passed the existence + forced-tool-call audit, or an
+    explicit "unverified YYYY-MM-DD (<reason>)" marker. This makes adding a
+    model without auditing it a conscious, visible act. Local discovery and
+    native seat aliases are verified live at runtime rather than through API keys.
+    """
+
+    DATE_RE = r"\d{4}-\d{2}-\d{2}"
+
+    def test_every_catalog_entry_is_annotated(self):
+        import re
+        # An ISO date (optionally with a "(…)" capability note such as
+        # "(tools: auto-choice)"), or an explicit "unverified …" marker.
+        pattern = re.compile(
+            rf"^({self.DATE_RE}( \(.+\))?|unverified {self.DATE_RE} \(.+\))$"
+        )
+        for provider, models in KNOWN_MODELS.items():
+            if provider in ("ollama", "custom", "claude-code", "codex"):
+                continue
+            for model in models:
+                self.assertIn(
+                    model, MODEL_VERIFIED,
+                    f"{provider}/{model} has no verification annotation — "
+                    "run tools/audit_models.py and record the date",
+                )
+                self.assertRegex(
+                    MODEL_VERIFIED[model], pattern,
+                    f"{provider}/{model} annotation must be an ISO date or "
+                    "'unverified YYYY-MM-DD (<reason>)'",
+                )
+
+    def test_no_stale_annotations(self):
+        cataloged = {
+            model
+            for provider, models in KNOWN_MODELS.items()
+            for model in models
+        }
+        for model in MODEL_VERIFIED:
+            self.assertIn(
+                model, cataloged,
+                f"MODEL_VERIFIED entry '{model}' is not in any catalog — "
+                "remove it or restore the model",
+            )
+
+
+class TestCerebrasConfigLoading(unittest.TestCase):
+    def test_inherited_anthropic_defaults_are_replaced(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from conch.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conch_dir = Path(tmp) / "conch"
+            conch_dir.mkdir()
+            (conch_dir / "config").write_text("provider = cerebras\n")
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}), \
+                 mock.patch.object(Path, "home", return_value=Path(tmp)):
+                config = load_config()
+        self.assertEqual(config["provider"], "cerebras")
+        self.assertEqual(config["api_key_env"], "CEREBRAS_API_KEY")
+        self.assertEqual(config["model"], "gpt-oss-120b")
+        self.assertEqual(config["chat_model"], "gpt-oss-120b")
+
+
+class TestAnthropicGen5RequestShape(unittest.TestCase):
+    def test_gen5_gets_larger_max_tokens(self):
+        self.assertEqual(_anthropic_max_tokens("claude-opus-5"), 32768)
+        self.assertEqual(_anthropic_max_tokens("claude-sonnet-5"), 32768)
+        self.assertEqual(_anthropic_max_tokens("claude-fable-5"), 32768)
+
+    def test_older_claude_keeps_16k(self):
+        self.assertEqual(_anthropic_max_tokens("claude-sonnet-4-6"), 16384)
+        self.assertEqual(_anthropic_max_tokens("claude-opus-4-8"), 16384)
+        self.assertEqual(_anthropic_max_tokens("claude-sonnet-4-5-20250929"), 16384)
+
+    def test_stream_preserves_thinking_blocks(self):
+        events = [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
+            {"type": "content_block_start", "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "plan first"}},
+            {"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "sig123"}},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "done"}},
+            {"type": "content_block_stop"},
+            {"type": "message_delta", "usage": {"output_tokens": 4}},
+        ]
+        lines = [f"data: {json.dumps(event)}\n".encode() for event in events]
+
+        class _FakeResp:
+            def __iter__(self):
+                return iter(lines)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
+             patch("urllib.request.urlopen", return_value=_FakeResp()):
+            result = stream_anthropic(
+                {"model": "claude-opus-5"},
+                [{"role": "user", "content": "hi"}],
+            )
+        self.assertEqual(result["content"], "done")
+        self.assertEqual(result["_anthropic_content"][0], {
+            "type": "thinking",
+            "thinking": "plan first",
+            "signature": "sig123",
+        })
+        self.assertEqual(result["_anthropic_content"][1], {"type": "text", "text": "done"})
+
+
+class _GenerationCapture:
+    def __init__(self):
+        self.events = []
+
+    def feed(self, text):
+        self.events.append(("answer", text))
+
+    def feed_detail(self, kind, text):
+        self.events.append((kind, text))
+
+    def text(self, kind):
+        return "".join(text for event_kind, text in self.events if event_kind == kind)
+
+
+class TestGenerationDetails(unittest.TestCase):
+    def _compat(self, deltas, capture, provider="openai"):
+        lines = [
+            ("data: " + json.dumps({"choices": [{"delta": delta}]}) + "\n\n").encode()
+            for delta in deltas
+        ]
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(
+            b"".join(lines) + b"data: [DONE]\n\n"
+        )):
+            return providers._stream_openai_compat(
+                "https://example.test/chat/completions", {}, {"model": "test"},
+                "test", provider, capture.feed,
+            )
+
+    def test_compat_reasoning_aliases_and_opaque_details(self):
+        for provider in ("openai", "cerebras", "openrouter", "custom", "bedrock"):
+            with self.subTest(provider=provider):
+                capture = _GenerationCapture()
+                result = self._compat([
+                    {"reasoning_content": "Plan ", "reasoning": "Plan ",
+                     "reasoning_details": [{"type": "reasoning.text", "text": "Plan "}]},
+                    {"reasoning": "carefully. "},
+                    {"reasoning_details": [
+                        {"type": "reasoning.text", "text": "Check. ", "signature": "opaque"},
+                        {"type": "reasoning.summary", "summary": "Then answer. "},
+                        {"type": "reasoning.encrypted", "data": "secret", "text": "secret"},
+                        {"type": "unknown", "text": "secret"},
+                    ]},
+                    {"reasoning": {"type": "reasoning", "summary": [
+                        {"type": "summary_text", "text": "Ready."}
+                    ], "encrypted_content": "secret"}},
+                    {"content": "The "}, {"content": "answer."},
+                ], capture, provider)
+                self.assertEqual(capture.text("reasoning"),
+                                 "Plan carefully. Check. Then answer. Ready.")
+                self.assertEqual(capture.text("answer"), "The answer.")
+                self.assertEqual(result["content"], "The answer.")
+                self.assertNotIn("secret", str(capture.events))
+                self.assertNotIn("opaque", str(capture.events))
+
+    def test_reasoning_only_stays_out_of_result_and_plain_callbacks(self):
+        received = []
+        for callback in (None, received.append):
+            payload = b'data: {"choices":[{"delta":{"reasoning":"private plan"}}]}\n\n'
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(payload)):
+                result = providers._stream_openai_compat(
+                    "https://example.test/chat/completions", {}, {}, "test", "openai", callback,
+                )
+            self.assertEqual(result["content"], "")
+            self.assertIsNone(result["tool_calls"])
+        self.assertEqual(received, [])
+
+    def test_inline_tags_split_at_every_boundary(self):
+        for tag in ("think", "reasoning"):
+            text = f"Before<{tag}>published thought</{tag}>After"
+            for split in range(1, len(text)):
+                with self.subTest(tag=tag, split=split):
+                    capture = _GenerationCapture()
+                    result = self._compat([
+                        {"content": text[:split]}, {"content": text[split:]}
+                    ], capture)
+                    self.assertEqual(capture.text("reasoning"), "published thought")
+                    self.assertEqual(capture.text("answer"), "BeforeAfter")
+                    self.assertEqual(result["content"], "BeforeAfter")
+
+    def test_unterminated_thinking_remains_detail_only(self):
+        capture = _GenerationCapture()
+        result = self._compat([{"content": "Answer<think>unfinished</thi"}], capture)
+        self.assertEqual(result["content"], "Answer")
+        self.assertEqual(capture.text("answer"), "Answer")
+        self.assertEqual(capture.text("reasoning"), "unfinished</thi")
+
+    def test_details_arrive_before_following_event_and_error(self):
+        capture = _GenerationCapture()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(response):
+                yield b'data: {"choices":[{"delta":{"reasoning":"plan"}}]}\n'
+                self.assertEqual(capture.events, [("reasoning", "plan")])
+                yield b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"local_shell","arguments":"{\\"command\\":"}}]}}]}\n'
+                self.assertEqual(capture.events[-1][0], "progress")
+                yield b'data: {"error":{"message":"generation failed"}}\n'
+
+        with patch("urllib.request.urlopen", return_value=Response()):
+            result = providers._stream_openai_compat(
+                "https://example.test/chat/completions", {}, {}, "test", "openai", capture.feed,
+            )
+        self.assertTrue(result["_error"])
+        self.assertIn("generation failed", result["content"])
+        self.assertEqual(capture.text("answer"), "")
+        self.assertNotIn("command", str(capture.events))
+
+    def test_tool_progress_is_once_per_call_not_argument_fragment(self):
+        capture = _GenerationCapture()
+        result = self._compat([
+            {"tool_calls": [{"index": 0, "id": "c1", "function": {
+                "name": "local_shell", "arguments": '{"command":'
+            }}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": '"pwd"}'}}]},
+        ], capture)
+        self.assertEqual([kind for kind, _ in capture.events], ["progress"])
+        self.assertNotIn("pwd", str(capture.events))
+        self.assertEqual(result["tool_calls"][0]["function"]["arguments"], '{"command":"pwd"}')
+
+    def test_anthropic_published_thinking_and_opaque_replay_are_separate(self):
+        capture = _GenerationCapture()
+        events = [
+            {"type": "content_block_start", "content_block": {
+                "type": "thinking", "thinking": "First "
+            }},
+            {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "think"}},
+            {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "."}},
+            {"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "sig"}},
+            {"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "nature"}},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {
+                "type": "redacted_thinking", "data": "encrypted"
+            }},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {
+                "type": "tool_use", "name": "local_shell", "id": "c1"
+            }},
+            {"type": "content_block_delta", "delta": {
+                "type": "input_json_delta", "partial_json": '{"command":'
+            }},
+            {"type": "content_block_delta", "delta": {
+                "type": "input_json_delta", "partial_json": '"pwd"}'
+            }},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Answer"}},
+            {"type": "content_block_stop"},
+        ]
+        wire = "".join("data: " + json.dumps(event) + "\n\n" for event in events).encode()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
+             patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+            result = providers.stream_anthropic({"model": "claude-sonnet-5"}, [], on_token=capture.feed)
+        self.assertEqual(capture.text("reasoning"), "First think.")
+        self.assertEqual(capture.text("answer"), "Answer")
+        self.assertEqual(capture.text("progress"), "Generating tool call: local_shell")
+        self.assertEqual(result["content"], "Answer")
+        self.assertEqual(result["_anthropic_content"][:2], [
+            {"type": "thinking", "thinking": "First think.", "signature": "signature"},
+            {"type": "redacted_thinking", "data": "encrypted"},
+        ])
+        self.assertNotIn("signature", str(capture.events))
+        self.assertNotIn("encrypted", str(capture.events))
+        self.assertNotIn("command", str(capture.events))
+        self.assertEqual(result["tool_calls"][0]["function"]["arguments"], '{"command": "pwd"}')
+
+    def test_ollama_ndjson_thinking_inline_tags_and_tool_gate(self):
+        capture = _GenerationCapture()
+        call = {"function": {"name": "local_shell", "arguments": {"command": "pwd"}}}
+        chunks = [
+            {"message": {"thinking": "Native "}},
+            {"message": {"thinking": "thought. "}},
+            {"message": {"content": "<thi"}},
+            {"message": {"content": "nk>Inline"}},
+            {"message": {"content": "</think>"}},
+            {"message": {"content": '{"name":"local_shell","arguments":{"command":"pwd"}}'}},
+            {"message": {"tool_calls": [call]}},
+            {"message": {"tool_calls": [call]}},
+            {"done": True},
+        ]
+        wire = "".join(json.dumps(chunk) + "\n" for chunk in chunks).encode()
+        with patch.object(providers, "validate_ollama_model", return_value=(True, "")), \
+             patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+            result = providers.stream_ollama({"model": "test"}, [], on_token=capture.feed)
+        self.assertEqual(capture.text("reasoning"), "Native thought. Inline")
+        self.assertEqual(capture.text("answer"), "")
+        self.assertEqual(capture.text("progress"), "Generating tool call")
+        self.assertEqual(result["content"], chunks[5]["message"]["content"])
+        self.assertEqual(len(result["tool_calls"]), 1)
+        self.assertNotIn("command", str(capture.events))
+
+
+    def test_gateway_wrappers_keep_bound_detail_consumer(self):
+        for stream, key in (
+            (providers.stream_openrouter, "OPENROUTER_API_KEY"),
+            (providers.stream_bedrock, "AWS_BEARER_TOKEN_BEDROCK"),
+        ):
+            with self.subTest(provider=stream.__name__):
+                capture = _GenerationCapture()
+                wire = (
+                    b'data: {"choices":[{"delta":{"reasoning":"Native ","content":"<thi"}}]}\n\n'
+                    b'data: {"choices":[{"delta":{"content":"nk>inline</think>Answer"}}]}\n\n'
+                )
+                with patch.dict("os.environ", {key: "test-key"}), \
+                     patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+                    result = stream({"model": "test"}, [], on_token=capture.feed)
+                self.assertEqual(capture.text("reasoning"), "Native inline")
+                self.assertEqual(capture.text("answer"), "Answer")
+                self.assertEqual(result["content"], "Answer")
+
+    def test_raw_reasoning_only_is_not_promoted_to_answer(self):
+        for raw, key in (
+            (providers.raw_openai, "OPENAI_API_KEY"),
+            (providers.raw_cerebras, "CEREBRAS_API_KEY"),
+        ):
+            with self.subTest(provider=raw.__name__):
+                wire = json.dumps({"choices": [{"message": {
+                    "content": None, "reasoning": "published plan, not an answer"
+                }}]}).encode()
+                with patch.dict("os.environ", {key: "test-key"}), \
+                     patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+                    result = raw({"model": "test"}, [])
+                self.assertEqual(result["content"], "")
+
+    def test_ollama_native_thinking_and_fragmented_answer_are_separate(self):
+        capture = _GenerationCapture()
+        chunks = [
+            {"message": {"thinking": "First "}},
+            {"message": {"thinking": "think."}},
+            {"message": {"thinking": {"data": "opaque"}, "content": "An"}},
+            {"message": {"content": "swer"}, "done": True},
+        ]
+        wire = "".join(json.dumps(chunk) + "\n" for chunk in chunks).encode()
+        with patch.object(providers, "validate_ollama_model", return_value=(True, "")), \
+             patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+            result = providers.stream_ollama({"model": "test"}, [], on_token=capture.feed)
+        self.assertEqual(capture.events, [
+            ("reasoning", "First "), ("reasoning", "think."),
+            ("answer", "An"), ("answer", "swer"),
+        ])
+        self.assertEqual(result["content"], "Answer")
+
+
+if __name__ == "__main__":
+    unittest.main()

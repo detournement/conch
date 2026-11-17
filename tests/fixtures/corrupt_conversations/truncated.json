@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "id": "bbbb2222",
+  "title": "Truncated mid-object",
+  "model": "test-model",
+  "provider": "test-provider",
+  "messages": [
+    {
+      "role": "user",
+      "content": "this write was torn mid-obj

@@ -1,6 +1,5 @@
 """Tests for conch.public_apis — catalog parsing, search, and API calling."""
 
-import json
 import unittest
 from unittest.mock import patch, MagicMock
 

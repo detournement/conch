@@ -220,5 +220,15 @@ def call_api(
             if len(body) > _MAX_RESPONSE:
                 text = text[:_MAX_RESPONSE] + "\n... (truncated)"
             return text
+    except urllib.error.HTTPError as exc:
+        error_body = ""
+        try:
+            error_body = exc.read(2048).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        detail = f"HTTP {exc.code}"
+        if error_body:
+            detail += f": {error_body}"
+        return f"API call failed: {detail}"
     except Exception as exc:
         return "API call failed: %s" % exc

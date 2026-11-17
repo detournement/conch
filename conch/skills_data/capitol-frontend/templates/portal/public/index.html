@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Filestore portal</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Filestore portal</h1>
+        <p class="muted" id="who"></p>
+      </header>
+
+      <div class="error-banner" id="error-banner" hidden></div>
+
+      <section class="panel" id="signin-panel" hidden>
+        <h2>Sign in</h2>
+        <p class="muted">Access is limited to allowlisted accounts.</p>
+        <div id="google-signin"></div>
+        <form id="dev-login" hidden>
+          <label for="dev-email">Developer sign-in (local only)</label>
+          <input id="dev-email" type="email" placeholder="you@example.com" />
+          <button type="submit">Sign in</button>
+        </form>
+      </section>
+
+      <section class="panel" id="feed-panel" hidden>
+        <div class="toolbar">
+          <h2>Records</h2>
+          <span class="badge" id="feed-source"></span>
+          <button class="secondary" id="signout-btn">Sign out</button>
+        </div>
+        <p class="stale" id="stale-note" hidden>Showing the last good snapshot — the live read failed; it will retry.</p>
+        <ul id="records"></ul>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

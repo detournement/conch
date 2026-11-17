@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for the conch-edge daemon (macOS, per-user agent).
+
+  The default way to install and manage the daemon is the built-in
+  installer, which renders this template with your machine's paths:
+
+      conch-edge install     # render + load + verify
+      conch-edge status      # launchd state + daemon health
+      conch-edge uninstall   # stop + remove
+
+  Manual install (this file carries the documentation defaults):
+    1. Adjust ProgramArguments to the absolute path of conch-edge
+       (`which conch-edge`).
+    2. cp deploy/com.conch.edge.plist ~/Library/LaunchAgents/
+    3. launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.conch.edge.plist
+
+  The daemon requires `edge_daemon = true` in ~/.config/conch/config (it
+  exits with EX_CONFIG otherwise), runs unprivileged as you, writes its log
+  to ~/.local/state/conch/kernel/daemon.log, and exposes only a local
+  0700-protected control socket - never a network port. Secrets stay by
+  reference: this file carries only PATH; hand the daemon channel/provider
+  tokens with `launchctl setenv NAME value`, never by editing this file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.conch.edge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/conch-edge</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart on crash, but respect a clean exit (config disabled,
+             another daemon holds the lock). -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/conch-edge.launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/conch-edge.launchd.err</string>
+</dict>
+</plist>

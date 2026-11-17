@@ -1,4 +1,651 @@
-provider=cerebras
-model=zai-glm-4.7
-chat_model=zai-glm-4.7
-api_key_env=CEREBRAS_API_KEY
+# Conch configuration
+# Files are read in order (later overrides earlier):
+#   ~/.config/conch/config, ~/.conchrc, then a per-project .conchrc
+#   (nearest file between the current directory and the git root).
+
+# Seat providers: claude-code (Claude), codex (ChatGPT).
+# Explicit API/local alternatives: anthropic, openai, cerebras, bedrock,
+# openrouter, ollama, custom.
+# Install the official CLI, then: conch auth login claude-code
+provider=claude-code
+model=sonnet
+chat_model=sonnet
+api_key_env=
+# Native subprocess deadline (seconds); tokens remain in the CLI's own store.
+#seat_timeout=120
+#
+# ChatGPT seat: conch auth login codex
+#provider=codex
+#model=default
+#chat_model=default
+#
+# Direct API usage is separate billing, not part of a subscription seat:
+#provider=anthropic
+#model=claude-sonnet-5
+#chat_model=claude-sonnet-5
+#api_key_env=ANTHROPIC_API_KEY
+
+# --- AWS Bedrock (Moonshot Kimi) example -------------------------------------
+# Uses Bedrock's OpenAI-compatible endpoint with a long-term Bedrock API key
+# (create one: aws iam create-service-specific-credential --user-name <you>
+#  --service-name bedrock.amazonaws.com) exported as AWS_BEARER_TOKEN_BEDROCK.
+#provider=bedrock
+#model=moonshotai.kimi-k2.5
+#chat_model=moonshotai.kimi-k2.5
+#bedrock_region=us-east-2
+#api_key_env=AWS_BEARER_TOKEN_BEDROCK
+
+# --- Ollama (local) example -------------------------------------------------
+# Models are discovered live from the server and filtered to tool-capable
+# ones; conch only supports models that advertise the "tools" capability.
+#provider=ollama
+#base_url=http://localhost:11434
+#model=qwen3.6:27b
+#chat_model=qwen3.6:27b
+# Context window requested on every Ollama call (clamped to the model's max).
+# When the model's max is unknown (older server without model_info) the
+# default degrades to a conservative 8192; setting this explicitly wins.
+#ollama_num_ctx=32768
+# How long the server keeps the model loaded between turns.
+#ollama_keep_alive=10m
+
+# --- Custom OpenAI-compatible endpoint (vLLM, LM Studio, llama.cpp) ----------
+# Assumed tool-capable; verified by a startup probe.
+#provider=custom
+#custom_base_url=http://192.0.2.50:8000/v1
+#custom_model=qwen2.5-32b
+#custom_context_window=32768
+#api_key_env=MY_ENDPOINT_KEY
+
+# --- llama-idx inference registry (discovery) --------------------------------
+# One endpoint that knows the whole self-hosted fleet (llama.cpp, Ollama,
+# OpenAI-compatible boxes that come and go): github.com/detournement/llama-idx.
+# With llamaidx_url set, /models grows an llamaidx section with namespaced
+# entries (llamaidx/provider/model) and /model llamaidx/gpubox/qwen3-32b
+# switches to one — routed through the existing ollama/custom adapters by
+# flavor; the registry only supplies flavor + base_url + model id. Only the
+# registry's tool-VERIFIED models are listed; conch still runs its own
+# probe-on-select. Down providers vanish; degraded ones show a marker.
+# Fallback chains draw registry boxes before any cloud hop. local_only
+# applies to the registry URL and every discovered provider base_url.
+# Unset = feature off, zero new traffic.
+#
+# The registry is also a queryable data source. With llamaidx_url set:
+#   - /llamaidx prints the whole fleet (?status=all): down boxes with
+#     their last error and last-seen time, degraded boxes, per-model
+#     context/quant/loaded state.
+#   - the llamaidx_registry builtin tool gives the model the same
+#     read-only view in chat ("is burt up?", "what GPUs are running?"),
+#     and conch_config can list and select llamaidx/provider/model
+#     entries (probe-on-select still runs before committing).
+# Reporting is read-only against the registry and never wakes the boxes.
+#llamaidx_url=http://registry.example:8642
+# Registries running read_auth=true: NAME of the env var with the read
+# token (never the token itself).
+#llamaidx_token_env=LLAMAIDX_TOKEN
+
+# --- Sandboxed execution (exec backend) ---------------------------------------
+# Run approved shell commands in a sandbox instead of (or alongside) the
+# local machine. The permission model is unchanged — prompts, safe_auto,
+# and destructive-command gates decide WHETHER a command runs; the
+# backend only changes WHERE. Flip per session with
+# /sandbox docker [image] | e2b | off; set a startup default here.
+# The host environment is NEVER forwarded into a sandbox.
+# Unset (or local) = feature off, zero new code paths.
+#exec_backend=local
+#
+# docker: one ephemeral local container per session (removed on exit).
+# The cwd can be mounted at /workspace so builds see the project:
+# rw (default) / ro / none (fully isolated scratch box).
+#sandbox_docker_image=python:3.12-slim
+#sandbox_docker_mount=rw
+#
+# e2b: an E2B cloud sandbox (e2b.dev) over a stdlib-only client. The
+# sandbox is a CLEAN remote environment — it does not see local files
+# (clone your repo inside it). NAME of the env var with the API key
+# (never the key itself); template and TTL are optional.
+#e2b_api_key_env=E2B_API_KEY
+#e2b_template=base
+#e2b_timeout_seconds=600
+
+# --- OpenRouter ---------------------------------------------------------------
+# Frontier models not on the other providers, via openrouter.ai:
+#   moonshotai/kimi-k3           (2.8T MoE, 1M context, $3/$15 per MTok)
+#   z-ai/glm-5.2                 (~750B MoE, 1M context, $0.98/$3.08 per MTok)
+#   deepseek/deepseek-v4-pro     (1.6T MoE, 1M context, $0.435/$0.87 per MTok)
+#   deepseek/deepseek-v4-flash   (284B MoE, 1M context, $0.14/$0.28 per MTok)
+# Switch between them in chat with /model.
+#provider=openrouter
+#model=moonshotai/kimi-k3
+#chat_model=moonshotai/kimi-k3
+#api_key_env=OPENROUTER_API_KEY
+
+# --- Startup model check -----------------------------------------------------
+# Every start probes the configured model once: native seat login plus a
+# structured tool response; catalog + models list for API providers; /api/tags
+# + tools capability for Ollama; /v1/models + tool-call probe for custom.
+# In a terminal a failure shows the diagnosis and ranked alternatives
+# to pick from (session only, or saved as the new default — your choice).
+# Non-interactive runs (--non-interactive, pipes, cron, conch-ask, the edge
+# daemon) never prompt: they try fallback_models in order and otherwise fail
+# closed with exit status 69. Nothing is ever switched silently.
+#model_check=on
+# Default: 60 seconds for native seats, 4 for API/local providers.
+#model_check_timeout=4
+# Pre-approved alternatives for non-interactive runs, tried in order.
+# custom/<model> uses custom_base_url; llamaidx/<box>/<model> resolves via
+# the registry; cloud entries need their key and respect local_only.
+#fallback_models=ollama/qwen2.5:7b, anthropic/claude-sonnet-5
+
+# --- Behavior ----------------------------------------------------------------
+# Auto-execute shell commands without confirmation (a startup notice is shown
+# when this is enabled here). Off by default.
+#agent_mode=false
+
+# Turn-level git checkpoints (on by default): inside a git repo, every
+# turn that changes the worktree snapshots it to refs/conch/checkpoints/*
+# — your branch, index, stash, and history are never touched, gitignored
+# and secret-shaped paths (.env, *.pem, id_rsa*, ...) are never captured,
+# and /undo / /checkpoint restore write a snapshot back as uncommitted
+# changes. /checkpoint on|off flips it per session.
+#git_checkpoints=true
+#git_checkpoint_limit=20
+
+# Shell approval policy: prompt_all (default), safe_auto (read-only commands
+# auto-approve), or yolo (everything auto-executes). Destructive commands
+# (rm, dd, git push --force, ...) always prompt, even in agent/yolo mode.
+#permission_mode=safe_auto
+
+# Per-message token stats line (tokens in/out, cost, tok/s, context gauge)
+# after every assistant reply. On by default; /tks toggles it for the
+# session. tok/s is exact when the backend reports generation time
+# (Ollama, llama.cpp timings) and a ~-labeled wall-clock estimate otherwise.
+#show_token_stats=true
+
+# Desktop notification when an interactive turn runs at least this many
+# seconds (macOS via osascript, Linux via notify-send). 0 or off disables.
+#notify_after_seconds=30
+
+# Command prefixes that never prompt (comma-separated).
+#allow_prefixes=git status, ls, cat
+
+# Editor for every editor-backed command (/edit, /paste --editor,
+# /notes new, /notes open). Resolution: this key → $VISUAL → $EDITOR →
+# nano if installed → vi. The value may carry arguments (e.g. `code --wait`).
+# The editor takes the terminal under the /terminal gate, so these commands
+# work in interactive local sessions only.
+#editor=nano
+
+# Interactive credentials are never configured here. Use `/terminal <command>`
+# or `/ssh connect user@host [port]` and type them only after Conch hands the
+# real terminal to the requesting program. OpenSSH config and known_hosts apply.
+# ControlMaster lifetime after the bootstrap exits (seconds, 1-86400).
+#ssh_control_persist=600
+
+# Tool profile applied for the session (builtin: minimal, dev, comms, full).
+# On Ollama the minimal profile is the default unless overridden.
+#tool_profile=minimal
+
+# Define custom tool profiles as comma-separated group lists.
+#profile_research=github, jira
+
+# Per-turn budgets: tool rounds are set with /rounds; an optional token cap
+# makes the model summarize progress instead of stopping abruptly.
+#turn_token_budget=40000
+
+# Reassemble multi-line pastes at the chat prompt into one message (on by
+# default; GNU readline 8.1+ additionally gets true bracketed paste). Turn
+# off only if your terminal delivers typed input in bursts that get
+# mistaken for pastes. /paste and /edit always work regardless.
+#multiline_paste=true
+
+# Small fast model for side tasks (session summaries, history compaction).
+#weak_model=qwen3-8b
+#weak_provider=ollama
+
+# Subagent delegation (delegate_task tool): model + tool-round budget.
+# Skill-scoped subagents (delegate_task skill=<name>) use the skill's own
+# model/rounds/tools instead; skills live in ~/.config/conch/skills/*.md.
+#subagent_model=qwen3-8b
+#subagent_rounds=10
+# Seat-parent/local-child and named OMP examples: docs/LOCAL-SUBAGENTS.md.
+# Conch skills and OMP agents use different configuration files.
+
+# Fan-out (fan_out tool): independent subtasks in parallel worker processes.
+# The session model stays your default; fanout_model picks the workers' model:
+#   unset/default   the session's model (or subagent_model when that is set)
+#   <model> or <provider>/<model>   that model
+#   auto            chosen per task from the models usable right now, by the
+#                   task's effort; never a costlier kind of billing than the
+#                   session's (a seat or local session never reaches API billing)
+# /fanout shows what is available and sets this.
+#fanout_model=auto
+#fanout_concurrency=4   # default 4; workers on one local server run one at a time
+#fanout_rounds=10
+#fanout_timeout=600     # seconds per task
+
+# --- Edge daemon and missions (Swarm Phase 1) ----------------------------------
+# Off by default: the shell keeps its classic in-process scheduler and never
+# loads the mission kernel. Setting edge_daemon=true moves scheduled tasks
+# and durable missions into the transactional SQLite kernel under
+# ~/.local/state/conch/kernel/, owned by the `conch-edge` daemon. The
+# documented default way to run the daemon is supervised — `conch-edge
+# install` renders the launchd (macOS) or systemd user-unit (Linux)
+# template from deploy/ with this machine's paths, loads it, and verifies
+# health, so the daemon restarts on crash and survives reboots
+# (`conch-edge status` / `conch-edge uninstall` manage it). The shell
+# attaches with /missions, /mission, /approvals; /schedule keeps working
+# unchanged, executed by the daemon. On first daemon start, existing
+# tasks.json schedules migrate into the kernel (original preserved as
+# tasks.json.bak). Mission notifications ride notify_channel when
+# configured (Slack/SMS/email); without one they land in the daemon log as
+# delivered records — configuring a channel upgrades delivery with no
+# other changes. External events (inbound channel messages, event.post on
+# the control socket) wake parked missions immediately — no waiting out
+# the cadence timer. Emergency stop: create
+# ~/.local/state/conch/kernel/STOP (checked at session start and before
+# every tool round) or /mission abort <id>. Cadence missions (recurring
+# schedule, no success criteria) default to allow_model_completion=false
+# in their spec: the model cannot self-complete them — complete_mission is
+# refused and journaled (completion_denied); an operator finishes them.
+# Missions with success criteria or run_once default to true; set the
+# spec field explicitly to override.
+#edge_daemon=false
+
+# --- Mission judgment and shared memory ----------------------------------------
+# Critic/self-review sessions: every standard mission gets a scheduled,
+# cheap review session (weak_model when configured, else the main model)
+# that scores progress against the mission's success criteria and lands a
+# verdict as kernel events: continue, re-plan (a new numbered plan version
+# journaled as an explicit plan_revised event), or escalate (a channel
+# notification through the outbox — never silent). Stall detection is
+# deterministic and runs BEFORE the model sees anything: no material
+# kernel-event change (plan/task/action/artifact/approval/binding) across
+# the last N work sessions, or the same step failing repeatedly. A stalled
+# mission may never "continue". Reviews are bounded sessions (small
+# context, no tools), respect budgets (declare a `reviews` budget line to
+# cap them — exhaustion is a journaled skip, never a crash), and are
+# suppressed by STOP/pause exactly like work sessions. Per-mission
+# overrides live in the mission spec's `review` object
+# (enabled/every_sessions/every_seconds/stall_sessions/token_budget/
+# wall_seconds); `/mission show` renders the latest verdict.
+#mission_reviews=true
+#mission_review_every_sessions=5
+#mission_review_every_seconds=86400
+#mission_review_stall_sessions=3
+#mission_review_token_budget=12000
+#mission_review_wall_seconds=180
+
+# Cross-mission memory consolidation: after each work-session checkpoint
+# (and on completion), a weak-model pass distills durable, non-secret
+# lessons from that session's journal delta into the shared memory store
+# (~/.local/state/conch/memory.json), tagged with mission id + topic —
+# deduplicated, size-capped, and hard-scrubbed (credentials, UUIDs, and
+# channel identities are rejected whole). Any mission's rehydration then
+# retrieves the top-K relevant shared lessons into a clearly labeled
+# "Lessons from prior missions" block (FTS match on goal/plan/task
+# keywords, hard char cap; the overall rehydration bound is unchanged).
+# Consolidation runs as a post-checkpoint side task with a timeout —
+# failure or timeout is a logged skip and never blocks the session path.
+# The memory store itself refuses credential material on EVERY write path
+# (save_memory tool, /remember, session summaries): entries matching the
+# credential detector are rejected whole, and retrieval re-scans entries
+# on the way out so legacy credential-bearing entries never reach model
+# context (dropped and logged by type — always on, not configurable).
+#mission_consolidation=true
+#mission_consolidation_max_lessons=3
+#mission_consolidation_max_chars=240
+#mission_consolidation_timeout=20
+#mission_consolidation_store_cap=200
+#mission_lessons_k=3
+#mission_lessons_max_chars=700
+
+# --- Personal items (todos, recipes, papers) ------------------------------------
+# The /todo and /list commands and the personal_items tool store durable
+# personal records in named spaces inside the local mission kernel. Local-only
+# by design: never sent to Capitol, never consolidated into shared lessons,
+# and the credential write-guard rejects secret-bearing items whole. No keys
+# are required. Reserved for P2 (the morning-digest cadence mission over the
+# notify channel): the local hour the digest fires.
+#items_digest_hour=8
+
+# --- Trusted SSH fleet (Swarm Phase 2) ----------------------------------------
+# Off by default and entirely opt-in: the interactive shell never depends on
+# the fleet. When you enroll trusted SSH hosts, the controller deploys bounded
+# workers (signed single-file .pyz by default, or the digest-pinned docker
+# `worker` image for strict isolation) and dispatches versioned task envelopes
+# over `conch-hostctl rpc <worker>` on SSH stdio. Workers are replaceable
+# compute: mission truth, credentials, budgets, and the external-action ledger
+# stay on the controller.
+#
+# Artifact signing: build+sign with tools/build_worker_artifact.py using an
+# OpenSSH key; hosts verify the sshsig + digest against an allowed-signers
+# trust anchor before activation (fail-closed). Point hosts at the anchor:
+#fleet_allowed_signers=~/.config/conch/fleet/allowed_signers
+# The fleet home on each worker host (content-addressed artifact store,
+# receipts, per-worker releases). Defaults to ~/.local/state/conch-fleet.
+#fleet_home=~/.local/state/conch-fleet
+# Scheduling / reliability knobs (controller side):
+#fleet_max_attempts=3                 # retry cap per dispatch (by failure class)
+#fleet_backoff_base_seconds=2.0       # exponential backoff base (full jitter)
+#fleet_heartbeat_deadline_seconds=90  # miss this long -> UNREACHABLE + requeue
+#fleet_max_delegation_depth=3         # brokered delegate_task depth cap
+#fleet_max_fan_out=8                  # brokered children per parent cap
+# Shared-endpoint resource groups so one Ollama box is never oversubscribed:
+# give co-located workers the same group and cap the group's concurrency.
+#fleet_resource_group_caps=ollama-box-1:1,ollama-box-2:2
+
+# The fleet awakening: enable the conch-controller daemon, the /fleet
+# command family, and the fleet_delegate tool (local sessions only).
+# The controller owns its own kernel scope (~/.local/state/conch/fleet —
+# separate database, lock, epoch, and control socket from conch-edge, so
+# both daemons coexist). Run it supervised: `conch-controller install`.
+# Worker authority defaults stay READ-only/narrow; raise one worker's
+# ceiling with `/fleet grant <worker> --actions ... --tools ...|full
+# --data <class>` (grants are ledgered kernel events). Hard exclusions
+# never lift for workers: conch_config, manage_tools, skill_manage,
+# interactive_terminal, ssh_remote, fleet_delegate.
+#fleet_controller=false
+# Heartbeat sweep cadence (seconds between fleet-wide status sweeps) and
+# per-RPC transport timeout:
+#fleet_heartbeat_sweep_seconds=30
+#fleet_rpc_timeout=60
+
+# --- Remote loop (Matrix / Slack / SMS / email) --------------------------------
+# Opt-in remote operation: scheduled output is delivered over notify_channel,
+# and inbound replies are polled and routed into conversations. SAFETY:
+# inbound senders MUST be allowlisted per channel (no allowlist = no inbound);
+# remote sessions are capped at safe_auto — anything beyond read-only
+# commands posts an approval request you answer with 'approve <id>'.
+# Direct-terminal and SSH-control tools are never exposed to channel sessions,
+# so a remote Slack/SMS/email message cannot trigger a credential prompt.
+#remote_enabled=false
+#notify_channel=slack
+#remote_poll_interval=60
+#remote_rounds=8
+
+# Who hosts channel intake when edge_daemon=true: `daemon` (default — the
+# conch-edge daemon answers messages 24/7 with no shell attached) or
+# `shell` (the interactive shell keeps its classic loop). Exactly one
+# consumer polls either way: every host must hold the kernel
+# channel_intake lease per pass, so messages are never double-answered nor
+# dropped across handoffs. `input msn-<id> <text>` from an allowlisted
+# sender answers that mission and wakes it immediately.
+#remote_host=daemon
+
+# Matrix — the sovereign phone channel (see README "Phone: sovereign setup").
+# Point matrix_homeserver at YOUR homeserver (deploy/docker-compose.phone.yml
+# ships Conduit + ntfy; deploy/phone-bootstrap.sh mints the token file).
+# The access token is held by reference: matrix_token_env names the env var
+# (default MATRIX_ACCESS_TOKEN) — it is never stored or logged. Allowed
+# senders are FULL Matrix user IDs (@user:server) and fail closed: no
+# allowlist means no inbound. thread mapping: an Element thread is one
+# conch conversation (thread_id = room id + thread root). Image attachments
+# from allowlisted senders are quarantined with the same caps as Slack.
+# E2EE: stdlib cannot do Olm/Megolm — either use an unencrypted room on
+# your own homeserver over TLS (plaintext at rest on your own box), or run
+# pantalaimon and point matrix_homeserver at it (http://localhost:8009).
+#matrix_homeserver=http://localhost:6167
+#matrix_room=!AbCdEf:conch.local
+#matrix_allowed_senders=@you:conch.local
+#matrix_token_env=MATRIX_ACCESS_TOKEN
+# The bot's own user id (skips echoes of its own sends); discovered via
+# /whoami when unset.
+#matrix_user=@conch:conch.local
+# /sync long-poll window in ms (0-60000). One poll blocks up to this long
+# and returns as soon as a message arrives.
+#matrix_sync_timeout_ms=10000
+
+# ntfy — outbound push for INTERRUPTS (approval requests, digests, mission
+# milestones) while Matrix carries the conversation. Self-hosted topic;
+# notify_push=ntfy routes interrupt pushes, notify_channel keeps routing
+# conversation deliveries. The optional access token is by reference
+# (ntfy_token_env, default NTFY_TOKEN). ntfy_click deep-links the
+# notification tap; when unset and matrix_room is set, a matrix.to link
+# to the room is used (opens Element). v1 actions are click/view only —
+# one-tap approve needs an authenticated endpoint that does not exist
+# yet (upgrade path: a tailnet-only listener, never a public endpoint).
+#notify_push=ntfy
+#ntfy_url=http://localhost:8093
+#ntfy_topic=conch-alerts
+#ntfy_token_env=NTFY_TOKEN
+#ntfy_priority=default
+#ntfy_title=conch
+#ntfy_click=
+
+# Fake loopback channel — tests, demos, and acceptance drills ONLY. Inbound
+# messages are JSON lines ({"sender","text","thread_id"}) appended to
+# <dir>/inbound.jsonl; replies append to <dir>/outbound.jsonl. The sender
+# allowlist fails closed exactly like the real transports. Never configure
+# it alongside production traffic.
+#fake_channel_dir=/tmp/conch-fake-channel
+#fake_allowed_senders=me
+
+# Slack: create a bot, set SLACK_BOT_TOKEN in the environment.
+# Bot scopes: chat:write + the history scope for your channel type
+# (channels:history public / groups:history private / im:history DM), plus
+# files:read for photo attachments (eBay pilot intake). After adding a
+# scope, reinstall the app to the workspace to mint a fresh bot token.
+# Attachments from allowlisted senders are downloaded to the quarantine
+# dir under the XDG state dir and validated (JPEG/PNG/GIF/WebP by magic
+# bytes, 12 MB cap, at most 12 per message) before anything uses them.
+#slack_channel=C0123456789
+#slack_allowed_senders=U0AAAAAAA, U0BBBBBBB
+
+# SMS via Twilio: set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in the environment.
+#twilio_from=+15550001111
+#sms_to=+15559998888
+#sms_allowed_senders=+15559998888
+
+# Email: SMTP out, IMAP UNSEEN polling in. Set EMAIL_PASSWORD in the environment.
+#email_address=conch@example.com
+#email_to=me@example.com
+#email_smtp_host=smtp.example.com
+#email_imap_host=imap.example.com
+#email_allowed_senders=me@example.com
+
+# Repository map injected when cwd is a git repo (~1k tokens). On by default.
+#repo_map=true
+
+# --- Capitol A2A ---------------------------------------------------------------
+# Works is an optional conch-works distribution. /install works installs it
+# into the current Conch Python environment from the private GitHub SSH source
+# by default; override with CONCH_WORKS_PACKAGE_SPEC, /install works --package,
+# or this non-secret package spec (for example, a local wheel).
+#works_package_spec=/path/to/conch_works-0.7.1-py3-none-any.whl
+#
+# Conch drives governed Capitol workflows over the A2A gateway. The bearer
+# token is NEVER stored here: capitol_bearer_env names the environment
+# variable it is read from; if that is unset, the A2Actrl registry
+# (~/.capitol-a2a/agents.yaml) entry matching the org+agent is used.
+# Under local_only, only localhost/LAN Capitol endpoints are permitted.
+#capitol_base_url=http://localhost:8300
+#capitol_org=00000000-0000-0000-0000-000000000000
+#capitol_agent=00000000-0000-0000-0000-000000000000
+#capitol_bearer_env=CAPITOL_A2A_BEARER
+
+# Mission supervision (daemon): how often the edge daemon polls Capitol to
+# advance bound-run cursors, and the TTL for the origin-bound kernel
+# approval a Human-in-the-Loop checkpoint parks as. An unreachable Capitol
+# degrades the binding with exponential backoff (mission parks, never fails).
+#capitol_poll_seconds=10
+#capitol_hitl_ttl_seconds=86400
+
+# Bounded builder/provisioning profile (CapitolAdmin) — OFF BY DEFAULT.
+# Enables creating/managing platform assets (orchestrator agents, workflow
+# version publish/pin/rollback, agent allowlists, schedules, collections) on
+# the configured org. Every mutation is additionally gated by a fail-closed
+# required-policy check, records an idempotency key + external-action ledger
+# entry + version pin + rollback reference, and never blind-retries. Minted
+# bearers are written to the A2Actrl registry (0600) by reference; only a
+# fingerprint is ever returned or logged. Set capitol_admin=true AND
+# capitol_platform_url to enable. The admin token (a platform user JWT) is
+# resolved per call from the env var named by capitol_admin_token_env
+# (default CAPITOL_ADMIN_TOKEN) or an x_user_token in the registry entry for
+# the org — never stored in conch config.
+#capitol_admin=false
+#capitol_platform_url=http://localhost:8811
+#capitol_admin_token_env=CAPITOL_ADMIN_TOKEN
+
+# Capitol docs: the platform's release-true documentation MCP server
+# (capitol-docs-server, mcp-servers-runner). When set, conch mounts it as
+# the MCP server "capitol-docs" (tools search_capitol_docs, how_do_i,
+# explain_concept, get_doc, whats_new, ...) and the capitol / capitol-docs
+# skills answer "what is X / how do I X" from it, citing doc ids and the
+# corpus_version. Unset = no docs tools, zero traffic. An mcp.json entry
+# named "capitol-docs" (e.g. with auth headers) takes precedence.
+#capitol_docs_url=http://localhost:8042/mcp
+
+# ProcessCompiler (/compile): a stated goal becomes a reviewed Architecture
+# Card and, on your approval, a materialized + drilled + supervised process.
+# v1 is interactive-only and materializes on the local stack only;
+# materialization additionally requires capitol_admin=true. Created assets
+# carry the compile_asset_prefix (disposable, rollback-safe); session bounds
+# mirror mission sessions; compile_drill_timeout bounds each acceptance-
+# drill run's wait.
+#compile_asset_prefix=conch-compile
+#compile_wall_seconds=600
+#compile_max_tool_rounds=15
+#compile_token_budget=200000
+#compile_drill_timeout=600
+
+# --- Capture (capture → cards/plans/workflows) ----------------------------------
+# /install capture enables capture→card drafting: journaled sessions and
+# missions (/compile from-session, from-mission), recent shell history
+# (from-history), a designated email folder (from-email), imported Scribe
+# workflow context (from-scribe), and deterministic recurrence mining
+# (/compile suggestions → from-suggestion). Capture only drafts — every
+# card goes through the normal review/approve/materialize chain, and all
+# captured text is credential-guarded. Nothing here runs while
+# capture_enabled is off.
+#capture_enabled=false
+# Email source: reads the named IMAP folder READ-ONLY over the email
+# channel's account (email_address / email_imap_host / EMAIL_PASSWORD),
+# gated by the same fail-closed email_allowed_senders allowlist; a
+# per-folder UID cursor makes re-runs ingest only new mail. No default
+# folder — unset means the email source is absent.
+#capture_email_folder=Conch/Capture
+#capture_email_max_messages=25
+# Recurrence mining thresholds (/compile suggestions).
+#compile_suggest_min_count=3
+#compile_suggest_window_days=30
+# Scribe importer: Scribe's MCP server as a capture source. The hosted
+# endpoint authenticates with OAuth — export a pre-obtained access token
+# in the env var named by scribe_token_env (conch never stores it).
+# Unset URL = the source is absent (zero traffic).
+#scribe_mcp_url=https://mcp.scribe.com/mcp
+#scribe_token_env=SCRIBE_MCP_TOKEN
+# Browser capture satellite (/install capture browser): the Chrome MV3
+# extension in conch/satellites/browser_capture + the conch-capture-host
+# native messaging host. Captures DOM interaction (semantic clicks,
+# navigation paths, form-submit field NAMES, copy events without
+# content) on origins explicitly allowlisted in the extension options —
+# nothing else, nothing until you add one. Events are secretguard-
+# scrubbed by the host and journaled locally (source="browser") for
+# /compile from-browser and the recurrence mining. Off by default;
+# requires capture_enabled too.
+#capture_browser=false
+# Override the pinned extension id (only needed if you repackage the
+# extension yourself; the shipped manifest key pins the default id).
+#capture_browser_extension_id=hgmjnpkpdnaeekckabogikdcpdfeeghh
+
+# eBay pilot (/ebay <photo...> [-- notes]): sandbox photo→listing driver.
+# Identity + seller prerequisites for ebay.draft_request.v1 (ask the org
+# operator; the sandbox seller-policy IDs come from the provisioned org).
+#ebay_app_id=conch-ebay
+#ebay_account_ref=org-ebay-sandbox
+#ebay_actor_id=00000000-0000-0000-0000-000000000000
+#ebay_fulfillment_policy_id=6244379000
+#ebay_payment_policy_id=6244377000
+#ebay_return_policy_id=6244378000
+#ebay_merchant_location_key=sandbox-location
+# Optional workflow pins; discovered from the agent's allowlist when unset.
+#ebay_draft_workflow=
+#ebay_publish_workflow=
+# Intake path for the photo-bearing draft turn. "chat" (default) attaches
+# photos as A2A FileParts on a chat message — the one upload path the
+# gateway promotes into durable org artifacts the image node can resolve.
+# "typed" uploads via request_upload_url and calls the workflow directly
+# (blocked on gateways that do not promote typed uploads). Revise and
+# publish always use the typed workflow surface.
+#ebay_intake=chat
+# Caps: a thin clamp on publish outcomes (never on listing content — the
+# workflow's judgment stands). Within the clamp the sandbox auto-publishes
+# after a y/n confirm; outside it the exact approval phrase is required.
+# Sandbox default: auto allowed, no caps configured.
+#ebay_auto_publish=true
+#ebay_max_price_usd=
+#ebay_allowed_category_ids=
+
+# Slack message-first intake (Milestone 1b): a photo-bearing message from
+# an allowlisted sender in slack_channel starts a listing session; the
+# thread then carries clarifying questions, the draft review, the publish
+# approval ('approve N' / 'deny N', origin-bound + TTL'd), and
+# confirmations. Needs the remote loop plus the files:read Slack scope
+# (see the Slack section above). On by default whenever Capitol is
+# configured; set false to keep photos out of the eBay flow.
+#ebay_channel_intake=true
+# Publish over the channel without an approve reply when the caps clamp
+# passes. Default false: every channel publish takes the origin-bound
+# approval path, even within caps — opt in deliberately after setting
+# real caps (ebay_max_price_usd / ebay_allowed_category_ids).
+#ebay_channel_auto_publish=false
+# Dedicated eBay orchestrator agent. When set, every eBay flow (shell,
+# channel, folder) targets this agent while capitol_agent stays on your
+# default orchestrator. Find it with the org agent directory ("eBay
+# Sales Operator" in the provisioned org).
+#ebay_agent=
+
+# --- Watched folders (general pattern, edge daemon) -----------------------------
+# Named watches turn local folders into governed intake surfaces. The
+# kernel owns the mechanics — polling, debounce/grouping (a multi-file
+# drop plus an optional .txt of notes becomes ONE drop), magic-byte
+# validation, quarantine, processed/ and rejected/ archival (originals
+# are never deleted; rejects carry a .reason.txt), and content-digest
+# dedupe that survives restarts. What a drop MEANS is the handler
+# binding:
+#   pack:<name>       start a flow-pack session (the pack's
+#                     watched_folder intake; a drop is never consent
+#                     for an effect — publishes always need the
+#                     origin-bound approval challenge)
+#   mission:<id>      journal the drop as a kernel event and wake the
+#                     mission (file paths + digests, never bytes)
+# Worked example — the eBay sales loop:
+#folder_watch_ebay=~/EbayDrop
+#folder_watch_ebay_handler=pack:ebay-listing
+#folder_watch_ebay_poll=5
+#folder_watch_ebay_debounce=8
+# Continue pack folder sessions from the shell: /ebay drops,
+# /ebay answer <drop-id> <text>, /ebay approve <id> | deny <id>.
+
+# --- Status page (eBay sales dashboard) -----------------------------------------
+# The edge daemon pushes sanitized, allowlisted status snapshots (listing
+# phases, folder drops, pending approval IDs — never credentials, scanned
+# by the credential detector before every send) to an authenticated
+# status page. Unset = off, zero traffic. The write token is read from
+# the named env var; the page's read token lives only in the deployment.
+# Approvals are display-only on the page — deciding them stays in the
+# shell/thread, origin-bound.
+#status_page_url=
+#status_page_token_env=CONCH_STATUS_WRITE_TOKEN
+#status_export_interval_seconds=30
+
+# --- Lifecycle hooks -----------------------------------------------------------
+# Shell scripts run around the agent loop; payload arrives as JSON on stdin.
+# pre_tool_use: non-zero exit blocks the tool call; JSON stdout rewrites args.
+#hook_pre_tool_use=~/.config/conch/hooks/gate.sh
+#hook_post_tool_use=~/.config/conch/hooks/audit.sh
+#hook_on_turn_end=~/.config/conch/hooks/notify.sh
+
+# --- Prompt overrides ---------------------------------------------------------
+# Map provider/model globs to your own system-prompt template files.
+# The most specific matching pattern wins.
+#chat_prompt:ollama/qwen*=~/.config/conch/prompts/qwen-chat.md
+#ask_prompt:ollama=~/.config/conch/prompts/local-ask.md
+
+# --- Ask-mode context ---------------------------------------------------------
+# Extra context sent with one-shot `conch-ask` requests. send_cwd also puts
+# the working directory in the chat system prompt (fixed per session).
+send_cwd=true
+send_os_shell=true
+send_history_count=0

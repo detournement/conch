@@ -18,6 +18,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+from conch import providers
 from conch.providers import (
     KNOWN_MODELS,
     MODEL_PRICING,
@@ -766,6 +767,253 @@ class TestAnthropicGen5RequestShape(unittest.TestCase):
             "signature": "sig123",
         })
         self.assertEqual(result["_anthropic_content"][1], {"type": "text", "text": "done"})
+
+
+class _GenerationCapture:
+    def __init__(self):
+        self.events = []
+
+    def feed(self, text):
+        self.events.append(("answer", text))
+
+    def feed_detail(self, kind, text):
+        self.events.append((kind, text))
+
+    def text(self, kind):
+        return "".join(text for event_kind, text in self.events if event_kind == kind)
+
+
+class TestGenerationDetails(unittest.TestCase):
+    def _compat(self, deltas, capture, provider="openai"):
+        lines = [
+            ("data: " + json.dumps({"choices": [{"delta": delta}]}) + "\n\n").encode()
+            for delta in deltas
+        ]
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(
+            b"".join(lines) + b"data: [DONE]\n\n"
+        )):
+            return providers._stream_openai_compat(
+                "https://example.test/chat/completions", {}, {"model": "test"},
+                "test", provider, capture.feed,
+            )
+
+    def test_compat_reasoning_aliases_and_opaque_details(self):
+        for provider in ("openai", "cerebras", "openrouter", "custom", "bedrock"):
+            with self.subTest(provider=provider):
+                capture = _GenerationCapture()
+                result = self._compat([
+                    {"reasoning_content": "Plan ", "reasoning": "Plan ",
+                     "reasoning_details": [{"type": "reasoning.text", "text": "Plan "}]},
+                    {"reasoning": "carefully. "},
+                    {"reasoning_details": [
+                        {"type": "reasoning.text", "text": "Check. ", "signature": "opaque"},
+                        {"type": "reasoning.summary", "summary": "Then answer. "},
+                        {"type": "reasoning.encrypted", "data": "secret", "text": "secret"},
+                        {"type": "unknown", "text": "secret"},
+                    ]},
+                    {"reasoning": {"type": "reasoning", "summary": [
+                        {"type": "summary_text", "text": "Ready."}
+                    ], "encrypted_content": "secret"}},
+                    {"content": "The "}, {"content": "answer."},
+                ], capture, provider)
+                self.assertEqual(capture.text("reasoning"),
+                                 "Plan carefully. Check. Then answer. Ready.")
+                self.assertEqual(capture.text("answer"), "The answer.")
+                self.assertEqual(result["content"], "The answer.")
+                self.assertNotIn("secret", str(capture.events))
+                self.assertNotIn("opaque", str(capture.events))
+
+    def test_reasoning_only_stays_out_of_result_and_plain_callbacks(self):
+        received = []
+        for callback in (None, received.append):
+            payload = b'data: {"choices":[{"delta":{"reasoning":"private plan"}}]}\n\n'
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(payload)):
+                result = providers._stream_openai_compat(
+                    "https://example.test/chat/completions", {}, {}, "test", "openai", callback,
+                )
+            self.assertEqual(result["content"], "")
+            self.assertIsNone(result["tool_calls"])
+        self.assertEqual(received, [])
+
+    def test_inline_tags_split_at_every_boundary(self):
+        for tag in ("think", "reasoning"):
+            text = f"Before<{tag}>published thought</{tag}>After"
+            for split in range(1, len(text)):
+                with self.subTest(tag=tag, split=split):
+                    capture = _GenerationCapture()
+                    result = self._compat([
+                        {"content": text[:split]}, {"content": text[split:]}
+                    ], capture)
+                    self.assertEqual(capture.text("reasoning"), "published thought")
+                    self.assertEqual(capture.text("answer"), "BeforeAfter")
+                    self.assertEqual(result["content"], "BeforeAfter")
+
+    def test_unterminated_thinking_remains_detail_only(self):
+        capture = _GenerationCapture()
+        result = self._compat([{"content": "Answer<think>unfinished</thi"}], capture)
+        self.assertEqual(result["content"], "Answer")
+        self.assertEqual(capture.text("answer"), "Answer")
+        self.assertEqual(capture.text("reasoning"), "unfinished</thi")
+
+    def test_details_arrive_before_following_event_and_error(self):
+        capture = _GenerationCapture()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(response):
+                yield b'data: {"choices":[{"delta":{"reasoning":"plan"}}]}\n'
+                self.assertEqual(capture.events, [("reasoning", "plan")])
+                yield b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"local_shell","arguments":"{\\"command\\":"}}]}}]}\n'
+                self.assertEqual(capture.events[-1][0], "progress")
+                yield b'data: {"error":{"message":"generation failed"}}\n'
+
+        with patch("urllib.request.urlopen", return_value=Response()):
+            result = providers._stream_openai_compat(
+                "https://example.test/chat/completions", {}, {}, "test", "openai", capture.feed,
+            )
+        self.assertTrue(result["_error"])
+        self.assertIn("generation failed", result["content"])
+        self.assertEqual(capture.text("answer"), "")
+        self.assertNotIn("command", str(capture.events))
+
+    def test_tool_progress_is_once_per_call_not_argument_fragment(self):
+        capture = _GenerationCapture()
+        result = self._compat([
+            {"tool_calls": [{"index": 0, "id": "c1", "function": {
+                "name": "local_shell", "arguments": '{"command":'
+            }}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": '"pwd"}'}}]},
+        ], capture)
+        self.assertEqual([kind for kind, _ in capture.events], ["progress"])
+        self.assertNotIn("pwd", str(capture.events))
+        self.assertEqual(result["tool_calls"][0]["function"]["arguments"], '{"command":"pwd"}')
+
+    def test_anthropic_published_thinking_and_opaque_replay_are_separate(self):
+        capture = _GenerationCapture()
+        events = [
+            {"type": "content_block_start", "content_block": {
+                "type": "thinking", "thinking": "First "
+            }},
+            {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "think"}},
+            {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "."}},
+            {"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "sig"}},
+            {"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "nature"}},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {
+                "type": "redacted_thinking", "data": "encrypted"
+            }},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {
+                "type": "tool_use", "name": "local_shell", "id": "c1"
+            }},
+            {"type": "content_block_delta", "delta": {
+                "type": "input_json_delta", "partial_json": '{"command":'
+            }},
+            {"type": "content_block_delta", "delta": {
+                "type": "input_json_delta", "partial_json": '"pwd"}'
+            }},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Answer"}},
+            {"type": "content_block_stop"},
+        ]
+        wire = "".join("data: " + json.dumps(event) + "\n\n" for event in events).encode()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
+             patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+            result = providers.stream_anthropic({"model": "claude-sonnet-5"}, [], on_token=capture.feed)
+        self.assertEqual(capture.text("reasoning"), "First think.")
+        self.assertEqual(capture.text("answer"), "Answer")
+        self.assertEqual(capture.text("progress"), "Generating tool call: local_shell")
+        self.assertEqual(result["content"], "Answer")
+        self.assertEqual(result["_anthropic_content"][:2], [
+            {"type": "thinking", "thinking": "First think.", "signature": "signature"},
+            {"type": "redacted_thinking", "data": "encrypted"},
+        ])
+        self.assertNotIn("signature", str(capture.events))
+        self.assertNotIn("encrypted", str(capture.events))
+        self.assertNotIn("command", str(capture.events))
+        self.assertEqual(result["tool_calls"][0]["function"]["arguments"], '{"command": "pwd"}')
+
+    def test_ollama_ndjson_thinking_inline_tags_and_tool_gate(self):
+        capture = _GenerationCapture()
+        call = {"function": {"name": "local_shell", "arguments": {"command": "pwd"}}}
+        chunks = [
+            {"message": {"thinking": "Native "}},
+            {"message": {"thinking": "thought. "}},
+            {"message": {"content": "<thi"}},
+            {"message": {"content": "nk>Inline"}},
+            {"message": {"content": "</think>"}},
+            {"message": {"content": '{"name":"local_shell","arguments":{"command":"pwd"}}'}},
+            {"message": {"tool_calls": [call]}},
+            {"message": {"tool_calls": [call]}},
+            {"done": True},
+        ]
+        wire = "".join(json.dumps(chunk) + "\n" for chunk in chunks).encode()
+        with patch.object(providers, "validate_ollama_model", return_value=(True, "")), \
+             patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+            result = providers.stream_ollama({"model": "test"}, [], on_token=capture.feed)
+        self.assertEqual(capture.text("reasoning"), "Native thought. Inline")
+        self.assertEqual(capture.text("answer"), "")
+        self.assertEqual(capture.text("progress"), "Generating tool call")
+        self.assertEqual(result["content"], chunks[5]["message"]["content"])
+        self.assertEqual(len(result["tool_calls"]), 1)
+        self.assertNotIn("command", str(capture.events))
+
+
+    def test_gateway_wrappers_keep_bound_detail_consumer(self):
+        for stream, key in (
+            (providers.stream_openrouter, "OPENROUTER_API_KEY"),
+            (providers.stream_bedrock, "AWS_BEARER_TOKEN_BEDROCK"),
+        ):
+            with self.subTest(provider=stream.__name__):
+                capture = _GenerationCapture()
+                wire = (
+                    b'data: {"choices":[{"delta":{"reasoning":"Native ","content":"<thi"}}]}\n\n'
+                    b'data: {"choices":[{"delta":{"content":"nk>inline</think>Answer"}}]}\n\n'
+                )
+                with patch.dict("os.environ", {key: "test-key"}), \
+                     patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+                    result = stream({"model": "test"}, [], on_token=capture.feed)
+                self.assertEqual(capture.text("reasoning"), "Native inline")
+                self.assertEqual(capture.text("answer"), "Answer")
+                self.assertEqual(result["content"], "Answer")
+
+    def test_raw_reasoning_only_is_not_promoted_to_answer(self):
+        for raw, key in (
+            (providers.raw_openai, "OPENAI_API_KEY"),
+            (providers.raw_cerebras, "CEREBRAS_API_KEY"),
+        ):
+            with self.subTest(provider=raw.__name__):
+                wire = json.dumps({"choices": [{"message": {
+                    "content": None, "reasoning": "published plan, not an answer"
+                }}]}).encode()
+                with patch.dict("os.environ", {key: "test-key"}), \
+                     patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+                    result = raw({"model": "test"}, [])
+                self.assertEqual(result["content"], "")
+
+    def test_ollama_native_thinking_and_fragmented_answer_are_separate(self):
+        capture = _GenerationCapture()
+        chunks = [
+            {"message": {"thinking": "First "}},
+            {"message": {"thinking": "think."}},
+            {"message": {"thinking": {"data": "opaque"}, "content": "An"}},
+            {"message": {"content": "swer"}, "done": True},
+        ]
+        wire = "".join(json.dumps(chunk) + "\n" for chunk in chunks).encode()
+        with patch.object(providers, "validate_ollama_model", return_value=(True, "")), \
+             patch("urllib.request.urlopen", return_value=io.BytesIO(wire)):
+            result = providers.stream_ollama({"model": "test"}, [], on_token=capture.feed)
+        self.assertEqual(capture.events, [
+            ("reasoning", "First "), ("reasoning", "think."),
+            ("answer", "An"), ("answer", "swer"),
+        ])
+        self.assertEqual(result["content"], "Answer")
 
 
 if __name__ == "__main__":

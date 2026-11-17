@@ -101,12 +101,23 @@ def _validate(value, schema: dict) -> None:
             _validate(item, schema.get('items', {}))
 
 
-def _events(stdout: str) -> dict:
-    usage = {}
-    completed = False
-    for line in stdout.splitlines():
+class _Events:
+    """Validate JSONL as it arrives, exposing only published reasoning text."""
+
+    def __init__(self, on_detail=None):
+        self.on_detail = on_detail
+        self.usage = {}
+        self.completed = False
+        self.reasoning = {}
+        self.responses = set()
+
+    def detail(self, kind, text):
+        if self.on_detail is not None and text:
+            self.on_detail(kind, text)
+
+    def feed(self, line):
         if not line.strip():
-            continue
+            return
         event = _decode(line)
         if not isinstance(event, dict):
             raise SeatError('Codex returned an invalid event stream')
@@ -125,26 +136,51 @@ def _events(stdout: str) -> dict:
                     raise SeatError('Codex returned an invalid diagnostic')
                 safe_message, _ = redact_credentials(message, '[credential redacted]')
                 logger.warning('Codex diagnostic: %s', ' '.join(safe_message.split())[:500])
-            elif item.get('type') not in ('agent_message', 'reasoning'):
+            elif item.get('type') == 'reasoning':
+                text = item.get('text', '')
+                identity = item.get('id', '')
+                if not isinstance(text, str) or not isinstance(identity, str):
+                    raise SeatError('Codex returned invalid reasoning text')
+                previous = self.reasoning.get(identity, '')
+                # item.updated/completed carry snapshots, not token deltas.
+                # A repeated, stale or revised prefix cannot be appended safely.
+                if text.startswith(previous):
+                    self.reasoning[identity] = text
+                    self.detail('reasoning', text[len(previous):])
+            elif item.get('type') == 'agent_message':
+                identity = item.get('id', '')
+                if not isinstance(identity, str):
+                    raise SeatError('Codex returned an invalid stream item')
+                if identity not in self.responses:
+                    self.responses.add(identity)
+                    self.detail('progress', 'Codex preparing structured response')
+            else:
                 # Read-only also denies apply_patch, which has no disable switch.
                 # Do not accept even an attempted native tool execution.
                 raise SeatError('Codex attempted a native tool; Conch must own all tool execution')
         elif kind == 'turn.completed':
-            completed = True
+            self.completed = True
             reported = event.get('usage')
             if isinstance(reported, dict):
                 counts = {key: reported.get(key)
                           for key in ('input_tokens', 'output_tokens')}
                 if all(type(value) is int and value >= 0 for value in counts.values()):
-                    usage = counts
-        elif kind not in ('thread.started', 'turn.started'):
+                    self.usage = counts
+            self.detail('progress', 'Codex generation complete')
+        elif kind == 'thread.started':
+            self.detail('progress', 'Codex session started')
+        elif kind == 'turn.started':
+            self.detail('progress', 'Codex generating')
+        else:
             raise SeatError('Codex returned an unsupported event; update Conch or the official CLI')
-    if not completed:
-        raise SeatError('Codex did not complete its response')
-    return usage
+
+    def finish(self):
+        if not self.completed:
+            raise SeatError('Codex did not complete its response')
+        return self.usage
 
 
-def invoke(model: str, prompt: str, schema: dict, timeout: float) -> dict:
+def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None) -> dict:
     """Generate structured content only; never delegate Conch tools to Codex."""
     with tempfile.TemporaryDirectory(prefix='conch-codex-') as directory:
         root = Path(directory)
@@ -176,12 +212,20 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float) -> dict:
         if model and model != 'default':
             argv.extend(['--model', model])
         argv.append('-')
-        result = run(argv, prompt=prompt, timeout=timeout, cwd=str(work))
+        events = _Events(on_detail)
+        if on_detail is None:
+            result = run(argv, prompt=prompt, timeout=timeout, cwd=str(work))
+        else:
+            result = run(argv, prompt=prompt, timeout=timeout, cwd=str(work),
+                         on_stdout_line=events.feed)
         if result.returncode:
             # Native stderr may include auth details, prompts, or tool output.
             raise SeatError(f'Codex exited with status {result.returncode}; '
                             f'ensure the official CLI supports isolated exec. {_LOGIN_REMEDY}')
-        usage = _events(result.stdout)
+        if on_detail is None:
+            for line in result.stdout.splitlines():
+                events.feed(line)
+        usage = events.finish()
         try:
             response = _decode(output_path.read_text(encoding='utf-8'))
         except (OSError, UnicodeError) as exc:

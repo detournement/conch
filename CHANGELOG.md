@@ -9,6 +9,55 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+### Added
+
+- In-flight guidance at safe model/tool boundaries. Enter while busy steers the
+  current turn; unstarted stale tools are skipped without interrupting running
+  commands or bypassing approvals, history invariants, or turn budgets.
+- Alt+Q queues an explicit follow-up; Ctrl+Q edits or deletes pending messages
+  while preserving the composer draft and protecting edits from concurrent delivery.
+- Provider reasoning and generation progress appear by default, separately from
+  final answers and tool output. Alt+R hides/shows the bounded detail panel;
+  opaque reasoning and native tool arguments are never displayed.
+- First-run setup shows whether each Claude/ChatGPT seat is signed in, installed,
+  or missing its CLI, and defaults to the first usable one. A signed-in seat is
+  selected without a second browser login.
+
+### Changed
+
+- First-run setup no longer ends on a choice that cannot be completed. A missing
+  seat CLI, failed sign-in, empty or rejected API key, unreachable Ollama, or
+  empty custom URL saves nothing and returns to the provider menu; a rejected
+  key is saved only on explicit confirmation. Setup text wraps to the terminal
+  and shows `~`-relative paths.
+- The key-hint row drops its least important hints on narrow terminals instead
+  of cutting text mid-word, and lists pending-message and detail keys only when
+  they apply. Command-palette and pending rows stay on one line each.
+- A failed model request is reported once, without a repeated detail line or a
+  trailing `[no response]`. Generation progress clears when the turn ends;
+  published reasoning stays readable until the next turn.
+
+### Fixed
+
+- Model/tool guidance now routes animations, full-screen programs, and
+  cursor-updating displays through the explicitly approved direct terminal
+  handoff, rather than claiming captured shell output was displayed.
+- Captured shell output removes fragmented private CSI and terminal control
+  payloads before applying output budgets, preserving readable text.
+- Ordinary output publication stays synchronous with raw input attached.
+  Live panels account for wrapped display cells and no longer leak repeated
+  headings or typed drafts into scrollback through deferred print handoffs.
+- Guidance sent while a final answer is empty or is a rejected textual tool call
+  no longer stores that answer in history; blank guidance is ignored.
+- Steering messages appear in the transcript after the reply they followed.
+- Escape cancels approvals and pickers without a one-second delay; Backspace
+  removes a pending message like Delete.
+- Claude seat turns survive the CLI's transient API retries, and a seat stream
+  error on macOS is no longer replaced by a cleanup `PermissionError`.
+- Captured output keeps one copy of overstruck man-page text, and an
+  unterminated terminal control string can no longer swallow later lines.
+- Non-streamed OpenAI and Cerebras replies strip inline `<think>` blocks.
+
 ## [0.8.0] - 2026-11-16
 
 ### Added

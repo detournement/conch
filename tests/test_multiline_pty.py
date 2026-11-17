@@ -333,6 +333,152 @@ class TerminalUIQueueTests(PtyTestCase):
         self.assertEqual(session.parsed("ANSWER="), ["approved"])
         self.assertNotIn("approved", session.parsed("HIST=")[0])
 
+    def test_safe_boundary_consumes_only_steering(self):
+        session = self.session("steering")
+        session.send(b"guide\rnext-turn\x1bq/help\rexit\r")
+        session.send(b"\x1b[200~/help\nquit\x1b[201~\r")
+        self.assertEqual(self.finish_queue(session), ["next-turn", "/help", "exit"])
+        self.assertEqual(session.parsed("STEERING="), [["guide", "/help\nquit"]])
+        history = session.parsed("HIST=")[0]
+        self.assertEqual(history.count("guide"), 1)
+        self.assertEqual(history.count("/help\nquit"), 1)
+
+    def test_queue_off_keeps_busy_draft_for_later_submission(self):
+        session = self.session("queue-off")
+        session.send(b"kept\r\x1bq")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\r")
+        self.assertEqual(self.finish_queue(session), ["kept"])
+        self.assertEqual(session.parsed("STEERING="), [[]])
+
+    def test_reserved_edit_blocks_later_steering_and_preserves_draft(self):
+        session = self.session("queue-edit")
+        session.send(b"first\rsecond\rdraft\x11\r")
+        self.assertTrue(session.wait_for("RESERVED"), session.transcript())
+        session.send(b"\x01\x0bedited\x1b\rcontinued\r\x11")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\r")
+        self.assertEqual(self.finish_queue(session), ["draft"])
+        self.assertEqual(session.parsed("STEERING="), [[[], ["edited\ncontinued", "second"]]])
+        history = session.parsed("HIST=")[0]
+        self.assertIn("edited\ncontinued", history)
+        self.assertNotIn("first", history)
+
+    def test_escape_restores_reserved_message_and_original_order(self):
+        session = self.session("queue-edit")
+        session.send(b"first\rsecond\rdraft\x11\r")
+        self.assertTrue(session.wait_for("RESERVED"), session.transcript())
+        session.send(b"-discard\x1b")
+        self.assertTrue(session.wait_for("EDIT-RELEASED"), session.transcript())
+        session.send(b"\x11")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\r")
+        self.assertEqual(self.finish_queue(session), ["draft"])
+        self.assertEqual(session.parsed("STEERING="), [[[], ["first", "second"]]])
+        self.assertNotIn("first-discard", session.parsed("HIST=")[0])
+
+    def test_editing_steering_into_command_defers_it(self):
+        session = self.session("queue-edit")
+        session.send(b"first\rsecond\r\x11\r")
+        self.assertTrue(session.wait_for("RESERVED"), session.transcript())
+        session.send(b"\x01\x0b/help\r\x11")
+        self.assertEqual(self.finish_queue(session), ["/help"])
+        self.assertEqual(session.parsed("STEERING="), [[[], ["second"]]])
+
+    def test_selection_keeps_identity_when_earlier_item_is_consumed(self):
+        session = self.session("queue-selection")
+        session.send(b"first\rsecond\x1bqthird\x1bqdraft\x11\x1b[B")
+        self.assertTrue(session.wait_for("SELECTION-DRAINED"), session.transcript())
+        session.send(b"\r")
+        self.assertTrue(session.wait_for("EDITING"), session.transcript())
+        session.send(b"\x01\x0bchanged\r\x11")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\r")
+        self.assertEqual(self.finish_queue(session), ["changed", "third", "draft"])
+        self.assertEqual(session.parsed("STEERING="), [["first"]])
+
+    def test_delete_removes_only_selected_message_without_history(self):
+        session = self.session("queue-delete")
+        session.send(b"first\rremove-me\rthird\rdraft\x11")
+        self.assertTrue(session.wait_for("LIST-OPEN"), session.transcript())
+        session.send(b"\x1b[B\x1b[3~\x11")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\r")
+        self.assertEqual(self.finish_queue(session), ["first", "third", "draft"])
+        self.assertNotIn("remove-me", session.parsed("HIST=")[0])
+
+    def test_turn_end_waits_for_reserved_edit_before_delivering(self):
+        session = self.session("queue-read")
+        session.send(b"first\rsecond\r\x11\r")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\x01\x0brevised\r\x11")
+        self.assertEqual(self.finish_queue(session), ["revised", "second"])
+
+    def test_close_unblocks_reader_with_reserved_message(self):
+        session = self.session("queue-close")
+        session.send(b"first\r\x11\r")
+        self.assertTrue(session.wait_for("DONE"), session.transcript())
+        self.assertEqual(session.parsed("CLOSED="), [True])
+        self.assertNotIn("first", session.parsed("HIST=")[0])
+
+    def test_approval_supersedes_edit_without_submitting_either_draft(self):
+        session = self.session("approval-edit")
+        session.send(b"first\rdraft\x11\r")
+        self.assertTrue(session.wait_for("RESERVED"), session.transcript())
+        session.send(b"-unsaved")
+        self.assertTrue(session.wait_for("APPROVAL-ONLY:"), session.transcript())
+        session.send(b"approved\r")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\r")
+        self.assertEqual(self.finish_queue(session), ["draft"])
+        self.assertEqual(session.parsed("STEERING="), [["first"]])
+        self.assertEqual(session.parsed("ANSWER="), ["approved"])
+        history = session.parsed("HIST=")[0]
+        self.assertNotIn("approved", history)
+        self.assertNotIn("first-unsaved", history)
+
+    def test_handoff_discards_reserved_edit_and_composer(self):
+        session = self.session("nested-handoff")
+        session.send(b"secret-queued\rsecret-draft\x11\r-unsaved")
+        self.assertTrue(session.wait_for("RESUMED-INPUT"), session.transcript())
+        session.send(b"fresh\rquit\r")
+        self.assertTrue(session.wait_for("DONE"), session.transcript())
+        self.assertEqual(session.parsed("QUEUED="), [["fresh"]])
+        self.assertEqual(session.parsed("HIST=")[0], ["quit", "fresh"])
+
+
+class TerminalUIDetailTests(PtyTestCase):
+    def test_hiding_details_retains_updates_until_next_turn(self):
+        session = self.session("details")
+        self.assertTrue(session.wait_for("DETAILS-READY"), session.transcript())
+        self.assertTrue(session.wait_for("visible-reasoning-continued"), session.transcript())
+        session.send(b"\x1br")
+        self.assertTrue(session.wait_for("DETAILS-HIDDEN"), session.transcript())
+        self.assertNotIn("hidden-reasoning", session.transcript())
+        session.send(b"\x1br")
+        self.assertTrue(session.wait_for("hidden-reasoning"), session.transcript())
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"next-detail-turn\rquit\r")
+        self.assertTrue(session.wait_for("DONE"), session.transcript())
+        details = session.parsed("DETAILS=")[0]
+        self.assertIn("visible-reasoning-continued", details)
+        self.assertIn("visible-progress", details)
+        self.assertIn("hidden-reasoning", details)
+        self.assertEqual(session.parsed("DETAILS-CLEARED="), [True])
+
+    def test_output_publication_keeps_raw_input_and_preserves_draft(self):
+        session = self.session("publication")
+        session.send(b"fast-startup-draft")
+        self.assertTrue(session.wait_for("DRAINING"), session.transcript())
+        session.send(b"\rquit\r")
+        self.assertTrue(session.wait_for("DONE"), session.transcript())
+        modes = session.parsed("OUTPUT-MODES=")[0]
+        self.assertEqual(modes, [(False, False)] * 12)
+        self.assertEqual(session.parsed("QUEUED="), [["fast-startup-draft"]])
+        self.assertIn("FINAL-RESPONSE", session.transcript())
+        for index in range(12):
+            self.assertIn("DIAGNOSTIC-" + str(index), session.transcript())
+
 
 if __name__ == "__main__":
     unittest.main()

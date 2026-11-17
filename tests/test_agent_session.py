@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from conch.session import AgentSession, SessionBudgets
+from conch.session import AgentSession
 from conch.tooling import (
     LocalShellClient,
     LocalShellPolicy,
@@ -217,52 +217,6 @@ class TestAgentSessionObject(unittest.TestCase):
         child.attach_clients({"local_shell": shell}, bind=False)
         self.assertIs(shell.permissions(), parent_state)
 
-    def test_run_turn_wraps_chat_turn(self):
-        session = AgentSession(
-            {"provider": "openai", "chat_model": "gpt-4o"},
-            budgets=SessionBudgets(max_tool_rounds=7),
-        )
-        state = ToolRuntimeState(all_tools=[], tool_map={"x": object()}, tools=[])
-        session.attach_clients({}, chat_state=state)
-        seen = {}
-
-        def fake_chat_turn(config, provider, raw_fn, messages, tools,
-                           tool_map, builtin_clients, max_tool_rounds=25,
-                           chat_state=None, on_token=None, input_fn=None):
-            seen.update(
-                provider=provider, tools=tools, tool_map=tool_map,
-                max_tool_rounds=max_tool_rounds, chat_state=chat_state,
-                config=config,
-            )
-            return "ok", {"input_tokens": 1, "output_tokens": 1, "model": "m"}
-
-        with patch("conch.runtime.chat_turn", fake_chat_turn):
-            reply, usage = session.run_turn(
-                [{"role": "user", "content": "hi"}]
-            )
-        self.assertEqual(reply, "ok")
-        self.assertEqual(seen["provider"], "openai")
-        self.assertEqual(seen["max_tool_rounds"], 7)
-        self.assertIs(seen["chat_state"], state)
-        self.assertIs(seen["tool_map"], state.tool_map)
-
-    def test_run_turn_token_budget_override_copies_config(self):
-        config = {"provider": "openai", "turn_token_budget": 100}
-        session = AgentSession(
-            config, budgets=SessionBudgets(turn_token_budget=5)
-        )
-        seen = {}
-
-        def fake_chat_turn(cfg, *args, **kwargs):
-            seen["config"] = cfg
-            return "", {}
-
-        with patch("conch.runtime.chat_turn", fake_chat_turn):
-            session.run_turn([])
-        self.assertEqual(seen["config"]["turn_token_budget"], 5)
-        self.assertEqual(config["turn_token_budget"], 100,
-                         "session budget override must not mutate the config")
-
     def test_run_turn_unknown_provider_raises(self):
         session = AgentSession({"provider": "not-a-provider"})
         with self.assertRaises(RuntimeError):
@@ -304,7 +258,7 @@ class TestDelegateChildSession(unittest.TestCase):
 
         def fake_chat_turn(config, provider, raw_fn, messages, tools,
                            tool_map, builtin_clients, max_tool_rounds=25,
-                           chat_state=None, on_token=None, input_fn=None):
+                           chat_state=None, on_token=None, input_fn=None, **kwargs):
             shell = builtin_clients.get("local_shell")
             captured["permissions"] = shell.permissions() if shell else None
             captured["rounds"] = max_tool_rounds

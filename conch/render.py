@@ -105,6 +105,15 @@ def _get_active_ui():
     return module.get_active_ui() if module is not None else None
 
 
+def emit_generation_detail(on_token, kind: str, text: str) -> None:
+    """Route published generation details separately from answer tokens."""
+    if kind not in ("reasoning", "progress") or not isinstance(text, str) or not text:
+        return
+    sink = getattr(getattr(on_token, "__self__", None), "feed_detail", None)
+    if callable(sink):
+        sink(kind, text)
+
+
 class StreamPrinter:
     """Incrementally render streamed LLM output with formatting.
 
@@ -123,6 +132,7 @@ class StreamPrinter:
         self._spinner = None
         self._ui = _get_active_ui()
         self._ui_committed = 0
+        self._detail_kind = None
         if show_waiting and (self._ui is not None or sys.stderr.isatty()):
             self._spinner = Spinner("Waiting for response")
             self._spinner.__enter__()
@@ -144,7 +154,30 @@ class StreamPrinter:
         sys.stdout.write("\r\033[2K")
         self._partial_written = 0
 
+    def feed_detail(self, kind: str, text: str) -> None:
+        """Display provider-supplied reasoning/progress without changing the reply."""
+        if kind not in ("reasoning", "progress") or not isinstance(text, str) or not text:
+            return
+        self.end_waiting()
+        if self._ui is not None:
+            self._ui.feed_detail(kind, text)
+        elif sys.stderr.isatty():
+            safe = "".join(c for c in text
+                           if c in "\n\t" or (ord(c) >= 32 and not 127 <= ord(c) < 160))
+            if kind != self._detail_kind or kind == "progress":
+                # Answer text may be mid-line on stdout; never glue onto it.
+                sys.stdout.flush()
+                sys.stderr.write(f"\n[{kind.capitalize()}] ")
+            sys.stderr.write(safe)
+            sys.stderr.flush()
+        self._detail_kind = kind
+
     def feed(self, chunk: str):
+        if self._ui is None and self._detail_kind is not None and sys.stderr.isatty():
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+            self._partial_written = 0
+        self._detail_kind = None
         if not self._started:
             self._started = True
             if self._spinner:
@@ -205,6 +238,7 @@ class StreamPrinter:
         self._line_buf = ""
         self._full_text = ""
         self._partial_written = 0
+        self._detail_kind = None
 
     def _emit_line(self, line: str):
         if not self._in_code and line.startswith("```"):

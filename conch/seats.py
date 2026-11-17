@@ -84,6 +84,7 @@ def normalize(response: dict, tools) -> dict:
 
 def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
     from .providers import error_response
+    from .render import emit_generation_detail
 
     provider = config.get("provider", "")
     model = config.get("chat_model") or config.get("model") or DEFAULT_MODELS.get(provider, "")
@@ -103,14 +104,20 @@ def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
         + json.dumps({"messages": messages, "tools": tools or []}, ensure_ascii=False)
     )
     try:
-        result = transport(provider).invoke(model, prompt, response_schema(tools), timeout)
+        on_detail = None
+        if on_token is not None:
+            def on_detail(kind, text):
+                emit_generation_detail(on_token, kind, text)
+        result = transport(provider).invoke(
+            model, prompt, response_schema(tools), timeout, on_detail=on_detail)
         reply = normalize(result["response"], tools)
     except SeatError as exc:
         return error_response(f"{provider}: {exc}")
     reply["_usage"] = result.get("usage") or {"input_tokens": 0, "output_tokens": 0}
     reply["_model"] = result.get("model") or model
     reply["_provider"] = provider
-    # Native CLIs buffer schema-constrained output; do not claim token streaming.
+    # Reasoning/progress use the separate detail channel. Only the validated
+    # final content is delivered here, exactly once and never as raw JSON.
     if on_token and reply["content"] and not reply["tool_calls"]:
         on_token(reply["content"])
     return reply

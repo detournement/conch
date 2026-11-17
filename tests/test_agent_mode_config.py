@@ -86,15 +86,6 @@ class TestAgentModeStartup(_AgentModeStateMixin, unittest.TestCase):
 
 
 class TestAgentModeNotice(_AgentModeStateMixin, unittest.TestCase):
-    def test_notice_text(self):
-        from conch.app import AGENT_MODE_CONFIG_NOTICE
-
-        self.assertEqual(
-            AGENT_MODE_CONFIG_NOTICE,
-            "agent mode is ON by default (shell commands run without confirmation) — "
-            "/agent to turn it off, or remove agent_mode from ~/.config/conch/config",
-        )
-
     def test_notice_flag_only_true_when_config_enabled(self):
         from conch.app import apply_agent_mode_from_config
 

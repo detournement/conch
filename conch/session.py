@@ -123,12 +123,16 @@ class AgentSession:
         max_tool_rounds: Optional[int] = None,
         on_token=None,
         input_fn=None,
+        steering_fn=None,
     ) -> tuple:
         """Run one bounded agent turn through ``runtime.chat_turn``.
 
         This is a wrapper: chat_turn's internals (rounds, compaction,
         budgets, tool dispatch) are unchanged; the session only supplies the
         state that used to be threaded through by hand at every call site.
+
+        ``steering_fn``, when supplied, atomically consumes pending user
+        guidance at safe boundaries without interrupting inference or tools.
         """
         raw_fn = self.raw_fn()
         if raw_fn is None:
@@ -160,6 +164,7 @@ class AgentSession:
                 chat_state=self.chat_state,
                 on_token=on_token,
                 input_fn=input_fn,
+                steering_fn=steering_fn,
             )
         finally:
             # A skill loaded mid-turn (skill_manage use) that declares a

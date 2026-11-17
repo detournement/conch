@@ -120,7 +120,170 @@ def _usage(payload: dict) -> dict:
     }
 
 
-def invoke(model: str, prompt: str, schema: dict, timeout: float) -> dict:
+class _Events:
+    """Consume Claude's partial messages without exposing its schema envelope."""
+
+    def __init__(self, on_detail):
+        self.on_detail = on_detail
+        self.result = None
+        self.message_id = ""
+        self.blocks = {}
+        self.current_index = 0
+        self.thinking = {}
+        self.structured_ids = set()
+
+    def detail(self, kind, text):
+        if text:
+            self.on_detail(kind, text)
+
+    def _thinking(self, key, text):
+        if not isinstance(text, str):
+            raise SeatError("Claude returned invalid thinking text")
+        previous = self.thinking.get(key, "")
+        if text.startswith(previous):
+            self.thinking[key] = text
+            self.detail("reasoning", text[len(previous):])
+
+    def _block(self, block, key):
+        if not isinstance(block, dict):
+            raise SeatError("Claude returned an invalid content block")
+        kind = block.get("type")
+        if kind == "thinking":
+            self._thinking(key, block.get("thinking", ""))
+        elif kind == "tool_use":
+            # This CLI-owned validator returns data, not native execution:
+            # https://code.claude.com/docs/en/agent-sdk/structured-outputs
+            identity = block.get("id")
+            if block.get("name") != "StructuredOutput" or not isinstance(identity, str) or not identity:
+                raise SeatError("Claude attempted a native tool; Conch must own all tool execution")
+            self.structured_ids.add(identity)
+        elif kind == "tool_result":
+            identity = block.get("tool_use_id")
+            if not isinstance(identity, str) or identity not in self.structured_ids:
+                raise SeatError("Claude returned an unrecognized native tool result")
+            # A validation failure may be retried by Claude. The final result
+            # remains authoritative; never display unvalidated input or errors.
+        elif kind not in ("text", "redacted_thinking"):
+            raise SeatError("Claude attempted an unsupported native content block")
+        return kind
+
+    def _message(self, message):
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            raise SeatError("Claude returned an invalid assistant message")
+        identity = message.get("id", self.message_id)
+        if not isinstance(identity, str):
+            raise SeatError("Claude returned an invalid message identity")
+        blocks = message["content"]
+        for index, block in enumerate(blocks):
+            # The CLI publishes each completed block before its stop event,
+            # using the same message ID, not always the whole accumulated list.
+            if len(blocks) == 1 and identity == self.message_id:
+                index = self.current_index
+            self._block(block, (identity, index))
+
+    def feed(self, line):
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError) as exc:
+            raise SeatError("Claude returned malformed stream JSON") from exc
+        if not isinstance(event, dict):
+            raise SeatError("Claude returned an invalid event stream")
+        kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "api_retry":
+            # The CLI retries transient API failures itself; the final result
+            # stays authoritative for whether the turn succeeded.
+            self.detail("progress", "Claude retrying after a transient API error")
+            return
+        if event.get("error") or event.get("is_error") or kind == "error":
+            raise SeatError("Claude reported a provider error; check native login and subscription limits")
+        if event.get("parent_tool_use_id"):
+            raise SeatError("Claude attempted a native subagent")
+        if kind == "result":
+            if self.result is not None:
+                raise SeatError("Claude returned multiple final results")
+            self.result = event
+        elif kind == "system":
+            subtype = event.get("subtype")
+            if subtype == "init":
+                self.detail("progress", "Claude session started")
+            elif subtype in ("status", "compact_boundary"):
+                self.detail("progress", "Claude updating session context")
+            else:
+                raise SeatError("Claude returned an unsupported system event")
+        elif kind == "assistant":
+            self._message(event.get("message"))
+        elif kind == "user":
+            message = event.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+                raise SeatError("Claude returned an invalid tool result message")
+            for block in message["content"]:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    raise SeatError("Claude returned an unexpected user message")
+                self._block(block, ("", 0))
+        elif kind == "stream_event":
+            self._partial(event.get("event"))
+        elif kind == "rate_limit_event":
+            self.detail("progress", "Claude rate limit update")
+        else:
+            raise SeatError("Claude returned an unsupported event; update Conch or the official CLI")
+
+    def _partial(self, event):
+        if not isinstance(event, dict):
+            raise SeatError("Claude returned an invalid partial message")
+        kind = event.get("type")
+        if kind == "message_start":
+            message = event.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("id"), str):
+                raise SeatError("Claude returned an invalid message identity")
+            self.message_id = message["id"]
+            self.blocks = {}
+            self.current_index = 0
+            self._message(message)
+            self.detail("progress", "Claude generating")
+        elif kind in ("content_block_start", "content_block_delta", "content_block_stop"):
+            index = event.get("index")
+            if type(index) is not int or index < 0:
+                raise SeatError("Claude returned an invalid content block index")
+            key = (self.message_id, index)
+            if kind == "content_block_start":
+                block = event.get("content_block")
+                self.blocks[index] = self._block(block, key)
+                self.current_index = index
+                if self.blocks[index] == "text":
+                    self.detail("progress", "Claude preparing response")
+                elif self.blocks[index] == "tool_use":
+                    self.detail("progress", "Claude preparing structured response")
+            elif index not in self.blocks:
+                raise SeatError("Claude returned a delta without a content block")
+            elif kind == "content_block_delta":
+                delta = event.get("delta")
+                if not isinstance(delta, dict):
+                    raise SeatError("Claude returned an invalid content delta")
+                delta_kind = delta.get("type")
+                block_kind = self.blocks[index]
+                if delta_kind == "thinking_delta" and block_kind == "thinking":
+                    text = delta.get("thinking")
+                    if not isinstance(text, str):
+                        raise SeatError("Claude returned invalid thinking text")
+                    self._thinking(key, self.thinking.get(key, "") + text)
+                elif (delta_kind, block_kind) not in (
+                    ("signature_delta", "thinking"), ("text_delta", "text"),
+                    ("input_json_delta", "tool_use"),
+                ):
+                    raise SeatError("Claude returned an unsupported content delta")
+        elif kind == "message_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, dict):
+                raise SeatError("Claude returned an invalid message delta")
+            if delta.get("stop_reason") == "tool_use" and "tool_use" not in self.blocks.values():
+                raise SeatError("Claude attempted an unrecognized native tool")
+        elif kind not in ("message_stop", "ping"):
+            raise SeatError("Claude returned an unsupported partial event")
+
+
+def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None) -> dict:
     """Generate one schema-constrained response without executing native tools."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise SeatError("Claude requires a positive finite timeout")
@@ -138,13 +301,21 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float) -> dict:
             if remaining <= 0:
                 raise SeatError("Claude timed out while checking its native login")
             argv = [
-                "claude", *_ISOLATION, "--print", "--output-format", "json",
+                "claude", *_ISOLATION, "--print", "--output-format",
+                "stream-json" if on_detail is not None else "json",
                 "--json-schema", encoded_schema, "--tools", "",
                 "--disable-slash-commands", "--no-session-persistence",
                 "--no-chrome", "--permission-mode", "dontAsk",
                 "--model", model or "sonnet",
             ]
-            result = run(argv, prompt=prompt, timeout=remaining, cwd=cwd)
+            events = None
+            if on_detail is None:
+                result = run(argv, prompt=prompt, timeout=remaining, cwd=cwd)
+            else:
+                argv.extend(["--verbose", "--include-partial-messages"])
+                events = _Events(on_detail)
+                result = run(argv, prompt=prompt, timeout=remaining, cwd=cwd,
+                             on_stdout_line=events.feed)
     except OSError as exc:
         raise SeatError(f"Could not isolate Claude ({type(exc).__name__})") from exc
     if result.returncode != 0:
@@ -152,10 +323,13 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float) -> dict:
         raise SeatError(
             f"Claude invocation failed (exit {result.returncode}); check the official CLI login, model access and subscription limits. {_LOGIN_REMEDY}"
         )
-    try:
-        payload = json.loads(result.stdout)
-    except (ValueError, TypeError) as exc:
-        raise SeatError("Claude returned malformed result JSON") from exc
+    if events is not None:
+        payload = events.result
+    else:
+        try:
+            payload = json.loads(result.stdout)
+        except (ValueError, TypeError) as exc:
+            raise SeatError("Claude returned malformed result JSON") from exc
     if not isinstance(payload, dict) or payload.get("type") != "result":
         raise SeatError("Claude returned no final result")
     if payload.get("subtype") != "success" or payload.get("is_error") is not False:
@@ -170,4 +344,6 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float) -> dict:
     actual_model = next(iter(models)) if len(models) == 1 else model or "sonnet"
     if not isinstance(actual_model, str) or not actual_model:
         raise SeatError("Claude returned an invalid model identity")
+    if on_detail is not None:
+        on_detail("progress", "Claude generation complete")
     return {"response": response, "usage": usage, "model": actual_model}

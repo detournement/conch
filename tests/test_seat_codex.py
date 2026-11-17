@@ -3,12 +3,14 @@
 import json
 import os
 import subprocess
+import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from conch import seat_codex
-from conch.seat_common import SeatError
+from conch.seat_common import SeatError, run
 from conch.seats import response_schema
 
 _TOOL = {'type': 'function', 'function': {
@@ -24,7 +26,7 @@ def _stream(*events):
 
 
 class CodexTransportTests(unittest.TestCase):
-    def invoke(self, response=None, *, events=None, returncode=0, stderr=''):
+    def invoke(self, response=None, *, events=None, returncode=0, stderr='', on_detail=None):
         if response is None:
             response = _RESPONSE
         if events is None:
@@ -39,7 +41,7 @@ class CodexTransportTests(unittest.TestCase):
             ]
         self.work = None
 
-        def native(argv, *, prompt, timeout, cwd):
+        def native(argv, *, prompt, timeout, cwd, on_stdout_line=None):
             self.assertEqual(prompt, 'private conversation')
             self.assertEqual(timeout, 12)
             self.assertNotIn(prompt, argv)
@@ -50,12 +52,15 @@ class CodexTransportTests(unittest.TestCase):
             self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
             output.write_text(response if isinstance(response, str)
                               else json.dumps(response), encoding='utf-8')
+            if on_stdout_line is not None:
+                for line in _stream(*events).splitlines():
+                    on_stdout_line(line)
             return subprocess.CompletedProcess(argv, returncode,
                                                _stream(*events), stderr)
 
         with patch.object(seat_codex, 'run', side_effect=native):
             return seat_codex.invoke('default', 'private conversation',
-                                     response_schema([_TOOL]), 12)
+                                     response_schema([_TOOL]), 12, on_detail=on_detail)
 
     def test_returns_structured_tool_request_without_executing_it(self):
         result = self.invoke()
@@ -164,6 +169,89 @@ class CodexTransportTests(unittest.TestCase):
                 [], 0, _stream({'type': 'turn.completed'}), ''),
         ), self.assertRaises(SeatError):
             seat_codex.invoke('default', 'prompt', response_schema([]), 12)
+
+
+    def test_snapshot_reasoning_is_live_and_never_replays_the_response_envelope(self):
+        owner = threading.get_ident()
+        details = []
+        work = []
+        events = [
+            {'type': 'thread.started', 'thread_id': 'private-thread'},
+            {'type': 'turn.started'},
+            {'type': 'item.started', 'item': {'id': 'r', 'type': 'reasoning', 'text': ''}},
+            {'type': 'item.updated', 'item': {'id': 'r', 'type': 'reasoning', 'text': 'Compare'}},
+            {'type': 'item.updated', 'item': {'id': 'r', 'type': 'reasoning', 'text': 'Compare options.'}},
+            {'type': 'item.updated', 'item': {'id': 'r', 'type': 'reasoning', 'text': 'Compare'}},
+            {'type': 'item.completed', 'item': {
+                'id': 'r', 'type': 'reasoning', 'text': 'Compare options.', 'encrypted_content': 'opaque-secret'}},
+            {'type': 'item.completed', 'item': {
+                'id': 'a', 'type': 'agent_message', 'text': json.dumps(_RESPONSE)}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 17, 'output_tokens': 9}},
+        ]
+
+        def receive(kind, text):
+            self.assertEqual(threading.get_ident(), owner)
+            details.append((kind, text))
+            if kind == 'reasoning':
+                Path(work[0], 'ack').touch()
+
+        def native(argv, **kwargs):
+            work.append(kwargs['cwd'])
+            self.assertIn('--ignore-user-config', argv)
+            self.assertIn('--ignore-rules', argv)
+            self.assertEqual(argv[argv.index('--sandbox') + 1], 'read-only')
+            self.assertIn('shell_tool', argv)
+            self.assertIn('forced_login_method="chatgpt"', argv)
+            output = argv[argv.index('--output-last-message') + 1]
+            script = (
+                "import json,pathlib,sys,time\n"
+                f"events = {events!r}\n"
+                "sys.stdin.read()\n"
+                "for event in events:\n"
+                "    print(json.dumps(event), flush=True)\n"
+                "    if event.get('item', {}).get('text') == 'Compare':\n"
+                "        deadline = time.monotonic() + 3\n"
+                "        while not pathlib.Path('ack').exists():\n"
+                "            if time.monotonic() > deadline: sys.exit(7)\n"
+                "            time.sleep(.01)\n"
+                f"pathlib.Path(sys.argv[1]).write_text({json.dumps(_RESPONSE)!r})\n"
+            )
+            kwargs['timeout'] = 5
+            return run([sys.executable, '-c', script, output], **kwargs)
+
+        with patch.object(seat_codex, 'run', side_effect=native):
+            result = seat_codex.invoke('default', 'private conversation',
+                                       response_schema([_TOOL]), 5, on_detail=receive)
+        self.assertEqual(result['response'], _RESPONSE)
+        self.assertEqual([text for kind, text in details if kind == 'reasoning'],
+                         ['Compare', ' options.'])
+        self.assertTrue(any(kind == 'progress' for kind, _ in details))
+        self.assertNotIn('opaque-secret', repr(details))
+        self.assertNotIn('example.txt', repr(details))
+        self.assertNotIn('tool_calls', repr(details))
+        self.assertFalse(Path(work[0]).exists())
+
+    def test_live_diagnostics_are_redacted_and_not_replayed_at_completion(self):
+        details = []
+        secret = 'sk-' + 'aB7cD9' * 8
+        with self.assertLogs('conch.seat_codex', level='WARNING') as logs:
+            result = self.invoke(events=[
+                {'type': 'item.completed', 'item': {
+                    'type': 'error', 'message': 'API key: ' + secret}},
+                {'type': 'turn.completed'},
+            ], on_detail=lambda kind, text: details.append((kind, text)))
+        self.assertEqual(result['response'], _RESPONSE)
+        self.assertEqual(len(logs.output), 1)
+        self.assertNotIn(secret, repr(logs.output) + repr(details))
+
+    def test_native_execution_is_rejected_during_live_delivery(self):
+        for kind in ('command_execution', 'file_change', 'mcp_tool_call', 'web_search'):
+            with self.subTest(kind=kind), self.assertRaisesRegex(SeatError, 'native tool'):
+                self.invoke(events=[
+                    {'type': 'item.started', 'item': {
+                        'type': kind, 'arguments': 'private-command'}},
+                    {'type': 'turn.completed'},
+                ], on_detail=lambda kind, text: self.assertNotIn('private-command', text))
 
 
 class CodexLoginTests(unittest.TestCase):

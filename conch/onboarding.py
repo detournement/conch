@@ -1,11 +1,16 @@
 """First-run onboarding: the interactive provider/key wizard.
 
-Runs once on a truly unconfigured interactive launch. The default path
-uses provider sign-in through the official Claude Code or Codex CLI.
+Runs once on a truly unconfigured interactive launch, in three steps:
+choose a provider, connect it, verify a model. The default path uses
+provider sign-in through the official Claude Code or Codex CLI.
 API-key providers remain explicit alternatives; their keys use hidden
 input and the private ``~/.config/conch/env`` file. Subscription tokens
 remain entirely in the native CLI's credential store. Conch writes only
 the provider/model selection to ``~/.config/conch/config`` (0600).
+
+A choice that cannot be completed (CLI missing, sign-in failed, no key,
+Ollama down, no URL) saves nothing and returns to the provider menu;
+nothing is written until a provider is actually connected.
 
 Non-interactive contexts (pipes, daemons, workers, CI) never see the
 wizard: it requires a real TTY on stdin and stdout, and honors
@@ -16,13 +21,16 @@ any configured surface disables it entirely.
 from __future__ import annotations
 
 import getpass
-import json
 import os
+import shutil
 import sys
+import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib import error, request
 
+from . import auth, seats
 from .config import (
     find_project_rc,
     get_config_path,
@@ -42,22 +50,71 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 RST = "\033[0m"
 
+INDENT = "  "
+WRAP_WIDTH = 88
+
 # (provider, key env, label, one-line pitch). The wizard's menu order.
 WIZARD_PROVIDERS = (
-    ("claude-code", "", "Claude seat", "sign in with Claude Code — no API key"),
-    ("codex", "", "ChatGPT seat", "sign in with Codex — no API key"),
-    ("anthropic", "ANTHROPIC_API_KEY", "Anthropic API", "separately billed API usage"),
-    ("openai", "OPENAI_API_KEY", "OpenAI API", "separately billed API usage"),
+    ("claude-code", "", "Claude seat", "Claude subscription"),
+    ("codex", "", "ChatGPT seat", "ChatGPT subscription"),
+    ("anthropic", "ANTHROPIC_API_KEY", "Anthropic API", "API key, billed separately"),
+    ("openai", "OPENAI_API_KEY", "OpenAI API", "API key, billed separately"),
     ("openrouter", "OPENROUTER_API_KEY", "OpenRouter",
      "one key, many models"),
     ("ollama", "", "Ollama", "local models, no API key"),
     ("custom", "", "Custom endpoint", "any OpenAI-compatible server"),
 )
 
+# A seat's menu state: what the user sees, and what choosing it has to do.
+SEAT_READY = "signed in"
+SEAT_NEEDS_LOGIN = "installed, sign-in needed"
+SEAT_MISSING = "CLI not installed"
+SEAT_STATUS_TIMEOUT = 5.0
+
 CONFIG_HEADER = (
     "# Conch config — written by first-run setup. Edit anytime;\n"
     "# see config.example in the repo for every option."
 )
+
+
+def _wrap_width() -> int:
+    return max(40, min(shutil.get_terminal_size((80, 24)).columns, WRAP_WIDTH))
+
+
+def _say(text: str, color: str = "", *, prefix: str = INDENT,
+         prefix_color: str = "") -> None:
+    """Print prose word-wrapped to min(terminal columns, WRAP_WIDTH).
+
+    *prefix* opens the first line and sets the hanging indent of the rest.
+    Colors go on after wrapping, so textwrap never counts ANSI codes.
+    """
+    lines = textwrap.wrap(text, width=_wrap_width() - len(prefix),
+                          break_on_hyphens=False) or [""]
+    for number, line in enumerate(lines):
+        head = " " * len(prefix) if number else prefix
+        if prefix_color and not number:
+            head = f"{prefix_color}{head}{RST}"
+        print(head + (f"{color}{line}{RST}" if color else line))
+
+
+def _step(number: int, title: str) -> None:
+    print()
+    _say(f"Step {number} of 3 · {title}", BOLD)
+
+
+def _display_path(path: str) -> str:
+    """*path* with the home directory abbreviated to ``~`` — display only."""
+    home = str(Path.home())
+    if path == home or path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def _confirm(question: str, default: bool) -> bool:
+    answer = input(
+        f"{INDENT}{question} [{'Y/n' if default else 'y/N'}]: "
+    ).strip().lower()
+    return default if not answer else answer in ("y", "yes")
 
 
 def _http_get(url: str, headers: dict, timeout: float = 12.0) -> Tuple[int, bytes]:
@@ -69,22 +126,37 @@ def _http_get(url: str, headers: dict, timeout: float = 12.0) -> Tuple[int, byte
         return exc.code, b""
 
 
-def detect_ollama(timeout: float = 1.0) -> Optional[List[str]]:
-    """Model names from a local Ollama server, or None when unreachable."""
-    from .providers import get_ollama_base_url
+def detect_ollama() -> Optional[List[str]]:
+    """Tool-capable model names from the local Ollama server — the only
+    ones the startup model check accepts — or None when it is unreachable."""
+    from .providers import list_ollama_models
 
-    base = get_ollama_base_url({}).rstrip("/")
     try:
-        status, body = _http_get(f"{base}/api/tags", {}, timeout=timeout)
+        return list_ollama_models(force_refresh=True)
     except Exception:
         return None
-    if status != 200:
-        return None
+
+
+def seat_state(provider: str) -> str:
+    """Whether the seat's official CLI is on PATH and natively signed in.
+    Any status failure means sign-in is needed, never an error."""
     try:
-        models = json.loads(body.decode("utf-8", "replace")).get("models") or []
-        return [str(m.get("name") or "") for m in models if m.get("name")]
-    except (ValueError, AttributeError):
-        return None
+        if not auth.cli_installed(provider):
+            return SEAT_MISSING
+        ok, _detail = seats.status(provider, timeout=SEAT_STATUS_TIMEOUT)
+    except Exception:
+        return SEAT_NEEDS_LOGIN
+    return SEAT_READY if ok else SEAT_NEEDS_LOGIN
+
+
+def _detect() -> Tuple[Dict[str, str], Optional[List[str]]]:
+    """(seat states, Ollama models), probed concurrently under one spinner."""
+    with Spinner("Detecting seats and local models"), \
+            ThreadPoolExecutor(max_workers=len(seats.PROVIDERS) + 1) as pool:
+        ollama = pool.submit(detect_ollama)
+        states = dict(zip(seats.PROVIDERS,
+                          pool.map(seat_state, seats.PROVIDERS)))
+        return states, ollama.result()
 
 
 def probe_provider(provider: str, api_key: str,
@@ -107,10 +179,6 @@ def probe_provider(provider: str, api_key: str,
                 "https://openrouter.ai/api/v1/key",
                 {"Authorization": f"Bearer {api_key}"},
             )
-        elif provider == "ollama":
-            return (detect_ollama() is not None,
-                    "local server reachable" if detect_ollama() is not None
-                    else "no server at the Ollama address")
         elif provider == "custom":
             headers = (
                 {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -159,48 +227,58 @@ def should_offer_wizard() -> bool:
     return True
 
 
-def _choose_provider() -> Tuple[str, str, Optional[List[str]]]:
-    """(provider, key_env, ollama_models) from the interactive menu."""
-    with Spinner("Detecting local models"):
-        ollama_models = detect_ollama()
-    print(f"\n{BOLD}{CYAN}  Welcome to Conch{RST}")
-    print("  Choose a provider → connect your account → verify a model.")
-    print("  Ctrl+C exits setup. You can return by running conch again.\n")
-    print("  Claude/ChatGPT seats use your subscription through an official CLI;"
-          " API keys are optional and billed separately.")
-    print("  You can change providers later with /provider.\n")
+def _print_menu(seat_states: Dict[str, str],
+                ollama_models: Optional[List[str]]) -> None:
+    label_width = max(len(row[2]) for row in WIZARD_PROVIDERS) + 2
     for index, (provider, _env, label, pitch) in enumerate(
         WIZARD_PROVIDERS, start=1
     ):
-        note = pitch
-        if provider == "ollama":
-            note = (
-                f"detected locally, {len(ollama_models)} model(s) — no API"
-                " key needed"
-                if ollama_models is not None else f"{pitch} (not running)"
-            )
-        print(f"    {BOLD}{index}{RST}. {label:<16}{DIM}{note}{RST}")
+        note, color = pitch, DIM
+        if provider in seat_states:
+            note = f"{pitch} — {seat_states[provider]}"
+            if seat_states[provider] == SEAT_READY:
+                color = GREEN
+        elif provider == "ollama":
+            if ollama_models is None:
+                note = f"{pitch} — not running"
+            else:
+                note = f"{pitch} — {len(ollama_models)} tool-capable model(s)"
+                if ollama_models:
+                    color = GREEN
+        _say(note, color, prefix=f"    {index}. {label:<{label_width}}",
+             prefix_color=BOLD)
+
+
+def _default_choice(seat_states: Dict[str, str]) -> int:
+    """Menu number Enter selects: the first signed-in seat, else the first
+    installed one, else the first row."""
+    for wanted in (SEAT_READY, SEAT_NEEDS_LOGIN):
+        for index, row in enumerate(WIZARD_PROVIDERS, start=1):
+            if seat_states.get(row[0]) == wanted:
+                return index
+    return 1
+
+
+def _ask_provider(default: int) -> Tuple[str, str, str]:
+    """(provider, key_env, label) for the chosen menu row."""
+    count = len(WIZARD_PROVIDERS)
+    by_name = {row[0]: row for row in WIZARD_PROVIDERS}
     while True:
-        raw = input(f"\n  Provider [1-{len(WIZARD_PROVIDERS)}, Enter=1]: ").strip()
-        if not raw:
-            raw = "1"
-        if raw.isdigit() and 1 <= int(raw) <= len(WIZARD_PROVIDERS):
-            provider, env_name, _label, _pitch = WIZARD_PROVIDERS[int(raw) - 1]
-            return provider, env_name, ollama_models
-        by_name = {p[0]: p for p in WIZARD_PROVIDERS}
-        if raw.lower() in by_name:
-            provider, env_name, _label, _pitch = by_name[raw.lower()]
-            return provider, env_name, ollama_models
-        print(f"  {RED}Pick a number between 1 and"
-              f" {len(WIZARD_PROVIDERS)}.{RST}")
+        raw = input(
+            f"{INDENT}Provider [1-{count}, Enter={default}]: "
+        ).strip().lower() or str(default)
+        if raw.isdecimal() and 1 <= int(raw) <= count:
+            return WIZARD_PROVIDERS[int(raw) - 1][:3]
+        if raw in by_name:
+            return by_name[raw][:3]
+        _say(f"Pick a number between 1 and {count}.", RED)
 
 
 def _collect_key(env_name: str) -> str:
-    """The API key via getpass — hidden input, may be empty (skip)."""
-    print(f"\n  {DIM}The key is stored in {get_env_file_path()} (0600),"
-          f" never echoed, never logged.{RST}")
-    key = getpass.getpass(f"  {env_name} (Enter to skip for now): ").strip()
-    return key
+    """The API key via getpass — hidden input; empty means go back."""
+    _say(f"The key is stored in {_display_path(get_env_file_path())} (0600),"
+         " never echoed, never logged.", DIM)
+    return getpass.getpass(f"{INDENT}{env_name} (Enter to go back): ").strip()
 
 
 CUSTOM_KEY_ENV = "CONCH_CUSTOM_API_KEY"
@@ -241,125 +319,219 @@ def _choose_custom_model(base_url: str, api_key: str) -> str:
     """Pick the endpoint's model so the config is complete on first launch
     (an empty custom_model otherwise warns on every start). Returns ""
     when nothing could be discovered — the user is told how to set it."""
-    print(f"  {DIM}Looking up models at {base_url} …{RST}")
+    _say(f"Looking up models at {base_url} …", DIM)
     with Spinner("Discovering custom models"):
         models, tool_capable = discover_custom_models(base_url, api_key)
+    config_path = _display_path(get_config_path())
     if models is None:
-        print(f"  {YELLOW}! Endpoint unreachable{RST} {DIM}— add"
-              f" `custom_model = <name>` to {get_config_path()} once it is"
-              f" up (conch verifies it at startup).{RST}")
+        _say("! Endpoint unreachable.", YELLOW)
+        _say(f"Add `custom_model = <name>` to {config_path} once it is up"
+             " (conch verifies it at startup).", DIM)
         return ""
     if not models:
-        print(f"  {YELLOW}! The endpoint lists no models{RST} {DIM}— set"
-              f" `custom_model = <name>` in {get_config_path()} when one is"
-              f" loaded.{RST}")
+        _say("! The endpoint lists no models.", YELLOW)
+        _say(f"Set `custom_model = <name>` in {config_path} when one is"
+             " loaded.", DIM)
         return ""
     if tool_capable:
-        print(f"  {GREEN}✓ {len(models)} model(s) passed the native"
-              f" tool-call check{RST}")
+        _say(f"✓ {len(models)} model(s) passed the native tool-call check",
+             GREEN)
     else:
-        print(f"  {YELLOW}! No model passed the native tool-call check"
-              f"{RST} {DIM}— tool use may not work with this endpoint.{RST}")
+        _say("! No model passed the native tool-call check — tool use may"
+             " not work with this endpoint.", YELLOW)
     return _choose_model(models)
 
 
 def _choose_model(models: List[str]) -> str:
     """Select an installed/discovered model before the startup capability check."""
     if len(models) == 1:
-        print(f"  {DIM}model: {models[0]}{RST}")
+        _say(f"model: {models[0]}", DIM)
         return models[0]
-    for index, name in enumerate(models[:12], start=1):
-        print(f"    {BOLD}{index}{RST}. {name}")
+    shown = min(len(models), 12)
+    for index, name in enumerate(models[:shown], start=1):
+        _say(name, prefix=f"    {index}. ", prefix_color=BOLD)
     while True:
-        raw = input(
-            f"  Model [1-{min(len(models), 12)}, Enter=1]: "
-        ).strip()
+        raw = input(f"{INDENT}Model [1-{shown}, Enter=1]: ").strip()
         if not raw:
             return models[0]
-        if raw.isdigit() and 1 <= int(raw) <= min(len(models), 12):
+        if raw.isdecimal() and 1 <= int(raw) <= shown:
             return models[int(raw) - 1]
         if raw in models:
             return raw
-        print(f"  {RED}Pick a number between 1 and"
-              f" {min(len(models), 12)}.{RST}")
+        _say(f"Pick a number between 1 and {shown}.", RED)
 
 
-def run_first_run_wizard() -> Optional[ModelCheckOutcome]:
-    """Configure a provider and return its startup verification outcome."""
-    provider, env_name, ollama_models = _choose_provider()
-    from .seats import PROVIDERS
+def _probe(provider: str, key: str, base_url: str = "") -> bool:
+    with Spinner("Verifying provider reachability"):
+        ok, detail = probe_provider(provider, key, base_url)
+    _say(f"✓ {detail}" if ok else f"! {detail}", GREEN if ok else YELLOW)
+    return ok
 
-    if provider in PROVIDERS:
-        from .auth import login
 
-        if login(provider):
-            print(f"  Sign-in did not complete; run: conch auth login {provider}")
-            return None
-        return verify_configured_model()
-    base_url = ""
-    key = ""
-    if provider == "custom":
-        base_url = input(
-            "  OpenAI-compatible base URL (e.g."
-            " http://localhost:8080/v1): "
-        ).strip().rstrip("/")
-        optional = getpass.getpass(
-            "  API key for it, if any (Enter for none): "
-        ).strip()
-        key = optional
-    elif env_name:
-        key = _collect_key(env_name)
+def _report_saved(config_path: str, key_saved: bool = False) -> None:
+    print()
+    _say(f"Configuration saved: {_display_path(config_path)}", DIM)
+    if key_saved:
+        _say(f"Key saved: {_display_path(get_env_file_path())} (0600)."
+             " `conch keys` lists, verifies, and rotates it later.", DIM)
 
-    if key or provider in ("ollama", "custom"):
-        answer = input("  Verify with one live request? [Y/n]: ").strip().lower()
-        if answer in ("", "y", "yes"):
-            with Spinner("Verifying provider reachability"):
-                ok, detail = probe_provider(provider, key, base_url)
-            if ok:
-                print(f"  {GREEN}✓ {detail}{RST}")
-            else:
-                print(f"  {YELLOW}! {detail}{RST}")
-                if env_name and input(
-                    "  Re-enter the key? [y/N]: "
-                ).strip().lower() in ("y", "yes"):
-                    key = _collect_key(env_name)
-                    with Spinner("Verifying provider reachability"):
-                        ok, detail = probe_provider(provider, key, base_url)
-                    print(f"  {GREEN}✓ {detail}{RST}" if ok
-                          else f"  {YELLOW}! {detail} — keeping it anyway;"
-                               f" fix it later in {get_env_file_path()}{RST}")
 
-    updates = {"provider": provider}
-    if provider == "ollama" and ollama_models:
-        selected_model = _choose_model(ollama_models)
-        updates.update(model=selected_model, chat_model=selected_model)
-    if provider == "custom" and base_url:
-        updates["custom_base_url"] = base_url
-        custom_model = _choose_custom_model(base_url, key)
-        if custom_model:
-            updates["custom_model"] = custom_model
-    if key and provider == "custom":
+def _seat_cli_missing(provider: str, label: str) -> bool:
+    install, docs = auth.install_hint(provider)
+    _say(f"! The {label} needs its official CLI, which is not installed.",
+         YELLOW)
+    _say(install, prefix="    Install: ")
+    _say(docs, prefix="    Docs:    ")
+    _say("Then choose it again, or pick another provider.", DIM,
+         prefix="    ")
+    return False
+
+
+def _connect_seat(provider: str, label: str,
+                  seat_states: Dict[str, str]) -> bool:
+    """Select a signed-in seat, running the native sign-in only when needed.
+    The state is re-read on every choice that was not already signed in, so
+    installing or signing in elsewhere and choosing again just works."""
+    if seat_states.get(provider) != SEAT_READY:
+        with Spinner(f"Checking {label} sign-in"):
+            seat_states[provider] = seat_state(provider)
+    if seat_states[provider] == SEAT_MISSING:
+        return _seat_cli_missing(provider, label)
+    if seat_states[provider] != SEAT_READY:
+        _say("Starting the provider's own sign-in; finish it in your"
+             " browser.", DIM)
+        try:
+            code, reason = auth.sign_in(provider)
+        except FileNotFoundError:
+            seat_states[provider] = SEAT_MISSING
+            return _seat_cli_missing(provider, label)
+        if code:
+            _say(f"! {reason or 'Sign-in did not complete.'}", YELLOW)
+            _say("Choose it again to retry, or pick another provider.", DIM)
+            return False
+        seat_states[provider] = SEAT_READY
+    model, config_path = auth.select(provider)
+    _say(f"✓ {label} is signed in.", GREEN)
+    _say(f"Saved {provider}/{model} to {_display_path(config_path)}; your"
+         " sign-in stays with the provider's CLI.", DIM)
+    return True
+
+
+def _connect_ollama(models: Optional[List[str]]) -> bool:
+    """Save the chosen local model, or say what to run when there is none."""
+    from .providers import (
+        DEFAULT_CHAT_MODEL_BY_PROVIDER,
+        get_ollama_base_url,
+        local_endpoint_policy_error,
+    )
+
+    if models is None:
+        base_url = get_ollama_base_url()
+        blocked = local_endpoint_policy_error("ollama", base_url, {})
+        if blocked:
+            _say(f"! {blocked}", YELLOW)
+        else:
+            _say(f"! Ollama is not reachable at {base_url}.", YELLOW)
+            _say("Start it with `ollama serve` (or open the Ollama app),"
+                 " then choose Ollama again.", DIM)
+        return False
+    if not models:
+        _say("! Ollama is running but has no model that supports tool"
+             " calling, which Conch requires.", YELLOW)
+        _say("Pull one with `ollama pull"
+             f" {DEFAULT_CHAT_MODEL_BY_PROVIDER['ollama']}`, then choose"
+             " Ollama again.", DIM)
+        return False
+    selected = _choose_model(models)
+    _report_saved(set_config_values(
+        {"provider": "ollama", "model": selected, "chat_model": selected},
+        header=CONFIG_HEADER,
+    ))
+    return True
+
+
+def _connect_custom() -> bool:
+    base_url = input(
+        f"{INDENT}Base URL (e.g. http://localhost:8080/v1): "
+    ).strip().rstrip("/")
+    if not base_url:
+        _say("! No URL entered, so nothing was saved.", YELLOW)
+        return False
+    key = getpass.getpass(
+        f"{INDENT}API key for it, if any (Enter for none): "
+    ).strip()
+    if _confirm("Verify with one live request?", True):
+        _probe("custom", key, base_url)
+    updates = {"provider": "custom", "custom_base_url": base_url}
+    custom_model = _choose_custom_model(base_url, key)
+    if custom_model:
+        updates["custom_model"] = custom_model
+    if key:
         # Custom endpoints read OPENAI_API_KEY-style bearer via api_key_env;
         # store under a conch-specific name and point config at it.
         updates["api_key_env"] = CUSTOM_KEY_ENV
     config_path = set_config_values(updates, header=CONFIG_HEADER)
+    if key:
+        set_env_values({CUSTOM_KEY_ENV: key}, set_by="first-run setup")
+    _report_saved(config_path, key_saved=bool(key))
+    return True
+
+
+def _connect_api_key(provider: str, env_name: str) -> bool:
+    while True:
+        key = _collect_key(env_name)
+        if not key:
+            _say("! No key entered, so nothing was saved.", YELLOW)
+            return False
+        if (not _confirm("Verify with one live request?", True)
+                or _probe(provider, key)
+                or _confirm("Save this key anyway?", False)):
+            break
+        _say("Enter the key again, or press Enter to pick another"
+             " provider.", DIM)
+    config_path = set_config_values({"provider": provider},
+                                    header=CONFIG_HEADER)
     # Same write path as `conch keys set`: the key becomes conch-managed
     # (authoritative over a stale shell export) and shows up in
     # `conch keys list` with its provenance.
-    if key and env_name:
-        set_env_values({env_name: key}, set_by="first-run setup")
-    elif key and provider == "custom":
-        set_env_values({CUSTOM_KEY_ENV: key}, set_by="first-run setup")
+    set_env_values({env_name: key}, set_by="first-run setup")
+    _report_saved(config_path, key_saved=True)
+    return True
 
-    print(f"\n  {DIM}Configuration saved: {config_path}{RST}")
-    if key:
-        print(f"  {DIM}key: {get_env_file_path()} (0600) — `conch keys` lists,"
-              f" verifies, and rotates it later{RST}")
-    if not key and env_name:
-        print(f"  {YELLOW}No key saved{RST} {DIM}— add a line"
-              f" `{env_name}=...` to {get_env_file_path()} or export it"
-              f" in your shell before chatting.{RST}")
-    return verify_configured_model()
+
+def run_first_run_wizard() -> ModelCheckOutcome:
+    """Choose a provider, connect it, and return its startup verification
+    outcome. A choice that cannot be connected saves nothing and returns to
+    the provider menu; only Ctrl+C/EOF leaves without a configuration."""
+    seat_states, ollama_models = _detect()
+    print()
+    _say("Welcome to Conch", CYAN)
+    _say("Three steps: choose a provider, connect it, verify a model."
+         " Ctrl+C exits setup; run conch again to return.")
+    print()
+    _say("Claude and ChatGPT seats use your subscription through the"
+         " provider's official CLI. API keys are optional and billed"
+         " separately. You can change providers later with /provider.")
+    while True:
+        _step(1, "Choose a provider")
+        _print_menu(seat_states, ollama_models)
+        print()
+        provider, env_name, label = _ask_provider(_default_choice(seat_states))
+        _step(2, f"Connect {label}")
+        if provider in seat_states:
+            connected = _connect_seat(provider, label, seat_states)
+        elif provider == "ollama":
+            if not ollama_models:
+                with Spinner("Detecting local models"):
+                    ollama_models = detect_ollama()
+            connected = _connect_ollama(ollama_models)
+        elif provider == "custom":
+            connected = _connect_custom()
+        else:
+            connected = _connect_api_key(provider, env_name)
+        if connected:
+            _step(3, "Verify a model")
+            return verify_configured_model()
 
 
 def verify_configured_model() -> ModelCheckOutcome:
@@ -371,14 +543,14 @@ def verify_configured_model() -> ModelCheckOutcome:
     gatekeeper to turn into a clean non-zero exit."""
     config = load_config()
     label = f"{config.get('provider')}/{config.get('chat_model') or config.get('model')}"
-    print(f"  {DIM}Checking {label} …{RST}")
+    _say(f"Checking {label} …", DIM)
     outcome = ensure_working_model(config, interactive=True, persist_mode="always")
     if not outcome.checked:
-        print(f"  {DIM}model check is off (model_check=off); {label} unverified{RST}")
+        _say(f"model check is off (model_check=off); {label} unverified", DIM)
     elif not outcome.switched:
         detail = outcome.result.detail if outcome.result is not None else ""
-        print(f"  {GREEN}✓ {outcome.label} verified{RST}"
-              + (f" {DIM}— {detail}{RST}" if detail else ""))
+        _say(f"✓ {outcome.label} verified"
+             + (f" — {detail}" if detail else ""), GREEN)
     return outcome
 
 
@@ -392,12 +564,10 @@ def maybe_run_first_run_wizard() -> Optional[ModelCheckOutcome]:
     from .bootstrap import StartupError
 
     try:
-        outcome = run_first_run_wizard()
-        if outcome is None:
-            sys.exit(1)
-        return outcome
+        return run_first_run_wizard()
     except (KeyboardInterrupt, EOFError):
-        print(f"\n  {DIM}Setup cancelled. Run `conch` again when ready.{RST}")
+        print()
+        _say("Setup cancelled. Run `conch` again when ready.", DIM)
         sys.exit(0)
     except StartupError as exc:
         # The post-setup model check found nothing working (or the user
@@ -405,6 +575,7 @@ def maybe_run_first_run_wizard() -> Optional[ModelCheckOutcome]:
         # so the next launch re-checks instead of chatting with a model
         # that is known not to answer.
         print(str(exc), file=sys.stderr)
-        print(f"  {DIM}Setup is saved in {get_config_path()} — run `conch`"
-              f" again once the model is reachable, or edit the config.{RST}")
+        _say(f"Setup is saved in {_display_path(get_config_path())}. Run"
+             " `conch` again once the model is reachable, or edit that"
+             " file.", DIM)
         sys.exit(exc.code)

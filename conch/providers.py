@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from .render import emit_generation_detail
 from .seats import PROVIDERS as SEAT_PROVIDERS, complete as seat_complete
 
 logger = logging.getLogger("conch.providers")
@@ -1445,9 +1446,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
     except Exception as exc:
         return error_response(str(exc))
     message = (data.get("choices") or [{}])[0].get("message", {})
-    content = (message.get("content") or "").strip()
-    if not content and message.get("reasoning"):
-        content = message["reasoning"].strip()
+    content = strip_think_blocks((message.get("content") or "").strip())
     return {
         "role": "assistant",
         "content": content,
@@ -1490,9 +1489,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         msg = err.get("message", json.dumps(err)) if isinstance(err, dict) else str(err)
         return error_response(msg)
     message = (data.get("choices") or [{}])[0].get("message", {})
-    content = (message.get("content") or "").strip()
-    if not content and message.get("reasoning"):
-        content = str(message["reasoning"]).strip()
+    content = strip_think_blocks((message.get("content") or "").strip())
     return {
         "role": "assistant",
         "content": content,
@@ -1759,55 +1756,47 @@ def raw_bedrock(config: dict, messages: List[dict], tools: Optional[List[dict]] 
 
 
 class _ReasoningStreamFilter:
-    """Suppress <reasoning>...</reasoning> spans from streamed display tokens.
+    """Separate chunked inline thinking from answer tokens without losing it."""
 
-    kimi-k2-thinking (Bedrock) streams its chain of thought as tagged spans
-    inside ordinary content deltas; without filtering, the raw reasoning is
-    printed live to the terminal. Tags can be split across chunk boundaries,
-    so a small tail is buffered until it can't be a tag prefix anymore.
-    """
+    TAGS = {"<reasoning>": "</reasoning>", "<think>": "</think>"}
 
-    OPEN = "<reasoning>"
-    CLOSE = "</reasoning>"
-
-    def __init__(self, on_token):
+    def __init__(self, on_token, on_reasoning=None):
         self._on_token = on_token
+        self._on_reasoning = on_reasoning
         self._buffer = ""
-        self._inside = False
+        self._close = ""
+
+    def _emit(self, text):
+        callback = self._on_reasoning if self._close else self._on_token
+        if text and callback:
+            callback(text)
 
     def feed(self, text: str):
         self._buffer += text
-        emitted: list = []
         while self._buffer:
-            tag = self.CLOSE if self._inside else self.OPEN
-            idx = self._buffer.find(tag)
-            if idx >= 0:
-                if not self._inside:
-                    emitted.append(self._buffer[:idx])
+            tags = (self._close,) if self._close else tuple(self.TAGS)
+            matches = [(self._buffer.find(tag), tag) for tag in tags]
+            matches = [(idx, tag) for idx, tag in matches if idx >= 0]
+            if matches:
+                idx, tag = min(matches)
+                self._emit(self._buffer[:idx])
                 self._buffer = self._buffer[idx + len(tag):]
-                self._inside = not self._inside
+                self._close = "" if self._close else self.TAGS[tag]
                 continue
-            if self._inside:
-                # Drop consumed reasoning, keep only a possible split close tag.
-                self._buffer = self._buffer[-(len(tag) - 1):]
-            else:
-                # Emit everything except a possible split open tag at the end.
-                keep = 0
-                for k in range(min(len(tag) - 1, len(self._buffer)), 0, -1):
+            # Retain only a possible split tag, not the preceding reasoning.
+            keep = 0
+            for tag in tags:
+                for k in range(min(len(tag) - 1, len(self._buffer)), keep, -1):
                     if tag.startswith(self._buffer[-k:]):
                         keep = k
                         break
-                emitted.append(self._buffer[:-keep] if keep else self._buffer)
-                self._buffer = self._buffer[-keep:] if keep else ""
+            self._emit(self._buffer[:-keep] if keep else self._buffer)
+            self._buffer = self._buffer[-keep:] if keep else ""
             break
-        out = "".join(emitted)
-        if out:
-            self._on_token(out)
 
     def finish(self):
-        if not self._inside and self._buffer:
-            self._on_token(self._buffer)
-            self._buffer = ""
+        self._emit(self._buffer)
+        self._buffer = ""
 
 
 def stream_bedrock(config: dict, messages: list, tools=None, on_token=None) -> dict:
@@ -1815,21 +1804,15 @@ def stream_bedrock(config: dict, messages: list, tools=None, on_token=None) -> d
     if not api_key:
         return missing_api_key_response("bedrock", config.get("api_key_env") or "AWS_BEARER_TOKEN_BEDROCK")
     body = _bedrock_body(config, messages, tools)
-    reasoning_filter = _ReasoningStreamFilter(on_token) if on_token else None
-    result = _stream_openai_compat(
+    return _stream_openai_compat(
         f"{get_bedrock_base_url(config)}/chat/completions",
         _bedrock_headers(config),
         body,
         body["model"],
         "bedrock",
-        reasoning_filter.feed if reasoning_filter else None,
+        on_token,
         config=config,
     )
-    if reasoning_filter:
-        reasoning_filter.finish()
-    if result.get("content"):
-        result["content"] = strip_think_blocks(result["content"])
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1910,21 +1893,15 @@ def stream_openrouter(config: dict, messages: list, tools=None, on_token=None) -
         return missing_api_key_response("openrouter", config.get("api_key_env") or "OPENROUTER_API_KEY")
     body = _openrouter_body(config, messages, tools)
     body["stream_options"] = {"include_usage": True}
-    reasoning_filter = _ReasoningStreamFilter(on_token) if on_token else None
-    result = _stream_openai_compat(
+    return _stream_openai_compat(
         f"{OPENROUTER_BASE_URL}/chat/completions",
         _openrouter_headers(config),
         body,
         body["model"],
         "openrouter",
-        reasoning_filter.feed if reasoning_filter else None,
+        on_token,
         config=config,
     )
-    if reasoning_filter:
-        reasoning_filter.finish()
-    if result.get("content"):
-        result["content"] = strip_think_blocks(result["content"])
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2491,6 +2468,34 @@ def _iter_sse(response):
             continue
 
 
+def _reasoning_text(value):
+    """Read published text/summary shapes only; opaque payloads stay opaque."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _reasoning_text(item)
+    elif isinstance(value, dict):
+        kind = value.get("type")
+        if kind in ("reasoning.text", "text", "summary_text"):
+            text = value.get("text")
+            if isinstance(text, str):
+                yield text
+        elif kind in ("reasoning.summary", "reasoning"):
+            yield from _reasoning_text(value.get("summary"))
+
+
+def _emit_openai_reasoning(on_token, delta):
+    # Gateways can repeat the same reasoning in normalized and native fields.
+    # Select one representation per delta rather than forwarding all aliases.
+    for key in ("reasoning_content", "reasoning", "reasoning_details"):
+        parts = [text for text in _reasoning_text(delta.get(key)) if text]
+        if parts:
+            for text in parts:
+                emit_generation_detail(on_token, "reasoning", text)
+            return
+
+
 def _stream_openai_compat(
     url: str,
     headers: dict,
@@ -2520,7 +2525,9 @@ def _stream_openai_compat(
     )
 
     content_parts: list[str] = []
-    reasoning_parts: list[str] = []
+    reasoning_filter = _ReasoningStreamFilter(
+        on_token, lambda text: emit_generation_detail(on_token, "reasoning", text)
+    )
     tool_calls_acc: dict[int, dict] = {}
     usage = {"input_tokens": 0, "output_tokens": 0}
 
@@ -2538,14 +2545,11 @@ def _stream_openai_compat(
                 delta = choice.get("delta", {})
 
                 text = delta.get("content") or ""
-                reasoning = delta.get("reasoning") or ""
-                if reasoning:
-                    reasoning_parts.append(reasoning)
+                _emit_openai_reasoning(on_token, delta)
 
                 if text:
                     content_parts.append(text)
-                    if on_token:
-                        on_token(text)
+                    reasoning_filter.feed(text)
 
                 for tc in delta.get("tool_calls", []):
                     idx = tc.get("index")
@@ -2571,6 +2575,7 @@ def _stream_openai_compat(
                         )
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                        emit_generation_detail(on_token, "progress", "Generating tool call")
                     if tc.get("id"):
                         tool_calls_acc[idx]["id"] = tc["id"]
                     fn = tc.get("function", {})
@@ -2613,13 +2618,8 @@ def _stream_openai_compat(
     except Exception as exc:
         return error_response(str(exc))
 
-    full_text = "".join(content_parts).strip()
-    # Reasoning-only replies (no content, no tool calls) surface the
-    # reasoning as the answer. On tool-call turns the empty content is
-    # correct — promoting reasoning there would persist chain-of-thought
-    # (OpenRouter models stream reasoning on every tool call).
-    if not full_text and reasoning_parts and not tool_calls_acc:
-        full_text = "".join(reasoning_parts).strip()
+    reasoning_filter.finish()
+    full_text = strip_think_blocks("".join(content_parts).strip())
     tool_calls = None
     if tool_calls_acc:
         tool_calls = [
@@ -2799,6 +2799,16 @@ def stream_anthropic(
                     cur_block_meta = block
                     cur_text = []
                     cur_json = ""
+                    if cur_block_type == "thinking":
+                        thinking = block.get("thinking", "")
+                        if isinstance(thinking, str) and thinking:
+                            cur_text.append(thinking)
+                            emit_generation_detail(on_token, "reasoning", thinking)
+                    elif cur_block_type == "tool_use":
+                        emit_generation_detail(
+                            on_token, "progress",
+                            f"Generating tool call: {block.get('name') or 'tool'}",
+                        )
                     if cur_block_type not in ANTHROPIC_KNOWN_BLOCK_TYPES:
                         unknown_blocks.append(str(cur_block_type))
 
@@ -2813,9 +2823,14 @@ def stream_anthropic(
                     elif delta.get("type") == "input_json_delta":
                         cur_json += delta.get("partial_json", "")
                     elif delta.get("type") == "thinking_delta":
-                        cur_text.append(delta.get("thinking", ""))
+                        thinking = delta.get("thinking", "")
+                        if isinstance(thinking, str):
+                            cur_text.append(thinking)
+                            emit_generation_detail(on_token, "reasoning", thinking)
                     elif delta.get("type") == "signature_delta":
-                        cur_block_meta["signature"] = delta.get("signature", "")
+                        cur_block_meta["signature"] = (
+                            cur_block_meta.get("signature", "") + delta.get("signature", "")
+                        )
 
                 elif etype == "content_block_stop":
                     if cur_block_type == "text":
@@ -3000,6 +3015,10 @@ def stream_ollama(
     # which rejects textual calls without executing them. The gate affects
     # display only.
     gate = _StreamDisplayGate(on_token) if on_token else None
+    reasoning_filter = _ReasoningStreamFilter(
+        gate.feed if gate else None,
+        lambda text: emit_generation_detail(on_token, "reasoning", text),
+    )
 
     try:
         with urllib.request.urlopen(
@@ -3027,12 +3046,15 @@ def stream_ollama(
                     if fingerprint not in seen_tool_calls:
                         seen_tool_calls.add(fingerprint)
                         raw_tool_calls.append(tool_call)
-                # Skip msg.get("thinking") tokens (qwen3 et al.) — reasoning is
-                # not part of the reply.
+                        emit_generation_detail(
+                            on_token, "progress", "Generating tool call"
+                        )
+                thinking = msg.get("thinking")
+                if isinstance(thinking, str) and thinking:
+                    emit_generation_detail(on_token, "reasoning", thinking)
                 if msg.get("content"):
                     content_parts.append(msg["content"])
-                    if gate:
-                        gate.feed(msg["content"])
+                    reasoning_filter.feed(msg["content"])
 
                 if data.get("done"):
                     final_data = data
@@ -3040,6 +3062,7 @@ def stream_ollama(
     except Exception as exc:
         return error_response(str(exc))
 
+    reasoning_filter.finish()
     if gate:
         gate.finish()
 

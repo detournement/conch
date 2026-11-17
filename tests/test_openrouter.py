@@ -168,13 +168,13 @@ class TestStreamOpenRouter(unittest.TestCase):
         self.assertEqual(tokens, [])
         self.assertEqual(result["tool_calls"][0]["function"]["name"], "local_shell")
 
-    def test_reasoning_only_reply_surfaces_reasoning(self):
+    def test_reasoning_only_reply_never_becomes_answer(self):
         lines = [
             b'data: {"choices": [{"delta": {"reasoning": "the answer is 4"}}]}\n',
             b"data: [DONE]\n",
         ]
         result = self._stream(lines)
-        self.assertEqual(result["content"], "the answer is 4")
+        self.assertEqual(result["content"], "")
 
 
 class TestOpenRouterConfigLoading(unittest.TestCase):

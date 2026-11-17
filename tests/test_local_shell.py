@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from conch.tooling import LocalShellClient, LocalShellPolicy
+from conch.tooling import LocalShellClient, LocalShellPolicy, _CapturedTerminalText
 
 
 class _ScriptedInput:
@@ -425,6 +425,59 @@ class TestNoAnswerDeclines(_QuietStdout, unittest.TestCase):
         self.assertTrue(os.path.exists(self.marker))
 
 
+class TestCapturedTerminalText(unittest.TestCase):
+    def test_controls_are_removed_across_every_read_boundary(self):
+        raw = (
+            "\x1b[?25l\x1b[2J\x1b[HMANDELBROT\r\n"
+            "\x1b[38:2:255:0:0mframe\t1\x1b[0m\r"
+            "\x1b]0;hidden title\x07"
+            "\x1b]8;;https://example.org\x1b\\link\x1b]8;;\x1b\\\n"
+            "\x1bPignored payload\x1b\\"
+            "\x9b?25h\x9dhidden title\x9c"
+            "\x1b(Bdone\x1b[?25h"
+        )
+        expected = "MANDELBROT\r\nframe\t1\rlink\ndone"
+        for boundary in range(len(raw) + 1):
+            with self.subTest(boundary=boundary):
+                sanitizer = _CapturedTerminalText()
+                self.assertEqual(
+                    sanitizer.feed(raw[:boundary]) + sanitizer.feed(raw[boundary:])
+                    + sanitizer.finish(),
+                    expected,
+                )
+        sanitizer = _CapturedTerminalText()
+        self.assertEqual(
+            "".join(sanitizer.feed(char) for char in raw) + sanitizer.finish(), expected)
+
+    def test_unterminated_control_payload_is_not_returned(self):
+        sanitizer = _CapturedTerminalText()
+        self.assertEqual(sanitizer.feed("text\x1b]52;c;") + sanitizer.finish(), "text")
+        self.assertEqual(sanitizer.feed("secret" * 10000), "")
+        self.assertEqual(sanitizer.feed("\x1b\\after") + sanitizer.finish(), "after")
+
+    def test_unterminated_string_does_not_swallow_later_output(self):
+        for raw, expected in (
+            ("before\x1b]0;title\x1b[0mAFTER\nline2\n", "beforeAFTER\nline2\n"),
+            ("\x1b]P0101010palette\r\nvisible\n", "\nvisible\n"),
+            ("\x1b]0;t\x18visible", "visible"),
+            ("mojibake \x9d quote\nnext line\n", "mojibake \nnext line\n"),
+        ):
+            with self.subTest(raw=raw):
+                sanitizer = _CapturedTerminalText()
+                self.assertEqual(sanitizer.feed(raw) + sanitizer.finish(), expected)
+
+    def test_backspace_overstrike_keeps_one_copy_of_each_character(self):
+        raw = "N\bNA\bAM\bME\bE\n     _\bf_\bi_\bl_\be"
+        for boundary in range(len(raw) + 1):
+            with self.subTest(boundary=boundary):
+                sanitizer = _CapturedTerminalText()
+                self.assertEqual(
+                    sanitizer.feed(raw[:boundary]) + sanitizer.feed(raw[boundary:])
+                    + sanitizer.finish(),
+                    "NAME\n     file",
+                )
+
+
 class TestLocalShellExecution(_QuietStdout, unittest.TestCase):
     def test_empty_command_errors(self):
         client = LocalShellClient()
@@ -475,6 +528,40 @@ class TestLocalShellExecution(_QuietStdout, unittest.TestCase):
                 {"command": "printf '10%%\\r20%%\\r100%%\\n'"},
             )
         self.assertEqual(result["content"][0]["text"], "10%\n20%\n100%")
+
+    def test_animation_controls_are_not_in_captured_or_streamed_text(self):
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))
+        with _CaptureStderr() as buf:
+            result = client.call_tool(
+                "local_shell",
+                {
+                    "command": (
+                        "printf '\\033[?25l\\033[2J\\033[HMANDELBROT\\n"
+                        "\\033]0;hidden title\\007frame\\n\\033[?25h'"
+                    )
+                },
+            )
+        self.assertEqual(result["content"][0]["text"], "MANDELBROT\nframe")
+        self.assertNotIn("[?25", buf.getvalue())
+        self.assertNotIn("hidden title", buf.getvalue())
+
+    def test_control_payload_does_not_consume_capture_budget(self):
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))
+        client.set_result_budget(256)
+        with _CaptureStderr():
+            result = client.call_tool(
+                "local_shell",
+                {
+                    "command": (
+                        "python3 -c \"import sys; "
+                        "sys.stdout.write('HEAD' + chr(27) + ']0;' + 'x' * 50000 "
+                        "+ chr(7) + 'TAIL')\""
+                    )
+                },
+            )
+        self.assertEqual(result["content"][0]["text"], "HEADTAIL")
 
     def test_timeout_zero_means_no_timeout(self):
         client = LocalShellClient()

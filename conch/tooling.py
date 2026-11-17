@@ -648,6 +648,76 @@ def ensure_tools_active(chat_state, names) -> List[str]:
     return added
 
 
+class _CapturedTerminalText:
+    """Strip terminal controls incrementally, without buffering control payloads.
+
+    State survives read boundaries so CSI parameters and OSC/DCS payloads cannot
+    leak into captured head/tail text when reads or result budgets split them.
+    One printable character is held back so a following backspace can
+    overstrike it (man-page bold/underline); ``finish`` releases it.
+    """
+
+    def __init__(self):
+        self._state = "text"
+        self._held = ""
+
+    def finish(self) -> str:
+        held, self._held = self._held, ""
+        return held
+
+    def feed(self, text: str) -> str:
+        output = []
+        for char in text:
+            state = self._state
+            if state == "string_escape":
+                # ESC \ ends the string; any other escape restarts parsing so
+                # an unterminated payload cannot swallow later sequences.
+                self._state = "text"
+                if char == "\\":
+                    continue
+                state = "escape"
+            if state == "string":
+                if char in "\x07\x9c\x18\x1a":
+                    self._state = "text"
+                elif char == "\x1b":
+                    self._state = "string_escape"
+                elif char == "\n":
+                    # Bound the loss from a never-terminated string to one line.
+                    self._state = "text"
+                    output.append(self._held + char)
+                    self._held = ""
+            elif char == "\x1b":
+                self._state = "escape"
+            elif state == "csi":
+                if "\x40" <= char <= "\x7e":
+                    self._state = "text"
+            elif state == "escape":
+                if char == "[":
+                    self._state = "csi"
+                elif char in "]PX^_":
+                    self._state = "string"
+                elif "\x20" <= char <= "\x2f":
+                    self._state = "escape_intermediate"
+                else:
+                    self._state = "text"
+            elif state == "escape_intermediate":
+                if not "\x20" <= char <= "\x2f":
+                    self._state = "text"
+            elif char == "\x9b":
+                self._state = "csi"
+            elif char in "\x90\x98\x9d\x9e\x9f":
+                self._state = "string"
+            elif char == "\b":
+                self._held = ""
+            elif char in "\n\r\t":
+                output.append(self._held + char)
+                self._held = ""
+            elif char >= " " and not "\x7f" <= char <= "\x9f":
+                output.append(self._held)
+                self._held = char
+        return "".join(output)
+
+
 @dataclass
 class LocalShellPolicy:
     interactive: bool = True
@@ -661,7 +731,13 @@ LOCAL_SHELL_TOOL = {
     "type": "function",
     "function": {
         "name": "local_shell",
-        "description": "Execute a shell command on the user's machine and return stdout/stderr.",
+        "description": (
+            "Execute a noninteractive shell command and return captured stdout/stderr "
+            "as plain text, not a live terminal display. Animations, fullscreen TUIs, "
+            "cursor-updating programs, and credential input cannot be shown through "
+            "this tool; use interactive_terminal when it is available. Never claim a "
+            "captured animation was displayed to the user."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -679,10 +755,12 @@ INTERACTIVE_TERMINAL_TOOL = {
         "name": "interactive_terminal",
         "description": (
             "Run a local command by handing the real terminal directly to it. "
-            "Use this instead of local_shell whenever sudo, SSH, getpass, a "
+            "Use this instead of local_shell for animations, fullscreen TUIs, "
+            "cursor-updating programs, or whenever sudo, SSH, getpass, a "
             "passphrase, or other interactive terminal input may be required. "
-            "The user must explicitly confirm even in agent mode. Conch never "
-            "reads or returns the interaction; only exit status is reported. "
+            "The user must explicitly confirm even in agent/yolo mode. Conch "
+            "suspends its UI and never reads or returns the interaction; only "
+            "exit status is reported, not proof of what was visually displayed. "
             "Never put a credential in the command."
         ),
         "parameters": {
@@ -880,6 +958,7 @@ class LocalShellClient:
         captured_head = ""
         captured_tail = ""
         captured_total = 0
+        sanitizer = _CapturedTerminalText()
 
         def capture(chunk: str) -> None:
             nonlocal captured_head, captured_tail, captured_total
@@ -907,7 +986,8 @@ class LocalShellClient:
                     if remaining <= 0:
                         proc.kill()
                         capture(
-                            f"\nCommand timed out after {effective_timeout}s"
+                            sanitizer.finish()
+                            + f"\nCommand timed out after {effective_timeout}s"
                         )
                         break
                     try:
@@ -923,7 +1003,7 @@ class LocalShellClient:
                             raise
                         if not data:
                             break
-                        chunk = data.decode("utf-8", errors="replace")
+                        chunk = sanitizer.feed(data.decode("utf-8", errors="replace"))
                         capture(chunk)
                         if stream_output:
                             sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
@@ -937,11 +1017,12 @@ class LocalShellClient:
                                 data = os.read(master_fd, 4096)
                                 if not data:
                                     break
-                                chunk = data.decode("utf-8", errors="replace")
+                                chunk = sanitizer.feed(data.decode("utf-8", errors="replace"))
                                 capture(chunk)
                         except OSError:
                             pass
                         break
+                capture(sanitizer.finish())
             except KeyboardInterrupt:
                 proc.kill()
                 return self._text("Command interrupted by user.")
@@ -971,7 +1052,6 @@ class LocalShellClient:
         # (progress bars rewriting a line) as a line break of its own.
         output = output.replace("\r\n", "\n")
         output = _re.sub(r"\r", "\n", output)
-        output = _re.sub(r"\x1b\[[0-9;]*[mABCDEFGHJKLMSTfhilnprsu]", "", output)
         output = _re.sub(r"\n{3,}", "\n\n", output).strip()
 
         if not output:

@@ -1904,12 +1904,17 @@ def chat_turn(
     chat_state=None,
     on_token=None,
     input_fn=None,
+    steering_fn=None,
 ) -> tuple:
     """Returns (reply_text, usage_info) where usage_info is a dict with
     input_tokens, output_tokens, and model.
 
     When *on_token* is a callable, the reply is streamed token-by-token
     through that callback instead of blocking behind a spinner.
+
+    ``steering_fn() -> list[str]`` atomically consumes pending user guidance.
+    Poll only at safe boundaries; finish an active request or tool, then
+    replace unexecuted tool calls with explicit results before adding guidance.
     """
     from .providers import STREAM_FNS, PROVIDER_TOOL_LIMITS
 
@@ -1944,6 +1949,15 @@ def chat_turn(
     # turn's bound exactly as /skill raises it before a turn starts.
     round_budget = int(max_tool_rounds)
     _round = -1
+
+    def take_steering() -> List[dict]:
+        # Blank guidance carries no instruction and providers reject it.
+        return [
+            {"role": "user", "content": text}
+            for text in (steering_fn() if steering_fn is not None else [])
+            if isinstance(text, str) and text.strip()
+        ]
+
     while True:
         _round += 1
         wanted = int(getattr(chat_state, "requested_tool_rounds", 0) or 0)
@@ -1971,6 +1985,7 @@ def chat_turn(
                                      total_usage, "token budget"),
                 total_usage,
             )
+        messages.extend(take_steering())
         if provider == "anthropic":
             sanitize_anthropic_messages(messages)
         if chat_state and getattr(chat_state, "needs_tool_refresh", False):
@@ -2037,6 +2052,9 @@ def chat_turn(
             _append_leading_system_context(send_messages, todo_block)
 
         stream_fn = STREAM_FNS.get(provider) if on_token else None
+        guidance = take_steering()
+        messages.extend(guidance)
+        send_messages.extend(guidance)
         _call_started = time.monotonic()
         if stream_fn:
             response = stream_fn(config, send_messages, send_tools if send_tools else None, on_token)
@@ -2073,6 +2091,9 @@ def chat_turn(
                     file=sys.stderr,
                 )
                 time.sleep(1)
+                guidance = take_steering()
+                messages.extend(guidance)
+                send_messages.extend(guidance)
                 _call_started = time.monotonic()
                 if stream_fn:
                     response = stream_fn(
@@ -2103,6 +2124,9 @@ def chat_turn(
                     " in the conch env file — retrying with the new key\033[0m",
                     file=sys.stderr,
                 )
+                guidance = take_steering()
+                messages.extend(guidance)
+                send_messages.extend(guidance)
                 _call_started = time.monotonic()
                 if stream_fn:
                     response = stream_fn(config, send_messages, send_tools, on_token)
@@ -2118,13 +2142,6 @@ def chat_turn(
                     ui_stream.reset()
             if is_error_response(response):
                 err_detail = error_detail(response)
-                print(f"  \033[33m⚠ {err_detail}\033[0m", file=sys.stderr)
-                if is_auth_error(err_detail):
-                    print(
-                        "  \033[2m(in this session: /keys set <NAME> saves and"
-                        " verifies a new key without restarting)\033[0m",
-                        file=sys.stderr,
-                    )
                 from .providers import RAW_FNS, DEFAULT_API_KEY_ENVS, get_fallback_chain
                 # Structural errors (invalid request shape, auth) won't be fixed
                 # by switching to another model on the same provider.
@@ -2135,6 +2152,16 @@ def chat_turn(
                     fallback_chain = [
                         (p, m, s) for p, m, s in fallback_chain if p != provider
                     ]
+                if fallback_chain:
+                    # With nothing to fall back to, the final failure line
+                    # below already carries this detail; do not print it twice.
+                    print(f"  \033[33m⚠ {err_detail}\033[0m", file=sys.stderr)
+                if is_auth_error(err_detail):
+                    print(
+                        "  \033[2m(in this session: /keys set <NAME> saves and"
+                        " verifies a new key without restarting)\033[0m",
+                        file=sys.stderr,
+                    )
                 failed_provider = provider
                 failed_model = current_model
                 for fb_provider, fb_model, needs_ctx_switch in fallback_chain:
@@ -2182,6 +2209,7 @@ def chat_turn(
                     fb_config["model"] = fb_model
                     if fb_overrides:
                         fb_config.update(fb_overrides)
+                    messages.extend(take_steering())
                     if needs_ctx_switch:
                         normalize_messages_on_switch(messages, fb_provider)
                     fb_messages = normalize_messages_for_provider(messages, fb_provider)
@@ -2287,6 +2315,14 @@ def chat_turn(
                 # backend before the next one (plan 3.3).
                 total_usage["error"] = final_detail
                 return "", total_usage
+        if ui_stream is not None and not ui_stream._full_text:
+            # A raw fallback answered without streaming. Put its prose on the
+            # live surface before guidance is taken, so the transcript shows
+            # the reply above the guidance that followed it.
+            unstreamed = response.get("content") or ""
+            if unstreamed and not looks_like_textual_tool_call(unstreamed):
+                ui_stream.feed(unstreamed)
+        guidance = take_steering()
         raw_tool_calls = response.get("tool_calls")
         too_many_tool_calls = (
             isinstance(raw_tool_calls, list)
@@ -2307,21 +2343,22 @@ def chat_turn(
             if hasattr(sp, "end_waiting"):
                 sp.end_waiting()
         if not tool_calls:
-            reply = response.get("content", "")
-            if looks_like_textual_tool_call(reply):
+            reply = response.get("content") or ""
+            textual = looks_like_textual_tool_call(reply)
+            if textual:
                 note_textual_tool_call(chat_state)
                 total_usage["tool_protocol_error"] = (
                     "model emitted a textual tool call"
-                )
-                reply = (
-                    "The model emitted a textual tool call, so Conch did not "
-                    "execute it. Use a verified native tool-calling model and "
-                    "check the inference server's chat template."
                 )
                 print(
                     "  \033[33m⚠ rejected textual tool call; nothing "
                     "executed\033[0m",
                     file=sys.stderr,
+                )
+                reply = (
+                    "The model emitted a textual tool call, so Conch did not "
+                    "execute it. Use a verified native tool-calling model and "
+                    "check the inference server's chat template."
                 )
             elif not reply.strip() and response_has_undispatchable_signal(response):
                 # Fail loud: the model actually returned something conch
@@ -2342,18 +2379,27 @@ def chat_turn(
                     json.dumps(shape, default=str),
                 )
                 print(f"  \033[33m⚠ {detail}\033[0m", file=sys.stderr)
-                total_usage["undispatchable"] = shape.get("kind", "empty")
-                reply = detail
+                if not guidance:
+                    total_usage["undispatchable"] = shape.get("kind", "empty")
+                    reply = detail
+            if guidance:
+                # The caller persists only the eventual final reply. Retain a
+                # real completed answer as intermediate context; an empty or
+                # rejected one must not enter history (providers refuse empty
+                # assistant turns, and textual calls teach the model drift).
+                if not textual and reply.strip():
+                    messages.append({"role": "assistant", "content": reply})
+                messages.extend(guidance)
+                if ui_stream is not None:
+                    ui_stream.reset()
+                continue
             from .tooling import run_hook
 
             run_hook("on_turn_end", {"reply": reply}, config)
             return reply, total_usage
 
         if ui_stream is not None:
-            # Commit this round before approvals and tool output. Raw fallback
-            # responses may carry prose even though no stream callback ran.
-            if not ui_stream._full_text and response.get("content"):
-                ui_stream.feed(response["content"])
+            # Commit this round before approvals and tool output.
             ui_stream.reset()
 
         fingerprint = _tool_batch_fingerprint(tool_calls)
@@ -2399,7 +2445,7 @@ def chat_turn(
             )
             remaining_result_count = max(0, remaining_result_count - 1)
 
-        if too_many_tool_calls:
+        if too_many_tool_calls and not guidance:
             reason = (
                 f"Rejected tool batch: the model exceeded the "
                 f"{max_parallel_tool_calls}-call per-round safety limit."
@@ -2412,7 +2458,7 @@ def chat_turn(
                 append_results_openai(messages, response, results)
             continue
 
-        if identical_batches >= max_identical_batches:
+        if identical_batches >= max_identical_batches and not guidance:
             reason = (
                 "Rejected repeated identical tool-call batch; inspect the "
                 "previous results and choose a different next action."
@@ -2434,6 +2480,14 @@ def chat_turn(
         from .tooling import run_hook
 
         for tool_call in tool_calls:
+            guidance.extend(take_steering())
+            if guidance:
+                add_result(
+                    tool_call,
+                    "Not executed: superseded by new user guidance. "
+                    "Reconsider the next action using the guidance below.",
+                )
+                continue
             fn = tool_call.get("function", {})
             name = str(fn.get("name") or "")
             if name not in allowed_tool_names:
@@ -2598,6 +2652,12 @@ def chat_turn(
             append_results_anthropic(messages, response, results)
         else:
             append_results_openai(messages, response, results)
+        guidance.extend(take_steering())
+        messages.extend(guidance)
+        if guidance:
+            # A superseded proposal is not a repeated execution attempt.
+            previous_batch = ""
+            identical_batches = 0
     # Round budget exhausted: summarize progress instead of a bare marker
     # (plan 2.6).
     print(

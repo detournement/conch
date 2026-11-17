@@ -69,7 +69,7 @@ are rejected with a usage error.
 Conch keeps the conversation in normal terminal scrollback, with a live
 multiline composer and a compact model/permission/session status line.
 You can keep editing while a response streams. Activity shows what is
-running and elapsed time, not invented completion percentages or hidden reasoning.
+running and elapsed time, not fabricated completion percentages or reasoning.
 
 Startup shows a rotating ASCII shell, phase label, and elapsed time while models
 and tools load. It clears before setup questions, sign-in, or the chat prompt.
@@ -77,7 +77,10 @@ Animation is disabled for non-TTY output and `TERM=dumb`.
 
 | Key or command | Action |
 | --- | --- |
-| Enter | Send; queue another message while Conch is working |
+| Enter | Send; while busy, steer the active turn at its next safe boundary |
+| Alt+Q (or Escape, then Q) | Queue a follow-up for after the current turn |
+| Ctrl+Q | View pending guidance/follow-ups; Enter edits, Delete or Backspace removes |
+| Alt+R (or Escape, then R) | Hide/show provider reasoning and generation progress |
 | Alt+Enter (or Escape, then Enter) | Insert a newline |
 | Tab | Complete slash commands with descriptions |
 | Ctrl+P, `/help` | Search commands; selecting one fills the composer without executing it |
@@ -91,6 +94,28 @@ Tool activity is compact by default; `/verbose on` shows full returned results.
 Approval prompts use a separate input buffer: queued chat and unfinished drafts
 cannot approve a command. `/queue off` keeps the draft editable but disables
 submission during a turn. Multiline paste stays one message and Enter sends it.
+
+Steering takes effect after the current model request or running tool finishes.
+Unstarted tools from the old proposal are skipped, with explicit results kept in
+history, and the model replans using your guidance. A running command is never
+silently interrupted or rolled back. Slash commands and exit requests wait until
+the turn ends; they are not injected into the model as guidance. Existing turn
+and token budgets still apply.
+
+In the pending-message editor, Enter saves, Alt+Enter inserts a newline, and
+Escape restores the original. Your composer draft is preserved. A message being
+edited is reserved against delivery; messages already delivered cannot be edited.
+Approval prompts remain separate and can supersede the queue editor safely.
+
+Provider-supplied reasoning and generation progress are visible by default in a
+bounded panel, separate from final answers and tool results. Alt+R hides the
+panel without discarding its text; it can be shown again, including after the
+turn ends. A new turn clears the previous details. Conch displays only what the
+provider exposes, never decrypts opaque reasoning, and does not enable extra
+thinking budgets. Providers without such events retain the activity indicator.
+Subscription CLIs publish available progress/reasoning while running; their
+schema-constrained final answers appear only after validation. Native tool
+arguments and credential output are not shown as generation details.
 
 The editor uses `prompt_toolkit` on a real terminal. Pipes, one-shot commands,
 `--non-interactive`, and `TERM=dumb` retain the plain input/output path.
@@ -469,17 +494,22 @@ API keys. This is the developer path; the website one-liner is the end-user path
 
 ### First launch
 
-The first interactive launch offers **Claude seats** (default) and **ChatGPT
-seats** before API-key providers. Choose **one** of the following paths.
+The first interactive launch lists **Claude seats** and **ChatGPT seats** before
+API-key providers and shows each seat's state: signed in, installed but not
+signed in, or CLI not installed. Enter selects the first usable seat. Choose
+**one** of the following paths.
 
-Setup walks through provider selection, sign-in or a hidden API-key prompt,
-and model verification before opening chat. Ollama and custom endpoints offer
+Setup has three steps: choose a provider, connect it (native sign-in or a
+hidden API-key prompt), and verify a model. Ollama and custom endpoints offer
 their available models. The successful verification is reused when chat opens,
 so setup does not immediately repeat the same model check. The first chat screen
 shows example requests, model/command discovery, and the active approval policy.
 
-Ctrl+C cancels setup without starting a broken session. Missing provider CLIs
-show installation/sign-in instructions; existing configuration skips the wizard.
+A choice that cannot be completed saves nothing and returns to the provider
+menu: a missing provider CLI (with its install command), a failed sign-in, an
+empty API key, an unreachable Ollama, or an empty custom URL. A key the provider
+rejects is saved only if you confirm. Ctrl+C cancels setup without starting a
+broken session; existing configuration skips the wizard.
 The installer does not ask for optional integration credentials.
 
 With Node.js and npm available, install the official CLI and sign in:
@@ -761,12 +791,17 @@ records a before/after pair.
 
 ### Credentials and terminal handoff
 
-Captured shell execution has no interactive stdin or controlling TTY. Use
-`/terminal <command>` for `sudo`, `getpass`, SSH key passphrases, or anything
-else that may request private input:
+`local_shell` captures stdout/stderr; the live editor shows its result after
+completion. It is not a screen for animations or full-screen programs, and
+`/verbose on` only expands the captured result.
+
+Use `interactive_terminal` (the model tool) or `/terminal <command>` for
+animations, cursor-updating displays, editors/TUIs, and programs needing `sudo`,
+`getpass`, SSH key passphrases, or other private input:
 
 ```text
 /terminal sudo -k systemctl status my-service
+/terminal python3 animation.py
 ```
 
 After local confirmation, the child owns the real terminal. Conch does not
@@ -777,6 +812,11 @@ forwarder such as `sudo -S` or `sshpass`.
 The live editor is suspended before a credential handoff. Conch discards any
 queued messages and unfinished draft, with a notice, so previously typed input
 cannot become credentials or leak into the conversation after the program exits.
+
+During a handoff the composer and steering shortcuts are suspended: keyboard
+input belongs to the child program. Finish it or press Ctrl+C to return to
+Conch. A successful exit reports that the process finished, not proof of what
+was displayed on screen.
 
 ## Models, local inference, and token stats
 
@@ -1340,7 +1380,7 @@ groups the same shipped surface.
 | `/connect`, `/apps` | Composio applications |
 | `/reload`, `/resettools` | Reload integrations or reset textual tool-call drift |
 | `/rounds <n>` | Set the turn's maximum tool rounds |
-| `/queue`, `/paste`, `/edit` | Typeahead and multiline composition |
+| `/queue on|off`, `/paste`, `/edit` | Steering/follow-up submission and multiline composition |
 | `/status`, `/cost` | Session and provider status |
 | `/capitol ...` | Capitol runtime, artifacts, packs, and gated administration |
 | `/compile ...` | Architecture Card design, capture, review, and operation |

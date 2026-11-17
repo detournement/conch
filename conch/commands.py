@@ -203,7 +203,7 @@ SLASH_COMMANDS = [
     ("/reload", "Reload MCP tools"),
     ("/resettools", "Reset tool-calling if the model drifts to textual calls"),
     ("/rounds <n>", "Set max tool call rounds"),
-    ("/queue", "Toggle typeahead input"),
+    ("/queue on|off", "Enable/disable busy submissions; Ctrl+Q edits pending messages"),
     ("/paste", "Paste lines literally; end with a lone '.' or Ctrl+D"),
     ("/edit", "Compose the next message in your editor"),
     ("/status", "Show version, provider, model, context window, and config"),
@@ -1452,7 +1452,7 @@ def handle_slash_command(
             "  \033[1m/apps\033[0m                List connectable services\n"
             + product_help +
             "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
-            "  \033[1m/queue\033[0m               Toggle typeahead (type while LLM works, on by default)\n"
+            "  \033[1m/queue on|off\033[0m        Enable/disable busy submissions; Ctrl+Q edits pending messages\n"
             "  \033[1m/paste\033[0m               Paste lines literally; end with a lone '.' or Ctrl+D\n"
             "  \033[1m/edit\033[0m                Compose the next message in your editor (also /paste --editor)\n"
             "  \033[1m/status\033[0m              Show provider, model, context window, and config\n"
@@ -2371,7 +2371,7 @@ def handle_slash_command(
     if command == "/queue":
         if arg in ("on", "true", "1"):
             print("\n  \033[1;32m✓ Typeahead enabled\033[0m")
-            print("  \033[2mType while the LLM is working — input runs next.\033[0m\n")
+            print("  \033[2mEnter steers at the next safe boundary; Alt+Q queues a follow-up. Ctrl+Q edits pending input.\033[0m\n")
             return "queue_on"
         if arg in ("off", "false", "0"):
             print("\n  \033[1;32m✓ Typeahead disabled\033[0m\n")

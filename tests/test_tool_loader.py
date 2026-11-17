@@ -172,7 +172,7 @@ class TestLateAttach(LoaderCase):
         seen = []
 
         def fake_chat_turn(config, provider, raw_fn, messages, tools, tool_map, builtin_clients,
-                           max_tool_rounds=25, chat_state=None, on_token=None, input_fn=None):
+                           max_tool_rounds=25, chat_state=None, on_token=None, input_fn=None, **kwargs):
             seen.append({
                 "tools": [t["function"]["name"] for t in (tools or [])],
                 "refresh": bool(chat_state.needs_tool_refresh),

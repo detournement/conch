@@ -387,7 +387,7 @@ class TestStreamOllama(OllamaCacheTestCase):
             {"done": True},
         ], on_token=tokens.append)
         self.assertEqual(result["content"], "hello")
-        self.assertEqual("".join(tokens), "<think>plan</think>hello")
+        self.assertEqual("".join(tokens), "hello")
 
     def test_thinking_field_not_treated_as_content(self):
         result = self._stream([

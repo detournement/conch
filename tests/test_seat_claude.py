@@ -3,11 +3,14 @@
 import json
 import os
 import subprocess
+import sys
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from conch import seat_claude
-from conch.seat_common import SeatError
+from conch.seat_common import SeatError, run
 
 RESPONSE = {"content": "hello", "tool_calls": []}
 SCHEMA = {
@@ -157,3 +160,163 @@ class ClaudeSeatTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(SeatError, "timed out"):
                 seat_claude.invoke("sonnet", "conversation", SCHEMA, 1)
             self.assertEqual(native.call_count, 1)
+
+
+def partial(kind, **fields):
+    return {"type": "stream_event", "event": {"type": kind, **fields}}
+
+
+class ClaudeLiveDetailTests(unittest.TestCase):
+    def invoke(self, events, on_detail, *, wait_for_reasoning=False, code=0):
+        work = []
+
+        def receive(kind, text):
+            on_detail(kind, text)
+            if kind == "reasoning":
+                Path(work[0], "ack").touch()
+
+        def native(argv, **kwargs):
+            if "auth" in argv:
+                self.assertNotIn("on_stdout_line", kwargs)
+                return completed(IDENTITY)
+            work.append(kwargs["cwd"])
+            self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
+            self.assertIn("--verbose", argv)
+            self.assertIn("--include-partial-messages", argv)
+            self.assertIn("--restricted", argv)
+            self.assertIn("--safe-mode", argv)
+            self.assertIn("--strict-mcp-config", argv)
+            self.assertEqual(argv[argv.index("--tools") + 1], "")
+            self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+            self.assertNotIn(kwargs["prompt"], argv)
+            script = (
+                "import json,pathlib,sys,time\n"
+                f"events = {events!r}\n"
+                "sys.stdin.read()\n"
+                "sys.stderr.write('private-auth-diagnostic'); sys.stderr.flush()\n"
+                "for event in events:\n"
+                "    print(event if isinstance(event, str) else json.dumps(event), flush=True)\n"
+                f"    if {wait_for_reasoning!r} and event.get('event', {{}}).get('delta', {{}}).get('type') == 'thinking_delta':\n"
+                "        deadline = time.monotonic() + 3\n"
+                "        while not pathlib.Path('ack').exists():\n"
+                "            if time.monotonic() > deadline: sys.exit(7)\n"
+                "            time.sleep(.01)\n"
+                f"sys.exit({code})\n"
+            )
+            return run([sys.executable, "-c", script], **kwargs)
+
+        try:
+            with patch.object(seat_claude, "run", side_effect=native):
+                return seat_claude.invoke("sonnet", "private conversation", SCHEMA, 5,
+                                          on_detail=receive)
+        finally:
+            for directory in work:
+                self.assertFalse(Path(directory).exists())
+
+    def test_live_thinking_and_validator_never_leak_raw_envelope_or_signatures(self):
+        details = []
+        owner = threading.get_ident()
+
+        def receive(kind, text):
+            self.assertEqual(threading.get_ident(), owner)
+            details.append((kind, text))
+
+        events = [
+            {"type": "system", "subtype": "init", "apiKeySource": "private-auth"},
+            partial("message_start", message={"id": "m", "content": []}),
+            partial("content_block_start", index=0, content_block={"type": "thinking", "thinking": ""}),
+            partial("content_block_delta", index=0, delta={"type": "thinking_delta", "thinking": "Compare "}),
+            partial("content_block_delta", index=0, delta={"type": "thinking_delta", "thinking": "options."}),
+            partial("content_block_delta", index=0, delta={"type": "signature_delta", "signature": "opaque-signature"}),
+            {"type": "assistant", "message": {"id": "m", "content": [
+                {"type": "thinking", "thinking": "Compare options.", "signature": "opaque-signature"}]}},
+            partial("content_block_stop", index=0),
+            partial("content_block_start", index=1, content_block={"type": "redacted_thinking", "data": "opaque-reasoning"}),
+            partial("content_block_stop", index=1),
+            partial("content_block_start", index=2, content_block={"type": "text", "text": ""}),
+            partial("content_block_delta", index=2, delta={"type": "text_delta", "text": json.dumps(RESPONSE)}),
+            partial("content_block_stop", index=2),
+            partial("content_block_start", index=3, content_block={
+                "type": "tool_use", "name": "StructuredOutput", "id": "validator", "input": {}}),
+            partial("content_block_delta", index=3, delta={
+                "type": "input_json_delta", "partial_json": '{"private-tool-arguments":'}),
+            {"type": "assistant", "message": {"id": "m", "content": [
+                {"type": "tool_use", "name": "StructuredOutput", "id": "validator", "input": RESPONSE}]}},
+            partial("content_block_stop", index=3),
+            partial("message_delta", delta={"stop_reason": "tool_use"}),
+            partial("message_stop"),
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "validator", "content": "Structured output provided successfully"}]}},
+            RESULT,
+        ]
+        result = self.invoke(events, receive, wait_for_reasoning=True)
+        self.assertEqual(result["response"], RESPONSE)
+        self.assertEqual([text for kind, text in details if kind == "reasoning"],
+                         ["Compare ", "options."])
+        self.assertTrue(any(kind == "progress" for kind, _ in details))
+        for secret in ("opaque", "private", "tool_calls", "Structured output", "hello"):
+            self.assertNotIn(secret, repr(details))
+
+    def test_native_tool_attempts_and_unmatched_results_fail_closed(self):
+        for block in (
+            {"type": "tool_use", "name": "Bash", "id": "x", "input": {"command": "private-command"}},
+            {"type": "tool_use", "name": "mcp__exec", "id": "x", "input": {}},
+            {"type": "server_tool_use", "name": "web_search", "id": "x"},
+            {"type": "tool_result", "tool_use_id": "unknown", "content": "private-output"},
+        ):
+            for partial_message in (True, False):
+                event = (partial("content_block_start", index=0, content_block=block)
+                         if partial_message else
+                         {"type": "assistant", "message": {"id": "m", "content": [block]}})
+                with self.subTest(block=block, partial=partial_message), self.assertRaises(SeatError) as caught:
+                    self.invoke([event, RESULT], lambda kind, text: None)
+                self.assertNotIn("private", str(caught.exception))
+
+    def test_validator_retry_retains_authoritative_final_validation(self):
+        validator = {"type": "tool_use", "name": "StructuredOutput", "id": "v", "input": {}}
+        prefix = [
+            {"type": "assistant", "message": {"id": "m", "content": [validator]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "v", "is_error": True, "content": "private validation error"}]}},
+        ]
+        self.assertEqual(self.invoke(prefix + [RESULT], lambda *args: None)["response"], RESPONSE)
+        for result in (
+            {**RESULT, "subtype": "error_max_structured_output_retries"},
+            {**RESULT, "permission_denials": [{"tool_name": "Bash"}]},
+            {**RESULT, "errors": ["private error"]},
+            {**RESULT, "structured_output": None},
+            {**RESULT, "usage": {"input_tokens": True, "output_tokens": 1}},
+        ):
+            with self.subTest(result=result), self.assertRaises(SeatError):
+                self.invoke(prefix + [result], lambda *args: None)
+
+    def test_live_failure_or_missing_final_result_never_becomes_success(self):
+        for events in (
+            [],
+            ["not JSON"],
+            [42],
+            [{"type": "error", "error": {"message": "private error"}}],
+            [{"type": "assistant", "error": "private error", "message": {"content": []}}, RESULT],
+            [partial("content_block_delta", index=0, delta={"type": "input_json_delta", "partial_json": "private"})],
+            [RESULT, RESULT],
+            [{"type": "future_native_tool", "arguments": "private"}, RESULT],
+        ):
+            with self.subTest(events=events), self.assertRaises(SeatError) as caught:
+                self.invoke(events, lambda *args: None)
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_transient_api_retry_does_not_abort_the_turn(self):
+        details = []
+        retry = {"type": "system", "subtype": "api_retry", "attempt": 1,
+                 "error": "overloaded", "error_status": 529}
+        result = self.invoke([retry, RESULT],
+                             lambda kind, text: details.append((kind, text)))
+        self.assertEqual(result["response"], RESPONSE)
+        self.assertEqual({kind for kind, _ in details}, {"progress"})
+        self.assertNotIn("overloaded", repr(details))
+
+    def test_nonzero_stream_exit_never_echoes_native_stderr(self):
+        details = []
+        with self.assertRaisesRegex(SeatError, "exit 1") as caught:
+            self.invoke([RESULT], lambda kind, text: details.append((kind, text)), code=1)
+        self.assertNotIn("private", str(caught.exception) + repr(details))

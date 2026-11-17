@@ -7,6 +7,7 @@ import contextlib
 import datetime
 import os
 import readline
+import shutil
 import sys
 import threading
 import urllib.request
@@ -63,9 +64,19 @@ CHAT_SYSTEM_PROMPT = None  # resolved per-provider at startup
 MAX_TOOL_ROUNDS = 25  # default, adjustable via /rounds
 
 AGENT_MODE_CONFIG_NOTICE = (
-    "agent mode is ON by default (shell commands run without confirmation) — "
-    "/agent to turn it off, or remove agent_mode from ~/.config/conch/config"
+    "Agent mode is on: shell commands run without asking. /agent off changes it."
 )
+
+
+def _display_path(path: str, width: int) -> str:
+    """Home-relative path, middle-truncated to fit on one terminal row."""
+    home = os.path.expanduser("~")
+    if path == home or path.startswith(home + os.sep):
+        path = "~" + path[len(home):]
+    if len(path) > width > 8:
+        head = (width - 1) // 3
+        path = path[:head] + "…" + path[-(width - 1 - head):]
+    return path
 
 
 
@@ -632,7 +643,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
             check_note = " ✓ verified"
         if _ui:
             print(f"\n\033[1;36mConch\033[0m \033[2mv{__version__}{check_note}\033[0m")
-            print(f"\033[2m{os.getcwd()}\033[0m")
+            columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+            print(f"\033[2m{_display_path(os.getcwd(), columns - 1)}\033[0m")
             resumed = any(message.get("role") == "user" for message in messages)
             if resumed:
                 print(f"\033[2mResumed: {current_conv.title} · /new starts fresh\033[0m")
@@ -1257,6 +1269,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                     messages,
                     on_token=_printer.feed if _printer else None,
                     input_fn=_safe_input,
+                    steering_fn=_ui.take_steering if _ui else None,
                 )
             except KeyboardInterrupt:
                 if _printer:
@@ -1308,7 +1321,11 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
             else:
                 if _printer:
                     _printer.flush()
-                print("\n\033[2m[no response]\033[0m\n")
+                if not _backend_failed:
+                    # A failed request already reported itself in full.
+                    print("\n\033[2m[no response]\033[0m\n")
+                else:
+                    print()
 
             # Display token/cost/speed info with a context-usage gauge.
             # Session accounting and the context warning always run; only

@@ -23,6 +23,10 @@ Releases before 0.6.0 predate this changelog.
   event": status events from newer Claude Code versions (thinking progress,
   notices, model fallback) are shown as progress, while events that mean
   native execution still stop the turn.
+- Claude seat turns no longer fail with "Claude attempted a native tool" when
+  the model calls a Conch tool by name instead of returning it: the CLI offers
+  no native tools, refuses the call, and the model answers again. A native tool
+  the CLI could actually run still stops the turn.
 
 ## [0.9.1] - 2026-11-17
 

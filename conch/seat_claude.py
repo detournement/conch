@@ -154,6 +154,14 @@ class _Events:
         self.current_index = 0
         self.thinking = {}
         self.structured_ids = set()
+        # Native tools the CLI offers, from its init event (None until then).
+        # With only StructuredOutput on offer, a tool_use for any other name
+        # cannot run: the CLI answers it with an error and the model retries.
+        self.native_tools = None
+        self.refused_ids = set()
+
+    def _no_native_tools(self) -> bool:
+        return self.native_tools is not None and self.native_tools <= {"StructuredOutput"}
 
     def detail(self, kind, text):
         if text:
@@ -177,12 +185,27 @@ class _Events:
             # This CLI-owned validator returns data, not native execution:
             # https://code.claude.com/docs/en/agent-sdk/structured-outputs
             identity = block.get("id")
-            if block.get("name") != "StructuredOutput" or not isinstance(identity, str) or not identity:
+            if not isinstance(identity, str) or not identity:
                 raise SeatError("Claude attempted a native tool; Conch must own all tool execution")
-            self.structured_ids.add(identity)
+            name = block.get("name")
+            if name == "StructuredOutput":
+                self.structured_ids.add(identity)
+            elif self._no_native_tools():
+                # The model reached for a tool by name (often a Conch tool it
+                # saw in the prompt). The CLI has none to run, so it can only
+                # refuse; the model then answers through StructuredOutput.
+                if identity not in self.refused_ids:
+                    self.refused_ids.add(identity)
+                    self.detail("progress", f"Claude tried to call {_notice(name) or 'a tool'} "
+                                            "itself; the CLI refused, so it answers again")
+            else:
+                raise SeatError("Claude attempted a native tool; Conch must own all tool execution")
         elif kind == "tool_result":
             identity = block.get("tool_use_id")
-            if not isinstance(identity, str) or identity not in self.structured_ids:
+            if isinstance(identity, str) and identity in self.refused_ids:
+                if block.get("is_error") is not True:
+                    raise SeatError("Claude ran a native tool; Conch must own all tool execution")
+            elif not isinstance(identity, str) or identity not in self.structured_ids:
                 raise SeatError("Claude returned an unrecognized native tool result")
             # A validation failure may be retried by Claude. The final result
             # remains authoritative; never display unvalidated input or errors.
@@ -252,6 +275,9 @@ class _Events:
         if subtype in _NATIVE_EXECUTION_EVENTS or subtype.startswith(_NATIVE_EXECUTION_PREFIXES):
             raise SeatError("Claude reported native execution; Conch must own all tool execution")
         if subtype == "init":
+            tools = event.get("tools")
+            if isinstance(tools, list) and all(isinstance(tool, str) for tool in tools):
+                self.native_tools = frozenset(tools)
             self.detail("progress", "Claude session started")
         elif subtype in ("status", "compact_boundary"):
             self.detail("progress", "Claude updating session context")

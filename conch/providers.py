@@ -606,11 +606,17 @@ DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
 def get_ollama_num_ctx(
     model: str, config: Optional[dict] = None
 ) -> Optional[int]:
-    """Return an explicit num_ctx override, or None for server-managed sizing."""
-    try:
-        num_ctx = int((config or {}).get("ollama_num_ctx", 0) or 0)
-    except (TypeError, ValueError):
-        num_ctx = 0
+    """Return an explicit num_ctx override, or None for server-managed sizing.
+    A context window chosen for this model in the picker wins over the
+    global ollama_num_ctx."""
+    from .model_tuning import context_for
+
+    num_ctx = context_for(config, "ollama", model)
+    if not num_ctx:
+        try:
+            num_ctx = int((config or {}).get("ollama_num_ctx", 0) or 0)
+        except (TypeError, ValueError):
+            num_ctx = 0
     if num_ctx <= 0:
         return None
     model_max = get_ollama_context_length(model, config)
@@ -740,14 +746,19 @@ def apply_ollama_request_options(body: Dict[str, Any], config: dict, model: str)
     if num_predict > 0:
         options["num_predict"] = num_predict
     body["options"] = options
-    if "ollama_think" in config:
-        value = str(config.get("ollama_think", "")).strip().lower()
-        if value in ("true", "1", "yes", "on"):
-            body["think"] = True
-        elif value in ("false", "0", "no", "off"):
-            body["think"] = False
-        elif value:
-            body["think"] = value
+    # Thinking: the effort chosen for this model in the picker, else the
+    # global ollama_think; neither leaves the server default.
+    from .model_tuning import effort_for
+
+    think = effort_for(config, "ollama", model)
+    if not think and "ollama_think" in config:
+        think = str(config.get("ollama_think", "")).strip().lower()
+    if think in ("true", "1", "yes", "on"):
+        body["think"] = True
+    elif think in ("false", "0", "no", "off"):
+        body["think"] = False
+    elif think:
+        body["think"] = think
     keep_alive = str((config or {}).get("ollama_keep_alive", "") or "").strip()
     body["keep_alive"] = keep_alive or DEFAULT_OLLAMA_KEEP_ALIVE
 
@@ -1159,6 +1170,7 @@ def build_openai_chat_request_body(
     temperature: float,
     max_completion_tokens: int,
     tools: Optional[List[dict]] = None,
+    reasoning_effort: str = "",
 ) -> Dict[str, Any]:
     """Build a Chat Completions body that works across GPT and o-series models."""
     body: Dict[str, Any] = {
@@ -1170,9 +1182,27 @@ def build_openai_chat_request_body(
         body["temperature"] = temperature
     if tools:
         body["tools"] = _sanitize_tools_for_openai(tools)
-        if _openai_tools_require_effort_none(model):
-            body["reasoning_effort"] = "none"
+    if tools and _openai_tools_require_effort_none(model):
+        body["reasoning_effort"] = "none"
+    elif reasoning_effort:
+        # Chosen in the model picker; model_tuning only allows it on
+        # reasoning models that tool-call with an effort set.
+        body["reasoning_effort"] = reasoning_effort
     return body
+
+
+def _model_effort(config: dict, provider: str, model: str) -> str:
+    from .model_tuning import effort_for
+
+    return effort_for(config, provider, model)
+
+
+def _apply_anthropic_effort(body: Dict[str, Any], config: dict, model: str) -> None:
+    """output_config.effort when one is chosen for *model* in the picker
+    (model_tuning allows only the levels the model documents)."""
+    effort = _model_effort(config, "anthropic", model)
+    if effort:
+        body["output_config"] = {"effort": effort}
 
 
 def _openai_tools_require_effort_none(model: str) -> bool:
@@ -1519,6 +1549,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         temperature=0.7,
         max_completion_tokens=16384,
         tools=tools,
+        reasoning_effort=_model_effort(config, "openai", model),
     )
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
@@ -1569,6 +1600,7 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         "system": system,
         "messages": _wire_images("anthropic", user_messages),
     }
+    _apply_anthropic_effort(body, config, model)
     if tools:
         import copy
         body["tools"] = [
@@ -1888,16 +1920,20 @@ def _openrouter_headers(config: dict) -> Dict[str, str]:
 
 
 def _openrouter_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
+    from .model_tuning import effort_for
+
+    model = config.get("chat_model", config.get("model", "moonshotai/kimi-k3"))
     body: Dict[str, Any] = {
-        "model": config.get("chat_model", config.get("model", "moonshotai/kimi-k3")),
+        "model": model,
         "messages": _wire_images("openrouter", messages),
         "max_tokens": 16384,
         # Low reasoning effort and NO temperature: at the default (max)
         # effort with temperature set, Kimi K3 sometimes answers in prose
         # instead of emitting tool_calls; with effort=low it tool-calls
         # reliably. OpenRouter normalizes the value for models with other
-        # effort scales (GLM-5.2 verified live with this exact body).
-        "reasoning_effort": "low",
+        # effort scales (GLM-5.2 verified live with this exact body). An
+        # effort chosen for the model in the picker replaces it.
+        "reasoning_effort": effort_for(config, "openrouter", model) or "low",
     }
     if tools:
         body["tools"] = _sanitize_tools_for_openai(tools)
@@ -2748,6 +2784,7 @@ def stream_openai(
         temperature=0.7,
         max_completion_tokens=16384,
         tools=tools,
+        reasoning_effort=_model_effort(config, "openai", model),
     )
     body["stream_options"] = {"include_usage": True}
     return _stream_openai_compat(
@@ -2789,6 +2826,7 @@ def stream_anthropic(
         "messages": _wire_images("anthropic", user_messages),
         "stream": True,
     }
+    _apply_anthropic_effort(body, config, model)
     if tools:
         import copy
         body["tools"] = [

@@ -319,7 +319,8 @@ class _Events:
             raise SeatError("Claude returned an unsupported partial event")
 
 
-def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None) -> dict:
+def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None,
+           effort: str = "") -> dict:
     """Generate one schema-constrained response without executing native tools."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise SeatError("Claude requires a positive finite timeout")
@@ -344,6 +345,10 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None
                 "--no-chrome", "--permission-mode", "dontAsk",
                 "--model", model or "sonnet",
             ]
+            if effort:
+                # A level model_tuning allows (low ... max); the CLI warns
+                # and ignores anything else.
+                argv.extend(["--effort", effort])
             events = None
             if on_detail is None:
                 result = run(argv, prompt=prompt, timeout=remaining, cwd=cwd)

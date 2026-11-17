@@ -553,6 +553,9 @@ class TerminalUI:
             # the model: the clip drops the title and tool count first.
             parts.append(str(fields["repo"]))
         model = "/".join(str(fields[key]) for key in ("provider", "model") if fields.get(key))
+        if model and fields.get("tuning"):
+            # Effort/context chosen for this model in the picker.
+            model += f" ({fields['tuning']})"
         if model:
             parts.append(model)
         if fields.get("conversation"):

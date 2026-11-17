@@ -237,8 +237,14 @@ def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
         if on_token is not None:
             def on_detail(kind, text):
                 emit_generation_detail(on_token, kind, text)
+        from .model_tuning import effort_for
+
+        # Effort chosen for this model in the picker; omitted when unset so
+        # the CLI keeps its own default.
+        effort = effort_for(config, provider, model)
+        extra = {"effort": effort} if effort else {}
         result = transport(provider).invoke(
-            model, prompt, response_schema(tools), timeout, on_detail=on_detail)
+            model, prompt, response_schema(tools), timeout, on_detail=on_detail, **extra)
         reply = normalize(result["response"], tools)
     except SeatError as exc:
         return error_response(f"{provider}: {exc}")

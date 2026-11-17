@@ -111,6 +111,8 @@ answer.
 | Enter | Make it the chat model (verified first, as `/model` does) |
 | Ctrl+F | Fan-out workers use it (again: clear it, so workers use `subagent_model` or the session model) |
 | Ctrl+T | Side tasks use it (again: back to the chat model) |
+| Ctrl+E | Step the model's reasoning effort (each level, then back to the default) |
+| Ctrl+W | Step the model's context window (Ollama: sizes up to the model's maximum, then the server default) |
 | Ctrl+A | Add a model the catalog lacks: `provider/model-id` (`openrouter/vendor/model` keeps its slash) |
 | Ctrl+X | Remove a model you added; fan-out and side-task settings using it are cleared |
 | Ctrl+R | Ask local servers, the registry, and seats again |
@@ -121,6 +123,25 @@ still runs the live model check. Role changes are saved as `fanout_model`,
 `weak_model`, and `weak_provider`. `/model <id> --provider <name>` switches to an
 exact provider when the same id exists under several. Registry models can only
 be the chat model.
+
+Effort and context are per model and apply to its next request, wherever it runs
+(chat, fan-out, side tasks). The row shows what is set (`[high · 32K ctx]`), and
+the status bar shows it beside the chat model. They exist only where the provider
+takes them:
+
+| Provider | Effort | Context window |
+| --- | --- | --- |
+| Claude seat (`claude-code`) | `low`, `medium`, `high`, `xhigh`, `max` (`--effort`) | fixed |
+| ChatGPT seat (`codex`) | `low`, `medium`, `high`, `xhigh` (`model_reasoning_effort`) | fixed |
+| Anthropic API | the levels each model documents (`output_config.effort`) | fixed |
+| OpenAI API | `low`, `medium`, `high` on reasoning models; GPT-6 and GPT-5.6 must run tool calls at `none` | fixed |
+| OpenRouter | `low`, `medium`, `high` (unset stays `low`) | fixed |
+| Ollama | thinking `off`/`on` (`low`/`medium`/`high` on gpt-oss), for models that think | `num_ctx` up to the model's maximum |
+| Bedrock, Cerebras, custom endpoints, llama-idx | none | set by the server |
+
+Choices are saved as `model_effort` and `model_context`; a value a model does not
+accept is never sent. For Ollama they win over `ollama_think` and
+`ollama_num_ctx`, which still apply to other models.
 
 ### Subagent panel
 
@@ -1557,6 +1578,7 @@ network sandbox for tools you explicitly enable or approve.
 | `notify_after_seconds` | `30` | Desktop notification after an interactive turn this long; `0` disables |
 | `github_context` | `true` | Load the GitHub repository's PRs, issues, and checks at startup |
 | `extra_models` | unset | Comma-separated `provider/model` entries added in the model picker |
+| `model_effort`, `model_context` | unset | Per-model effort and context window set in the model picker: `provider/model=value` lists |
 | `web_fetch_allow_domains` | unset | Comma-separated hosts (subdomains included) `web_fetch` reads without asking |
 | `allow_prefixes` | unset | Comma-separated shell command prefixes that never prompt |
 | `detect_location` | `false` | Look up the city from the public IP at startup |
@@ -1780,6 +1802,7 @@ conch/
 ├── terminal_ui.py, render.py         live composer, pickers, and scrollback rendering
 ├── config.py, settings_registry.py   config loading and validated live settings
 ├── model_catalog.py, model_picker.py model discovery, additions, and the picker
+├── model_tuning.py                   per-model reasoning effort and context window
 ├── convo_browser.py, agents_panel.py conversations page and subagent panel
 ├── fanout.py, subagent_activity.py   parallel workers and their live activity
 ├── filetools.py, webfetch.py         approved file edits and page fetching

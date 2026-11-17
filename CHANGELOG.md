@@ -9,6 +9,25 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+### Added
+
+- Model picker: Ctrl+E steps a model's reasoning effort and Ctrl+W its context
+  window, where the provider takes them (Claude and ChatGPT seats, Anthropic,
+  OpenAI reasoning models, OpenRouter, Ollama thinking and `num_ctx`). Choices
+  are per model, saved as `model_effort` and `model_context`, shown on the row
+  and in the status bar, and never sent to a model that does not accept them.
+
+### Fixed
+
+- Claude seat turns no longer fail with "Claude returned an unsupported system
+  event": status events from newer Claude Code versions (thinking progress,
+  notices, model fallback) are shown as progress, while events that mean
+  native execution still stop the turn.
+- Claude seat turns no longer fail with "Claude attempted a native tool" when
+  the model calls a Conch tool by name instead of returning it: the CLI offers
+  no native tools, refuses the call, and the model answers again. A native tool
+  the CLI could actually run still stops the turn.
+
 ## [0.9.1] - 2026-11-17
 
 ### Added

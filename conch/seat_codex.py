@@ -196,7 +196,8 @@ class _Events:
         return self.usage
 
 
-def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None) -> dict:
+def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None,
+           effort: str = '') -> dict:
     """Generate structured content only; never delegate Conch tools to Codex."""
     with tempfile.TemporaryDirectory(prefix='conch-codex-') as directory:
         root = Path(directory)
@@ -227,6 +228,10 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None
             argv.extend(['--disable', feature])
         if model and model != 'default':
             argv.extend(['--model', model])
+        if effort in ('low', 'medium', 'high', 'xhigh'):
+            # Chosen in the model picker (model_tuning); verified live with
+            # codex-cli 0.169.
+            argv.extend(['-c', f'model_reasoning_effort="{effort}"'])
         argv.append('-')
         events = _Events(on_detail)
         if on_detail is None:

@@ -8,8 +8,9 @@ llama-idx registry, and seat sign-in fill in as they answer.
 
 Enter makes the selection the chat model (from a running turn: once it
 ends). Ctrl+F and Ctrl+T assign the worker and side-task roles (saved to
-config); Ctrl+A adds a model the catalog lacks, Ctrl+X removes one you
-added, Ctrl+R asks the servers again.
+config); Ctrl+E steps the model's reasoning effort and Ctrl+W its context
+window where the provider has them (model_tuning); Ctrl+A adds a model the
+catalog lacks, Ctrl+X removes one you added, Ctrl+R asks the servers again.
 """
 
 from __future__ import annotations
@@ -303,6 +304,50 @@ class ModelPicker:
         self._set({"weak_model": entry.model, "weak_provider": entry.provider})
         self.notice = f"Titles, summaries, and compaction use {entry.label}."
 
+    def cycle_effort(self):
+        """Next effort level for the selected model, then back to default."""
+        from . import model_tuning
+
+        entry = self.selected()
+        if entry is None:
+            return
+        if entry.provider == REGISTRY:
+            self.notice = "Registry models run with their server's settings."
+            return
+        value, levels = model_tuning.cycle_effort(self.config, entry.provider, entry.model)
+        what = "Thinking" if entry.provider == "ollama" else "Effort"
+        if not levels:
+            self.notice = (f"{entry.label} does not think (per the server)."
+                           if entry.provider == "ollama"
+                           else f"{entry.label} has no effort setting Conch can send.")
+        elif value:
+            self.notice = f"{what} for {entry.label}: {value} (of {', '.join(levels)})."
+        else:
+            self.notice = f"{what} for {entry.label}: the provider default."
+
+    def cycle_context(self):
+        """Next context window for the selected model, then back to default."""
+        from . import model_tuning
+
+        entry = self.selected()
+        if entry is None:
+            return
+        value, sizes = model_tuning.cycle_context(self.config, entry.provider, entry.model)
+        if not sizes:
+            where = "its server" if entry.provider in ("custom", REGISTRY) else "the provider"
+            self.notice = f"{entry.label}: the context window is fixed by {where}."
+        elif value:
+            self.notice = (f"Context window for {entry.label}: "
+                           f"{model_tuning.context_label(value)} tokens "
+                           f"(up to {model_tuning.context_label(sizes[-1])}).")
+        else:
+            self.notice = f"Context window for {entry.label}: the server default."
+
+    def _tuning(self, entry: ModelEntry) -> str:
+        from .model_tuning import describe
+
+        return describe(self.config, entry.provider, entry.model)
+
     def start_add(self):
         entry = self.selected()
         provider = (entry.provider if entry and entry.provider not in
@@ -390,6 +435,7 @@ class ModelPicker:
         # Names take what they need (up to the room left) so the numbers sit
         # beside them instead of at the far edge of a wide terminal.
         longest = max((len(entry.model) + (9 if entry.source == "added" else 0)
+                       + (len(self._tuning(entry)) + 4 if self._tuning(entry) else 0)
                        for kind, entry in self.rows if kind == "model"), default=20)
         return max(10, min(width - fixed, max(24, longest + 2))), roles, context, price, tier
 
@@ -423,8 +469,9 @@ class ModelPicker:
             dim = status is not None and status.available is False
             plain = "class:selected" if selected else ("class:muted" if dim else "")
             muted = plain or "class:muted"
+            tuning = self._tuning(entry)
             name = entry.model + ("  (added)" if entry.source == "added" else "") + (
-                f"  ({entry.note})" if entry.note else "")
+                f"  ({entry.note})" if entry.note else "") + (f"  [{tuning}]" if tuning else "")
             row = [(plain or "class:current", "●" if self.is_current(entry) else " "),
                    (plain, "   ")]
             row += _highlight(_fit(name, label_w), plain, self._pattern)
@@ -451,6 +498,15 @@ class ModelPicker:
             parts.append({"seat": "subscription seat", "local": "local inference"}.get(
                 entry.billing, "price unknown"))
         parts.append(f"{entry.tier} tier")
+        from . import model_tuning
+
+        if model_tuning.effort_levels(entry.provider, entry.model, self.config, probe=False):
+            effort = model_tuning.effort_for(self.config, entry.provider, entry.model)
+            what = "thinking" if entry.provider == "ollama" else "effort"
+            parts.append(f"{what} {effort or 'default'} (^E)")
+        if entry.provider == "ollama":
+            context = model_tuning.context_for(self.config, entry.provider, entry.model)
+            parts.append(f"context {model_tuning.context_label(context) if context else 'server default'} (^W)")
         source = {"catalog": "built-in catalog", "added": "added by you",
                   "server": "reported by the server", "registry": "llama-idx registry"}
         parts.append(source.get(entry.source, entry.source))
@@ -482,8 +538,8 @@ class ModelPicker:
             else:
                 first = "Enter use after this turn" if self.busy else "Enter use"
             hints = [first,
-                     "type to filter", "^F fan-out", "^T side tasks", "^A add",
-                     "^X remove", "^R refresh", "Esc quit"]
+                     "type to filter", "^F fan-out", "^T side tasks", "^E effort",
+                     "^W context", "^A add", "^X remove", "^R refresh", "Esc quit"]
         return [[("class:muted", " " + _fit_hints(hints, width - 1))]]
 
     # --- application --------------------------------------------------------------
@@ -569,6 +625,14 @@ class ModelPicker:
         @keys.add("c-x", filter=listing)
         def _remove(event):
             self.remove_selected()
+
+        @keys.add("c-e", filter=listing)
+        def _effort(event):
+            self.cycle_effort()
+
+        @keys.add("c-w", filter=listing)
+        def _context(event):
+            self.cycle_context()
 
         @keys.add("c-r", filter=listing)
         def _refresh(event):

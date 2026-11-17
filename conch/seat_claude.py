@@ -25,6 +25,29 @@ _ISOLATION = (
     "--settings", '{"disableAllHooks":true,"forceLoginMethod":"claudeai"}',
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--safe-mode",
 )
+# System events that mean the CLI executed something itself (hooks, local
+# commands, native tasks or subagents, tool permission decisions). Conch owns
+# all execution, so these fail closed. Every other system event is the CLI
+# reporting on itself (notices, model fallback, thinking progress, UI and
+# session state); those are shown as progress or ignored, so a newer CLI's
+# status events never break a turn.
+_NATIVE_EXECUTION_EVENTS = frozenset({
+    "local_command", "permission_denied", "background_tasks_changed", "tool_host_result",
+})
+_NATIVE_EXECUTION_PREFIXES = ("hook_", "task_")
+_MODEL_FALLBACK_EVENTS = frozenset({
+    "model_fallback", "model_refusal_fallback", "model_consent_fallback",
+})
+_NOTICE_EVENTS = frozenset({"informational", "notification", "model_refusal_no_fallback"})
+_NOTICE_CHARS = 160
+
+
+def _notice(value) -> str:
+    """One bounded line of CLI notice text, control characters removed."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join("".join(char if char.isprintable() else " " for char in value).split())
+    return text if len(text) <= _NOTICE_CHARS else text[:_NOTICE_CHARS - 1] + "…"
 
 
 def auth_command(action: str) -> list[str]:
@@ -131,6 +154,14 @@ class _Events:
         self.current_index = 0
         self.thinking = {}
         self.structured_ids = set()
+        # Native tools the CLI offers, from its init event (None until then).
+        # With only StructuredOutput on offer, a tool_use for any other name
+        # cannot run: the CLI answers it with an error and the model retries.
+        self.native_tools = None
+        self.refused_ids = set()
+
+    def _no_native_tools(self) -> bool:
+        return self.native_tools is not None and self.native_tools <= {"StructuredOutput"}
 
     def detail(self, kind, text):
         if text:
@@ -154,12 +185,27 @@ class _Events:
             # This CLI-owned validator returns data, not native execution:
             # https://code.claude.com/docs/en/agent-sdk/structured-outputs
             identity = block.get("id")
-            if block.get("name") != "StructuredOutput" or not isinstance(identity, str) or not identity:
+            if not isinstance(identity, str) or not identity:
                 raise SeatError("Claude attempted a native tool; Conch must own all tool execution")
-            self.structured_ids.add(identity)
+            name = block.get("name")
+            if name == "StructuredOutput":
+                self.structured_ids.add(identity)
+            elif self._no_native_tools():
+                # The model reached for a tool by name (often a Conch tool it
+                # saw in the prompt). The CLI has none to run, so it can only
+                # refuse; the model then answers through StructuredOutput.
+                if identity not in self.refused_ids:
+                    self.refused_ids.add(identity)
+                    self.detail("progress", f"Claude tried to call {_notice(name) or 'a tool'} "
+                                            "itself; the CLI refused, so it answers again")
+            else:
+                raise SeatError("Claude attempted a native tool; Conch must own all tool execution")
         elif kind == "tool_result":
             identity = block.get("tool_use_id")
-            if not isinstance(identity, str) or identity not in self.structured_ids:
+            if isinstance(identity, str) and identity in self.refused_ids:
+                if block.get("is_error") is not True:
+                    raise SeatError("Claude ran a native tool; Conch must own all tool execution")
+            elif not isinstance(identity, str) or identity not in self.structured_ids:
                 raise SeatError("Claude returned an unrecognized native tool result")
             # A validation failure may be retried by Claude. The final result
             # remains authoritative; never display unvalidated input or errors.
@@ -205,13 +251,7 @@ class _Events:
                 raise SeatError("Claude returned multiple final results")
             self.result = event
         elif kind == "system":
-            subtype = event.get("subtype")
-            if subtype == "init":
-                self.detail("progress", "Claude session started")
-            elif subtype in ("status", "compact_boundary"):
-                self.detail("progress", "Claude updating session context")
-            else:
-                raise SeatError("Claude returned an unsupported system event")
+            self._system(event)
         elif kind == "assistant":
             self._message(event.get("message"))
         elif kind == "user":
@@ -228,6 +268,28 @@ class _Events:
             self.detail("progress", "Claude rate limit update")
         else:
             raise SeatError("Claude returned an unsupported event; update Conch or the official CLI")
+
+    def _system(self, event):
+        subtype = event.get("subtype")
+        subtype = subtype if isinstance(subtype, str) else ""
+        if subtype in _NATIVE_EXECUTION_EVENTS or subtype.startswith(_NATIVE_EXECUTION_PREFIXES):
+            raise SeatError("Claude reported native execution; Conch must own all tool execution")
+        if subtype == "init":
+            tools = event.get("tools")
+            if isinstance(tools, list) and all(isinstance(tool, str) for tool in tools):
+                self.native_tools = frozenset(tools)
+            self.detail("progress", "Claude session started")
+        elif subtype in ("status", "compact_boundary"):
+            self.detail("progress", "Claude updating session context")
+        elif subtype in _MODEL_FALLBACK_EVENTS:
+            original = _notice(event.get("originalModel") or event.get("fromModel"))
+            fallback = _notice(event.get("fallbackModel") or event.get("toModel"))
+            switch = f" from {original} to {fallback}" if original and fallback else ""
+            self.detail("progress", f"Claude switched models{switch}")
+        elif subtype in _NOTICE_EVENTS:
+            text = _notice(event.get("content") or event.get("text"))
+            if text:
+                self.detail("progress", f"Claude: {text}")
 
     def _partial(self, event):
         if not isinstance(event, dict):
@@ -283,7 +345,8 @@ class _Events:
             raise SeatError("Claude returned an unsupported partial event")
 
 
-def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None) -> dict:
+def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None,
+           effort: str = "") -> dict:
     """Generate one schema-constrained response without executing native tools."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise SeatError("Claude requires a positive finite timeout")
@@ -308,6 +371,10 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None
                 "--no-chrome", "--permission-mode", "dontAsk",
                 "--model", model or "sonnet",
             ]
+            if effort:
+                # A level model_tuning allows (low ... max); the CLI warns
+                # and ignores anything else.
+                argv.extend(["--effort", effort])
             events = None
             if on_detail is None:
                 result = run(argv, prompt=prompt, timeout=remaining, cwd=cwd)

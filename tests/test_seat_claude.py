@@ -272,6 +272,51 @@ class ClaudeLiveDetailTests(unittest.TestCase):
                     self.invoke([event, RESULT], lambda kind, text: None)
                 self.assertNotIn("private", str(caught.exception))
 
+    def test_stray_tool_call_the_cli_refuses_does_not_end_the_turn(self):
+        """Sonnet 5.5 sometimes calls a Conch tool by name natively. With only
+        StructuredOutput on offer the CLI refuses it and the model answers
+        again through StructuredOutput; the turn must succeed."""
+        stray = {"type": "tool_use", "name": "local_shell", "id": "stray",
+                 "input": {"command": "private-command"}}
+        refused = {"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "stray", "is_error": True,
+            "content": "<tool_use_error>Error: No such tool available: local_shell</tool_use_error>"}]}}
+        events = [
+            {"type": "system", "subtype": "init", "tools": ["StructuredOutput"]},
+            partial("message_start", message={"id": "m", "content": []}),
+            partial("content_block_start", index=0, content_block=stray),
+            partial("content_block_delta", index=0, delta={"type": "input_json_delta", "partial_json": "{}"}),
+            {"type": "assistant", "message": {"id": "m", "content": [stray]}},
+            partial("content_block_stop", index=0),
+            partial("message_delta", delta={"stop_reason": "tool_use"}),
+            partial("message_stop"),
+            refused,
+            RESULT,
+        ]
+        details = []
+        result = self.invoke(events, lambda kind, text: details.append(text))
+        self.assertEqual(result["response"], RESPONSE)
+        self.assertEqual(details.count(
+            "Claude tried to call local_shell itself; the CLI refused, so it answers again"), 1)
+        self.assertNotIn("private", repr(details))
+
+    def test_stray_tool_calls_stay_fatal_unless_the_cli_could_not_run_them(self):
+        stray = {"type": "tool_use", "name": "local_shell", "id": "stray", "input": {}}
+        ran = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "stray", "content": "private-output"}]}}
+        cases = {
+            "the CLI offers native tools": [
+                {"type": "system", "subtype": "init", "tools": ["Bash", "StructuredOutput"]},
+                {"type": "assistant", "message": {"id": "m", "content": [stray]}}, RESULT],
+            "the stray call produced a result": [
+                {"type": "system", "subtype": "init", "tools": ["StructuredOutput"]},
+                {"type": "assistant", "message": {"id": "m", "content": [stray]}}, ran, RESULT],
+        }
+        for name, events in cases.items():
+            with self.subTest(name), self.assertRaises(SeatError) as caught:
+                self.invoke(events, lambda *args: None)
+            self.assertNotIn("private", str(caught.exception))
+
     def test_validator_retry_retains_authoritative_final_validation(self):
         validator = {"type": "tool_use", "name": "StructuredOutput", "id": "v", "input": {}}
         prefix = [
@@ -314,6 +359,31 @@ class ClaudeLiveDetailTests(unittest.TestCase):
         self.assertEqual(result["response"], RESPONSE)
         self.assertEqual({kind for kind, _ in details}, {"progress"})
         self.assertNotIn("overloaded", repr(details))
+
+    def test_cli_status_events_are_progress_not_failures(self):
+        """A newer CLI's notices, model fallbacks, and internal status events
+        must not abort a turn (they did: 'unsupported system event')."""
+        details = []
+        events = [
+            {"type": "system", "subtype": "informational", "content": "Opus usage\x1b[31m is high",
+             "level": "notice"},
+            {"type": "system", "subtype": "model_fallback", "originalModel": "claude-opus-5-5",
+             "fallbackModel": "claude-sonnet-5", "level": "warning"},
+            {"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 40},
+            {"type": "system", "subtype": "turn_duration", "duration_ms": 900},
+            RESULT,
+        ]
+        result = self.invoke(events, lambda kind, text: details.append((kind, text)))
+        self.assertEqual(result["response"], RESPONSE)
+        texts = [text for _, text in details]
+        self.assertIn("Claude: Opus usage [31m is high", texts)
+        self.assertIn("Claude switched models from claude-opus-5-5 to claude-sonnet-5", texts)
+
+    def test_native_execution_system_events_fail_closed(self):
+        for subtype in ("hook_started", "task_started", "permission_denied", "local_command",
+                        "background_tasks_changed"):
+            with self.subTest(subtype=subtype), self.assertRaisesRegex(SeatError, "native execution"):
+                self.invoke([{"type": "system", "subtype": subtype}, RESULT], lambda *args: None)
 
     def test_nonzero_stream_exit_never_echoes_native_stderr(self):
         details = []

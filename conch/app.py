@@ -918,8 +918,11 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
 
     def _sync_ui_context():
         if _ui:
+            from .model_tuning import describe as describe_tuning
+
             _ui.set_context(
                 provider=provider, model=model_name,
+                tuning=describe_tuning(config, provider, model_name),
                 permission=session.permissions.get_permission_mode(),
                 conversation=current_conv.title, cwd=os.getcwd(),
                 repo=_repo_ctx.indicator() if _repo_ctx is not None else "",

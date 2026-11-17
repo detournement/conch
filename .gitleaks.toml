@@ -19,7 +19,7 @@ keywords = ["cap_a2a_"]
 [rules.allowlist]
 description = "Synthetic cap_a2a_ fixtures used by the test suite"
 regexes = [
-    '''cap_a2a_(TESTTOKENxx0123456789abcdef|WRONG|LOCAL|CUSTOM|MINTEDBEARER0001|ROTATEDBEARER002)''',
+    '''cap_a2a_(TESTTOKENxx0123456789abcdef|WRONG|LOCAL|CUSTOM|MINTEDBEARER0001|ROTATEDBEARER002|OTHER|REMOTECOPY|UNRELATED|MINTEDATMATERIALIZE)''',
 ]
 
 [allowlist]
@@ -50,4 +50,7 @@ regexes = [
     # to prove the personal-items credential write-guard. Never real — the
     # 16-char suffix is the word SYNTHETICFIXTURE.
     '''AKIASYNTHETICFIXTURE''',
+    # Synthetic placeholders in tests/test_keys_mcp_refs.py proving inline
+    # MCP secrets are found in URLs and args. Never real.
+    '''(url|arg)secret0123456789''',
 ]

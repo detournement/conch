@@ -121,6 +121,23 @@ still runs the live model check. Role changes are saved as `fanout_model`,
 `weak_model`, and `weak_provider`. `/model <id> --provider <name>` switches to an
 exact provider when the same id exists under several.
 
+### Subagent panel
+
+`/agents` (or `/subagents`) shows how Conch delegates work and lets you tune it:
+
+- **Settings:** the fan-out worker model (`fanout_model`, or `a` for auto), how many
+  workers run at once (`fanout_concurrency`), the `delegate_task` model
+  (`subagent_model`), each subagent's tool-round budget (`subagent_rounds`), and the
+  side-task model. Enter edits a number or opens the model picker for a model; Del
+  resets to the default. Changes are validated and saved like `set_setting`.
+- **Skill subagents:** every skill a `delegate_task` call can scope to, with its
+  model preference, tools, and rounds.
+- **Activity:** fan-out workers and delegated subagents of this session, running and
+  finished, with model, status, and time. `x` stops running fan-out workers.
+
+It opens during a turn too, so you can watch workers run; setting changes apply to
+the next subagent call.
+
 ### Interactive terminal
 
 Conch keeps the conversation in normal terminal scrollback, with a live
@@ -146,6 +163,7 @@ columns by 31 rows); pipes and smaller windows skip it.
 | `/model`, `/models` | Open the [model picker](#model-picker): every model, roles, add your own |
 | `/provider` | Choose a provider |
 | `/fanout` | Show or set the model [fan-out](#fan-out) workers use |
+| `/agents`, `/subagents` | Open the [subagent panel](#subagent-panel): worker and subagent settings, skills, live activity |
 | `/convos`, `/switch` | Open the [conversations page](#conversations-page): search, read, resume, and see cost |
 | `/retry`, `/fork`, `/compact` | Re-run your last message; continue in a copy; summarize older history now |
 | `/image [path\|clear]` | Attach the clipboard image (or a file) to your next message; dragging an image file in works too |
@@ -165,7 +183,7 @@ the turn ends; they are not injected into the model as guidance. Existing turn
 and token budgets still apply.
 
 Panels open right away during a turn instead of waiting: `/models`, `/provider`,
-`/help`, `/convos` (and `/switch` with no id), plus the read-only reports
+`/help`, `/convos` (and `/switch` with no id), `/agents`, plus the read-only reports
 `/status`, `/cost`, `/tools`, `/profiles`, `/skills`, `/facts`, `/memories`, and
 `/tasks`. The turn keeps running behind a full-screen panel and its output appears
 when the panel closes. A pick that changes the session (a chat model, provider,
@@ -1091,7 +1109,17 @@ Only native tool calls are executable; repeated identical call batches stop.
 - Starting in a Git repository injects a bounded repository map. `CONCH.md`,
   `AGENTS.md`, and the nearest project `.conchrc` add project context.
 - `conch_introspect` reports live capabilities, redacted effective config, and
-  bounded views of Conch's own source.
+  bounded views of Conch's own source; `docs <topic>` returns the README and
+  `docs/` sections that explain a feature, and `settings` lists what Conch can
+  change about itself.
+- Ask Conch to change a setting and it does so through `conch_config`
+  (`list_settings`, `set_setting`, `reset_setting`): token stats, notifications,
+  git checkpoints, session summaries, fan-out and subagent models and limits, the
+  side-task model, and more. Values are validated, saved to the config file, and
+  applied to the running session where possible. Changes that let more run
+  unattended (`permission_mode`, `local_only`, `allow_prefixes`,
+  `web_fetch_allow_domains`, `detect_location`) and turning agent mode on show you
+  a confirmation first; a session that cannot ask refuses them.
 
 Conversation files use atomic writes. Corrupt files are salvaged when
 possible, otherwise quarantined without blocking startup.

@@ -925,6 +925,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         for _name in ("read_file", "edit_file", "write_file", "web_fetch"):
             if _name in builtin_clients:
                 builtin_clients[_name].set_policy(standard)
+        builtin_clients["conch_config"].set_policy(standard)
         builtin_clients["skill_manage"].configure(
             interactive=interactive, input_fn=_safe_input
         )
@@ -961,9 +962,10 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         """A panel or report typed during a turn opens now, on its own thread,
         instead of waiting for the turn: the /help palette, the /model(s) and
         /provider pickers, the conversations page (/convos, /switch with no
-        id), and the read-only reports above. A pick that changes the session
-        (model, provider, conversation) is queued to run when the turn ends.
-        None for everything else, which still waits for the turn."""
+        id), the subagent panel (/agents), and the read-only reports above. A
+        pick that changes the session (model, provider, conversation) is
+        queued to run when the turn ends. None for everything else, which
+        still waits for the turn."""
         head, _, argument = command.partition(" ")
         head, argument = head.lower(), argument.strip()
         if head in ("/help", "/h", "/?") or (head == "/provider" and not argument):
@@ -976,6 +978,22 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             return _live_models
         if head in ("/convos", "/switch") and not argument:
             return _live_conversations
+        if head in ("/agents", "/subagents") and not argument:
+            def agents():
+                # The subagent panel; a model setting goes through the
+                # picker and back. x stops this session's running fan-out.
+                from .agents_panel import admin_loop, run_agents_panel_during_turn
+                from .model_picker import pick_model_during_turn
+
+                stop = getattr(builtin_clients.get("fan_out"), "stop", None)
+                admin_loop(
+                    config, provider, model_name,
+                    lambda select, notice: _ui.run_panel(
+                        lambda: run_agents_panel_during_turn(
+                            config, stop_fanout=stop, select=select, notice=notice)),
+                    lambda cfg, prov, mod, purpose=None: _ui.run_panel(
+                        lambda: pick_model_during_turn(cfg, prov, mod, purpose=purpose)))
+            return agents
         if head in _LIVE_REPORTS and not argument:
             def report():
                 handle_slash_command(

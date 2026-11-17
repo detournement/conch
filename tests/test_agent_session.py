@@ -127,6 +127,8 @@ class TestSessionPolicyIsolation(unittest.TestCase):
         client = ConchConfigClient()
         client.bind("openai", "gpt-4o", {}, {})
         client.bind_permissions(state)
+        # Turning agent mode on asks the user; this session answers yes.
+        client.set_policy(LocalShellPolicy(interactive=True, input_fn=lambda _prompt: "y"))
         client.call_tool(
             "conch_config", {"action": "set_agent_mode", "value": "on"}
         )

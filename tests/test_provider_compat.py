@@ -292,6 +292,7 @@ class TestToolCapping(unittest.TestCase):
                 "delegate_task",
                 "skill_manage",
                 "conch_introspect",
+                "conch_config",
                 "read_file",
                 "edit_file",
                 "write_file",

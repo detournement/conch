@@ -130,6 +130,18 @@ Workers on one local server run one at a time unless `fanout_concurrency` says
 the server can take more, so the gain there is a clean context per task rather
 than wall-clock time. Seat and API workers run in parallel.
 
+## See and change subagent settings: /agents
+
+`/agents` (or `/subagents`) opens one page for all of this. **Settings** lists
+`fanout_model`, `fanout_concurrency`, `subagent_model`, `subagent_rounds`, and
+`side_task_model` with their current value and default: Enter edits a number
+inline or opens the model picker for a model, `a` sets the fan-out model to
+`auto`, and Delete resets the selected setting. Every change is checked and saved
+to your config. **Skill subagents** lists the skills `delegate_task` can run
+(`skill=<name>`) with their model, tools, and round budget. **Activity** shows
+this session's fan-out workers and delegate runs live; typed while a turn runs,
+`x` stops the running fan-out workers.
+
 ## Optional: make both endpoints named OMP subagents
 
 This section applies to **OMP users**, not Conch runtime configuration. Keep your

@@ -230,6 +230,25 @@ class TestDelegateTask(unittest.TestCase):
             client.call_tool("delegate_task", {"task": "t"})
         self.assertEqual(seen["config"]["chat_model"], "gpt-4o-mini")
 
+    def test_provider_qualified_subagent_model_routes_to_that_provider(self):
+        """/agents and conch_config save subagent_model as provider/model;
+        the subagent must run there, not on the parent's provider."""
+        seen = {}
+
+        def fake_chat_turn(config, *args, **kw):
+            seen["config"] = config
+            return "ok", {}
+
+        client = _make_delegate(config={
+            "provider": "openai", "chat_model": "gpt-4o", "model": "gpt-4o",
+            "subagent_model": "anthropic/claude-haiku-4-5",
+        })
+        with patch("conch.runtime.chat_turn", fake_chat_turn), \
+             patch("sys.stderr", io.StringIO()):
+            client.call_tool("delegate_task", {"task": "t"})
+        self.assertEqual((seen["config"]["provider"], seen["config"]["chat_model"]),
+                         ("anthropic", "claude-haiku-4-5"))
+
     def test_ollama_subagent_model_validated(self):
         seen = {}
 

@@ -12,7 +12,7 @@ import time
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 MAX_GROUP_TOOLS = 200
@@ -28,6 +28,9 @@ PINNED_TOOL_NAMES = {
     "delegate_task",
     "skill_manage",
     "conch_introspect",
+    # Changing its own settings when asked must work on local models too,
+    # whose default (minimal) profile offers only this pinned core.
+    "conch_config",
     "read_file",
     "edit_file",
     "write_file",
@@ -2587,6 +2590,13 @@ class DelegateTaskClient:
         config = dict(self._config)
         parent_provider = (config.get("provider") or "").lower()
         provider = parent_provider
+        configured = str(config.get("subagent_model") or "").strip()
+        head, slash, rest = configured.partition("/")
+        if not preferred_model and slash and head.lower() in RAW_FNS:
+            # subagent_model as provider/model (how /agents and conch_config
+            # save it) routes to that provider; bare names keep the parent's.
+            preferred_provider = preferred_provider or head.lower()
+            preferred_model = rest
         if preferred_provider and preferred_provider in RAW_FNS:
             if (
                 local_only_enabled(config, parent_provider)
@@ -2650,15 +2660,40 @@ class DelegateTaskClient:
                     f"Error: unknown skill '{skill_name}' — use skill_manage "
                     "action='list' to see available skills."
                 )
+        from . import subagent_activity
+
+        # What the /agents panel shows: the preferred model (the subagent
+        # falls back to the parent's when the preference is unusable).
+        model = ((skill or {}).get("model") or str(self._config.get("subagent_model") or "")
+                 or str(self._config.get("chat_model") or self._config.get("model") or "")).strip()
+        provider = ((skill or {}).get("provider") or str(self._config.get("provider") or "")).lower()
+        if provider and model and model.split("/", 1)[0].lower() != provider:
+            model = f"{provider}/{model}"
+        label = f"[{skill['name']}] {task}" if skill else task
         # Serialize: one subagent at a time (single local GPU).
         if not self._lock.acquire(blocking=False):
             return self._text(
                 "Error: another subagent is already running — subagents run "
                 "one at a time. Finish or wait, then retry."
             )
+        token = subagent_activity.start("delegate", label, model)
+        status, summary = "failed", "no result"
         try:
-            return self._run(task, (arguments.get("context") or "").strip(), skill)
+            result = self._run(task, (arguments.get("context") or "").strip(), skill)
+            text = str(((result.get("content") or [{}])[0]).get("text") or "")
+            if text.startswith("Subagent summary:"):
+                status, summary = "done", text[len("Subagent summary:"):]
+            else:
+                summary = text or summary
+            return result
+        except KeyboardInterrupt:
+            status, summary = "cancelled", "interrupted"
+            raise
+        except BaseException as exc:
+            summary = f"{type(exc).__name__}: {exc}"
+            raise
         finally:
+            subagent_activity.finish(token, status, summary)
             self._lock.release()
 
     def _run(self, task: str, context: str, skill: Optional[dict] = None) -> dict:
@@ -2926,7 +2961,12 @@ CONCH_CONFIG_TOOL = {
         "description": (
             "Read or change Conch's own configuration. Use this when the user "
             "asks to switch models, change providers, toggle agent mode, clear "
-            "history, or asks about current settings, costs, or available models. "
+            "history, change a setting, or asks about current settings, costs, "
+            "or available models. list_settings shows every setting conch can "
+            "change about itself with its value and what it does; set_setting "
+            "(key + value) validates, saves, and applies one; reset_setting "
+            "(key) restores its default. Settings marked 'asks the user first' "
+            "(and turning agent mode on) show the user a confirmation prompt. "
             "get_registry/set_registry/clear_registry manage the llama-idx "
             "fleet registry (llamaidx_url): set_registry validates the URL "
             "before persisting it, and its models then appear in list_models "
@@ -2949,14 +2989,21 @@ CONCH_CONFIG_TOOL = {
                         "set_rounds",
                         "clear_history",
                         "new_conversation",
+                        "list_settings",
+                        "set_setting",
+                        "reset_setting",
                     ],
                     "description": "The config action to perform",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Setting name for set_setting/reset_setting (see list_settings)",
                 },
                 "value": {
                     "type": "string",
                     "description": (
                         "The value to set (model name, provider name, "
-                        "registry URL, on/off, number)"
+                        "registry URL, on/off, number, setting value)"
                     ),
                 },
             },
@@ -2978,6 +3025,30 @@ class ConchConfigClient:
         self._config: dict = {}
         self._permissions: Optional[PermissionState] = None
         self.pending_actions: List[tuple] = []
+        # Confirmations for changes that widen what runs unattended.
+        self.policy = LocalShellPolicy()
+
+    def set_policy(self, policy: LocalShellPolicy):
+        self.policy = policy
+
+    def _confirm(self, change: str) -> Optional[str]:
+        """None when the user said yes; otherwise the result to return. No
+        answer (EOF, Ctrl-C) and no way to ask both mean no."""
+        if not self.policy.interactive:
+            return ("Refused: this change needs the user's confirmation and "
+                    "nobody can be asked in this session. Nothing was changed.")
+        from .render import clear_active_spinners
+
+        clear_active_spinners()
+        print(f"\n  \033[1;33m\u2699 {change}\033[0m", flush=True)
+        ask = self.policy.input_fn or input
+        try:
+            answer = ask("  \033[1;33mAllow? [y/N]\033[0m ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer in ("y", "yes"):
+            return None
+        return "The user declined the change; nothing was changed."
 
     def bind(self, provider: str, model: str, session_usage: dict, config: Optional[dict] = None):
         self._provider = provider
@@ -3390,8 +3461,47 @@ class ConchConfigClient:
 
         if action == "set_agent_mode":
             enabled = value.lower() in ("on", "true", "1", "yes")
+            if enabled and not self.permissions().get_agent_mode():
+                refusal = self._confirm(
+                    "Turn on agent mode: shell commands run without asking "
+                    "(destructive ones still ask)")
+                if refusal:
+                    return self._text(refusal)
             self.permissions().set_agent_mode(enabled)
             return self._text(f"Agent mode {'ON' if enabled else 'OFF'}.")
+
+        if action == "list_settings":
+            from .settings_registry import describe
+
+            return self._text(
+                "Settings conch can change about itself (set_setting key=<name> "
+                "value=<value>; reset_setting key=<name>):\n"
+                + "\n".join(describe(self._config)))
+
+        if action in ("set_setting", "reset_setting"):
+            from .settings_registry import (
+                BY_KEY, current_value, default_of, normalize, reset_setting, set_setting,
+            )
+
+            key = str(arguments.get("key") or "").strip().lower()
+            setting = BY_KEY.get(key)
+            if setting is None:
+                return self._text(f"Unknown setting '{key}'. Settings: {', '.join(BY_KEY)}.")
+            try:
+                if action == "reset_setting":
+                    # Defaults are the narrow values: resetting never widens.
+                    return self._text(reset_setting(self._config, key,
+                                                    permissions=self.permissions()))
+                normalized = normalize(setting, value, self._config)
+            except ValueError as exc:
+                return self._text(f"Not changed: {key} {exc}.")
+            if setting.ask_first and normalized != current_value(self._config, key):
+                shown = normalized or f"default ({default_of(setting) or 'unset'})"
+                refusal = self._confirm(f"Change {key} to {shown}: {setting.description}")
+                if refusal:
+                    return self._text(refusal)
+            return self._text(set_setting(self._config, key, normalized,
+                                          permissions=self.permissions()))
 
         if action == "set_rounds":
             try:
@@ -3436,18 +3546,26 @@ CONCH_INTROSPECT_TOOL = {
         "description": (
             "Inspect YOUR OWN capabilities, configuration, and source code. "
             "Use when the user asks what you can do, what commands/tools/"
-            "skills exist, how a conch feature works internally, or where "
-            "you are installed. Actions: capabilities (full feature surface, "
-            "generated from live registries), config (effective settings), "
-            "source_overview (map of conch's own codebase), read_source "
-            "(read one conch source file)."
+            "skills exist, how a conch feature works, or where you are "
+            "installed. Actions: capabilities (full feature surface, generated "
+            "from live registries), docs (how a feature works: searches the "
+            "README and docs for 'query'; no query lists the topics), settings "
+            "(what you can change about yourself via conch_config set_setting), "
+            "config (effective settings), source_overview (map of conch's own "
+            "codebase), read_source (read one conch source file)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["capabilities", "config", "source_overview", "read_source"],
+                    "enum": ["capabilities", "docs", "settings", "config",
+                             "source_overview", "read_source"],
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Feature or topic to look up (for docs), e.g. "
+                                   "'model picker' or 'fan-out'",
                 },
                 "path": {
                     "type": "string",
@@ -3509,6 +3627,16 @@ class ConchIntrospectClient:
             return self._text(self._config_report())
         if action == "source_overview":
             return self._text(self._source_overview())
+        if action == "docs":
+            return self._text(self._docs(str(arguments.get("query") or "")))
+        if action == "settings":
+            from .settings_registry import describe
+
+            return self._text(
+                "Settings you can change about yourself with conch_config "
+                "(set_setting key=<name> value=<value>; reset_setting key=<name>). "
+                "Ones marked 'asks the user first' show the user a confirmation:\n"
+                + "\n".join(describe(self._config)))
         if action == "read_source":
             return self._read_source(
                 arguments.get("path", ""), int(arguments.get("start_line", 1) or 1)
@@ -3527,6 +3655,10 @@ class ConchIntrospectClient:
 
         lines.append("\n## Slash commands (typed by the user, handled by conch)")
         for spec, description in all_slash_commands():
+            # Capped so the whole report fits INTROSPECT_OUTPUT_MAX as the
+            # command list grows; docs <topic> has the full story.
+            if len(description) > 56:
+                description = description[:55].rstrip() + "…"
             lines.append(f"- {spec}: {description}")
         user_commands = load_user_commands()
         if user_commands:
@@ -3558,7 +3690,71 @@ class ConchIntrospectClient:
         lines.append("\n## Providers")
         lines.append(f"- supported: {', '.join(sorted(RAW_FNS))}")
         lines.append(f"- current: {self._provider}/{self._model}")
+        lines.append("\n## Learn more")
+        lines.append("- conch_introspect docs <topic>: how a feature works (README, docs)")
+        lines.append("- conch_introspect settings: what you can change via conch_config set_setting")
         return "\n".join(lines)
+
+    # --- docs ---------------------------------------------------------------
+
+    def _doc_sections(self) -> List[Tuple[str, str, str]]:
+        """(file, heading path, body) for every heading section of the
+        README and docs/*.md in this checkout."""
+        root = conch_source_root()
+        files = [root / "README.md"] + sorted((root / "docs").glob("*.md"))
+        sections: List[Tuple[str, str, str]] = []
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            trail: List[str] = []
+            heading, body = "", []
+            fence = False
+            for line in text.splitlines() + ["# "]:
+                if line.startswith("```"):
+                    fence = not fence
+                match = None if fence else re.match(r"^(#{1,4})\s+(.*)$", line)
+                if match:
+                    if heading or body:
+                        sections.append((path.name, " › ".join(trail) or path.name,
+                                         "\n".join(body).strip()))
+                    level = len(match.group(1))
+                    trail = trail[:level - 1] + [match.group(2).strip()]
+                    heading, body = match.group(2).strip(), []
+                else:
+                    body.append(line)
+        return [section for section in sections if section[2] or section[1]]
+
+    def _docs(self, query: str) -> str:
+        sections = self._doc_sections()
+        if not sections:
+            return ("Documentation is not installed alongside this copy of conch; "
+                    "use source_overview and read_source instead.")
+        words = [w for w in re.split(r"[^a-z0-9]+", query.lower()) if len(w) > 1]
+        if not words:
+            topics = [f"- {name}: {trail}" for name, trail, _ in sections
+                      if trail.count("›") <= 1]
+            return "Documented topics (docs query=<topic> to read one):\n" + "\n".join(topics)
+        scored = []
+        for index, (name, trail, body) in enumerate(sections):
+            heading, text = trail.lower(), body.lower()
+            score = sum(5 * heading.count(w) + text.count(w) for w in words)
+            if all(w in heading or w in text for w in words):
+                score *= 2
+            if score:
+                scored.append((-score, index))
+        if not scored:
+            return f"No documentation mentions '{query}'. Try capabilities or source_overview."
+        budget = INTROSPECT_OUTPUT_MAX - 200
+        parts: List[str] = []
+        for _, index in sorted(scored)[:6]:
+            name, trail, body = sections[index]
+            part = f"## {trail} ({name})\n{body}"
+            if parts and sum(len(p) for p in parts) + len(part) > budget:
+                continue
+            parts.append(part[:budget])
+        return "\n\n".join(parts)
 
     def _tool_lines(self) -> List[str]:
         state = self._chat_state

@@ -9,6 +9,8 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-17
+
 ### Added
 
 - In-flight guidance at safe model/tool boundaries. Enter while busy steers the
@@ -66,9 +68,25 @@ Releases before 0.6.0 predate this changelog.
   closes; picks that change the session run as soon as the turn ends.
 - A large ASCII conch heads the startup banner again on terminals with room for
   it; pipes and small windows skip it.
+- Conch changes its own settings when asked: `conch_config` gains
+  `list_settings`, `set_setting`, and `reset_setting` over a registry of
+  validated settings (saved and applied live where possible). Changes that let
+  more run unattended, and turning agent mode on, ask you first.
+- `conch_introspect docs <topic>` returns the documentation sections that
+  explain a feature, and `conch_introspect settings` lists what Conch can change
+  about itself.
+- Subagent panel (`/agents`, `/subagents`): fan-out worker and `delegate_task`
+  settings (model, parallel workers, round budget, side-task model) edited in
+  place or through the model picker, the skills a subagent can be scoped to, and
+  live activity of this session's workers and subagents; `x` stops running
+  fan-out workers. It opens during a turn as well.
 
 ### Changed
 
+- CI pins ruff (an unpinned upgrade had been failing lint across the tree), and
+  the secret-scan allowlist covers the last synthetic test fixtures, so both
+  checks pass again. `delegate_task` honours a `provider/model` value in
+  `subagent_model`.
 - First-run setup no longer ends on a choice that cannot be completed. A missing
   seat CLI, failed sign-in, empty or rejected API key, unreachable Ollama, or
   empty custom URL saves nothing and returns to the provider menu; a rejected
@@ -82,9 +100,9 @@ Releases before 0.6.0 predate this changelog.
   published reasoning stays readable until the next turn.
 - `/convos` and a bare `/switch` open the conversations page instead of the
   one-line picker, and switching conversations confirms which one resumed.
-- Local models (Ollama, custom endpoints) are offered up to 16 tools per
-  request instead of 12: the file tools and `web_fetch` joined the always-on
-  set, and the 4 slots for tools picked by relevance are kept.
+- Local models (Ollama, custom endpoints) are offered up to 17 tools per
+  request instead of 12: the file tools, `web_fetch`, and `conch_config` joined
+  the always-on set, and the 4 slots for tools picked by relevance are kept.
 - The repository map in `conch_introspect` and the system prompt caps each
   file's symbol list (with a `+N` count) and keeps naming files once symbols no
   longer fit, so one large module cannot hide the rest.
@@ -397,5 +415,6 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.0]: https://github.com/detournement/conch/releases/tag/v0.9.0
 [0.7.0]: https://github.com/detournement/conch/compare/v0.6.0...edge
 [0.6.0]: https://github.com/detournement/conch/releases/tag/v0.6.0

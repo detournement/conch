@@ -523,7 +523,7 @@ class RealWorkerTests(unittest.TestCase):
         deadline = time.monotonic() + 15
         while len(_Endpoint.arrivals) < 2 and time.monotonic() < deadline:
             time.sleep(0.05)
-        parent.client._cancel()
+        parent.client.stop()
         runner.join(timeout=15)
         self.assertFalse(runner.is_alive())
         self.assertIn("0 of 2", outcome["text"])

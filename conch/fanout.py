@@ -33,6 +33,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import subagent_activity
+
 EFFORTS = ("light", "standard", "heavy")
 MAX_TASKS = 8
 DEFAULT_CONCURRENCY = 4
@@ -544,7 +546,9 @@ class FanOutClient:
         result["seconds"] = time.monotonic() - started
         return result
 
-    def _cancel(self) -> None:
+    def stop(self) -> None:
+        """Stop the running fan-out: workers still running are killed and
+        tasks not yet started never start. Safe from any thread."""
         self._cancelled.set()
         with self._lock:
             running = list(self._processes)
@@ -634,6 +638,8 @@ class FanOutClient:
 
         def run(index: int) -> dict:
             choice = tasks[index]["choice"]
+            token = subagent_activity.start("fan-out", tasks[index]["task"], choice.label)
+            status, summary = "failed", "no result"
             try:
                 result = self._execute(
                     envelopes[index], timeout,
@@ -652,8 +658,19 @@ class FanOutClient:
                     result["fallback"] = (
                         f"{choice.label} failed ({error or 'no result'});"
                         f" ran on {own.label} instead")
+                if result.get("ok"):
+                    status = "done"
+                    summary = result.get("fallback") or str(result.get("summary") or "")
+                else:
+                    summary = str(result.get("error") or "no result")
                 return result
+            except BaseException as exc:
+                summary = f"{type(exc).__name__}: {exc}"
+                raise
             finally:
+                if status != "done" and self._cancelled.is_set():
+                    status = "cancelled"
+                subagent_activity.finish(token, status, summary)
                 if activities[index] is not None:
                     ui.end_activity(activities[index])
 
@@ -663,7 +680,7 @@ class FanOutClient:
                 results = [future.result() for future in futures]
             except BaseException:
                 # Ctrl+C stops the whole fan-out, not just the wait for it.
-                self._cancel()
+                self.stop()
                 raise
         elapsed = time.monotonic() - started
 

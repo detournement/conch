@@ -222,6 +222,9 @@ def make_builtin_clients(
     save_memory.bind(memory)
     conch_config = ConchConfigClient()
     conch_config.bind_permissions(perms)
+    # Settings that widen what runs unattended ask the user; a session that
+    # cannot ask (pipes, schedules) refuses them.
+    conch_config.set_policy(LocalShellPolicy(interactive=interactive))
     public_api = PublicApiClient()
     search_convos = SearchConversationsClient()
     clients: Dict[str, Any] = {

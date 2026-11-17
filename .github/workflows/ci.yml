@@ -13,7 +13,9 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install ruff
-        run: python -m pip install ruff
+        # Pinned: an unpinned ruff picks up new default rules and fails the
+        # whole tree on its own schedule. Bump deliberately.
+        run: python -m pip install ruff==0.15.12
       - name: Lint
         run: ruff check conch tests
 

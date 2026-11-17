@@ -42,7 +42,7 @@ from .tooling import (
 # ---------------------------------------------------------------------------
 
 BUILTIN_SLASH_COMMANDS = (
-    "/?", "/agent", "/approvals", "/approve", "/apps", "/cancel",
+    "/?", "/agent", "/agents", "/approvals", "/approve", "/apps", "/cancel",
     "/checkpoint", "/clear", "/compact", "/connect", "/convos", "/cost", "/delete",
     "/deny", "/disable", "/edit", "/enable", "/export", "/fact", "/facts", "/fanout",
     "/find", "/fork", "/forget", "/grep", "/h", "/help", "/image", "/install", "/keys",
@@ -51,7 +51,7 @@ BUILTIN_SLASH_COMMANDS = (
     "/models", "/new", "/note", "/notes", "/paste", "/profile", "/profiles",
     "/provider", "/queue", "/registry", "/reload", "/remember", "/rename", "/reset",
     "/resettools", "/retry", "/rounds", "/s", "/sandbox", "/schedule", "/search",
-    "/skill", "/skills", "/ssh", "/status", "/switch", "/tasks",
+    "/skill", "/skills", "/ssh", "/status", "/subagents", "/switch", "/tasks",
     "/terminal", "/tks", "/todo", "/tools", "/tty", "/undo", "/verbose",
     "/yolo",
 )
@@ -177,6 +177,8 @@ SLASH_COMMANDS = [
     ("/tks [on|off]", "Toggle the per-message token stats line (tokens, cost, tok/s)"),
     ("/fanout [auto|default|<provider/model>]",
      "Show or set the model parallel fan-out workers use"),
+    ("/agents", "Subagent panel: fan-out and delegate settings, skill subagents, live activity"),
+    ("/subagents", "Alias for /agents"),
     ("/sandbox [docker [image]|e2b|off]",
      "Run approved shell commands in a sandbox instead of locally"),
     ("/checkpoint [list|diff <#>|restore <#>|on|off]",
@@ -1495,6 +1497,7 @@ def handle_slash_command(
             "  \033[1m/verbose\033[0m             Toggle showing tool args + output\n"
             "  \033[1m/tks [on|off]\033[0m        Toggle the per-message token stats line (tok/s)\n"
             "  \033[1m/fanout [model|auto]\033[0m Show or set the model parallel fan-out workers use\n"
+            "  \033[1m/agents\033[0m, \033[1m/subagents\033[0m  Subagent settings, skill subagents, live activity\n"
             "  \033[1m/sandbox [docker|e2b|off]\033[0m Run approved commands in a sandbox, not locally\n"
             "  \033[1m/checkpoint [verb]\033[0m    List/diff/restore turn-level git checkpoints\n"
             "  \033[1m/undo\033[0m                Revert the last turn that ran commands\n"
@@ -2169,6 +2172,22 @@ def handle_slash_command(
             print(f"\n  \033[1;32m✓ Forgot memory #{entry_id}\033[0m\n")
         else:
             print(f"\n  \033[31mNo memory with ID #{entry_id}\033[0m\n")
+        return None
+
+    if command in ("/agents", "/subagents"):
+        from .agents_panel import admin_loop, describe_text, run_agents_panel
+        from .convo_browser import can_browse
+
+        if can_browse():
+            from .model_picker import pick_model
+
+            # No turn runs here, so there is no fan-out to stop.
+            admin_loop(config, provider, model_name,
+                       lambda select, notice: run_agents_panel(
+                           config, select=select, notice=notice),
+                       pick_model)
+        else:
+            print("\n" + "\n".join("  " + line for line in describe_text(config)) + "\n")
         return None
 
     if command in ("/models", "/ls", "/model") and not arg:

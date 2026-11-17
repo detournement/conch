@@ -53,10 +53,12 @@ _STYLE = {
 }
 
 
-def pick_model(config: dict, provider: str, model: str, *,
+def pick_model(config: dict, provider: str, model: str, *, purpose: Optional[str] = None,
                input=None, output=None) -> Optional[ModelEntry]:
-    """Run the picker on the terminal; the entry chosen with Enter, or None."""
-    picker = ModelPicker(config, provider, model)
+    """Run the picker on the terminal; the entry chosen with Enter, or None.
+    *purpose* names the setting being chosen (e.g. fanout_model) when the
+    pick is not the chat model."""
+    picker = ModelPicker(config, provider, model, purpose=purpose)
     if input is None:
         input = create_input(sys.stdin)
     if output is None:
@@ -65,11 +67,11 @@ def pick_model(config: dict, provider: str, model: str, *,
     return picker.result
 
 
-async def pick_model_during_turn(config: dict, provider: str,
-                                 model: str) -> Optional[ModelEntry]:
+async def pick_model_during_turn(config: dict, provider: str, model: str, *,
+                                 purpose: Optional[str] = None) -> Optional[ModelEntry]:
     """The picker on the live shell's own event loop while a turn runs: the
     chat-model pick is queued for when the turn ends; role changes save now."""
-    picker = ModelPicker(config, provider, model, busy=True)
+    picker = ModelPicker(config, provider, model, busy=True, purpose=purpose)
     await picker.build().run_async(pre_run=picker.start_live, handle_sigint=False)
     return picker.result
 
@@ -86,10 +88,13 @@ def _price_text(entry: ModelEntry) -> str:
 class ModelPicker:
     """State, rendering, and keys for one run of the picker."""
 
-    def __init__(self, config: dict, provider: str, model: str, busy: bool = False):
+    def __init__(self, config: dict, provider: str, model: str, busy: bool = False,
+                 purpose: Optional[str] = None):
         self.config = config
         self.current = ((provider or "").lower(), model or "")
         self.busy = busy
+        # The setting this pick fills when it is not the chat model.
+        self.purpose = purpose
         self.entries: List[ModelEntry] = catalog_entries(config)
         self.statuses: Dict[str, ProviderStatus] = static_status(config)
         self._pending = 0  # live sources still to answer
@@ -363,6 +368,8 @@ class ModelPicker:
         chat = "/".join(part for part in self.current if part) or "none"
         first = (f" Models · chat {chat} · fan-out {self.fanout_label()}"
                  f" · side tasks {self.side_label()}")
+        if self.purpose:
+            first = f" Choose a model for {self.purpose} ·" + first[len(" Models ·"):]
         count = sum(1 for kind, _ in self.rows if kind == "model")
         second = [f"{count} model{'s' if count != 1 else ''}"]
         if self._words():
@@ -470,7 +477,11 @@ class ModelPicker:
         if self.mode == "add":
             hints = ["Enter adds", "Esc cancels", "OpenRouter ids keep their slash: openrouter/vendor/model"]
         else:
-            hints = ["Enter use after this turn" if self.busy else "Enter use",
+            if self.purpose:
+                first = f"Enter sets {self.purpose}"
+            else:
+                first = "Enter use after this turn" if self.busy else "Enter use"
+            hints = [first,
                      "type to filter", "^F fan-out", "^T side tasks", "^A add",
                      "^X remove", "^R refresh", "Esc quit"]
         return [[("class:muted", " " + _fit_hints(hints, width - 1))]]

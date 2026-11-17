@@ -142,6 +142,16 @@ to your config. **Skill subagents** lists the skills `delegate_task` can run
 this session's fan-out workers and delegate runs live; typed while a turn runs,
 `x` stops the running fan-out workers.
 
+`subagent_model` takes `provider/model` (for example `custom/qwen3.8:27b`) or a
+bare model name on the session provider; a skill's own `model:` wins over it.
+Registry models (`llamaidx/...`) and `auto` work only for `fanout_model`. When
+`fanout_model` is blank, fan-out workers use `subagent_model`, then the session
+model.
+
+Local providers (`ollama`, `custom`) send at most 17 tool schemas per request:
+13 always-pinned tools (shell, file read/edit/write, `web_fetch`,
+`delegate_task`, `conch_config`, ...) plus 4 slots chosen by relevance.
+
 ## Optional: make both endpoints named OMP subagents
 
 This section applies to **OMP users**, not Conch runtime configuration. Keep your

@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.7.0][release] ·
+[Current release: v0.9.1][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.7.0
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.1
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -109,17 +109,18 @@ answer.
 | --- | --- |
 | Type | Filter by provider, model, tier, or billing |
 | Enter | Make it the chat model (verified first, as `/model` does) |
-| Ctrl+F | Fan-out workers use it (again: back to the session model) |
+| Ctrl+F | Fan-out workers use it (again: clear it, so workers use `subagent_model` or the session model) |
 | Ctrl+T | Side tasks use it (again: back to the chat model) |
 | Ctrl+A | Add a model the catalog lacks: `provider/model-id` (`openrouter/vendor/model` keeps its slash) |
-| Ctrl+X | Remove a model you added; roles pointing at it reset |
+| Ctrl+X | Remove a model you added; fan-out and side-task settings using it are cleared |
 | Ctrl+R | Ask local servers, the registry, and seats again |
 | Esc | Clear the filter, then quit |
 
 Added models are saved as `extra_models` in the config file and switching to one
 still runs the live model check. Role changes are saved as `fanout_model`,
 `weak_model`, and `weak_provider`. `/model <id> --provider <name>` switches to an
-exact provider when the same id exists under several.
+exact provider when the same id exists under several. Registry models can only
+be the chat model.
 
 ### Subagent panel
 
@@ -141,7 +142,10 @@ the next subagent call.
 ### Interactive terminal
 
 Conch keeps the conversation in normal terminal scrollback, with a live
-multiline composer and a compact model/permission/session status line.
+multiline composer. The status line shows the permission mode, pending
+messages, session cost, the repository and branch (`🐙 owner/repo ⎇ branch` on
+GitHub; see [repository awareness](#conversations-memory-and-context)), the
+provider/model, the conversation, and active/total tools, as space allows.
 You can keep editing while a response streams. Activity shows what is
 running and elapsed time, not fabricated completion percentages or reasoning.
 
@@ -166,6 +170,7 @@ columns by 31 rows); pipes and smaller windows skip it.
 | `/agents`, `/subagents` | Open the [subagent panel](#subagent-panel): worker and subagent settings, skills, live activity |
 | `/convos`, `/switch` | Open the [conversations page](#conversations-page): search, read, resume, and see cost |
 | `/retry`, `/fork`, `/compact` | Re-run your last message; continue in a copy; summarize older history now |
+| `/rename`, `/export` | Retitle the conversation; write it as Markdown with credentials redacted |
 | `/image [path\|clear]` | Attach the clipboard image (or a file) to your next message; dragging an image file in works too |
 | Ctrl+C | Stop active work and return pending messages to the composer; when idle, clear/cancel input (twice to exit) |
 | Ctrl+D | Exit with an empty composer |
@@ -231,11 +236,12 @@ Refactor the authentication module and run its focused tests.
 ```
 
 Docker changes where approved shell commands run; it does not bypass Conch's
-permission checks. Conch automatically records each turn that runs commands
-on `refs/conch/checkpoints/*` — a `before` snapshot just before the turn's
-first command and an `after` snapshot when it changed the worktree — without
-adding commits to your branch. `/undo` puts the worktree back to the `before`
-state of the last such turn, as uncommitted work, after confirmation.
+permission checks, and file tools still act on the host. Conch automatically
+records each turn that runs commands or edits files on
+`refs/conch/checkpoints/*` — a `before` snapshot just before the turn's first
+change and an `after` snapshot when it changed the worktree — without adding
+commits to your branch. `/undo` restores the `before` state of the last such
+turn, as uncommitted work, after confirmation; files the turn created stay.
 
 ### Start a durable mission
 
@@ -252,9 +258,10 @@ and reboots.
 
 ### Find recurring work to automate
 
-Setup marker: capture is opt-in.
+Setup marker: capture is opt-in, and `/compile` needs the optional Works module.
 
 ```text
+/install works
 /install capture
 /compile suggestions
 /compile from-suggestion 1
@@ -294,10 +301,11 @@ channel configuration and fail-closed sender allowlists.
 
 ## The five components
 
-The shell is installed first. The other four components already ship in the
-same distribution behind configuration gates; today, `/install` means
-enable, configure, and install any supervised user service. Run `/install`
-inside Conch to see their current status.
+The shell is installed first. Edge, fleet, and local capture ship in the same
+distribution behind configuration gates; Works is an optional module that
+`/install works` installs. `/install` enables and configures components and
+installs any supervised user service. Run `/install` inside Conch to see their
+current status.
 
 ```mermaid
 flowchart LR
@@ -518,6 +526,9 @@ remain experimental; Firefox is not supported.
    ~/.local/share/conch/browser-capture/extension
    ```
 
+   That is the default location; with `XDG_DATA_HOME` set it is
+   `$XDG_DATA_HOME/conch/browser-capture/extension`, as setup prints.
+
    The pinned extension id is `hgmjnpkpdnaeekckabogikdcpdfeeghh`.
 
 3. Open the extension's Options page and add each origin you want captured.
@@ -532,13 +543,16 @@ remain experimental; Firefox is not supported.
 
 Privacy boundaries are structural:
 
-- no `<all_urls>` permission; both extension and host reject other origins;
+- no `<all_urls>` permission; the extension forwards only allowlisted origins
+  and the host accepts only http(s) origins;
 - navigation stores the path, never query strings or fragments;
 - clicks store role and accessible label, never coordinates;
 - submits store form and field names, never values; password and
   secret-looking fields are excluded at the source and host;
-- copy events store only that a copy happened, never clipboard contents;
-- no keystrokes, page text, screenshots, input values, or clipboard text;
+- copy events store the source element's role and label, never clipboard
+  contents;
+- element labels can include bounded text from the clicked or copied-from
+  element; no keystrokes, screenshots, input values, or clipboard text;
 - native messaging uses stdio—no listening port and no cloud service;
 - the host validates the caller and schema, applies Conch's secret guard, and
   journals locally, with a bounded local spool only as a fallback.
@@ -567,7 +581,7 @@ The installer:
 - keeps using the original install method on upgrades;
 - installs from the GitHub `edge` branch tarball by default.
 
-`conch-shell` is not published on PyPI at v0.7.0. The release tag exists for
+`conch-shell` is not published on PyPI at v0.9.1. The release tag exists for
 source and auditability, while the website installer deliberately follows the
 maintained edge release line.
 
@@ -603,9 +617,10 @@ shows example requests, model/command discovery, and the active approval policy.
 A choice that cannot be completed saves nothing and returns to the provider
 menu: a missing provider CLI (with its install command), a failed sign-in, an
 empty API key, an unreachable Ollama, or an empty custom URL. A key the provider
-rejects is saved only if you confirm. If the final model check fails, setup
-offers another provider and discards the failed attempt. Ctrl+C cancels setup
-without starting a broken session; existing configuration skips the wizard.
+rejects is saved only if you confirm (custom-endpoint key checks are advisory).
+If the final model check fails, setup offers another provider: accepting
+discards the failed attempt, declining keeps its saved settings. Ctrl+C cancels
+setup without starting a broken session; existing configuration skips the wizard.
 The installer does not ask for optional integration credentials.
 
 With Node.js and npm available, install the official CLI and sign in:
@@ -647,7 +662,8 @@ unmodified native client. Conch dispatches requested tools through its existing
 approval policy. Native user hooks, plugins, MCP configuration, command execution,
 and search are disabled or isolated; Codex's residual patch tool is denied by
 read-only/never-approval policy. Enterprise-managed Codex MCP configurations are
-not supported by this isolation boundary. Output is buffered, not token-streamed.
+not supported by this isolation boundary. Final answers are buffered; published
+reasoning and generation progress appear while the request runs.
 Subscription limits still apply; token statistics label seat usage rather than
 estimating API charges. Seat sessions do not automatically fall back to API-key
 billing. An explicitly configured startup `fallback_models` list remains prior consent.
@@ -712,10 +728,11 @@ What `rotate` does, in order:
    `~/.config/conch/env` (0600) with your confirmation, names stale
    `export NAME=…` lines in your shell profiles by `file:line`, flags inline
    secrets in `mcp.json`, and checks the edge daemon.
-2. **check** — verifies every credential live with the cheapest call its
-   service has (provider key → models list, Jira → `/myself`, Composio, E2B,
-   Slack, each MCP server's own handshake, the Capitol agent card) and shows a
-   table with a `shell` column and a `daemon` column.
+2. **check** — probes each supported service with its cheapest call (provider
+   key → models list, Jira → `/myself`, Composio, E2B, Slack, each MCP server's
+   own handshake, the Capitol agent card); services without a read probe get a
+   format check and unknown names are skipped. The table shows a `shell`
+   column and, when the edge daemon is enabled, a `daemon` column.
 3. **rotate** — for each rejected or missing key, prompts for the new value
    (hidden, never echoed), verifies it, and saves it. Unattended forms:
    `--from-env` imports whatever the process environment provides
@@ -727,8 +744,10 @@ What `rotate` does, in order:
    line, a Capitol registry bearer to re-bootstrap).
 
 `conch keys required` prints the NAMEs the active config needs — what to ask
-the key admin for. `conch keys check` alone exits 0 only when every required
-key is `ok` in both columns.
+the key admin for. `conch keys check` exits nonzero when a required key is
+missing or rejected, when a responding daemon disagrees with the shell, or when
+the daemon speaks an obsolete control protocol; an unreachable service is a
+warning, not a failure.
 
 What the doctor warnings mean:
 
@@ -755,10 +774,10 @@ loads it, so the interactive shell, `conch-ask`, the edge daemon under
 launchd/systemd, workers, and MCP server launches all see the same keys
 without any profile exports. A key saved through `conch keys` (or first-run
 setup) is recorded as *conch-managed* in `env.manifest.json` next to it and
-**wins over a shell export of the same name** — it was verified live when
-it was saved, and a lingering `export` is the classic stale-key trap after a
-rotation. A line you add to the file by hand keeps the older rule: the
-process environment wins. `conch keys list` always shows which source is
+**wins over a shell export of the same name**: a lingering `export` is the
+classic stale-key trap after a rotation (saving verifies the key unless you
+skip it, as `conch keys set --no-verify` does). A line you add to the file by
+hand keeps the older rule: the process environment wins. `conch keys list` always shows which source is
 effective and fingerprints both when they differ; `conch keys set` never
 leaves a saved key silently shadowed.
 
@@ -767,7 +786,7 @@ leaves a saved key silently shadowed.
 Nothing needs a restart to pick up a rotated key: `/keys set NAME` in a
 session takes effect on the next request; `/reload` re-reads the file and
 restarts MCP servers with it; a provider's 401 makes the session re-read
-the file and retry once before reporting; the daemon re-reads the file
+the file and, if the key changed, retry once before reporting; the daemon re-reads the file
 whenever it changes (every tick), on `SIGHUP`, and on the `keys.reload`
 control op that `conch keys set/rotate` send it. Every auth failure names
 the key and the fix — `NAME was rejected by <service> (401) — run:
@@ -808,6 +827,11 @@ edits the command, and `a` allowlists that prefix for the session. No answer
 is never consent: Ctrl-C or a closed stdin (EOF) at the prompt declines and
 the command is not run.
 
+File edits, `web_fetch`, risky `conch_config` changes, and `fan_out` have their
+own approval rules, described with the [tools](#tools-and-integrations), the
+[self-settings](#conversations-memory-and-context), and [fan-out](#fan-out). A
+session that cannot ask refuses anything that needs a yes.
+
 ### Non-interactive runs
 
 A session that cannot answer an approval prompt never gets one. Pass
@@ -828,6 +852,9 @@ announced on stderr); with no list, or no working entry, the run fails closed
 with exit status 69 and a message naming the problem and the alternatives that
 answered. `conch-ask` and the `conch-edge` daemon are always non-interactive
 in this sense.
+
+Before the probe, chat startup checks that an API-key provider's key is set; a
+missing key exits with status 2 without trying `fallback_models`.
 
 ### Sandboxed execution
 
@@ -854,12 +881,15 @@ allowlists, destructive-command checks, and lifecycle hooks still decide
 
 Set a startup default with `exec_backend=local`, `docker`, or `e2b`.
 
+The backend applies to `local_shell` only. File tools and terminal handoffs
+still act on the host; a sandbox does not isolate them.
+
 ### Automatic Git checkpoints
 
 Inside a Git repository, checkpoints are on by default. A turn that runs a
-shell command or terminal handoff snapshots the worktree twice through a
-temporary index under `refs/conch/checkpoints/*`: a `before` snapshot right
-before its first command executes, and an `after` snapshot at the end of the
+shell command, a terminal handoff, or an approved file edit or write snapshots
+the worktree twice through a temporary index under `refs/conch/checkpoints/*`:
+a `before` snapshot right before its first change, and an `after` snapshot at the end of the
 turn when the worktree changed. Neither alters your branch, real index,
 stash, or history.
 
@@ -878,10 +908,12 @@ further to undo; use `/checkpoint list` and `/checkpoint restore <number>`
 to go further back or to return to an `after` state. Turns whose only
 changes came through MCP tools get an `after` snapshot but no `before`
 one, so for those use `/checkpoint restore`.
+A restore overwrites the files recorded in the snapshot; files created after it
+(including by the turn being undone) are left in place.
 
-Gitignored files and secret-shaped paths such as `.env`, private keys, and
-credential files are excluded. A restore therefore cannot materialize a
-secret that was skipped. The default retention is 20 snapshots
+New gitignored files and secret-shaped paths such as `.env`, private keys, and
+credential files are not added to snapshots, but files already committed in
+`HEAD` stay in them: checkpoints do not remove committed secrets. The default retention is 20 snapshots
 (`git_checkpoint_limit`) — about ten command-running turns, since each
 records a before/after pair.
 
@@ -936,10 +968,12 @@ The cloud catalog was live-audited on 2026-09-23:
 <!-- markdownlint-enable MD013 -->
 
 Responses-only models are not advertised because Conch currently uses Chat
-Completions for OpenAI-compatible tools. In the interactive editor, `/model`
-and `/models` open the current provider's searchable catalog; `/provider`
-selects another provider. `/model <name>` accepts an explicit model ID and
-validates it before switching. Plain sessions retain the textual catalog.
+Completions for OpenAI-compatible tools. In the interactive editor, `/models`
+and bare `/model` open the [model picker](#model-picker) across every provider,
+seat, local server, the llama-idx registry, and `extra_models`; `/provider`
+selects another provider. `/model <name> [--provider <name>]` accepts an
+explicit model ID and validates it before switching. Plain sessions retain the
+textual catalog.
 
 ### Startup model check
 
@@ -1005,8 +1039,8 @@ OpenAI-compatible fleet:
 /registry off
 ```
 
-`/registry set` validates `/v1/inference`, the registry version, and its
-tool-verified entries before saving `llamaidx_url`. `/llamaidx` reports up,
+`/registry set` checks `/v1/inference` and the registry schema version before
+saving `llamaidx_url` (an empty catalog is accepted). `/llamaidx` reports up,
 degraded, and down providers without waking them. Selection still runs
 Conch's own tool probe, and `local_only` applies to both the registry and every
 discovered provider URL.
@@ -1031,7 +1065,8 @@ It updates after each completed turn and survives `/new`, `/clear`, and model or
 conversation switches. API amounts use `~$` to indicate estimates; subscription
 seats, local inference, and unknown pricing are labelled explicitly. Mixed
 sessions retain known API spend alongside those labels. `/cost` shows the same
-total; restarting Conch starts a new session total.
+total; restarting Conch starts a new session total. Per-conversation totals,
+fan-out workers included, appear on the [conversations page](#conversations-page).
 
 ## Shell capabilities
 
@@ -1045,9 +1080,10 @@ total; restarting Conch starts a new session total.
   keys, Conch's own env file) need confirmation even in agent mode. Edits and
   writes show a colored diff and ask `Apply? [y/n/a/A/?]` (`a` applies file
   edits for the rest of the session); agent mode applies them while still
-  printing the diff. Writes are atomic, keep line endings and file mode, and
-  are covered by `/undo` checkpoints. Remote channel sessions can read but
-  not edit.
+  printing the diff; credential and system paths still ask. Changes are atomic
+  and keep the file mode; `edit_file` also keeps CRLF line endings. Inside a Git
+  repository with checkpoints on, `/undo` covers them. Remote channel sessions
+  can read but not edit.
 - **Web:** `web_fetch` reads an http(s) page as text (HTML stripped to
   headings, paragraphs, and links; JSON pretty-printed; binary types refused),
   capped at 2 MB downloaded. `prompt_all` asks per URL (`a` allows the host
@@ -1070,6 +1106,16 @@ total; restarting Conch starts a new session total.
   GitHub, and Slack.
 - **Profiles:** `/profile minimal`, `dev`, `comms`, or `full`; custom
   `profile_<name>` entries can select tool groups.
+
+Built-in tools are `local_shell`, `interactive_terminal`, `ssh_remote`,
+`read_file`, `edit_file`, `write_file`, `web_fetch`, `manage_tools`,
+`save_memory`, `search_conversations`, `todo_list`, `personal_items`,
+`delegate_task`, `fan_out`, `skill_manage`, `conch_config`,
+`conch_introspect`, and `public_api`; configured components add `api_layer`,
+`llamaidx_registry`, `fleet_delegate`, and `capitol_control`. Ollama and custom
+endpoints are offered at most 17 tools per request: 13 pinned ones (shell, SSH,
+file tools, `web_fetch`, `delegate_task`, `conch_config`, ...) plus four picked
+by relevance.
 
 Tool calls are canonicalized and schema-validated before hooks or execution.
 Only native tool calls are executable; repeated identical call batches stop.
@@ -1104,19 +1150,24 @@ Only native tool calls are executable; repeated identical call batches stop.
   (default 3) or any tool use. A summary near-identical to one already
   stored is not written again. `session_summary_min_turns=0` turns
   session summaries off.
-- Every memory write and read passes deterministic credential detection.
-  Secret-bearing entries are rejected whole; legacy matches are withheld.
-- Starting in a Git repository injects a bounded repository map. `CONCH.md`,
-  `AGENTS.md`, and the nearest project `.conchrc` add project context.
+- Searchable-memory writes and recall pass deterministic credential detection.
+  Secret-bearing entries are rejected whole; legacy matches are withheld from
+  recall. Standing facts (`/fact`) are not credential-scanned.
+- Starting in a Git repository injects a bounded repository map unless
+  `repo_map=false`. The nearest `CONCH.md` or `AGENTS.md` supplies project
+  instructions (`CONCH.md` wins in the same directory); the nearest project
+  `.conchrc` supplies configuration overrides.
 - Inside a git checkout the status bar shows where you are: `🐙 owner/repo ⎇ branch`
   for a GitHub repository (with the branch's open PR number and `✓`/`✗`/`●` for its
   checks), `name ⎇ branch` otherwise; the startup banner repeats it. For GitHub,
   one background `gh api graphql` call at startup loads the description, default
   branch, latest release, the branch's pull request and checks (failing ones named),
-  and the most recently updated open pull requests and issues into the model's
-  context, so it starts knowing the repository's state. It needs the `gh` CLI
-  signed in (`gh auth login`); without it the banner says why and the model is told
-  to use `gh`. `github_context = false` turns the fetch off.
+  and the most recently updated open pull requests and issues. The snapshot
+  joins the model's context before the first turn that finds it ready (it
+  usually lands while you type); one-shot runs wait up to two seconds for it.
+  It needs the `gh` CLI signed in (`gh auth login`); without it the banner says
+  why and the model is told to use `gh`. `github_context = false` turns the
+  fetch off.
 - `conch_introspect` reports live capabilities, redacted effective config, and
   bounded views of Conch's own source; `docs <topic>` returns the README and
   `docs/` sections that explain a feature, and `settings` lists what Conch can
@@ -1135,8 +1186,9 @@ possible, otherwise quarantined without blocking startup.
 
 ### Skills, delegation, and custom commands
 
-Skills are Markdown procedures under `~/.config/conch/skills/`. They can scope
-tools, model, and round budget:
+Skills are Markdown procedures shipped with Conch and optional plugins, or
+stored under `~/.config/conch/skills/`; a user skill overrides a shipped one of
+the same name. Skills can scope tools, model, and round budget:
 
 ```text
 /skills
@@ -1153,9 +1205,12 @@ The model can delegate a bounded subtask into a fresh context with
 Markdown files in `~/.config/conch/commands/` become custom slash commands,
 with `$ARGUMENTS` interpolation.
 
+`/agents` (or `/subagents`) opens the [subagent panel](#subagent-panel) for
+these settings, the skill subagents, and live worker activity.
+
 #### Fan-out
 
-With `fan_out` the model runs 2 to 8 independent subtasks in parallel, each in
+With `fan_out` the model runs up to 8 independent subtasks in parallel, each in
 a fresh worker process with a clean context, and gets one summary back per
 task. It suits work that splits cleanly: searching several areas, reading
 several files, comparing options.
@@ -1165,7 +1220,8 @@ use:
 
 | `fanout_model` | Workers use |
 | --- | --- |
-| unset or `default` | The session's model |
+| unset | `subagent_model`, or the session's model if that is unset |
+| `default` | The session's model |
 | `<model>` or `<provider>/<model>` | That model, checked before it is saved |
 | `auto` | A model chosen per task from what is usable right now |
 
@@ -1185,14 +1241,17 @@ environment, a signed-in seat, a reachable local server. An explicit
 
 A key that is set is treated as usable without being tested first. If an
 auto-chosen model then fails, that task is retried once on the session's model
-and its result says so. A model you configured yourself is never swapped: its
-failure is reported.
+and its result says so (not after a timeout or cancellation, or when it already
+ran on the session's model). An explicit `fanout_model` that is unusable before
+dispatch falls back with a warning; once dispatched, its failures are reported,
+never swapped.
 
 Workers never exceed the session's authority and cannot ask you anything:
 
 - In the default ask-first mode Conch asks once before a fan-out starts.
-  Workers then run read-only commands (`ls`, `cat`, `grep`, ...) without
-  asking and refuse everything else, reporting what they could not do.
+  Workers then run read-only commands (`ls`, `cat`, `grep`, ...) and the
+  session's allowed command prefixes without asking, and refuse everything
+  else, reporting what they could not do.
 - In `safe_auto` and agent mode workers follow the same mode without a prompt.
   Destructive commands are always refused.
 - Workers get the session's active built-in tools, minus self-management,
@@ -1214,7 +1273,8 @@ their configuration files are not interchangeable.
 - Multiline paste is one message, not one command per line.
 - `/paste` reads literally until `.` or Ctrl+D.
 - `/edit` composes in the configured editor.
-- In the live composer, Alt+Enter inserts newlines; Enter sends the whole draft.
+- In the live composer, Alt+Enter inserts newlines; Enter sends the whole draft,
+  or steers a running turn (see [Interactive terminal](#interactive-terminal)).
   Plain input retains fenced-block and backslash continuation handling.
 - `/queue on` and `/queue off` control submission while the model is working.
 - `/schedule 10m check disk usage`, `/tasks`, and `/cancel` manage recurring
@@ -1224,8 +1284,9 @@ their configuration files are not interchangeable.
 
 `hook_pre_tool_use`, `hook_post_tool_use`, and `hook_on_turn_end` name scripts
 that receive JSON on stdin. A nonzero pre-hook blocks the call; JSON output
-from a pre-hook can rewrite arguments. A broken hook reports an error rather
-than silently bypassing policy.
+from a pre-hook can rewrite arguments, which are schema-validated again. A hook
+that crashes or times out is reported and the call proceeds, so treat hooks as
+a convenience gate, not a security boundary.
 
 ## Edge daemon and missions
 
@@ -1290,7 +1351,8 @@ Remote safety is enforced in code:
 - approvals cannot be replayed from another origin;
 - remote sessions do not receive direct-terminal, SSH-control,
   self-management, or fleet-delegation tools;
-- a kernel lease ensures only one process polls each channel.
+- with `edge_daemon=true`, a kernel lease ensures only one process polls each
+  channel.
 
 Slack and Matrix images from allowlisted senders are content-sniffed,
 size-capped, count-capped, and quarantined before use. Slack requires
@@ -1414,8 +1476,9 @@ Runtime operations are available through plain chat and `/capitol`:
 
 The runtime surface discovers agent cards and workflow identifiers rather than
 inventing them. Starts use idempotency keys, resumable watches persist their
-cursor, HITL questions are relayed verbatim, and downloaded artifacts are
-quarantined and digest-reported. Procedure discovery/read uses the
+cursor, HITL questions are shown as bounded, control-stripped text, and
+downloads are digest-reported: chat-tool downloads go into quarantine, while
+`/capitol down` writes to the destination you give. Procedure discovery/read uses the
 authenticated workflow REST API, is side-effect-free, validates strict schema
 versions and content digests, and treats returned prose as untrusted data.
 
@@ -1487,10 +1550,22 @@ network sandbox for tools you explicitly enable or approve.
 | `weak_model`, `weak_provider` | unset | Small model for summaries, compaction, and mission reviews |
 | `session_summary_min_turns` | `3` | User turns before a session is summarized into memory (tool use also qualifies); `0` disables |
 | `subagent_model`, `subagent_rounds` | parent, `10` | Defaults for delegated subtasks |
-| `fanout_model` | session model | Model for parallel fan-out workers: a model, `provider/model`, or `auto` |
-| `fanout_concurrency` | `4`; `1` on a local server | Fan-out workers running at once |
+| `fanout_model` | `subagent_model`, else session model | Fan-out worker model: a model, `provider/model`, or `auto`; `/fanout default` clears it |
+| `fanout_concurrency` | `4` | Workers running at once; workers on one local server run one at a time unless this key is set |
 | `fanout_rounds`, `fanout_timeout` | `subagent_rounds`, `600` | Tool rounds and seconds allowed per fan-out task |
 | `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds |
+| `notify_after_seconds` | `30` | Desktop notification after an interactive turn this long; `0` disables |
+| `github_context` | `true` | Load the GitHub repository's PRs, issues, and checks at startup |
+| `extra_models` | unset | Comma-separated `provider/model` entries added in the model picker |
+| `web_fetch_allow_domains` | unset | Comma-separated hosts (subdomains included) `web_fetch` reads without asking |
+| `allow_prefixes` | unset | Comma-separated shell command prefixes that never prompt |
+| `detect_location` | `false` | Look up the city from the public IP at startup |
+| `multiline_paste` | `true` | A multi-line paste is one message |
+| `max_identical_tool_batches` | `3` | Repeated identical tool batches allowed in a turn; minimum `2` |
+| `max_parallel_tool_calls` | `16` | Tool calls accepted in one batch; minimum `1` |
+| `system_prompt`, `chat_system_prompt` | built-in | Override the ask-mode and chat system prompts |
+| `send_cwd`, `send_os_shell` | `false`, `false` | Add the working directory (chat and ask) or OS/shell (ask) to context |
+| `send_history_count` | `0` | Ask-mode shell-history lines taken from `CONCH_HISTORY` |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -1511,6 +1586,15 @@ network sandbox for tools you explicitly enable or approve.
 | `ollama_keep_alive` | `10m` | Model residency between turns |
 | `custom_base_url`, `custom_model` | unset | OpenAI-compatible endpoint and model |
 | `llamaidx_url`, `llamaidx_token_env` | unset | Registry URL and optional read-token env name |
+| `ollama_context_window`, `custom_context_window` | discovered; `4096`, `32768` | Context size used when the server does not report one |
+| `temperature` | `0.2` | Local-provider sampling temperature; `ollama_temperature`, `custom_temperature` override it |
+| `max_output_tokens` | unset | Output-token cap for Ollama and custom endpoints; `ollama_num_predict`, `custom_max_tokens` override it |
+| `ollama_think` | server default | Ollama reasoning toggle or level |
+| `ollama_timeout`, `custom_timeout` | `120`, `120` | Inference request timeouts in seconds |
+| `custom_parallel_tool_calls` | server default | Ask a custom endpoint for parallel tool calls |
+| `local_tool_exemplar` | `true` | Show local models one example tool call |
+| `bedrock_region` | AWS region env, else `us-east-1` | Bedrock endpoint region |
+| `e2b_api_url` | `https://api.e2b.app` | E2B API endpoint |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -1531,6 +1615,8 @@ network sandbox for tools you explicitly enable or approve.
 | `remote_poll_interval`, `remote_rounds` | `60`, `8` | Poll interval and remote turn-round cap |
 | `notify_channel` | unset | `matrix`, `slack`, `sms`, or `email` |
 | `*_allowed_senders` | unset | Fail-closed inbound sender allowlist for each channel |
+| `notify_push` | unset | `ntfy` routes push notifications independently of conversation channels |
+| `remote_approval_ttl` | `600` | Seconds before a remote approval request expires |
 | `capitol_base_url`, `capitol_org`, `capitol_agent` | unset | Capitol runtime identity |
 | `capitol_bearer_env` | `CAPITOL_A2A_BEARER` | Runtime bearer environment-variable name |
 | `capitol_admin` | `false` | Enable policy-gated provisioning |
@@ -1539,14 +1625,15 @@ network sandbox for tools you explicitly enable or approve.
 
 <!-- markdownlint-enable MD013 -->
 
-See [`config.example`](config.example) for the exhaustive, commented surface,
-including Matrix, ntfy, Slack, SMS, email, hooks, prompt overrides, compiler
-bounds, fleet scheduling, and Capitol administration.
+See [`config.example`](config.example) for more commented settings, including
+Matrix, ntfy, Slack, SMS, email, hooks, prompt overrides, compiler bounds, fleet
+scheduling, and Capitol administration. Conch can also list and change its own
+settings when you ask (see [Conversations, memory, and context](#conversations-memory-and-context)).
 
 ## Slash command reference
 
-`/help` is generated from the current shell and plugin registries. This table
-groups the same shipped surface.
+`/help` opens the command palette in the live editor and prints command help in
+plain sessions. This table groups the shipped commands.
 
 <!-- markdownlint-disable MD013 -->
 
@@ -1554,6 +1641,8 @@ groups the same shipped surface.
 | --- | --- |
 | `/help` | Search commands in the live editor; list commands in plain sessions |
 | `/models`, `/model <name> [--provider <name>]`, `/provider <name>` | Open the model picker, or switch the validated model/provider |
+| `/fanout [auto\|default\|<provider/model>]` | Show or set the fan-out worker model |
+| `/agents`, `/subagents` | Subagent settings, skill subagents, and live worker activity |
 | `/registry [set <url>\|off]`, `/llamaidx` | Configure and inspect llama-idx |
 | `/remember`, `/memories`, `/forget`, `/fact`, `/facts` | Persistent memory and always-loaded facts |
 | `/skills`, `/skill <name> [task]` | List or run skills |
@@ -1580,15 +1669,20 @@ groups the same shipped surface.
 | `/connect`, `/apps` | Composio applications |
 | `/reload`, `/resettools` | Reload integrations or reset textual tool-call drift |
 | `/rounds <n>` | Set the turn's maximum tool rounds |
-| `/queue on|off`, `/paste`, `/edit` | Steering/follow-up submission and multiline composition |
+| `/queue on\|off`, `/paste`, `/edit` | Steering/follow-up submission and multiline composition |
 | `/status`, `/cost` | Session and provider status |
 | `/capitol ...` | Capitol runtime, artifacts, packs, and gated administration |
 | `/compile ...` | Architecture Card design, capture, review, and operation |
 | `/fleet ...` | Trusted-worker enrollment and task plane |
 | `/ebay <photo...> [-- notes]` | Sandbox eBay listing flow over Capitol |
 | `/<custom>` | A Markdown command from `~/.config/conch/commands/` |
+| `/q`, `exit` | Leave Conch |
 
 <!-- markdownlint-enable MD013 -->
+
+Panels (`/models`, `/provider`, `/help`, `/convos`, `/agents`) and read-only
+reports open during a running turn; picks that change the session wait for the
+turn to end.
 
 ## Containers
 
@@ -1653,8 +1747,8 @@ the normal approval and execution backend.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests
-uvx ruff check --select E9,F63,F7,F82 conch tests
+.venv/bin/python -m unittest discover -s tests -t .
+uvx ruff@0.15.12 check conch tests   # the version CI pins
 docker compose config --quiet
 docker compose build conch
 ```
@@ -1662,17 +1756,17 @@ docker compose build conch
 Useful focused checks:
 
 ```bash
-python3 -m unittest tests.test_introspect tests.test_repomap
-python3 -m unittest tests.test_install_command tests.test_compile_capture
-python3 -m unittest tests.test_compile_browser tests.test_browser_packaging
+.venv/bin/python -m unittest tests.test_introspect tests.test_repomap
+.venv/bin/python -m unittest tests.test_install_command tests.test_compile_capture
+.venv/bin/python -m unittest tests.test_compile_browser tests.test_browser_packaging
 ```
 
 Audit cloud model catalogs before releases:
 
 ```bash
-python tools/audit_models.py
-python tools/audit_models.py --provider openai
-python tools/audit_models.py --prune-suggestions
+.venv/bin/python tools/audit_models.py
+.venv/bin/python tools/audit_models.py --provider openai
+.venv/bin/python tools/audit_models.py --prune-suggestions
 ```
 
 Providers without an API key are reported as unverifiable rather than silently
@@ -1684,12 +1778,19 @@ accepted.
 conch/
 ├── app.py, commands.py, runtime.py   interactive shell and agent loop
 ├── terminal_ui.py, render.py         live composer, pickers, and scrollback rendering
+├── config.py, settings_registry.py   config loading and validated live settings
+├── model_catalog.py, model_picker.py model discovery, additions, and the picker
+├── convo_browser.py, agents_panel.py conversations page and subagent panel
+├── fanout.py, subagent_activity.py   parallel workers and their live activity
+├── filetools.py, webfetch.py         approved file edits and page fetching
+├── images.py, notify.py              image attachments and desktop notifications
+├── github_context.py, repomap.py     repository awareness and the repo map
 ├── tooling.py, mcp.py, skills.py     tools, MCP, profiles, and skills
 ├── providers.py, llm.py              provider adapters and ask mode
-├── kernel/                           event-sourced missions and capture
+├── kernel/                           missions, capture, and the browser native host
 ├── fleet/                            controller, workers, grants, artifacts
 ├── capitol/                          A2A runtime, compiler, and flow packs
-├── satellites/browser_capture/       Chrome extension and native host
+├── satellites/browser_capture/       Chrome extension package data
 ├── channels.py, remote.py            channels, allowlists, remote loop
 └── conversations.py, memory.py       durable local context
 ```

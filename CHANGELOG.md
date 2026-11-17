@@ -9,6 +9,8 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-17
+
 ### Added
 
 - Repository awareness: inside a git checkout the status bar and startup banner
@@ -18,6 +20,12 @@ Releases before 0.6.0 predate this changelog.
   pull request and checks, and recent open pull requests and issues into the
   model's context before the first turn. `github_context = false` turns the
   fetch off.
+
+### Changed
+
+- README and the docs under `docs/` describe the current release: the release
+  link, configuration reference, tools, commands, and source layout match the
+  code again.
 
 ## [0.9.0] - 2026-11-17
 
@@ -425,6 +433,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.1]: https://github.com/detournement/conch/releases/tag/v0.9.1
 [0.9.0]: https://github.com/detournement/conch/releases/tag/v0.9.0
 [0.7.0]: https://github.com/detournement/conch/compare/v0.6.0...edge
 [0.6.0]: https://github.com/detournement/conch/releases/tag/v0.6.0

@@ -70,9 +70,11 @@ what refactor stage R1 actually implements. Every divergence:
    the same wording.
 9. **`approvals[0].describe`** is the approval-store description formula
    (previously an f-string in the driver).
-10. **The `watched_folder` intake is omitted** — engine gap G1 (the
-    edge-daemon folder watcher does not exist yet); the design example
-    carried it as a disabled placeholder.
+10. **The `watched_folder` intake is enabled**, not a disabled
+    placeholder: the edge-daemon folder watcher binds it via
+    `folder_watch_<name> = <path>` +
+    `folder_watch_<name>_handler = pack:ebay-listing`. Drops never
+    auto-publish.
 11. **`presentation_id` uses `engine.unique_id('conch-presentation')` on
     both surfaces**; the pre-extraction channel flow used a
     `conch-channel-` prefix. Presentation ids are generated ids —

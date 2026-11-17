@@ -1557,34 +1557,42 @@ def _graceful_exhaustion(
     return f"{content}\n\n({reason} reached — reply to continue)"
 
 
+def _latest_user_text(messages: List[dict]) -> str:
+    return next(
+        (
+            message.get("content", "")
+            for message in reversed(messages)
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+        ),
+        "",
+    )
+
+
 def select_request_tools(
     tools: Optional[List[dict]],
     provider: str,
     messages: List[dict],
     provider_tool_limits: Dict[str, int],
     pinned_names=None,
+    query: Optional[str] = None,
 ) -> Optional[List[dict]]:
     """Select the exact tools offered to the model for this request.
 
     *pinned_names* are session pins (a skill's declared tools) that must
     survive the per-provider relevance cap alongside the built-in pins.
+    *query* is the text relevance is judged against; it defaults to the
+    latest user message.
     """
     send_tools = list(tools or [])
     tool_limit = provider_tool_limits.get(provider)
     if tool_limit and len(send_tools) > tool_limit:
         from .tooling import select_relevant_tools
 
-        user_text = next(
-            (
-                message.get("content", "")
-                for message in reversed(messages)
-                if message.get("role") == "user"
-                and isinstance(message.get("content"), str)
-            ),
-            "",
-        )
         send_tools = select_relevant_tools(
-            send_tools, user_text, tool_limit, pinned_names
+            send_tools,
+            _latest_user_text(messages) if query is None else query,
+            tool_limit, pinned_names,
         )
     return send_tools or None
 
@@ -1950,13 +1958,19 @@ def chat_turn(
     round_budget = int(max_tool_rounds)
     _round = -1
 
+    # Tool relevance follows the whole turn: the request that started it plus
+    # any guidance. Terse guidance alone ("shorter") must not swap the toolset.
+    relevance = [_latest_user_text(messages)]
+
     def take_steering() -> List[dict]:
         # Blank guidance carries no instruction and providers reject it.
-        return [
+        guidance = [
             {"role": "user", "content": text}
             for text in (steering_fn() if steering_fn is not None else [])
             if isinstance(text, str) and text.strip()
         ]
+        relevance.extend(message["content"] for message in guidance)
+        return guidance
 
     while True:
         _round += 1
@@ -1994,6 +2008,7 @@ def chat_turn(
         send_tools = select_request_tools(
             tools, provider, messages, PROVIDER_TOOL_LIMITS,
             getattr(chat_state, "pinned_tools", None),
+            query="\n".join(relevance),
         )
         # Model-generated compaction first (plan 1.4); char-capping
         # compress_context stays as the cheap backstop below.
@@ -2216,6 +2231,7 @@ def chat_turn(
                     fb_tools = select_request_tools(
                         tools, fb_provider, messages, PROVIDER_TOOL_LIMITS,
                         getattr(chat_state, "pinned_tools", None),
+                        query="\n".join(relevance),
                     )
                     fb_tool_names = {
                         _tool_name(tool)

@@ -131,6 +131,15 @@ def get_config_path() -> str:
     return str(config_dir / "config")
 
 
+def display_path(path: str) -> str:
+    """*path* with the home directory abbreviated to ``~``. Display only:
+    never write the result to a file or pass it to the filesystem."""
+    home = str(Path.home())
+    if path == home or path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
 def get_env_file_path() -> str:
     """Path to the conch-owned API key file (may not exist yet).
 

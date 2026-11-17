@@ -39,7 +39,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .config import get_config_path, local_only_enabled, set_config_values
+from .config import display_path, get_config_path, local_only_enabled, set_config_values
 from .render import Spinner
 
 # Exit status for a run that fails closed on the model check (sysexits
@@ -1185,7 +1185,8 @@ def ensure_working_model(config: dict, *, interactive: bool,
                          out=None,
                          announce: Optional[Callable[[str], None]] = None,
                          persist_mode: str = "ask",
-                         discover: bool = True) -> ModelCheckOutcome:
+                         discover: bool = True,
+                         restart_hint: bool = True) -> ModelCheckOutcome:
     """Validate the configured model; recover with approval or fail closed.
 
     Mutates *config* in place when a switch is approved (interactive) or a
@@ -1199,6 +1200,8 @@ def ensure_working_model(config: dict, *, interactive: bool,
     receives the non-interactive one-liners (default: stderr).
     ``persist_mode`` is ``ask`` (session or default — the user chooses),
     ``always`` (the wizard: the pick becomes the default), or ``never``.
+    ``restart_hint=False`` omits the "edit the config and restart" advice
+    for a caller that offers its own next step (first-run setup).
     """
     provider = (config.get("provider") or "").lower()
     model = (config.get("chat_model") or config.get("model") or "").strip()
@@ -1212,7 +1215,7 @@ def ensure_working_model(config: dict, *, interactive: bool,
     if interactive:
         return _interactive_recovery(
             config, result, timeout=timeout, input_fn=input_fn, out=out,
-            persist_mode=persist_mode,
+            persist_mode=persist_mode, restart_hint=restart_hint,
         )
     return _non_interactive_recovery(
         config, result, timeout=timeout, announce=announce, discover=discover
@@ -1275,7 +1278,8 @@ def _non_interactive_recovery(config: dict, failure: ProbeResult, *, timeout: fl
 
 
 def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
-                          input_fn, out, persist_mode: str) -> ModelCheckOutcome:
+                          input_fn, out, persist_mode: str,
+                          restart_hint: bool = True) -> ModelCheckOutcome:
     import builtins
 
     ask = input_fn or builtins.input
@@ -1303,14 +1307,15 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
         say(f"\033[2m  ({note})\033[0m")
     if not candidates:
         say("\033[31m  No alternatives found.\033[0m")
-        say(
-            f"\033[2m  Fix the configured model or fallback_models in"
-            f" {get_config_path()}, then restart conch.\033[0m"
-        )
-        say(
-            "\033[2m  /models, /model, and /provider work only inside a running"
-            " Conch session, not at your system shell prompt.\033[0m"
-        )
+        if restart_hint:
+            say(
+                f"\033[2m  Fix the configured model or fallback_models in"
+                f" {display_path(get_config_path())}, then restart conch.\033[0m"
+            )
+            say(
+                "\033[2m  /models, /model, and /provider work only inside a running"
+                " Conch session, not at your system shell prompt.\033[0m"
+            )
         raise _startup_error(
             f"conch: no working model — {failure.label} {failure.describe()} and no alternative"
             " was found"

@@ -129,7 +129,12 @@ def run_ui_mode(mode):
                 wait_for_ui(lambda: ui._modal == "queue")
                 emit("LIST-OPEN")
                 wait_for_ui(lambda: ui._modal is None)
-            elif mode in ("steering", "queue-off"):
+            elif mode == "steering":
+                # guide, next-turn, /help, exit, and the pasted block.
+                wait_for_ui(lambda: len(ui._messages) == 5)
+                results["STEERING="] = ui.take_steering()
+            elif mode == "queue-off":
+                wait_for_ui(lambda: ui._editor.text == "kept" and bool(ui._notice))
                 results["STEERING="] = ui.take_steering()
             elif mode == "details":
                 ui.feed_detail("reasoning", "visible-reasoning")

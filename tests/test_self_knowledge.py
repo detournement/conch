@@ -11,7 +11,7 @@ import urllib.error
 from unittest.mock import patch
 
 from conch import providers
-from conch.config import get_config_path
+from conch.config import display_path, get_config_path
 from conch.modelcheck import CLOUD_PROVIDERS
 from conch.prompts import build_self_description
 from conch.providers import (
@@ -271,7 +271,7 @@ class TestStatusCommand(CtxCacheTestCase):
         self.assertIn("anthropic", output)
         self.assertIn("claude-sonnet-4-6", output)
         self.assertIn("1,000,000 tokens", output)
-        self.assertIn(get_config_path(), output)
+        self.assertIn(display_path(get_config_path()), output)
 
     def test_shows_context_usage_vs_window(self):
         messages = [{"role": "user", "content": "x" * 3500}]  # ~1000 tokens

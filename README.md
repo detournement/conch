@@ -87,7 +87,7 @@ Animation is disabled for non-TTY output and `TERM=dumb`.
 | `/model`, `/models` | Search models for the current provider |
 | `/provider` | Choose a provider |
 | `/convos`, `/switch` | Search and resume conversations |
-| Ctrl+C | Stop active work; when idle, clear/cancel input (twice to exit) |
+| Ctrl+C | Stop active work and return pending messages to the composer; when idle, clear/cancel input (twice to exit) |
 | Ctrl+D | Exit with an empty composer |
 
 Tool activity is compact by default; `/verbose on` shows full returned results.
@@ -508,8 +508,9 @@ shows example requests, model/command discovery, and the active approval policy.
 A choice that cannot be completed saves nothing and returns to the provider
 menu: a missing provider CLI (with its install command), a failed sign-in, an
 empty API key, an unreachable Ollama, or an empty custom URL. A key the provider
-rejects is saved only if you confirm. Ctrl+C cancels setup without starting a
-broken session; existing configuration skips the wizard.
+rejects is saved only if you confirm. If the final model check fails, setup
+offers another provider and discards the failed attempt. Ctrl+C cancels setup
+without starting a broken session; existing configuration skips the wizard.
 The installer does not ask for optional integration credentials.
 
 With Node.js and npm available, install the official CLI and sign in:

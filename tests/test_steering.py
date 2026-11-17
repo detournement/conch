@@ -260,6 +260,27 @@ class TestSafeBoundarySteering(unittest.TestCase):
             ["perform the work", "Real guidance"],
         )
 
+    def test_tool_relevance_keeps_the_original_request_after_guidance(self):
+        queries = []
+
+        def relevant(tools, text, limit, pinned=None):
+            queries.append(text)
+            return tools[:limit]
+
+        def respond(messages, tools):
+            if len(self.requests) == 1:
+                self.pending.append("shorter")
+                return _response("Initial answer")
+            return _response("Short answer")
+
+        with patch.dict("conch.providers.PROVIDER_TOOL_LIMITS", {"openai": 1}), \
+                patch("conch.tooling.select_relevant_tools", side_effect=relevant):
+            self.run_turn(respond)
+        self.assertEqual(len(queries), 2)
+        self.assertIn("perform the work", queries[0])
+        self.assertIn("perform the work", queries[1])
+        self.assertIn("shorter", queries[1])
+
     def test_ui_stream_commits_intermediate_response_without_repeating_it(self):
         class Surface:
             def __init__(self):

@@ -579,10 +579,14 @@ class TerminalUI:
             hints.append("Alt+R details")
         if not self._notice:
             hints.append("Alt+Enter newline")
+        return [("class:muted", self._fit_hints(hints))]
+
+    def _fit_hints(self, hints):
+        """One row of hints, most important first, dropped from the end."""
         width = self._output.get_size().columns - 1
         while len(hints) > 1 and get_cwidth(" · ".join(hints)) > width:
             hints.pop()
-        return [("class:muted", self._clip(" · ".join(hints)))]
+        return self._clip(" · ".join(hints))
 
     @staticmethod
     def _can_steer(text):
@@ -677,15 +681,16 @@ class TerminalUI:
             return fragments
 
     def _modal_hints(self):
+        # Ordered by importance: leaving and confirming outlast navigation.
         if self._modal == "queue":
-            text = "Up/Down selects · Enter edits · Delete removes · Escape closes"
+            hints = ["Escape closes", "Enter edits", "Delete removes", "Up/Down selects"]
         elif self._modal == "queue-edit":
-            text = "Enter saves · Alt+Enter newline · Escape restores original"
+            hints = ["Enter saves", "Escape restores original", "Alt+Enter newline"]
         elif self._modal == "choose":
-            text = "Type to filter · Up/Down selects · Enter chooses · Escape cancels"
+            hints = ["Enter chooses", "Escape cancels", "Up/Down selects", "Type to filter"]
         else:
-            text = "Enter submits · Escape cancels"
-        return [("class:muted", text)]
+            hints = ["Enter submits", "Escape cancels"]
+        return [("class:muted", self._fit_hints(hints))]
 
     def _move_pending(self, direction):
         with self._condition:
@@ -747,6 +752,25 @@ class TerminalUI:
             self._queue_selection = items[min(index, len(items) - 1)] if items else None
             self._condition.notify_all()
 
+    def restore_pending(self) -> int:
+        """Move every undelivered message back into the composer, ahead of
+        the current draft. Returns how many were moved."""
+        def restore():
+            with self._condition:
+                items = self._pending_items()
+                for item in items:
+                    self._messages.remove(item)
+                self._editing_message = None
+                self._queue_selection = None
+            if items:
+                draft = self._editor.text
+                text = "\n".join([item.text for item in items] + ([draft] if draft else []))
+                self._editor.buffer.document = Document(text, len(text))
+                self._notice = (f"Stopped · {len(items)} pending "
+                                f"message{'' if len(items) == 1 else 's'} returned to the draft")
+            return len(items)
+        return self._change(restore)
+
     def _reset_selection(self):
         self._selection = 0
 
@@ -761,12 +785,17 @@ class TerminalUI:
             return [("class:muted", "No matches")]
         self._selection = min(self._selection, len(choices) - 1)
         start = max(0, self._selection - 6)
+        visible = range(start, min(len(choices), start + 8))
+        # Descriptions share one column; a single long label is capped so it
+        # cannot push every description off the row.
+        column = min(28, max(get_cwidth(str(choices[index][1])) for index in visible))
         fragments = []
-        for index in range(start, min(len(choices), start + 8)):
+        for index in visible:
             _, label, description = choices[index]
             style = "class:selected" if index == self._selection else ""
+            gap = " " * max(0, column - get_cwidth(str(label)))
             fragments.append((style, self._clip(
-                f"{'›' if index == self._selection else ' '} {label}  {description}") + "\n"))
+                f"{'›' if index == self._selection else ' '} {label}{gap}  {description}") + "\n"))
         return fragments
 
     def _open_modal(self, kind, title, choices=(), palette=False):
@@ -853,8 +882,9 @@ class TerminalUI:
                 # published reasoning stays readable until the next turn.
                 self._detail_text = ""
                 self._detail_kind = None
+            if busy != self._busy:
+                self._notice = ""
             self._busy = busy
-            self._notice = ""
             self._flush_deferred_echo()
         self._change(update)
 

@@ -32,10 +32,13 @@ from urllib import error, request
 
 from . import auth, seats
 from .config import (
+    display_path,
     find_project_rc,
     get_config_path,
     get_env_file_path,
+    get_env_manifest_path,
     load_config,
+    remove_env_values,
     set_config_values,
     set_env_values,
 )
@@ -100,14 +103,6 @@ def _say(text: str, color: str = "", *, prefix: str = INDENT,
 def _step(number: int, title: str) -> None:
     print()
     _say(f"Step {number} of 3 · {title}", BOLD)
-
-
-def _display_path(path: str) -> str:
-    """*path* with the home directory abbreviated to ``~`` — display only."""
-    home = str(Path.home())
-    if path == home or path.startswith(home + os.sep):
-        return "~" + path[len(home):]
-    return path
 
 
 def _confirm(question: str, default: bool) -> bool:
@@ -276,7 +271,7 @@ def _ask_provider(default: int) -> Tuple[str, str, str]:
 
 def _collect_key(env_name: str) -> str:
     """The API key via getpass — hidden input; empty means go back."""
-    _say(f"The key is stored in {_display_path(get_env_file_path())} (0600),"
+    _say(f"The key is stored in {display_path(get_env_file_path())} (0600),"
          " never echoed, never logged.", DIM)
     return getpass.getpass(f"{INDENT}{env_name} (Enter to go back): ").strip()
 
@@ -322,7 +317,7 @@ def _choose_custom_model(base_url: str, api_key: str) -> str:
     _say(f"Looking up models at {base_url} …", DIM)
     with Spinner("Discovering custom models"):
         models, tool_capable = discover_custom_models(base_url, api_key)
-    config_path = _display_path(get_config_path())
+    config_path = display_path(get_config_path())
     if models is None:
         _say("! Endpoint unreachable.", YELLOW)
         _say(f"Add `custom_model = <name>` to {config_path} once it is up"
@@ -370,9 +365,9 @@ def _probe(provider: str, key: str, base_url: str = "") -> bool:
 
 def _report_saved(config_path: str, key_saved: bool = False) -> None:
     print()
-    _say(f"Configuration saved: {_display_path(config_path)}", DIM)
+    _say(f"Configuration saved: {display_path(config_path)}", DIM)
     if key_saved:
-        _say(f"Key saved: {_display_path(get_env_file_path())} (0600)."
+        _say(f"Key saved: {display_path(get_env_file_path())} (0600)."
              " `conch keys` lists, verifies, and rotates it later.", DIM)
 
 
@@ -412,7 +407,7 @@ def _connect_seat(provider: str, label: str,
         seat_states[provider] = SEAT_READY
     model, config_path = auth.select(provider)
     _say(f"✓ {label} is signed in.", GREEN)
-    _say(f"Saved {provider}/{model} to {_display_path(config_path)}; your"
+    _say(f"Saved {provider}/{model} to {display_path(config_path)}; your"
          " sign-in stays with the provider's CLI.", DIM)
     return True
 
@@ -502,7 +497,9 @@ def _connect_api_key(provider: str, env_name: str) -> bool:
 def run_first_run_wizard() -> ModelCheckOutcome:
     """Choose a provider, connect it, and return its startup verification
     outcome. A choice that cannot be connected saves nothing and returns to
-    the provider menu; only Ctrl+C/EOF leaves without a configuration."""
+    the provider menu, and so can one whose model then fails verification."""
+    from .bootstrap import StartupError
+
     seat_states, ollama_models = _detect()
     print()
     _say("Welcome to Conch", CYAN)
@@ -531,7 +528,32 @@ def run_first_run_wizard() -> ModelCheckOutcome:
             connected = _connect_api_key(provider, env_name)
         if connected:
             _step(3, "Verify a model")
-            return verify_configured_model()
+            try:
+                return verify_configured_model()
+            except StartupError:
+                try:
+                    again = _confirm("Choose a different provider?", True)
+                except (KeyboardInterrupt, EOFError):
+                    again = False
+                if not again:
+                    raise
+                _discard_setup()
+                _say("Nothing from that attempt was kept.", DIM)
+
+
+def _discard_setup() -> None:
+    """Remove what this run wrote, so another provider starts clean. The
+    wizard only runs when none of these files exist, so nothing of the
+    user's own is ever deleted."""
+    names = [row[1] for row in WIZARD_PROVIDERS if row[1]] + [CUSTOM_KEY_ENV]
+    for name in remove_env_values(names):
+        os.environ.pop(name, None)
+    for path in (get_config_path(), get_env_file_path(),
+                 get_env_manifest_path()):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 def verify_configured_model() -> ModelCheckOutcome:
@@ -544,7 +566,8 @@ def verify_configured_model() -> ModelCheckOutcome:
     config = load_config()
     label = f"{config.get('provider')}/{config.get('chat_model') or config.get('model')}"
     _say(f"Checking {label} …", DIM)
-    outcome = ensure_working_model(config, interactive=True, persist_mode="always")
+    outcome = ensure_working_model(config, interactive=True, persist_mode="always",
+                                   restart_hint=False)
     if not outcome.checked:
         _say(f"model check is off (model_check=off); {label} unverified", DIM)
     elif not outcome.switched:
@@ -575,7 +598,7 @@ def maybe_run_first_run_wizard() -> Optional[ModelCheckOutcome]:
         # so the next launch re-checks instead of chatting with a model
         # that is known not to answer.
         print(str(exc), file=sys.stderr)
-        _say(f"Setup is saved in {_display_path(get_config_path())}. Run"
+        _say(f"Setup is saved in {display_path(get_config_path())}. Run"
              " `conch` again once the model is reachable, or edit that"
              " file.", DIM)
         sys.exit(exc.code)

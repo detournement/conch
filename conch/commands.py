@@ -2390,7 +2390,10 @@ def handle_slash_command(
         return None
 
     if command == "/status":
-        from .config import get_config_path, local_only_enabled
+        import shutil
+        import textwrap
+
+        from .config import display_path, get_config_path, local_only_enabled
         from .providers import (
             get_context_window,
             validate_model_for_provider,
@@ -2432,7 +2435,7 @@ def handle_slash_command(
         print(f"    Agent mode:     {agent_status}")
         config_path = get_config_path()
         exists = "" if os.path.isfile(config_path) else "  \033[2m(not created yet — using defaults)\033[0m"
-        print(f"    Config file:    {config_path}{exists}")
+        print(f"    Config file:    {display_path(config_path)}{exists}")
         if provider == "ollama":
             print(f"    Ollama server:  {get_ollama_base_url(config)}")
         elif provider == "custom":
@@ -2449,7 +2452,17 @@ def handle_slash_command(
             if k not in _skip_keys and not _is_secret(k)
         ]
         if extras:
-            print(f"    Settings:       \033[2m{', '.join(extras)}\033[0m")
+            # Wrap on setting boundaries with a hanging indent; the terminal's
+            # own wrap would split names and values mid-word.
+            label = "    Settings:       "
+            width = max(40, shutil.get_terminal_size(fallback=(80, 24)).columns - 1)
+            lines = textwrap.wrap(
+                ", ".join(extras), width=width - len(label),
+                break_long_words=False, break_on_hyphens=False,
+            )
+            for number, line in enumerate(lines):
+                head = label if not number else " " * len(label)
+                print(f"{head}\033[2m{line}\033[0m")
         print()
         return None
 

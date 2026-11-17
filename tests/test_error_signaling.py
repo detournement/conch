@@ -204,7 +204,11 @@ class TestChatTurnNeverPersistsErrors(_QuietStderr):
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hello"},
         ]
-        with patch("conch.providers.get_fallback_chain", return_value=[]):
+        # The expected default server URL must not depend on the developer's
+        # own OLLAMA_HOST.
+        environment = {k: v for k, v in os.environ.items() if k != "OLLAMA_HOST"}
+        with patch("conch.providers.get_fallback_chain", return_value=[]), \
+                patch.dict(os.environ, environment, clear=True):
             reply, usage = chat_turn(
                 config={"provider": provider, "chat_model": "qwen3"},
                 provider=provider,

@@ -324,14 +324,16 @@ class WizardCase(OnboardingCase):
     """Scripted wizard walks: no network, no native CLI, no real model check."""
 
     def walk(self, inputs, keys=(), *, ollama=(None,), signed_in=(),
-             installed=(), login_exit=1, columns=80, key_accepted=True):
+             installed=(), login_exit=1, columns=80, key_accepted=True,
+             verification=()):
         """Drive maybe_run_first_run_wizard with scripted answers.
 
         The script runs out into Ctrl+C, so a walk that never connects a
         provider ends with ``exit_code == 0``. *ollama* lists successive
         detection results (the last repeats); *signed_in*/*installed* name
         the seats whose official CLI is on PATH; a native login exiting 0
-        signs that seat in.
+        signs that seat in. *verification* lists model-check results in
+        order (an exception fails that check); later checks succeed.
         """
         ready = set(signed_in)
         on_path = ready | set(installed)
@@ -367,8 +369,16 @@ class WizardCase(OnboardingCase):
             use("conch.seats.status", side_effect=status)
             use("conch.auth.status", side_effect=status)
             walk.login = use("conch.auth.subprocess.run", side_effect=native)
+            checks = list(verification)
+
+            def check(config, **kwargs):
+                result = checks.pop(0) if checks else None
+                if isinstance(result, BaseException):
+                    raise result
+                return _verified(config, **kwargs)
+
             walk.check = use("conch.onboarding.ensure_working_model",
-                             side_effect=_verified)
+                             side_effect=check)
             walk.asked = use("builtins.input",
                              side_effect=[*inputs, KeyboardInterrupt])
             walk.hidden = use("conch.onboarding.getpass.getpass",
@@ -453,6 +463,47 @@ class TestWizardRecovery(WizardCase):
         self.assertIn(f"OPENAI_API_KEY={SECRET}",
                       Path(config_mod.get_env_file_path()).read_text())
         self.assertNotIn(SECRET, walk.output)
+
+    def test_failed_verification_can_restart_with_nothing_kept(self):
+        from conch.bootstrap import StartupError
+
+        # openai connects, its model fails; "choose different" → back to menu.
+        walk = self.walk(["openai", "n", "y"], keys=[SECRET],
+                         verification=[StartupError("no working model", code=69)])
+        self.assert_back_at_provider_prompt_then_cancelled_after_check(walk)
+        self.assertNotIn("OPENAI_API_KEY", os.environ)
+
+    def test_failed_verification_then_another_provider_starts_clean(self):
+        from conch.bootstrap import StartupError
+
+        walk = self.walk(
+            ["custom", "http://127.0.0.1:1/v1", "n", "", "anthropic", "n"],
+            keys=["endpoint-secret", SECRET],
+            verification=[StartupError("no working model", code=69)],
+        )
+        self.assertTrue(walk.outcome)
+        loaded = config_mod.load_config()
+        self.assertEqual(loaded["provider"], "anthropic")
+        self.assertNotIn("custom_base_url",
+                         Path(config_mod.get_config_path()).read_text())
+        env_text = Path(config_mod.get_env_file_path()).read_text()
+        self.assertIn(f"ANTHROPIC_API_KEY={SECRET}", env_text)
+        self.assertNotIn("endpoint-secret", env_text)
+
+    def test_declining_to_restart_keeps_the_setup_and_reports_failure(self):
+        from conch.bootstrap import StartupError
+
+        walk = self.walk(["openai", "n", "n"], keys=[SECRET],
+                         verification=[StartupError("no working model", code=69)])
+        self.assertEqual(walk.exit_code, 69)
+        self.assertIn("provider = openai",
+                      Path(config_mod.get_config_path()).read_text())
+
+    def assert_back_at_provider_prompt_then_cancelled_after_check(self, walk):
+        self.assertEqual(walk.exit_code, 0)
+        self.assertIsNone(walk.outcome)
+        walk.check.assert_called_once()
+        self.assert_nothing_saved()
 
     def test_ollama_is_detected_again_when_chosen_again(self):
         # Menu detection, first choice: down. Second choice: up with a model.

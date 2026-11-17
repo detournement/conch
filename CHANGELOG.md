@@ -36,6 +36,14 @@ Releases before 0.6.0 predate this changelog.
 - A failed model request is reported once, without a repeated detail line or a
   trailing `[no response]`. Generation progress clears when the turn ends;
   published reasoning stays readable until the next turn.
+- Ctrl+C during a turn returns pending guidance and follow-ups to the composer
+  instead of letting them start new work after the stop.
+- When first-run model verification fails, setup offers another provider and
+  discards the failed attempt's config and key instead of exiting with a saved
+  configuration that cannot start.
+- The `/provider` picker lists the current provider first and shows what each
+  other provider needs; picker descriptions align in one column. `/status`
+  wraps settings on boundaries and shows `~`-relative paths.
 
 ### Fixed
 
@@ -57,6 +65,8 @@ Releases before 0.6.0 predate this changelog.
 - Captured output keeps one copy of overstruck man-page text, and an
   unterminated terminal control string can no longer swallow later lines.
 - Non-streamed OpenAI and Cerebras replies strip inline `<think>` blocks.
+- Tool relevance on tool-capped providers follows the turn's original request
+  plus guidance, not the latest guidance message alone.
 
 ## [0.8.0] - 2026-11-16
 

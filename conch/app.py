@@ -30,7 +30,7 @@ from .bootstrap import (
     start_task_backend,
 )
 from .commands import handle_slash_command
-from .config import get_bool, load_config
+from .config import display_path, get_bool, load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
 from .modelcheck import ensure_working_model
@@ -70,13 +70,27 @@ AGENT_MODE_CONFIG_NOTICE = (
 
 def _display_path(path: str, width: int) -> str:
     """Home-relative path, middle-truncated to fit on one terminal row."""
-    home = os.path.expanduser("~")
-    if path == home or path.startswith(home + os.sep):
-        path = "~" + path[len(home):]
+    path = display_path(path)
     if len(path) > width > 8:
         head = (width - 1) // 3
         path = path[:head] + "…" + path[-(width - 1 - head):]
     return path
+
+
+def _provider_note(name: str, current: str) -> str:
+    """What choosing this provider needs, for the /provider picker."""
+    if name == current:
+        return "Current provider"
+    env_name = DEFAULT_API_KEY_ENVS.get(name)
+    if env_name:
+        return (f"{env_name} is set" if os.environ.get(env_name, "").strip()
+                else f"Needs {env_name}")
+    return {
+        "claude-code": "Claude subscription sign-in, no API key",
+        "codex": "ChatGPT subscription sign-in, no API key",
+        "ollama": "Local models",
+        "custom": "OpenAI-compatible endpoint",
+    }.get(name, "")
 
 
 
@@ -864,8 +878,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
             return None
         if head == "/provider" and not argument.strip():
             selected = _ui.choose("Provider", [
-                (name, name, "Current provider" if name == provider else "Switch provider")
-                for name in RAW_FNS
+                (name, name, _provider_note(name, provider))
+                for name in sorted(RAW_FNS, key=lambda name: name != provider)
             ])
             return "/provider " + selected if selected else None
         if head in ("/model", "/models") and not argument.strip():
@@ -891,7 +905,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                     conversation["id"], conversation.get("title") or "Untitled",
                     ("Current · " if conversation["id"] == current_conv.id else "")
                     + f"{conversation.get('message_count', 0)} messages · "
-                    + conversation.get("updated_at", "")[:16],
+                    + conversation.get("updated_at", "")[:16].replace("T", " "),
                 )
                 for conversation in conv_mgr.list_all()
             ]
@@ -1276,7 +1290,13 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                     _printer.flush()
                 if _ui:
                     _ui.clear_activities()
-                print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
+                    # Stopping must not be undone by queued input starting
+                    # new work: hand it back to the composer instead.
+                    _ui.set_busy(False)
+                    _ui.restore_pending()
+                    print("  \033[33m\u26a0 Interrupted\033[0m\n")
+                else:
+                    print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
                 _save_current()
                 continue
             except BaseException:

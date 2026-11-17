@@ -230,6 +230,14 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
                 "the user asks for commits. Conch snapshots the worktree "
                 "after every turn that changes files (/undo restores)."
             )
+    # GitHub snapshot (repository, branch PR and checks, open PRs and
+    # issues) once github_context.start() has fetched it.
+    from .github_context import get as repo_context
+    repo_ctx = repo_context()
+    if repo_ctx is not None:
+        section = repo_ctx.prompt_section()
+        if section:
+            prompt += "\n\n" + section
     # Available skills (plan 4.1): compact list so the model knows what it
     # can load with skill_manage.
     from .skills import build_skills_context
@@ -478,6 +486,13 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         print(_NON_INTERACTIVE_NOTICE, file=sys.stderr)
     with Spinner("Starting Conch") if interactive else contextlib.nullcontext():
         config = load_config()
+    # Repository awareness: the repo and branch now, the GitHub snapshot in
+    # the background (it joins the system prompt before the first turn that
+    # finds it ready, and the status bar as soon as it lands).
+    from . import github_context
+
+    _repo_ctx = github_context.start(config)
+    _repo_ctx_in_prompt = _repo_ctx is None or _repo_ctx.done.is_set()
     agent_mode_from_config = apply_agent_mode_from_config(config)
     try:
         provider, raw_fn = resolve_startup_provider(config)
@@ -721,6 +736,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             print(f"\n\033[1;36mConch\033[0m \033[2mv{__version__}{check_note}\033[0m")
             columns = shutil.get_terminal_size(fallback=(80, 24)).columns
             print(f"\033[2m{_display_path(os.getcwd(), columns - 1)}\033[0m")
+            if _repo_ctx is not None:
+                print(_repo_ctx.banner_line())
             resumed = any(message.get("role") == "user" for message in messages)
             if resumed:
                 print(f"\033[2mResumed: {current_conv.title} · /new starts fresh\033[0m")
@@ -741,6 +758,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             f"\033[1;36mConch chat\033[0m \033[2mv{__version__} "
             f"({provider}/{model_name}{check_note})\033[0m"
         )
+        if _repo_ctx is not None:
+            print(f"\033[2m{_repo_ctx.banner_line()}\033[0m")
         if chat_state.all_tools:
             if len(chat_state.tools) < len(chat_state.all_tools):
                 print(f"\033[2m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active (/tools to manage)\033[0m")
@@ -903,6 +922,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 provider=provider, model=model_name,
                 permission=session.permissions.get_permission_mode(),
                 conversation=current_conv.title, cwd=os.getcwd(),
+                repo=_repo_ctx.indicator() if _repo_ctx is not None else "",
                 tools=f"{len(chat_state.tools)}/{len(chat_state.all_tools)}",
                 session_cost=format_session_cost(session_usage, provider, model_name, config),
             )
@@ -1124,6 +1144,10 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             _ui.start()
             set_verbose_tools(False)
             _sync_ui_context()
+            if _repo_ctx is not None:
+                # The snapshot usually lands while the user types the first
+                # message: show its PR and check state without waiting.
+                _repo_ctx.on_ready(lambda: _ui.set_context(repo=_repo_ctx.indicator()))
         _print_banner()
         while True:
             # MCP tools that finished loading since the last turn attach
@@ -1438,6 +1462,13 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 _backend_failed = False
                 print("  \033[2m(server back online)\033[0m")
 
+            # The GitHub snapshot arrived after the prompt was built: put it
+            # in now, once, before this turn (a single prefix-cache miss).
+            if not _repo_ctx_in_prompt and _repo_ctx.done.is_set():
+                _repo_ctx_in_prompt = True
+                system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = system_prompt
             # Set title from first user message immediately
             if current_conv.title == "New conversation":
                 current_conv.title = user_input.strip().splitlines()[0][:60] or "New conversation"
@@ -1895,6 +1926,13 @@ def main():
         if model_check.switched:
             provider, model_name = model_check.provider, model_check.model
         base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
+        # Only a working model earns the GitHub fetch; a one-shot has a
+        # single turn, so it waits a moment for the snapshot.
+        from . import github_context
+
+        _repo_ctx = github_context.start(config)
+        if _repo_ctx is not None:
+            _repo_ctx.done.wait(timeout=2.0)
         location = (
             _detect_location()
             if get_bool(config, "detect_location", False)

@@ -9,6 +9,16 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+### Added
+
+- Repository awareness: inside a git checkout the status bar and startup banner
+  show the repository and branch (`🐙 owner/repo ⎇ branch` on GitHub, with the
+  branch's open PR and a check-state icon). On GitHub, one background `gh`
+  request loads the description, default branch, latest release, the branch's
+  pull request and checks, and recent open pull requests and issues into the
+  model's context before the first turn. `github_context = false` turns the
+  fetch off.
+
 ## [0.9.0] - 2026-11-17
 
 ### Added

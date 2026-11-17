@@ -548,6 +548,10 @@ class TerminalUI:
                 priority = " · ".join(parts[:-1])
                 text = f"{priority}\n{parts[-1]}" if priority else parts[-1]
                 return [("class:status", _safe(text))]
+        if fields.get("repo"):
+            # Where the session is (🐙 owner/repo ⎇ branch #PR ✓) before
+            # the model: the clip drops the title and tool count first.
+            parts.append(str(fields["repo"]))
         model = "/".join(str(fields[key]) for key in ("provider", "model") if fields.get(key))
         if model:
             parts.append(model)

@@ -1108,6 +1108,15 @@ Only native tool calls are executable; repeated identical call batches stop.
   Secret-bearing entries are rejected whole; legacy matches are withheld.
 - Starting in a Git repository injects a bounded repository map. `CONCH.md`,
   `AGENTS.md`, and the nearest project `.conchrc` add project context.
+- Inside a git checkout the status bar shows where you are: `🐙 owner/repo ⎇ branch`
+  for a GitHub repository (with the branch's open PR number and `✓`/`✗`/`●` for its
+  checks), `name ⎇ branch` otherwise; the startup banner repeats it. For GitHub,
+  one background `gh api graphql` call at startup loads the description, default
+  branch, latest release, the branch's pull request and checks (failing ones named),
+  and the most recently updated open pull requests and issues into the model's
+  context, so it starts knowing the repository's state. It needs the `gh` CLI
+  signed in (`gh auth login`); without it the banner says why and the model is told
+  to use `gh`. `github_context = false` turns the fetch off.
 - `conch_introspect` reports live capabilities, redacted effective config, and
   bounded views of Conch's own source; `docs <topic>` returns the README and
   `docs/` sections that explain a feature, and `settings` lists what Conch can

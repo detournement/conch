@@ -15,6 +15,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from . import mcp as mcp_mod
+from .images import IMAGE_TOKENS, is_image_block, placeholder, without_payloads
 from .render import Spinner, StreamPrinter, _get_active_ui, clear_active_spinners
 
 logger = logging.getLogger("conch.runtime")
@@ -289,14 +290,17 @@ def get_context_limit(provider: str, config: Optional[dict] = None) -> int:
 def char_count(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
     # Count the complete wire representation. Tool-call names/arguments and
     # role/ID framing consume context too; counting only message.content
-    # substantially underestimates long agent loops.
+    # substantially underestimates long agent loops. An image counts as
+    # IMAGE_TOKENS worth of chars, never its base64 length, so calibration
+    # against the provider's real input tokens stays meaningful.
+    messages, image_count = without_payloads(messages)
     total = sum(
         len(json.dumps(message, ensure_ascii=False, default=str))
         for message in messages
     )
     if tools:
         total += len(json.dumps(tools, ensure_ascii=False, default=str))
-    return total
+    return total + int(image_count * IMAGE_TOKENS * CHARS_PER_TOKEN)
 
 
 def estimate_tokens(
@@ -305,7 +309,12 @@ def estimate_tokens(
     *,
     key: str = "default",
 ) -> int:
-    return int(char_count(messages, tools) / get_chars_per_token(key))
+    # Images are a fixed per-image cost; only text goes through the ratio.
+    messages, image_count = without_payloads(messages)
+    return (
+        int(char_count(messages, tools) / get_chars_per_token(key))
+        + image_count * IMAGE_TOKENS
+    )
 
 
 def format_context_gauge(used_tokens: int, window: int) -> str:
@@ -447,6 +456,8 @@ def _message_as_text(message: dict) -> str:
                     f"tool call {block.get('name', '')}: "
                     f"{json.dumps(block.get('input', {}), ensure_ascii=False)}"
                 )
+            elif is_image_block(block):
+                rendered.append(placeholder(block))
             elif block.get("type") == "tool_result":
                 rendered.append(
                     f"tool result {block.get('tool_use_id', '')}: "
@@ -516,16 +527,34 @@ def _prepend_history_note(recent: List[dict], text: str) -> List[dict]:
     return [{"role": "user", "content": note}] + recent
 
 
+def _compaction_span(messages: List[dict]) -> tuple:
+    """(start, cut): ``messages[start:cut]`` is the older history a
+    compaction summarizes — after the system prompt, before the last few
+    whole tool-call groups."""
+    start = 1 if messages and messages[0].get("role") == "system" else 0
+    return start, _recent_group_start(messages, start, AUTO_COMPACT_KEEP_RECENT)
+
+
+def can_compact(messages: List[dict]) -> bool:
+    """Whether there is enough older history to be worth a summary call."""
+    start, cut = _compaction_span(messages)
+    return cut - start >= 4
+
+
 def auto_compact(
     messages: List[dict],
     tools: Optional[List[dict]],
     provider: str,
     config: Optional[dict],
     raw_fn,
+    *,
+    force: bool = False,
+    focus: str = "",
 ) -> bool:
     """LLM-generated compaction: at ~70% of the context budget, replace older
     history with a single model-written summary, keeping the system prompt
-    and the last few messages verbatim.
+    and the last few messages verbatim. *force* (/compact) skips the
+    threshold; *focus* is appended to the summarizer's instruction.
 
     Returns True when history was compacted. On any failure (summary call
     errors, empty summary) leaves messages untouched — the cheap char-capping
@@ -533,15 +562,14 @@ def auto_compact(
     """
     limit = get_context_limit(provider, config)
     key = calibration_key(provider, config)
-    if estimate_tokens(
+    if not force and estimate_tokens(
         messages, tools, key=key
     ) < limit * AUTO_COMPACT_THRESHOLD:
         return False
     has_system = bool(messages) and messages[0].get("role") == "system"
-    start = 1 if has_system else 0
-    cut = _recent_group_start(messages, start, AUTO_COMPACT_KEEP_RECENT)
-    if cut - start < 4:
+    if not can_compact(messages):
         return False  # too little old history to be worth an LLM call
+    start, cut = _compaction_span(messages)
     old = messages[start:cut]
 
     lines = []
@@ -568,7 +596,10 @@ def auto_compact(
     # context than the main model.
     transcript = truncate_middle(transcript, int(summary_limit * 2))
     summary_messages = [
-        {"role": "system", "content": _COMPACT_SYSTEM_PROMPT},
+        {"role": "system", "content": _COMPACT_SYSTEM_PROMPT + (
+            f"\n\nGive particular attention to: {focus.strip()}"
+            if focus and focus.strip() else ""
+        )},
         {"role": "user", "content": transcript},
     ]
     try:
@@ -590,13 +621,21 @@ def auto_compact(
     return True
 
 
-def summarize_message(message: dict) -> dict:
+def summarize_message(message: dict, keep_images: bool = False) -> dict:
+    """Char-capped copy of *message*. Images become ``[image: name]`` text
+    unless *keep_images* (the current turn): base64 is never sliced."""
     content = message.get("content", "")
     if isinstance(content, str) and len(content) > 500:
         return {**message, "content": content[:200] + "\n...[compressed]...\n" + content[-100:]}
     if isinstance(content, list):
         blocks = []
         for block in content:
+            if is_image_block(block):
+                blocks.append(
+                    block if keep_images
+                    else {"type": "text", "text": placeholder(block)}
+                )
+                continue
             if isinstance(block, dict):
                 text = block.get("text", block.get("content", ""))
                 if isinstance(text, str) and len(text) > 500:
@@ -622,8 +661,20 @@ def compress_context(
     start = 1 if has_system else 0
     system = [messages[0]] if has_system else []
     spans = _history_group_spans(messages, start)
+    # The latest real user turn keeps its images: it is what the model is
+    # being asked about. Older images collapse to placeholders.
+    current = len(messages)
+    for index in range(len(messages) - 1, start - 1, -1):
+        if messages[index].get("role") == "user" and not is_anthropic_tool_result(
+            messages[index]
+        ):
+            current = index
+            break
     groups = [
-        [summarize_message(message) for message in messages[begin:end]]
+        [
+            summarize_message(messages[index], keep_images=index >= current)
+            for index in range(begin, end)
+        ]
         for begin, end in spans
     ]
     dropped_messages = 0
@@ -1046,6 +1097,15 @@ def normalize_messages_for_provider(messages: list, provider: str) -> list:
             ]
             text_content = "\n".join(p for p in text_parts if p).strip()
 
+            if not has_tool and any(is_image_block(b) for b in content):
+                # A user turn with attachments stays a text+image block
+                # list; each adapter converts images to its wire shape.
+                normalized.append({"role": role, "content": [
+                    b for b in content
+                    if isinstance(b, dict) and b.get("type") in ("text", "image")
+                ]})
+                i += 1
+                continue
             if has_tool and not text_content:
                 # Pure Anthropic tool block — skip it and its tool_result pair
                 i += 1
@@ -1158,6 +1218,15 @@ def normalize_messages_on_switch(messages: list, new_provider: str):
                         ):
                             i += 1
                     continue
+            elif any(is_image_block(b) for b in content):
+                # Keep attachments across the switch; the new provider's
+                # adapter converts canonical image blocks at request time.
+                cleaned.append({"role": role, "content": [
+                    b for b in content
+                    if isinstance(b, dict) and b.get("type") in ("text", "image")
+                ]})
+                i += 1
+                continue
             else:
                 text_parts = [
                     b.get("text", "")
@@ -1558,15 +1627,20 @@ def _graceful_exhaustion(
 
 
 def _latest_user_text(messages: List[dict]) -> str:
-    return next(
-        (
-            message.get("content", "")
-            for message in reversed(messages)
-            if message.get("role") == "user"
-            and isinstance(message.get("content"), str)
-        ),
-        "",
-    )
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        # A turn with image attachments is text+image blocks; its text is
+        # still the latest request (tool-result lists are not).
+        if isinstance(content, list) and any(is_image_block(b) for b in content):
+            return "\n".join(
+                str(b.get("text", "")) for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+    return ""
 
 
 def select_request_tools(

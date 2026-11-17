@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import uuid
 
+from .images import has_images, is_image_block, text_only
 from .seat_common import SeatError
 
 PROVIDERS = ("claude-code", "codex")
@@ -173,6 +175,39 @@ def normalize(response: dict, tools) -> dict:
             "tool_calls": normalized or None}
 
 
+SEAT_IMAGE_NOTE = "not sent: subscription seats take text only"
+# Images already warned about this process, so a tool loop re-sending the
+# same history doesn't repeat the warning on every model call.
+_warned_images: set = set()
+
+
+def _seat_messages(provider: str, messages: list) -> list:
+    """Seats receive a text prompt: images become labeled placeholders, and
+    the user is told once (stderr) when a newly attached image is dropped."""
+    if not has_images(messages):
+        return messages
+    fresh = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not is_image_block(block):
+                continue
+            data = (block.get("source") or {}).get("data") or ""
+            key = (block.get("name"), len(data), data[:64])
+            if key not in _warned_images:
+                _warned_images.add(key)
+                fresh.append(block.get("name") or "image")
+    if fresh:
+        print(
+            f"  \033[33m⚠ {provider}: {', '.join(fresh)} not sent — "
+            "subscription seats take text only\033[0m",
+            file=sys.stderr,
+        )
+    return text_only(messages, SEAT_IMAGE_NOTE)
+
+
 def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
     from .providers import error_response
     from .render import emit_generation_detail
@@ -194,7 +229,8 @@ def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
         "Never execute tools yourself. Text alone does nothing: when you say you will "
         "do something, include its tool_calls entry in this same response. Use an empty "
         "tool_calls array only for a final answer.\n"
-        + json.dumps({"messages": messages, "tools": tools or []}, ensure_ascii=False)
+        + json.dumps({"messages": _seat_messages(provider, messages), "tools": tools or []},
+                     ensure_ascii=False)
     )
     try:
         on_detail = None

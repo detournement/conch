@@ -44,8 +44,23 @@ class TestSelectRelevantTools(unittest.TestCase):
         self.assertEqual([t["function"]["name"] for t in result],
                          ["t0", "t1", "t2", "t3"])
 
-    def test_ollama_limit_is_small(self):
-        self.assertEqual(PROVIDER_TOOL_LIMITS["ollama"], 12)
+    def test_local_cap_leaves_room_beyond_the_pinned_core(self):
+        """Pinning more always-on tools must not starve local models of the
+        relevance-picked ones (MCP servers, memory, search), and the cap must
+        stay far below what cloud providers accept."""
+        from conch.tooling import PINNED_TOOL_NAMES
+
+        for provider in ("ollama", "custom"):
+            limit = PROVIDER_TOOL_LIMITS[provider]
+            self.assertGreaterEqual(limit - len(PINNED_TOOL_NAMES), 4, provider)
+            self.assertLessEqual(limit, 24, provider)
+        tools = [_tool(name) for name in sorted(PINNED_TOOL_NAMES)]
+        tools += [_tool("github_create_issue", "Create a GitHub issue")]
+        tools += [_tool(f"filler_{i}", "unrelated") for i in range(20)]
+        picked = select_relevant_tools(
+            tools, "open a github issue", PROVIDER_TOOL_LIMITS["ollama"]
+        )
+        self.assertIn("github_create_issue", [t["function"]["name"] for t in picked])
 
 
 class TestConfigProfiles(unittest.TestCase):

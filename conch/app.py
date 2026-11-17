@@ -10,6 +10,7 @@ import readline
 import shutil
 import sys
 import threading
+import time
 import urllib.request
 from typing import List, Optional
 
@@ -34,7 +35,9 @@ from .config import display_path, get_bool, load_config
 from .conversations import Conversation, ConversationManager
 from .memory import MemoryStore
 from .modelcheck import ensure_working_model
-from .providers import DEFAULT_API_KEY_ENVS, RAW_FNS, format_session_cost, record_session_usage
+from .providers import (
+    DEFAULT_API_KEY_ENVS, RAW_FNS, add_usage, format_session_cost, record_session_usage,
+)
 from .render import highlight, StreamPrinter, Spinner
 from .runtime import sanitize_anthropic_messages
 from .session import AgentSession
@@ -262,10 +265,10 @@ def session_worth_summarizing(messages: List[dict], config: dict) -> bool:
     min_turns = session_summary_min_turns(config)
     if min_turns is None:
         return False
+    from .conversations import is_user_prompt, prompt_text
+
     user_turns = [
-        m for m in messages
-        if isinstance(m, dict) and m.get("role") == "user"
-        and isinstance(m.get("content"), str) and m["content"].strip()
+        m for m in messages if is_user_prompt(m) and prompt_text(m).strip()
     ]
     if not user_turns:
         return False
@@ -278,9 +281,14 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
     try:
         summary_prompt = "Summarize this conversation in 2-3 concise bullet points."
         summary_messages = [{"role": "system", "content": "You summarize conversations concisely."}]
+        from .conversations import is_user_prompt, prompt_text
+
         for message in messages[1:]:
-            if isinstance(message.get("content"), str) and message["role"] in ("user", "assistant"):
-                summary_messages.append({"role": message["role"], "content": message["content"][:500]})
+            if is_user_prompt(message):
+                # Typed text only: attached images read as [image: name].
+                summary_messages.append({"role": "user", "content": prompt_text(message)[:500]})
+            elif message["role"] == "assistant" and isinstance(message.get("content"), str):
+                summary_messages.append({"role": "assistant", "content": message["content"][:500]})
         summary_messages.append({"role": "user", "content": summary_prompt})
         # Session summaries are a side task — use the weak model when
         # configured (plan 2.7).
@@ -368,12 +376,23 @@ def _conversation_title(conv: Conversation, messages: List[dict]) -> str:
 
 
 def _startup_conversation(conv_mgr, model_name, provider, system_prompt,
-                          fresh=False):
-    """Pick the conversation the shell starts in: the most recent one by
-    default, a brand-new one when --new was passed or nothing usable
-    exists (no history, or every stored file was corrupt and quarantined).
+                          fresh=False, resume_id=None):
+    """Pick the conversation the shell starts in: *resume_id* when given
+    (picked on the conversations page), else the most recent one, or a
+    brand-new one when --new was passed or nothing usable exists (no
+    history, or every stored file was corrupt and quarantined).
     Returns (conversation, messages) with messages ready for the loop."""
-    current_conv = None if fresh else conv_mgr.get_most_recent()
+    current_conv = None
+    if resume_id:
+        current_conv = conv_mgr.load(resume_id)
+        if current_conv is None:
+            print(f"\033[33m  ⚠ Conversation {resume_id} no longer exists; "
+                  "resuming the most recent one\033[0m", file=sys.stderr)
+        elif not current_conv.messages:
+            current_conv.messages = [{"role": "system", "content": system_prompt}]
+            return current_conv, current_conv.messages
+    if current_conv is None and not fresh:
+        current_conv = conv_mgr.get_most_recent()
     if current_conv and current_conv.messages:
         messages = list(current_conv.messages)
         # Only strip textual tool-call artifacts (model-emitted junk);
@@ -400,7 +419,8 @@ def _startup_conversation(conv_mgr, model_name, provider, system_prompt,
     return current_conv, messages
 
 
-def chat_loop(new_conversation=False, interactive=True, startup_check=None):
+def chat_loop(new_conversation=False, interactive=True, startup_check=None,
+              resume_id=None):
     # Startup wiring lives in conch.bootstrap so headless modes can reuse it;
     # this function owns only the interactive composition (warnings printed
     # to stderr, startup failures become process exits).
@@ -494,7 +514,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
 
     conv_mgr = ConversationManager()
     current_conv, messages = _startup_conversation(
-        conv_mgr, model_name, provider, system_prompt, fresh=new_conversation
+        conv_mgr, model_name, provider, system_prompt, fresh=new_conversation,
+        resume_id=resume_id,
     )
 
     history_file = _history_path()
@@ -691,8 +712,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
         memory_count = len(memory.get_all())
         if memory_count:
             print(f"\033[2m{memory_count} memor{'y' if memory_count == 1 else 'ies'} loaded\033[0m")
-        user_msgs = [m for m in messages if m.get("role") == "user"
-                     and isinstance(m.get("content"), str)]
+        from .conversations import is_user_prompt
+
+        user_msgs = [m for m in messages if is_user_prompt(m)]
         if user_msgs:
             print(f"\033[2mResuming: {current_conv.title} ({len(user_msgs)} messages)\033[0m")
         convos = conv_mgr.list_all()
@@ -806,7 +828,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
             )[0][:80]
             _git_ckpt.snapshot(label, kind="before")
 
-    for _hooked in ("local_shell", "interactive_terminal"):
+    for _hooked in ("local_shell", "interactive_terminal", "edit_file", "write_file"):
         if hasattr(builtin_clients.get(_hooked), "set_before_run"):
             builtin_clients[_hooked].set_before_run(_before_mutation)
 
@@ -859,6 +881,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
         builtin_clients["local_shell"].set_policy(standard)
         builtin_clients["interactive_terminal"].set_policy(handoff)
         builtin_clients["ssh_remote"].set_policy(handoff)
+        for _name in ("read_file", "edit_file", "write_file", "web_fetch"):
+            if _name in builtin_clients:
+                builtin_clients[_name].set_policy(standard)
         builtin_clients["skill_manage"].configure(
             interactive=interactive, input_fn=_safe_input
         )
@@ -901,18 +926,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                 f"Models · {provider} · /model ID accepts other models", options
             )
             return "/model " + selected if selected else None
-        if head in ("/convos", "/switch") and not argument.strip():
-            options = [
-                (
-                    conversation["id"], conversation.get("title") or "Untitled",
-                    ("Current · " if conversation["id"] == current_conv.id else "")
-                    + f"{conversation.get('message_count', 0)} messages · "
-                    + conversation.get("updated_at", "")[:16].replace("T", " "),
-                )
-                for conversation in conv_mgr.list_all()
-            ]
-            selected = _ui.choose("Conversations · resume a session", options)
-            return "/switch " + selected if selected else None
         return command
 
     def _run_slash_builtin(tool_name: str, arguments: dict):
@@ -995,6 +1008,11 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
 
     last_interrupt = 0.0
     _backend_failed = False  # preflight the server after a failed turn (plan 3.3)
+    # /retry sets this to the previous user message; the next turn sends it
+    # verbatim (attachments included) instead of building one from input.
+    _replay_message = None
+    # /image attachments waiting for the next message (canonical blocks).
+    _pending_images: List[dict] = []
     try:
         if _use_terminal_ui:
             from .terminal_ui import TerminalUI
@@ -1118,6 +1136,12 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                 ):
                     _run_slash_builtin(result[1], result[2])
                     continue
+                if isinstance(result, tuple) and result[0] in (
+                    "attach_image", "attach_image_clear"
+                ):
+                    from .images import handle_attach_command
+                    handle_attach_command(result, _pending_images)
+                    continue
                 if isinstance(result, tuple) and result[0] == "user_prompt":
                     _custom_prompt = result[1]
                     _prompt_meta = result[2] if len(result) > 2 else None
@@ -1150,6 +1174,58 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                                 f"tool round budget raised to {_wanted} for "
                                 "this session; /rounds to change)\033[0m"
                             )
+                if result == "retry_last_prompt":
+                    # Resend the last prompt exactly as stored (attachments
+                    # included): drop it and everything after it, then fall
+                    # through to the turn path like a user_prompt result.
+                    from .conversations import prompt_text, retry_point
+                    result = None
+                    _retry_at = retry_point(messages)
+                    if _retry_at is None:
+                        print("\n  \033[2mNothing to retry\033[0m\n")
+                        continue
+                    _replay_message = messages[_retry_at]
+                    del messages[_retry_at:]
+                    current_conv.messages = messages
+                    _custom_prompt = prompt_text(_replay_message).strip() or "(retry)"
+                    print(f"  \033[2m↻ Retrying: "
+                          f"{_custom_prompt.splitlines()[0][:70]}\033[0m")
+                if result == "fork_conversation":
+                    _save_current()
+                    _parent_id = current_conv.id
+                    current_conv = conv_mgr.fork(current_conv)
+                    messages = current_conv.messages
+                    builtin_clients["todo_list"].clear()
+                    print(f"\n  \033[1;32m⑂ Forked into {current_conv.id}; "
+                          f"{_parent_id} is unchanged\033[0m\n")
+                    continue
+                if isinstance(result, tuple) and result[0] == "compact_conversation":
+                    from .runtime import (
+                        auto_compact, calibration_key, can_compact, estimate_tokens,
+                    )
+                    if not can_compact(messages):
+                        print("\n  \033[2mToo little history to compact yet.\033[0m\n")
+                        continue
+                    _est_key = calibration_key(provider, config)
+                    _before = estimate_tokens(messages, key=_est_key)
+                    try:
+                        with Spinner("Compacting history"):
+                            _compacted = auto_compact(
+                                messages, chat_state.tools, provider, config, raw_fn,
+                                force=True, focus=result[1],
+                            )
+                    except KeyboardInterrupt:
+                        _compacted = False
+                    if not _compacted:
+                        print("\n  \033[31mNothing compacted: the summary call failed "
+                              "or was cancelled; history is unchanged.\033[0m\n")
+                        continue
+                    current_conv.messages = messages
+                    _save_current()
+                    _after = estimate_tokens(messages, key=_est_key)
+                    print(f"\n  \033[1;32m✓ Compacted history\033[0m "
+                          f"\033[2m(~{_before:,} → ~{_after:,} tokens)\033[0m\n")
+                    continue
                 if result == "new_conversation":
                     _save_current()
                     # Summarize in the background: the LLM call would
@@ -1187,6 +1263,11 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                     conv = conv_mgr.load(result[1])
                     if conv:
                         _switch_to(conv)
+                        from .conversations import is_user_prompt
+
+                        _prompts = sum(1 for m in messages if is_user_prompt(m))
+                        print(f"\n  \033[1;32m\u2713 Resumed: {current_conv.title}\033[0m"
+                              f" \033[2m({_prompts} messages)\033[0m\n")
                     else:
                         print(f"\n  \033[31mNo conversation with ID {result[1]}\033[0m\n")
                     continue
@@ -1258,10 +1339,34 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
             if current_conv.title == "New conversation":
                 current_conv.title = user_input.strip().splitlines()[0][:60] or "New conversation"
 
-            # Keep messages[0] byte-stable (KV prefix cache); volatile context
-            # (timestamp + recalled memories) rides on the user message.
-            mem_context = memory.build_context(user_input)
-            messages.append({"role": "user", "content": _augment_user_message(user_input, mem_context)})
+            # /retry resends its stored message (attachments included) only
+            # while what is being sent is still that retry: a failed preflight
+            # hands the text back to the composer, and anything else typed
+            # there is a new message.
+            _replay, _replay_message = _replay_message, None
+            if _replay is not None:
+                from .conversations import prompt_text
+
+                if user_input.strip() != (prompt_text(_replay).strip() or "(retry)"):
+                    _replay = None
+            if _replay is not None:
+                user_message = _replay
+            else:
+                # Keep messages[0] byte-stable (KV prefix cache); volatile
+                # context (timestamp + recalled memories) rides on the user
+                # message.
+                mem_context = memory.build_context(user_input)
+                # Pending /image attachments plus image paths typed or
+                # dropped into the message ride along as image blocks.
+                from .images import turn_images, user_content
+                _turn_images = turn_images(
+                    user_input, _pending_images,
+                    provider=provider, model=model_name, config=config,
+                )
+                user_message = {"role": "user", "content": user_content(
+                    _augment_user_message(user_input, mem_context), _turn_images,
+                )}
+            messages.append(user_message)
 
             if _ui:
                 _sync_ui_context()
@@ -1280,6 +1385,10 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                 (user_input.strip().splitlines() or [""])[0][:80]
             )
 
+            # Everything accounted from here to the end of the turn (fan-out
+            # workers included) is this conversation's usage.
+            _usage_mark = dict(session_usage)
+            _turn_started = time.monotonic()
             try:
                 reply, turn_usage = session.run_turn(
                     messages,
@@ -1299,6 +1408,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                     print("  \033[33m\u26a0 Interrupted\033[0m\n")
                 else:
                     print("\n\n  \033[33m\u26a0 Interrupted\033[0m\n")
+                add_usage(current_conv.usage, session_usage, since=_usage_mark)
                 _save_current()
                 continue
             except BaseException:
@@ -1402,6 +1512,15 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None):
                         f"  \033[33m⚠ Context {ctx_used / ctx_window * 100:.0f}% full — "
                         f"older history will be compacted soon (/clear or /new to reset)\033[0m"
                     )
+            add_usage(current_conv.usage, session_usage, since=_usage_mark)
+            if interactive:
+                # A long turn may have outlasted the user's attention: tell
+                # the desktop it ended (notify_after_seconds; 0 = off).
+                from .notify import turn_finished
+
+                turn_finished(config, time.monotonic() - _turn_started,
+                              reply=reply or "", failed=_backend_failed,
+                              conversation=current_conv.title)
 
             # Git checkpoint when the turn mutated the worktree.
             if _ckpt_fp is not None and _git_ckpt.fingerprint() != _ckpt_fp:
@@ -1522,12 +1641,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         prog="conch",
         usage="conch [-n | --new] [--non-interactive] [--] [prompt ...]\n"
+              "       conch convos\n"
               "       conch auth [login|status|logout] [claude-code|codex]\n"
               "       conch keys [list|check|set NAME|rotate|doctor|...]",
         description=(
             "The LLM-assisted shell. With no arguments, resumes your most"
             " recent\nconversation; any other arguments are sent as a"
             " one-shot prompt.\n\n"
+            "conch convos browses, searches, and resumes saved conversations"
+            " and shows\ntheir token use and cost (see conch convos --help).\n"
             "conch auth signs into Claude or ChatGPT seats through their"
             " official CLIs.\nconch keys manages API and integration keys"
             " (see conch keys --help)."
@@ -1613,13 +1735,15 @@ def session_is_interactive(argv_flag: bool = False, stdin=None) -> bool:
 
 
 #: First words of argv that are subcommands, not prompts.
-SUBCOMMANDS = {"keys": "conch.keys", "auth": "conch.auth"}
+SUBCOMMANDS = {"keys": "conch.keys", "auth": "conch.auth",
+               "convos": "conch.convo_browser"}
 
 
 def main():
     raw_argv = sys.argv[1:]
     if raw_argv and raw_argv[0] in SUBCOMMANDS:
-        # Credential commands run before configuration or inference startup.
+        # Credential commands and the conversations page run before
+        # configuration or inference startup.
         import importlib
 
         command = importlib.import_module(SUBCOMMANDS[raw_argv[0]])
@@ -1687,9 +1811,18 @@ def main():
             permissions=default_permissions(),
             memory=memory,
         )
+        # Image paths in a one-shot prompt attach too; the 📎 lines go to
+        # stderr so a piped reply on stdout stays clean.
+        from .images import turn_images, user_content
+        _turn_images = turn_images(
+            user_text, [], provider=provider, model=model_name, config=config,
+            out=lambda line: print(line, file=sys.stderr),
+        )
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": _augment_user_message(user_text, mem_context)},
+            {"role": "user", "content": user_content(
+                _augment_user_message(user_text, mem_context), _turn_images,
+            )},
         ]
         try:
             reply, _usage = session.run_turn(

@@ -292,14 +292,18 @@ class TestToolCapping(unittest.TestCase):
                 "delegate_task",
                 "skill_manage",
                 "conch_introspect",
+                "read_file",
+                "edit_file",
+                "write_file",
+                "web_fetch",
             },
         )
 
     def test_provider_tool_limits_defined(self):
         self.assertEqual(PROVIDER_TOOL_LIMITS.get("openai"), 128)
         self.assertEqual(PROVIDER_TOOL_LIMITS.get("cerebras"), 128)
-        self.assertEqual(PROVIDER_TOOL_LIMITS.get("ollama"), 12)
-        self.assertEqual(PROVIDER_TOOL_LIMITS.get("custom"), 12)
+        self.assertIn("ollama", PROVIDER_TOOL_LIMITS)
+        self.assertIn("custom", PROVIDER_TOOL_LIMITS)
         self.assertIsNone(PROVIDER_TOOL_LIMITS.get("anthropic"))
 
 

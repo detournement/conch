@@ -206,6 +206,17 @@ def make_builtin_clients(
         prefixes = [p.strip() for p in allow.split(",") if p.strip()]
         local_shell.allow_prefixes(prefixes)
         ssh_remote.allow_prefixes(prefixes)
+    # File tools (one client behind read_file/edit_file/write_file) and
+    # web_fetch share local_shell's policy defaults and result budget.
+    from .filetools import FILE_TOOL_NAMES, FileToolsClient
+    from .webfetch import WebFetchClient
+
+    files = FileToolsClient(permissions=perms)
+    files.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=perms.get_agent_mode()))
+    files.set_result_budget(result_budget)
+    web = WebFetchClient(permissions=perms, config=config)
+    web.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=perms.get_agent_mode()))
+    web.set_result_budget(result_budget)
     manage_tools = ManageToolsClient()
     save_memory = SaveMemoryClient()
     save_memory.bind(memory)
@@ -231,7 +242,9 @@ def make_builtin_clients(
         "fan_out": FanOutClient(),
         "skill_manage": SkillManageClient(),
         "conch_introspect": ConchIntrospectClient(),
+        "web_fetch": web,
     }
+    clients.update({name: files for name in FILE_TOOL_NAMES})
     clients["skill_manage"].configure(interactive=interactive)
     # Product tools plug in through the session-tool seam: each provider
     # owns its config gate (capitol_control needs capitol_base_url,

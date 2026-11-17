@@ -154,7 +154,7 @@ class _FakeConvManager:
         import types
         conv = types.SimpleNamespace(
             id=f"conv{len(self._convs) + 1}", title="", model=model,
-            provider=provider, messages=[],
+            provider=provider, messages=[], usage={},
         )
         self._convs[conv.id] = conv
         return conv

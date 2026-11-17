@@ -64,6 +64,36 @@ only before the prompt, so words inside a prompt are never read as options;
 put `--` before a prompt whose first word starts with a dash. Unknown options
 are rejected with a usage error.
 
+### Conversations page
+
+```bash
+conch convos
+```
+
+A full-screen page over every saved conversation: when it was last used, its
+size, its recorded cost, and (on wide terminals) a preview of the latest
+exchange. The header totals messages, tokens, and estimated cost across all
+conversations; while searching, a second line totals just the matches. Enter
+resumes the selected conversation in the shell. `/convos` (or `/switch` with no
+id) opens the same page from inside the shell, where Enter switches to it.
+
+| Key | Action |
+| --- | --- |
+| `/` | Search titles, ids, models, and full message text; every word must match. Enter keeps the filter, Esc clears it |
+| Enter | Resume the selected conversation |
+| `v`, → | Read the transcript (↑↓, PgUp/PgDn, `g`/`G` scroll; Esc goes back) |
+| `s` | Sort by recent, cost, or message count (relevance while searching) |
+| `d` | Delete after a `y` confirmation; the conversation you are in cannot be deleted |
+| `r` | Rename (Enter saves, Esc cancels) |
+| `e` | Export as Markdown into the current directory |
+| `f` | Fork: copy the conversation and select the copy |
+| `q`, Esc | Quit |
+
+Cost is recorded per conversation as turns run, fan-out workers included, using
+the same estimates as `/cost`: API spend in dollars, subscription seats and local
+models labelled as such. Conversations saved before this tracking existed show
+`—`.
+
 ### Interactive terminal
 
 Conch keeps the conversation in normal terminal scrollback, with a live
@@ -87,7 +117,9 @@ Animation is disabled for non-TTY output and `TERM=dumb`.
 | `/model`, `/models` | Search models for the current provider |
 | `/provider` | Choose a provider |
 | `/fanout` | Show or set the model [fan-out](#fan-out) workers use |
-| `/convos`, `/switch` | Search and resume conversations |
+| `/convos`, `/switch` | Open the [conversations page](#conversations-page): search, read, resume, and see cost |
+| `/retry`, `/fork`, `/compact` | Re-run your last message; continue in a copy; summarize older history now |
+| `/image [path\|clear]` | Attach the clipboard image (or a file) to your next message; dragging an image file in works too |
 | Ctrl+C | Stop active work and return pending messages to the composer; when idle, clear/cancel input (twice to exit) |
 | Ctrl+D | Exit with an empty composer |
 
@@ -117,6 +149,12 @@ thinking budgets. Providers without such events retain the activity indicator.
 Subscription CLIs publish available progress/reasoning while running; their
 schema-constrained final answers appear only after validation. Native tool
 arguments and credential output are not shown as generation details.
+
+A turn that runs 30 seconds or longer posts a desktop notification when it
+finishes, naming the conversation and quoting the reply's first line (macOS via
+`osascript`, Linux via `notify-send`; nothing elsewhere). `notify_after_seconds`
+changes the threshold; `0` turns it off. Piped and `--non-interactive` sessions
+never notify.
 
 The editor uses `prompt_toolkit` on a real terminal. Pipes, one-shot commands,
 `--non-interactive`, and `TERM=dumb` retain the plain input/output path.
@@ -945,6 +983,21 @@ total; restarting Conch starts a new session total.
 
 - **Shell and SSH:** approval-gated local commands, direct terminal handoff,
   and validated OpenSSH ControlMaster sessions.
+- **Files:** `read_file`, `edit_file` (exact text replacement), and
+  `write_file`. Reads run without a prompt and return numbered lines with
+  credentials redacted; credential-looking paths (`.env`, `~/.ssh`, private
+  keys, Conch's own env file) need confirmation even in agent mode. Edits and
+  writes show a colored diff and ask `Apply? [y/n/a/A/?]` (`a` applies file
+  edits for the rest of the session); agent mode applies them while still
+  printing the diff. Writes are atomic, keep line endings and file mode, and
+  are covered by `/undo` checkpoints. Remote channel sessions can read but
+  not edit.
+- **Web:** `web_fetch` reads an http(s) page as text (HTML stripped to
+  headings, paragraphs, and links; JSON pretty-printed; binary types refused),
+  capped at 2 MB downloaded. `prompt_all` asks per URL (`a` allows the host
+  for the session); `safe_auto` and agent mode fetch without asking;
+  `web_fetch_allow_domains` lists hosts that never ask. URLs carrying
+  credentials are refused.
 - **MCP:** stdio and HTTP Model Context Protocol servers from
   `~/.config/conch/mcp.json`. Discovery is parallel and bounded per
   server: an HTTP server gets `connect_timeout` (default 5s) to answer
@@ -968,11 +1021,26 @@ Only native tool calls are executable; repeated identical call batches stop.
 ### Conversations, memory, and context
 
 - Conversations persist across launches. `/new`, `/convos`, `/switch`,
-  `/delete`, `/clear`, and `/search` manage them. Transcript files are
+  `/delete`, `/clear`, and `/search` manage them; `conch convos` and `/convos`
+  open the [conversations page](#conversations-page), with tokens and
+  estimated cost recorded per conversation. `/rename <title>` retitles the
+  current one; `/export [path]` writes it as Markdown (credentials redacted,
+  mode 0600; an existing file is never overwritten unless you add `--force`);
+  `/retry` drops the last reply and sends your last message again, images
+  included; `/fork` continues in a copy while
+  the original stays as it was; `/compact [focus]` summarizes older history
+  now instead of waiting for the context to fill. Transcript files are
   owner-only (0600 in a 0700 directory), and credential-shaped spans in
   model and tool output are replaced with `[credential redacted]` before
   a transcript is written or indexed — the running session keeps the
   original; what the user typed is stored as typed.
+- Images: drag a PNG, JPEG, GIF, or WebP into the terminal (or type its path)
+  and it is attached to that message; `/image` attaches the clipboard image
+  (`/image <path>` a file, `/image clear` drops pending ones) to your next
+  message. Images over 3.75 MB or 8000 px are downscaled with `sips` on macOS
+  and refused elsewhere. Images reach every API provider in its own format;
+  subscription seats take text only, and an Ollama model without vision gets
+  the text alone, with a warning either way.
 - `/remember` and the `save_memory` tool write searchable memory. `/fact`
   appends bounded, always-loaded facts to `~/.config/conch/facts.md`.
 - On `/new` and exit, a `[Session summary]` memory is written only when the
@@ -1415,7 +1483,9 @@ groups the same shipped surface.
 | `/remember`, `/memories`, `/forget`, `/fact`, `/facts` | Persistent memory and always-loaded facts |
 | `/skills`, `/skill <name> [task]` | List or run skills |
 | `/search <query>` | Search conversations, memories, and config |
-| `/new`, `/convos`, `/switch`, `/delete`, `/clear` | Conversation lifecycle |
+| `/new`, `/convos`, `/switch`, `/delete`, `/clear` | Conversation lifecycle; `/convos` opens the conversations page |
+| `/rename`, `/export`, `/retry`, `/fork`, `/compact` | Retitle, write Markdown, re-run the last message, branch, summarize now |
+| `/image [path\|clear]` | Attach an image to your next message |
 | `/agent`, `/yolo` | Toggle shell auto-execution |
 | `/terminal <command>` | Direct, uncaptured terminal handoff |
 | `/ssh connect\|status\|exec\|shell\|disconnect` | Validated OpenSSH control session |

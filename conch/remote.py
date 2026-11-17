@@ -241,6 +241,9 @@ REMOTE_EXCLUDED_TOOLS = {
     "delegate_task", "fan_out", "conch_config", "manage_tools", "skill_manage",
     "todo_list", "api_layer", "conch_introspect", "interactive_terminal",
     "ssh_remote", "fleet_delegate",
+    # No way to review a diff over a channel. read_file and web_fetch stay:
+    # their per-turn remote variants never prompt (see _remote_clients).
+    "edit_file", "write_file",
 }
 
 
@@ -353,6 +356,14 @@ class RemoteLoop:
             thread_id,
             sender,
         )
+        for key in ("read_file", "web_fetch"):
+            # The pool's clients carry the hosting session's interactive
+            # policy and permission mode; remote turns get non-interactive
+            # prompt_all copies, so guarded reads and unlisted fetches
+            # refuse instead of prompting the local terminal (or riding
+            # the host's /agent mode).
+            if hasattr(clients.get(key), "remote_variant"):
+                clients[key] = clients[key].remote_variant()
         if "capitol_control" in clients:
             # Origin-bound variant: reads and HITL responses pass
             # through; an effectful start pins its exact payload into an
@@ -440,6 +451,16 @@ class RemoteLoop:
         if usage.get("error"):
             reply = ("conch: the model backend is unreachable right now — "
                      "try again later.")
+        in_tok = usage.get("input_tokens", 0)
+        out_tok = usage.get("output_tokens", 0)
+        if in_tok or out_tok:
+            from .providers import record_session_usage
+
+            record_session_usage(
+                conv.usage, provider,
+                usage.get("model") or self.config.get("chat_model", self.config.get("model", "")),
+                in_tok, out_tok, self.config,
+            )
         if reply:
             messages.append({"role": "assistant", "content": reply})
         conv.messages = messages

@@ -25,6 +25,10 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # Per-message token stats line (tokens, cost, tok/s) in interactive
     # chat. On by default; /tks flips it for a session.
     "show_token_stats": "true",
+    # Interactive turns that run at least this many seconds post a desktop
+    # notification when they finish (macOS osascript, Linux notify-send).
+    # 0/off disables.
+    "notify_after_seconds": "30",
     # Turn-level git checkpoints when cwd is a git repo: mutating turns
     # snapshot the worktree to refs/conch/checkpoints/* (user branch and
     # index untouched). /checkpoint and /undo manage them.

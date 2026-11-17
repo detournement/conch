@@ -17,6 +17,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from .render import emit_generation_detail
+from .images import IMAGE_TOKENS, to_provider as _wire_images, without_payloads
 from .seats import PROVIDERS as SEAT_PROVIDERS, complete as seat_complete
 
 logger = logging.getLogger("conch.providers")
@@ -222,10 +223,12 @@ PROVIDER_TOOL_LIMITS = {
     "bedrock": 128,
     "openrouter": 128,
     # Local models drown in large tool lists: cap hard and select the most
-    # relevant tools per turn (see tooling.select_relevant_tools).
-    "ollama": 12,
+    # relevant tools per turn (see tooling.select_relevant_tools). The cap
+    # is the pinned core (tooling.PINNED_TOOL_NAMES, 12 tools) plus 4 slots
+    # for tools picked by relevance (MCP servers, memory, search, ...).
+    "ollama": 16,
     # Custom endpoints usually front local models too — stay conservative.
-    "custom": 12,
+    "custom": 16,
 }
 
 # Used for `/provider` and tool `set_provider` — stable defaults, not KNOWN_MODELS[0].
@@ -531,6 +534,28 @@ def ollama_model_supports_tools(
     return supports
 
 
+def ollama_model_supports_vision(
+    model: str,
+    config: Optional[dict] = None,
+    *,
+    timeout: float = OLLAMA_TAGS_TIMEOUT,
+) -> Optional[bool]:
+    """Whether /api/show lists the "vision" capability for *model*.
+
+    None when the server or model can't be checked (the request then goes
+    out and any error surfaces normally); False only on a definite answer,
+    so the caller can drop images with a clear warning instead of letting
+    a text-only model silently ignore them.
+    """
+    data, record = _ollama_show_cached(model, config, timeout=timeout)
+    if record is None or data is None:
+        return None
+    caps = data.get("capabilities")
+    if not isinstance(caps, list):
+        return None
+    return any(str(cap).lower() == "vision" for cap in caps)
+
+
 def get_ollama_context_length(
     model: str,
     config: Optional[dict] = None,
@@ -669,13 +694,15 @@ def _config_float(
 def _estimated_local_prompt_tokens(
     messages: List[dict], tools: Optional[List[dict]]
 ) -> int:
+    # Images count as a fixed prompt cost, never as their base64 length.
+    messages, image_count = without_payloads(messages)
     payload = json.dumps(
         {"messages": messages, "tools": tools or []},
         ensure_ascii=False,
         default=str,
     )
     # Conservative before model-specific runtime calibration is available.
-    return max(1, (len(payload) + 2) // 3)
+    return max(1, (len(payload) + 2) // 3) + image_count * IMAGE_TOKENS
 
 
 def _clamp_output_to_context(
@@ -1218,6 +1245,20 @@ def record_session_usage(
     return f"~${cost:.4f}" if kind == "api" else _BILLING_LABELS[kind]
 
 
+def add_usage(target: dict, usage: dict, since: Optional[dict] = None) -> None:
+    """Add *usage*'s counters to *target*. With *since*, an earlier snapshot
+    of the same dict, only what accumulated after it is added: that is how a
+    turn's share of session accounting (fan-out workers included) is
+    attributed to the conversation it ran in."""
+    since = since or {}
+    for key, value in usage.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        delta = value - since.get(key, 0)
+        if delta:
+            target[key] = target.get(key, 0) + delta
+
+
 def format_session_cost(
     usage: dict, provider: str = "", model: str = "", config: Optional[dict] = None,
 ) -> str:
@@ -1227,11 +1268,11 @@ def format_session_cost(
     cost = usage.get("cost", 0.0)
     if cost:
         kinds.add("api")
-    if not usage.get("turns"):
-        kinds.add(_billing_kind(provider, model, config))
-    elif not kinds:
-        # Usage without billing provenance must never be presented as free.
-        kinds.add("unknown")
+    if not kinds:
+        # Nothing recorded yet: this session's own kind of billing. Usage
+        # without billing provenance must never be presented as free.
+        kinds.add("unknown" if usage.get("turns")
+                  else _billing_kind(provider, model, config))
     parts = [f"~${cost:.4f}"] if "api" in kinds else []
     parts.extend(_BILLING_LABELS[kind] for kind in ("unknown", "seat", "local")
                  if kind in kinds)
@@ -1426,7 +1467,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
     base_url = (config.get("base_url") or os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")).rstrip("/")
     body: Dict[str, Any] = {
         "model": config.get("chat_model", config.get("model", "gpt-oss-120b")),
-        "messages": messages,
+        "messages": _wire_images("cerebras", messages),
         "temperature": 0.7,
         "max_completion_tokens": 16384,
         # Preserve prior thinking/tool context for agentic flows.
@@ -1469,7 +1510,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
     body = build_openai_chat_request_body(
         model,
-        messages,
+        _wire_images("openai", messages),
         temperature=0.7,
         max_completion_tokens=16384,
         tools=tools,
@@ -1521,7 +1562,7 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         "model": model,
         "max_tokens": _anthropic_max_tokens(model),
         "system": system,
-        "messages": user_messages,
+        "messages": _wire_images("anthropic", user_messages),
     }
     if tools:
         import copy
@@ -1645,7 +1686,7 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         return error_response(reason or f"Ollama model '{model}' is not verified")
     body: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _wire_images("ollama", messages),
         "stream": False,
     }
     apply_ollama_request_options(body, config, model)
@@ -1718,7 +1759,7 @@ def _bedrock_headers(config: dict) -> Dict[str, str]:
 def _bedrock_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "model": config.get("chat_model", config.get("model", "moonshotai.kimi-k2.5")),
-        "messages": messages,
+        "messages": _wire_images("bedrock", messages),
         "temperature": 0.7,
         "max_tokens": 16384,
     }
@@ -1844,7 +1885,7 @@ def _openrouter_headers(config: dict) -> Dict[str, str]:
 def _openrouter_body(config: dict, messages: List[dict], tools: Optional[List[dict]]) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "model": config.get("chat_model", config.get("model", "moonshotai/kimi-k3")),
-        "messages": messages,
+        "messages": _wire_images("openrouter", messages),
         "max_tokens": 16384,
         # Low reasoning effort and NO temperature: at the default (max)
         # effort with temperature set, Kimi K3 sometimes answers in prose
@@ -2330,7 +2371,7 @@ def _custom_body(config: dict, messages: List[dict], tools: Optional[List[dict]]
         max_tokens = min(4096, max(256, context_window // 4))
     body: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _wire_images("custom", messages),
         "temperature": _config_float(
             config,
             "custom_temperature",
@@ -2517,6 +2558,10 @@ def _stream_openai_compat(
     *config* only feeds the auth-failure message (which ``api_key_env``
     a 401/403 rejected) — the request itself is fully described by
     *url*/*headers*/*body*."""
+    # Backstop for every OpenAI-compatible stream: canonical image blocks
+    # become image_url parts (a no-op when the body is already converted).
+    if isinstance(body.get("messages"), list):
+        body["messages"] = _wire_images(provider, body["messages"])
     body["stream"] = True
     # Without this, OpenAI-compatible servers (llama.cpp included) send
     # no usage chunk at all and the per-turn token stats line has
@@ -2661,7 +2706,7 @@ def stream_cerebras(
     model = config.get("chat_model", config.get("model", "gpt-oss-120b"))
     body: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _wire_images("cerebras", messages),
         "temperature": 0.7,
         "max_completion_tokens": 16384,
         "clear_thinking": False,
@@ -2694,7 +2739,7 @@ def stream_openai(
     model = config.get("chat_model", config.get("model", "gpt-4o-mini"))
     body = build_openai_chat_request_body(
         model,
-        messages,
+        _wire_images("openai", messages),
         temperature=0.7,
         max_completion_tokens=16384,
         tools=tools,
@@ -2736,7 +2781,7 @@ def stream_anthropic(
         "model": model,
         "max_tokens": _anthropic_max_tokens(model),
         "system": system,
-        "messages": user_messages,
+        "messages": _wire_images("anthropic", user_messages),
         "stream": True,
     }
     if tools:
@@ -2991,7 +3036,7 @@ def stream_ollama(
         return error_response(reason or f"Ollama model '{model}' is not verified")
     body: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _wire_images("ollama", messages),
         "stream": True,
     }
     apply_ollama_request_options(body, config, model)

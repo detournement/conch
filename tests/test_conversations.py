@@ -22,6 +22,44 @@ class ConversationTests(unittest.TestCase):
                 self.assertEqual(loaded.messages[1]["content"][0]["text"], "hello")
                 self.assertEqual(loaded.messages[2]["content"][0]["type"], "tool_result")
 
+    def test_usage_survives_save_reload_and_reaches_the_index(self):
+        """Per-conversation cost is what the conversations page totals: it
+        must be written to the file and the index, not just kept in memory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict("os.environ", {"XDG_STATE_HOME": tmp}):
+                manager = ConversationManager()
+                conv = manager.create(model="m", provider="p")
+                conv.usage = {"input_tokens": 1200, "output_tokens": 34,
+                              "cost": 0.0123, "turns": 2, "api_turns": 2}
+                conv.messages = [{"role": "user", "content": "hi"}]
+                manager.save(conv)
+                manager.close()
+
+                fresh = ConversationManager()
+                self.assertEqual(fresh.load(conv.id).usage, conv.usage)
+                entry = next(e for e in fresh.list_all() if e["id"] == conv.id)
+                self.assertEqual(entry["usage"], conv.usage)
+                fresh.close()
+
+    def test_content_hits_are_complete_and_per_word(self):
+        """The page filter needs every matching conversation, even when one
+        conversation alone has more matching rows than search() keeps."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict("os.environ", {"XDG_STATE_HOME": tmp}):
+                manager = ConversationManager()
+                noisy = manager.create(model="m", provider="p")
+                noisy.messages = [{"role": "user", "content": f"docker run {i}"}
+                                  for i in range(500)]
+                manager.save(noisy)
+                quiet = manager.create(model="m", provider="p")
+                quiet.messages = [{"role": "user", "content": "docker compose up"}]
+                manager.save(quiet)
+                docker, compose = manager.content_hits(["Docker", "compose"])
+                self.assertEqual(set(docker), {noisy.id, quiet.id})
+                self.assertGreater(docker[noisy.id], docker[quiet.id])
+                self.assertEqual(set(compose), {quiet.id})
+                manager.close()
+
 
 class SearchTests(unittest.TestCase):
     def _make_manager(self, tmp):

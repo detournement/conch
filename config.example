@@ -162,6 +162,10 @@ api_key_env=
 # (Ollama, llama.cpp timings) and a ~-labeled wall-clock estimate otherwise.
 #show_token_stats=true
 
+# Desktop notification when an interactive turn runs at least this many
+# seconds (macOS via osascript, Linux via notify-send). 0 or off disables.
+#notify_after_seconds=30
+
 # Command prefixes that never prompt (comma-separated).
 #allow_prefixes=git status, ls, cat
 

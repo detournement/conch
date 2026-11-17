@@ -97,6 +97,20 @@ class TestStartupConversation(unittest.TestCase):
         mgr.close()
         mgr2.close()
 
+    def test_resume_id_starts_in_the_picked_conversation(self):
+        """The conversations page hands its pick to startup; it wins over
+        the most recent conversation."""
+        mgr = ConversationManager()
+        picked = self._seed_recent(mgr)
+        self._seed_recent(mgr)  # now the most recent
+        conv, messages = _startup_conversation(
+            mgr, "m", "p", "sys prompt", resume_id=picked.id
+        )
+        self.assertEqual(conv.id, picked.id)
+        self.assertEqual(messages[0], {"role": "system", "content": "sys prompt"})
+        self.assertEqual(messages[1]["content"], "existing history")
+        mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

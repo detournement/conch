@@ -98,7 +98,10 @@ class TestExactRequestAuthorization(unittest.TestCase):
                 max_tool_rounds=2,
             )
         self.assertEqual(seen[0], seen[1])
-        self.assertLessEqual(len(seen[0]), 12)
+        from conch.providers import PROVIDER_TOOL_LIMITS
+
+        self.assertLessEqual(len(seen[0]), PROVIDER_TOOL_LIMITS["custom"])
+        self.assertLess(len(seen[0]), len(tools))
 
 
 class TestArgumentAndIdIntegrity(TestExactRequestAuthorization):

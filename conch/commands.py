@@ -43,13 +43,14 @@ from .tooling import (
 
 BUILTIN_SLASH_COMMANDS = (
     "/?", "/agent", "/approvals", "/approve", "/apps", "/cancel",
-    "/checkpoint", "/clear", "/connect", "/convos", "/cost", "/delete",
-    "/deny", "/disable", "/edit", "/enable", "/fact", "/facts", "/fanout", "/find",
-    "/forget", "/grep", "/h", "/help", "/install", "/keys", "/list", "/llamaidx",
+    "/checkpoint", "/clear", "/compact", "/connect", "/convos", "/cost", "/delete",
+    "/deny", "/disable", "/edit", "/enable", "/export", "/fact", "/facts", "/fanout",
+    "/find", "/fork", "/forget", "/grep", "/h", "/help", "/image", "/install", "/keys",
+    "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
     "/models", "/new", "/note", "/notes", "/paste", "/profile", "/profiles",
-    "/provider", "/queue", "/registry", "/reload", "/remember", "/reset",
-    "/resettools", "/rounds", "/s", "/sandbox", "/schedule", "/search",
+    "/provider", "/queue", "/registry", "/reload", "/remember", "/rename", "/reset",
+    "/resettools", "/retry", "/rounds", "/s", "/sandbox", "/schedule", "/search",
     "/skill", "/skills", "/ssh", "/status", "/switch", "/tasks",
     "/terminal", "/tks", "/todo", "/tools", "/tty", "/undo", "/verbose",
     "/yolo",
@@ -158,10 +159,16 @@ SLASH_COMMANDS = [
     ("/skill <name> [task]", "Run a skill's procedure on a task"),
     ("/search <query>", "Search conversations, memories, and config"),
     ("/new", "Start a new conversation"),
-    ("/convos", "List past conversations"),
-    ("/switch <id>", "Switch conversation"),
+    ("/convos", "Browse, search, and resume conversations; see their cost"),
+    ("/switch [id]", "Switch conversation (no id: open the conversations page)"),
     ("/delete <id>", "Delete conversation"),
     ("/clear", "Wipe conversation history (keep conversation)"),
+    ("/rename <title>", "Rename the current conversation"),
+    ("/export [path]", "Write the current conversation to a Markdown file"),
+    ("/retry", "Drop the last reply and run your last message again"),
+    ("/fork", "Continue in a copy of this conversation; the original stays as it is"),
+    ("/compact [focus]", "Summarize older history now to free context"),
+    ("/image [path|clear]", "Attach an image (default: the clipboard) to your next message"),
     ("/agent", "Toggle agent mode (auto-execute shell)"),
     ("/yolo", "Alias for /agent"),
     ("/terminal <command>", "Run with direct, non-recorded terminal input/output"),
@@ -1469,10 +1476,16 @@ def handle_slash_command(
             "  \033[1m/skill <name> [task]\033[0m Run a skill's procedure on a task\n"
             "  \033[1m/search <query>\033[0m      Search conversations, memories, and config\n"
             "  \033[1m/new\033[0m                 Start a new conversation\n"
-            "  \033[1m/convos\033[0m              List past conversations\n"
-            "  \033[1m/switch <id>\033[0m         Switch conversation\n"
+            "  \033[1m/convos\033[0m              Browse, search, and resume conversations; see their cost\n"
+            "  \033[1m/switch [id]\033[0m         Switch conversation (no id: open the conversations page)\n"
             "  \033[1m/delete <id>\033[0m         Delete conversation\n"
             "  \033[1m/clear\033[0m               Wipe conversation history (keep conversation)\n"
+            "  \033[1m/rename <title>\033[0m      Rename the current conversation\n"
+            "  \033[1m/export [path]\033[0m       Write the current conversation to a Markdown file\n"
+            "  \033[1m/retry\033[0m               Drop the last reply and run your last message again\n"
+            "  \033[1m/fork\033[0m                Continue in a copy of this conversation\n"
+            "  \033[1m/compact [focus]\033[0m     Summarize older history now to free context\n"
+            "  \033[1m/image [path|clear]\033[0m  Attach an image (default: clipboard) to your next message\n"
             "  \033[1m/agent\033[0m, \033[1m/yolo\033[0m       Toggle agent mode (auto-execute shell)\n"
             "  \033[1m/terminal <command>\033[0m  Direct terminal handoff for sudo/getpass (never captured)\n"
             "  \033[1m/ssh connect <user@host> [port]\033[0m  Authenticate and open a control connection\n"
@@ -1621,6 +1634,18 @@ def handle_slash_command(
             )
         print(usage)
         return None
+
+    if command == "/image":
+        # The shell owns the pending-attachment list; this only parses.
+        # Bare /image reads the clipboard (None), a path is unquoted and
+        # unescaped the way a drag-and-drop or shell paste writes it.
+        if arg.lower() == "clear":
+            return ("attach_image_clear",)
+        if not arg:
+            return ("attach_image", None)
+        from .images import parse_path_arg
+
+        return ("attach_image", parse_path_arg(arg))
 
     if command == "/verbose":
         if arg in ("on", "true", "1"):
@@ -1819,14 +1844,83 @@ def handle_slash_command(
     if command == "/new" and conv_mgr is not None:
         return "new_conversation"
 
-    if command == "/convos" and conv_mgr is not None:
+    if command == "/rename" and conv_mgr is not None and current_conv is not None:
+        from .conversations import normalize_title
+
+        title = normalize_title(arg)
+        if not title:
+            print("\n  \033[2mUsage: /rename <title>\033[0m\n")
+            return None
+        if messages is not None:
+            current_conv.messages = messages
+        conv_mgr.rename(current_conv, title)
+        print(f"\n  \033[1;32m✓ Renamed to “{current_conv.title}”\033[0m\n")
+        return None
+
+    if command == "/export" and current_conv is not None:
+        from .conversations import export_conversation
+
+        force = bool(re.search(r"(?:^|\s)--force(?=\s|$)", arg))
+        target = re.sub(r"(?:^|\s)--force(?=\s|$)", " ", arg).strip() or None
+        if messages is not None:
+            # Export what this session holds now, not the last save.
+            current_conv.messages = messages
+            current_conv.provider = provider
+            current_conv.model = model_name
+        try:
+            path = export_conversation(current_conv, target, force=force)
+        except FileExistsError:
+            print(
+                f"\n  \033[31m{target} already exists; nothing written.\033[0m\n"
+                f"  \033[2m/export {target} --force replaces it.\033[0m\n"
+            )
+            return None
+        except OSError as exc:
+            print(f"\n  \033[31mExport failed: {exc}\033[0m\n")
+            return None
+        print(f"\n  \033[1;32m✓ Exported to {path}\033[0m\n")
+        return None
+
+    if command == "/retry":
+        return "retry_last_prompt"
+
+    if command == "/fork" and conv_mgr is not None:
+        return "fork_conversation"
+
+    if command == "/compact":
+        return ("compact_conversation", arg)
+
+    if command in ("/convos", "/switch") and conv_mgr is not None and not (
+        command == "/switch" and arg
+    ):
+        from .convo_browser import browse, can_browse
+
+        current_id = current_conv.id if current_conv else None
+        if can_browse():
+            chosen = browse(conv_mgr, current_id=current_id)
+            if current_conv is not None:
+                # The page may have renamed the conversation this shell is
+                # in; adopt that title so the next save keeps it.
+                entry = next((item for item in conv_mgr.list_all()
+                              if item.get("id") == current_id), None)
+                if entry and entry.get("title"):
+                    current_conv.title = entry["title"]
+            if chosen is None:
+                return None
+            if chosen == current_id:
+                print("\n  \033[2mAlready in this conversation.\033[0m\n")
+                return None
+            return ("switch_conversation", chosen)
+        if command == "/switch":
+            print("\n  \033[2mUsage: /switch <id>\033[0m\n")
+            return None
         conversations = conv_mgr.list_all()
         if not conversations:
             print("\n  \033[2mNo past conversations.\033[0m\n")
             return None
         print(f"\n  \033[1;36mConversations ({len(conversations)}):\033[0m")
         for conversation in conversations[:20]:
-            current = " \033[1;33m← current\033[0m" if current_conv and conversation["id"] == current_conv.id else ""
+            current = " \033[1;33m← current\033[0m" if conversation["id"] == current_id else ""
             print(
                 f"    \033[1m{conversation['id']}\033[0m  {conversation.get('title', 'untitled')}"
                 f"  \033[2m({conversation.get('message_count', 0)} msgs, {conversation.get('updated_at', '')[:16]})\033[0m{current}"
@@ -1835,9 +1929,6 @@ def handle_slash_command(
         return None
 
     if command == "/switch" and conv_mgr is not None:
-        if not arg:
-            print("\n  \033[2mUsage: /switch <id>\033[0m\n")
-            return None
         return ("switch_conversation", arg.strip())
 
     if command == "/delete" and conv_mgr is not None:

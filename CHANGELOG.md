@@ -29,6 +29,31 @@ Releases before 0.6.0 predate this changelog.
   and never on a costlier kind of billing than the session's. `/fanout` shows
   and sets it. Workers cannot prompt: an ask-first session confirms once, then
   workers run read-only commands and refuse the rest.
+- Conversations page: `conch convos` (or `/convos`, or `/switch` with no id, in
+  the shell) opens a full-screen browser over saved conversations. Type to
+  search titles, ids, models, and full message text; read transcripts; sort by
+  recent, cost, or size; delete after confirmation; Enter resumes. The header
+  totals messages, tokens, and estimated cost overall and across matches.
+- Tokens and estimated cost are recorded per conversation (`usage` in the
+  transcript file and index), fan-out workers and channel conversations
+  included. Conversations saved earlier show no cost.
+- Desktop notification when an interactive turn runs 30 seconds or longer
+  (`notify_after_seconds`; `0` disables): macOS via `osascript`, Linux via
+  `notify-send`. It names the conversation and quotes the reply's first line.
+- File tools: `read_file`, `edit_file`, and `write_file`. Edits and writes show
+  a colored diff and ask before applying (`a` applies file edits for the rest
+  of the session; agent mode applies without asking). Writes are atomic,
+  preserve line endings and mode, and are covered by `/undo`. Credential-looking
+  and system paths need confirmation even in agent mode.
+- `web_fetch` reads an http(s) page as text, asking first in `prompt_all`
+  (`web_fetch_allow_domains` skips the question for listed hosts). URLs that
+  carry credentials are refused.
+- Image input: image files dragged into the terminal or typed as paths are
+  attached to the message, and `/image` attaches the clipboard. Every API
+  provider receives them in its own format.
+- `/rename`, `/export` (Markdown, credentials redacted), `/retry`, `/fork`, and
+  `/compact [focus]`. The conversations page gains `r` rename, `e` export, and
+  `f` fork.
 
 ### Changed
 
@@ -43,6 +68,11 @@ Releases before 0.6.0 predate this changelog.
 - A failed model request is reported once, without a repeated detail line or a
   trailing `[no response]`. Generation progress clears when the turn ends;
   published reasoning stays readable until the next turn.
+- `/convos` and a bare `/switch` open the conversations page instead of the
+  one-line picker, and switching conversations confirms which one resumed.
+- Local models (Ollama, custom endpoints) are offered up to 16 tools per
+  request instead of 12: the file tools and `web_fetch` joined the always-on
+  set, and the 4 slots for tools picked by relevance are kept.
 - Ctrl+C during a turn returns pending guidance and follow-ups to the composer
   instead of letting them start new work after the stop.
 - When first-run model verification fails, setup offers another provider and

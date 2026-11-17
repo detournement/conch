@@ -28,6 +28,10 @@ PINNED_TOOL_NAMES = {
     "delegate_task",
     "skill_manage",
     "conch_introspect",
+    "read_file",
+    "edit_file",
+    "write_file",
+    "web_fetch",
 }
 
 TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch" / "tool_prefs.json"
@@ -2843,6 +2847,18 @@ def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], client
         builtin.append(INTERACTIVE_TERMINAL_TOOL)
     if "ssh_remote" in clients:
         builtin.append(SSH_REMOTE_TOOL)
+    # File tools and web_fetch live in their own modules (lazy: they import
+    # this one for LocalShellPolicy/PermissionState).
+    from .filetools import FILE_TOOL_DEFS
+
+    builtin.extend(
+        tool_def for tool_def in FILE_TOOL_DEFS
+        if tool_def["function"]["name"] in clients
+    )
+    if "web_fetch" in clients:
+        from .webfetch import WEB_FETCH_TOOL
+
+        builtin.append(WEB_FETCH_TOOL)
     if "conch_config" in clients:
         builtin.append(CONCH_CONFIG_TOOL)
     if "api_layer" in clients:

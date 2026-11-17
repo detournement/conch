@@ -30,8 +30,10 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import shutil
 import socket
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -794,7 +796,11 @@ def _probe_seat(provider: str, model: str, config: dict, timeout: float) -> Prob
         return ProbeResult(provider, model, ERROR, error_detail(response))
     for call in response.get("tool_calls") or []:
         if call["function"]["name"] == "conch_probe":
-            if json.loads(call["function"]["arguments"]).get("ok") is True:
+            try:
+                confirmed = json.loads(call["function"]["arguments"]).get("ok") is True
+            except (ValueError, AttributeError):
+                confirmed = False
+            if confirmed:
                 return ProbeResult(provider, model, OK, "seat authenticated; structured tool response verified")
     return ProbeResult(provider, model, CONFORMANCE_FAILED, "native client did not return the probe tool call")
 
@@ -1288,6 +1294,13 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
     def say(line: str = "") -> None:
         print(line, file=stream, flush=True)
 
+    def explain(text: str, color: str) -> None:
+        """Prose wrapped on words at the terminal width, colored afterwards."""
+        width = max(40, shutil.get_terminal_size((80, 24)).columns) - 3
+        for line in textwrap.wrap(text, width=width, break_long_words=False,
+                                  break_on_hyphens=False):
+            say(f"{color}  {line}\033[0m")
+
     def read(prompt: str) -> Optional[str]:
         try:
             return ask(prompt).strip()
@@ -1295,7 +1308,7 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
             say()
             return None
 
-    say(f"\033[33m  ⚠ {failure.label} is not usable: {failure.describe()}\033[0m")
+    explain(f"⚠ {failure.label} is not usable: {failure.describe()}", "\033[33m")
     say("\033[2m  Looking for alternatives…\033[0m")
     with Spinner("Discovering alternative models"):
         candidates, notes = discover_alternatives(
@@ -1304,18 +1317,16 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
     with Spinner("Verifying alternative models"):
         probe_candidates(candidates, config, timeout=timeout)
     for note in notes:
-        say(f"\033[2m  ({note})\033[0m")
+        explain(f"({note})", "\033[2m")
     if not candidates:
         say("\033[31m  No alternatives found.\033[0m")
         if restart_hint:
-            say(
-                f"\033[2m  Fix the configured model or fallback_models in"
-                f" {display_path(get_config_path())}, then restart conch.\033[0m"
-            )
-            say(
-                "\033[2m  /models, /model, and /provider work only inside a running"
-                " Conch session, not at your system shell prompt.\033[0m"
-            )
+            explain(
+                "Fix the configured model or fallback_models in"
+                f" {display_path(get_config_path())}, then restart conch.", "\033[2m")
+            explain(
+                "/models, /model, and /provider work only inside a running Conch"
+                " session, not at your system shell prompt.", "\033[2m")
         raise _startup_error(
             f"conch: no working model — {failure.label} {failure.describe()} and no alternative"
             " was found"

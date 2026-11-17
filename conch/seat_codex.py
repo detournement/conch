@@ -65,38 +65,51 @@ def _invalid_constant(value: str):
     raise ValueError('non-JSON constant')
 
 
-def _decode(text: str):
+def _decode(text: str, source: str):
     try:
         return json.loads(text, parse_constant=_invalid_constant)
     except (ValueError, TypeError) as exc:
-        raise SeatError('Codex returned malformed JSON') from exc
+        raise SeatError(f'Codex returned malformed {source}') from exc
+
+
+def _mismatch():
+    return SeatError('Codex output does not match the response schema')
 
 
 def _validate(value, schema: dict) -> None:
     """Validate the JSON-schema subset used by Conch's response envelope."""
-    kind = schema.get('type')
+    if 'anyOf' in schema:
+        for variant in schema['anyOf']:
+            try:
+                return _validate(value, variant)
+            except SeatError:
+                continue
+        raise _mismatch()
+    kinds = schema.get('type')
     types = {'object': dict, 'array': list, 'string': str,
              'boolean': bool, 'integer': int, 'number': (int, float),
              'null': type(None)}
-    if kind not in types or not isinstance(value, types[kind]):
-        raise SeatError('Codex output does not match the response schema')
-    if kind in ('integer', 'number') and isinstance(value, bool):
-        raise SeatError('Codex output does not match the response schema')
-    if 'enum' in schema and value not in schema['enum']:
-        raise SeatError('Codex returned a tool outside the response schema')
+    kind = next(
+        (name for name in ([kinds] if isinstance(kinds, str) else kinds or ())
+         if name in types and isinstance(value, types[name])
+         and not (name in ('integer', 'number') and isinstance(value, bool))),
+        None,
+    )
+    if kind is None or ('enum' in schema and value not in schema['enum']):
+        raise _mismatch()
     if kind == 'object':
         properties = schema.get('properties', {})
         if (not set(schema.get('required', ())).issubset(value)
                 or (schema.get('additionalProperties') is False
                     and not set(value).issubset(properties))):
-            raise SeatError('Codex output does not match the response schema')
+            raise _mismatch()
         for key, item in value.items():
             if key in properties:
                 _validate(item, properties[key])
     elif kind == 'array':
         if (len(value) < schema.get('minItems', 0)
                 or ('maxItems' in schema and len(value) > schema['maxItems'])):
-            raise SeatError('Codex output does not match the response schema')
+            raise _mismatch()
         for item in value:
             _validate(item, schema.get('items', {}))
 
@@ -118,7 +131,7 @@ class _Events:
     def feed(self, line):
         if not line.strip():
             return
-        event = _decode(line)
+        event = _decode(line, 'event JSON')
         if not isinstance(event, dict):
             raise SeatError('Codex returned an invalid event stream')
         kind = event.get('type')
@@ -135,7 +148,10 @@ class _Events:
                 if not isinstance(message, str) or not message.strip():
                     raise SeatError('Codex returned an invalid diagnostic')
                 safe_message, _ = redact_credentials(message, '[credential redacted]')
-                logger.warning('Codex diagnostic: %s', ' '.join(safe_message.split())[:500])
+                # Conch disables Codex's execution features on purpose, so the
+                # CLI reports them unavailable on every turn. Keep the record
+                # for debugging; it is not something the user must act on.
+                logger.debug('Codex diagnostic: %s', ' '.join(safe_message.split())[:500])
             elif item.get('type') == 'reasoning':
                 text = item.get('text', '')
                 identity = item.get('id', '')
@@ -227,13 +243,10 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None
                 events.feed(line)
         usage = events.finish()
         try:
-            response = _decode(output_path.read_text(encoding='utf-8'))
+            response = _decode(output_path.read_text(encoding='utf-8'), 'response JSON')
         except (OSError, UnicodeError) as exc:
             raise SeatError('Codex did not write a structured response') from exc
         _validate(response, schema)
         if not isinstance(response, dict):
             raise SeatError('Codex did not return a structured response object')
-        for call in response.get('tool_calls', []):
-            if not isinstance(_decode(call['arguments']), dict):
-                raise SeatError('Codex returned tool arguments that are not a JSON object')
         return {'response': response, 'usage': usage, 'model': model or 'default'}

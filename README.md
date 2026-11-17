@@ -579,10 +579,10 @@ The wizard ends with the [startup model check](#startup-model-check).
   separate checks. Resolve the reported runtime/model error; repeating login
   does not fix a transport failure. Confirm model entitlement and remaining
   quota. Do not configure API fallback unless you intend separate API billing.
-- **Codex says its Code Mode host is disabled:** this is a nonfatal native
-  diagnostic, not a tool call or a failed login. Conch intentionally disables
-  native execution and retains its own approval gates; you do not need to
-  enable the Code Mode host to use Conch.
+- **Codex reports that its Code Mode host is disabled:** this is a nonfatal
+  native diagnostic, not a tool call or a failed login, and Conch records it
+  only in debug logging. Conch intentionally disables native execution and
+  retains its own approval gates; you do not need to enable the Code Mode host.
 - **`zsh: no such file or directory: /models`:** slash commands run only inside
   a running Conch chat session. If startup exited, fix the reported error and
   run `conch` again before using `/models`, `/model`, or `/provider`.

@@ -44,6 +44,9 @@ Releases before 0.6.0 predate this changelog.
 - The `/provider` picker lists the current provider first and shows what each
   other provider needs; picker descriptions align in one column. `/status`
   wraps settings on boundaries and shows `~`-relative paths.
+- A command you decline is shown as `declined` with your feedback, not as an
+  error with the time spent at the prompt. Model-check failure text wraps on
+  words.
 
 ### Fixed
 
@@ -67,6 +70,12 @@ Releases before 0.6.0 predate this changelog.
 - Non-streamed OpenAI and Cerebras replies strip inline `<think>` blocks.
 - Tool relevance on tool-capped providers follows the turn's original request
   plus guidance, not the latest guidance message alone.
+- Seat turns no longer fail with `Codex returned malformed JSON` on commands
+  containing quotes. Tool arguments are now typed objects under the client's
+  schema enforcement instead of JSON written inside a string; arguments that
+  are still invalid are rejected per call so the model can correct them.
+- Codex's per-turn "Code Mode host is disabled" diagnostic no longer prints
+  into the chat; it is kept in debug logging.
 
 ## [0.8.0] - 2026-11-16
 

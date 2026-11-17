@@ -175,6 +175,16 @@ class TurnBoundaryTests(_DirectUI):
         self.assertEqual(self.ui._editor.text, "")
         self.ui._editor.text = "draft-kept"
 
+    def test_declined_command_is_reported_as_declined_with_its_feedback(self):
+        token = self.ui.tool_started("local_shell")
+        self.ui.tool_finished(
+            token, "User declined to execute the command. Feedback: use ls -la",
+            error=True)
+        line = self.published[-1]
+        self.assertIn("declined", line)
+        self.assertNotIn("error", line)
+        self.assertIn("use ls -la", line)
+
 
 class ChoiceRowTests(_DirectUI):
     async def test_long_choices_stay_one_row_each_so_all_remain_visible(self):

@@ -940,8 +940,15 @@ class TerminalUI:
             if tool is None:
                 return
             name, summary, started = tool
-            label = f"{name} · {'error' if error else 'done'} · {time.monotonic() - started:.1f}s"
+            declined = result.startswith(("User declined", "User did not approve"))
+            if declined:
+                # Not a failure, and the elapsed time was spent at the prompt.
+                label = f"{name} · declined"
+            else:
+                label = f"{name} · {'error' if error else 'done'} · {time.monotonic() - started:.1f}s"
             detail = result if verbose else " ".join(result.split())[:180]
+            if declined and not verbose:
+                detail = " ".join(result.partition("Feedback: ")[2].split())[:180]
             if detail:
                 label += "\n" + detail if verbose else ": " + detail
             self._enqueue_output(label + "\n", trusted=False)

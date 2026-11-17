@@ -14,22 +14,78 @@ from pathlib import Path
 from conch import seat_codex, seats
 from conch.providers import api_key_env_for, get_fallback_chain
 from conch.seat_common import SeatError, run
-from conch.seats import normalize
+from conch.runtime import parse_and_validate_tool_arguments
+from conch.seats import normalize, response_schema
 
 TOOL = {"type": "function", "function": {"name": "local_shell"}}
+TYPED_TOOL = {"type": "function", "function": {
+    "name": "local_shell",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "timeout": {"type": "integer"},
+            "mode": {"type": "string", "enum": ["fast", "safe"]},
+        },
+        "required": ["command"],
+    },
+}}
 
 
 class SeatBoundaryTests(unittest.TestCase):
-    def test_unknown_tool_and_nonobject_arguments_never_reach_dispatch(self):
-        for call in (
-            {"name": "unapproved", "arguments": "{}"},
-            {"name": "local_shell", "arguments": "[]"},
-            {"name": "local_shell", "arguments": "null"},
-            {"name": "local_shell", "arguments": "{bad"},
-            {"name": "local_shell", "arguments": '{"value":NaN}'},
-        ):
-            with self.subTest(call=call), self.assertRaises(SeatError):
-                normalize({"content": "", "tool_calls": [call]}, [TOOL])
+    def test_unknown_tool_never_reaches_dispatch(self):
+        for arguments in ("{}", {}):
+            with self.subTest(arguments=arguments), self.assertRaises(SeatError):
+                normalize({"content": "", "tool_calls": [
+                    {"name": "unapproved", "arguments": arguments}]}, [TOOL])
+
+    def test_bad_string_arguments_are_rejected_before_dispatch_not_by_failing_the_turn(self):
+        for arguments in ("[]", "null", "{bad", '{"value":NaN}',
+                          '{"command":"awk "unescaped" quote"}'):
+            with self.subTest(arguments=arguments):
+                reply = normalize({"content": "", "tool_calls": [
+                    {"name": "local_shell", "arguments": arguments}]}, [TYPED_TOOL])
+                parsed, error = parse_and_validate_tool_arguments(
+                    reply["tool_calls"][0], TYPED_TOOL)
+                self.assertIsNone(parsed)
+                self.assertTrue(error)
+
+    def test_arguments_that_are_neither_object_nor_string_fail_closed(self):
+        for arguments in (None, 7, ["ls"]):
+            with self.subTest(arguments=arguments), self.assertRaises(SeatError):
+                normalize({"content": "", "tool_calls": [
+                    {"name": "local_shell", "arguments": arguments}]}, [TYPED_TOOL])
+
+    def test_object_arguments_drop_unused_optionals_and_pass_validation(self):
+        command = 'awk \'{ pixels[x,y]="#" }\'\nprintf "\\033[H"'
+        reply = normalize({"content": "", "tool_calls": [{
+            "name": "local_shell",
+            "arguments": {"command": command, "timeout": None, "mode": None},
+        }]}, [TYPED_TOOL])
+        parsed, error = parse_and_validate_tool_arguments(reply["tool_calls"][0], TYPED_TOOL)
+        self.assertIsNone(error)
+        self.assertEqual(parsed, {"command": command})
+
+    def test_schema_types_arguments_per_tool_and_keeps_strings_for_open_schemas(self):
+        open_tool = {"type": "function", "function": {
+            "name": "open_tool", "parameters": {"type": "object", "properties": {
+                "headers": {"type": "object"}}}}}
+        variants = response_schema([TYPED_TOOL, open_tool, {
+            "type": "function", "function": {"name": "bare"}}])[
+            "properties"]["tool_calls"]["items"]["anyOf"]
+        by_name = {name: variant["properties"]["arguments"]
+                   for variant in variants
+                   for name in variant["properties"]["name"]["enum"]}
+        typed = by_name["local_shell"]
+        self.assertEqual(typed["type"], "object")
+        self.assertEqual(set(typed["required"]), {"command", "timeout", "mode"})
+        self.assertIs(typed["additionalProperties"], False)
+        self.assertEqual(typed["properties"]["command"]["type"], "string")
+        self.assertEqual(typed["properties"]["timeout"]["type"], ["integer", "null"])
+        self.assertEqual(typed["properties"]["mode"]["enum"], ["fast", "safe", None])
+        self.assertEqual(by_name["open_tool"]["type"], "string")
+        self.assertEqual(by_name["bare"]["type"], "string")
+        self.assertNotIn("null", str(TYPED_TOOL))  # The tool's own schema is untouched.
 
     def test_no_tool_request_is_accepted_when_tools_are_disabled(self):
         with self.assertRaises(SeatError):

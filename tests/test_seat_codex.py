@@ -84,11 +84,42 @@ class CodexTransportTests(unittest.TestCase):
         with self.assertRaises(SeatError):
             self.invoke(response)
 
-    def test_rejects_arguments_that_are_not_json_objects(self):
+    def test_string_arguments_are_left_for_conch_argument_validation(self):
         for arguments in ('[]', 'null', '{broken', '{"x":NaN}'):
-            with self.subTest(arguments=arguments), self.assertRaises(SeatError):
-                self.invoke({'content': '', 'tool_calls': [
-                    {'name': 'read_file', 'arguments': arguments}]})
+            with self.subTest(arguments=arguments):
+                response = {'content': '', 'tool_calls': [
+                    {'name': 'read_file', 'arguments': arguments}]}
+                self.assertEqual(self.invoke(response)['response'], response)
+
+    def test_typed_arguments_must_match_their_own_tool(self):
+        shell = {'type': 'function', 'function': {'name': 'shell', 'parameters': {
+            'type': 'object', 'properties': {
+                'command': {'type': 'string'}, 'timeout': {'type': 'integer'}},
+            'required': ['command']}}}
+        note = {'type': 'function', 'function': {'name': 'note', 'parameters': {
+            'type': 'object', 'properties': {'text': {'type': 'string'}},
+            'required': ['text']}}}
+        schema = response_schema([shell, note])
+
+        def check(name, arguments):
+            seat_codex._validate(
+                {'content': '', 'tool_calls': [{'name': name, 'arguments': arguments}]},
+                schema)
+
+        check('shell', {'command': 'echo "quoted"', 'timeout': None})
+        check('shell', {'command': 'ls', 'timeout': 5})
+        check('note', {'text': 'hello'})
+        for name, arguments in (
+            ('shell', {'command': 'ls'}),                      # strict: every key present
+            ('shell', {'command': 'ls', 'timeout': '5'}),
+            ('shell', {'command': 'ls', 'timeout': True}),
+            ('shell', {'command': 'ls', 'timeout': None, 'extra': 1}),
+            ('shell', {'text': 'hello'}),                      # another tool's arguments
+            ('note', '{"text":"hello"}'),
+            ('other', {'text': 'hello'}),
+        ):
+            with self.subTest(name=name, arguments=arguments), self.assertRaises(SeatError):
+                check(name, arguments)
 
     def test_rejects_missing_or_wrong_envelope_fields(self):
         for response in ({'content': 'hello'}, {'content': None, 'tool_calls': []},
@@ -98,7 +129,7 @@ class CodexTransportTests(unittest.TestCase):
                 self.invoke(response)
 
     def test_nonfatal_native_diagnostic_preserves_completed_response(self):
-        with self.assertLogs('conch.seat_codex', level='WARNING'):
+        with self.assertLogs('conch.seat_codex', level='DEBUG'):
             result = self.invoke(events=[
                 {'type': 'thread.started', 'thread_id': 'native-thread'},
                 {'type': 'item.completed', 'item': {
@@ -115,7 +146,7 @@ class CodexTransportTests(unittest.TestCase):
 
     def test_native_diagnostic_does_not_expose_credentials(self):
         secret = 'sk-' + 'aB7cD9' * 8
-        with self.assertLogs('conch.seat_codex', level='WARNING') as logs:
+        with self.assertLogs('conch.seat_codex', level='DEBUG') as logs:
             self.invoke(events=[
                 {'type': 'item.completed', 'item': {
                     'type': 'error', 'message': 'API key: ' + secret}},
@@ -124,7 +155,7 @@ class CodexTransportTests(unittest.TestCase):
         self.assertNotIn(secret, '\n'.join(logs.output))
 
     def test_nonfatal_diagnostic_cannot_mask_a_failed_turn(self):
-        with self.assertLogs('conch.seat_codex', level='WARNING'), self.assertRaises(SeatError):
+        with self.assertLogs('conch.seat_codex', level='DEBUG'), self.assertRaises(SeatError):
             self.invoke(events=[
                 {'type': 'item.completed', 'item': {
                     'type': 'error', 'message': 'Recoverable warning'}},
@@ -234,7 +265,7 @@ class CodexTransportTests(unittest.TestCase):
     def test_live_diagnostics_are_redacted_and_not_replayed_at_completion(self):
         details = []
         secret = 'sk-' + 'aB7cD9' * 8
-        with self.assertLogs('conch.seat_codex', level='WARNING') as logs:
+        with self.assertLogs('conch.seat_codex', level='DEBUG') as logs:
             result = self.invoke(events=[
                 {'type': 'item.completed', 'item': {
                     'type': 'error', 'message': 'API key: ' + secret}},

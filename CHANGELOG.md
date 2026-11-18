@@ -16,6 +16,11 @@ Releases before 0.6.0 predate this changelog.
   OpenAI reasoning models, OpenRouter, Ollama thinking and `num_ctx`). Choices
   are per model, saved as `model_effort` and `model_context`, shown on the row
   and in the status bar, and never sent to a model that does not accept them.
+- Shared file/link presentation guidance: models are asked to show complete web
+  URLs and absolute, percent-encoded `file:///` links for local files and
+  directories, including with custom prompts, subagents, and fallback models.
+  Destinations stay visible; terminal escapes and invented upload URLs are not
+  used. Click support depends on the terminal.
 
 ### Fixed
 

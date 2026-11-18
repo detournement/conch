@@ -2107,7 +2107,7 @@ def chat_turn(
         # Keep model-facing self-knowledge accurate after fallback and after a
         # local server reports its loaded context. This is request-scoped so
         # persisted history remains portable.
-        from .prompts import build_self_description
+        from .prompts import FILE_LINK_GUIDANCE, build_self_description
 
         active_model = config.get(
             "chat_model", config.get("model", "")
@@ -2117,7 +2117,8 @@ def chat_turn(
             "[Current runtime state] "
             + build_self_description(
                 provider, active_model, config
-            ),
+            )
+            + "\n\n" + FILE_LINK_GUIDANCE,
         )
 
         # Few-shot tool-call anchor + corrective reminder for local models
@@ -2317,7 +2318,8 @@ def chat_turn(
                         "[Current runtime state] "
                         + build_self_description(
                             fb_provider, fb_model, fb_config
-                        ),
+                        )
+                        + "\n\n" + FILE_LINK_GUIDANCE,
                     )
                     fb_messages = apply_tool_call_scaffolding(
                         fb_messages,

@@ -178,6 +178,73 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((dedicated / 'python').exists())
         self.assertNotIn(str(selected.parent), (tmp_path / '.bashrc').read_text())
 
+    def test_source_venv_companions_run_without_promoting_python_or_pip(self):
+        shells = [(name, shutil.which(name)) for name in ("bash", "zsh")]
+        shells = [(name, binary) for name, binary in shells if binary]
+        if not shells:
+            self.skipTest("bash and zsh unavailable")
+        for shell, binary in shells:
+            with self.subTest(shell=shell):
+                home = self.tmp_path / f"{shell} quoted ' home"
+                home.mkdir()
+                root = checkout(home)
+                selected = root / "bin/conch"
+                (root / ".venv/pyvenv.cfg").write_text("home=/usr/bin\n")
+                companions = ("conch-edge", "conch-controller", "conch-worker", "conch-hostctl")
+                sources = {"conch": selected}
+                for name in companions:
+                    sources[name] = executable(root / ".venv/bin" / name, name)
+                sources["conch-keys"] = executable(root / "bin/conch-keys", "checkout-keys")
+                executable(root / ".venv/bin/conch-keys", "wrong-venv-keys")
+                user_bin = home / "user/bin"
+                for name in ("python", "pip"):
+                    executable(user_bin / name, f"user-{name}")
+                    executable(root / "bin" / name, f"wrong-checkout-{name}")
+                    executable(root / ".venv/bin" / name, f"wrong-venv-{name}")
+                rc = home / (".bashrc" if shell == "bash" else ".zshrc")
+                rc.write_text(f"export CONCH_DIR={shlex.quote(str(root))}\n"
+                              'export PATH="${CONCH_DIR}/.venv/bin:$PATH"\n'
+                              f'source "${{CONCH_DIR}}/shell/conch.{shell}"\n')
+                env = environment(home, SHELL=binary, PATH=f"{user_bin}:/usr/bin:/bin")
+                before = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+                dry_run = repair_launcher(selected, check=True, environ=env)
+                self.assertFalse(dry_run.conflicts)
+                self.assertTrue(dry_run.pending)
+                self.assertFalse(dry_run.changed)
+                self.assertFalse(dry_run.backups)
+                self.assertEqual(before, {p: p.read_bytes() for p in home.rglob("*") if p.is_file()})
+                dedicated = home / ".local/share/conch/launchers"
+                self.assertFalse(dedicated.exists())
+                first = repair_launcher(selected, environ=env)
+                self.assertTrue(first.usable, first.conflicts)
+                for name, source in sources.items():
+                    self.assertEqual((dedicated / name).resolve(), source)
+                for name in ("python", "pip"):
+                    self.assertFalse((dedicated / name).exists())
+                public = home / ".local/bin/conch"
+                public.parent.mkdir(parents=True)
+                public.symlink_to(selected)
+                second = repair_launcher(public, environ=env)
+                self.assertTrue(second.usable, second.conflicts)
+                self.assertFalse(second.changed)
+                self.assertFalse(second.backups)
+                self.assertTrue(repair_launcher(public, check=True, environ=env).usable)
+                commands = [f"command -v {name}; {name}" for name in sources]
+                commands.extend(("command -v python; python", "command -v pip; pip",
+                                 'printf "%s\\n" "$PATH"', "ask"))
+                result = subprocess.run([binary, "-i", "-c", "; ".join(commands)], env=env,
+                                        capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                for name in sources:
+                    self.assertIn(str(dedicated / name), lines)
+                for expected in (*companions, "old", "checkout-keys", "user-python", "user-pip",
+                                 str(user_bin / "python"), str(user_bin / "pip"), "helper-preserved"):
+                    self.assertIn(expected, lines)
+                self.assertNotIn("wrong-", result.stdout)
+                self.assertNotIn(str(root / ".venv/bin"), result.stdout)
+                self.assertNotIn(str(root / "bin") + ":", result.stdout)
+
     def test_ambiguous_overrides_and_active_environments_are_not_false_fixed(self):
         tmp_path = self.tmp_path
         selected = executable(tmp_path / ".local/bin/conch")

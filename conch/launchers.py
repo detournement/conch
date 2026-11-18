@@ -558,11 +558,19 @@ def repair_launcher(launcher: Path, *, check: bool = False, home: Optional[Path]
         report.conflicts.append("selected launcher path contains an unsupported newline or PATH separator")
         return report
     directory = launcher.parent
-    if (directory.parent / "pyvenv.cfg").is_file():
-        # Expose only Conch tools, never the venv's python/pip or other tools.
+    source_root = launcher.resolve().parent.parent
+    source_venv = (source_root / ".venv/bin"
+                   if _checkout(source_root) and (source_root / ".venv/pyvenv.cfg").is_file()
+                   else None)
+    if (directory.parent / "pyvenv.cfg").is_file() or source_venv is not None:
+        # Expose only Conch tools, preferring source wrappers to venv entrypoints.
+        wrappers = source_root / "bin" if source_venv is not None else launcher.parent
         directory = home / ".local/share/conch/launchers"
         for name in _HELPERS:
-            source = launcher if name == "conch" else launcher.parent / name
+            source = launcher if name == "conch" else wrappers / name
+            if (name != "conch" and source_venv is not None
+                    and not (source.is_file() and os.access(source, os.X_OK))):
+                source = source_venv / name
             if not source.is_file() or not os.access(source, os.X_OK):
                 continue
             destination = directory / name

@@ -35,6 +35,8 @@ Releases before 0.6.0 predate this changelog.
   so HTTP 400/422 authentication failures cannot appear as accepted credentials.
 - Launcher repair leaves profiles with ambiguous multiline shell data unchanged
   and reports manual action rather than modifying quoted or generated scripts.
+- Source checkouts expose companion commands through Conch-only shims without
+  adding their private Python or pip to PATH, including symlinked launchers.
 - Upgrades reconcile recognized stale shell launchers with private backups,
   preserving credentials, helper integrations, customized PATH entries, and
   valid shell syntax inside conditional/function bodies. Experimental checkouts

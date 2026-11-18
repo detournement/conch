@@ -265,10 +265,16 @@ def _without_managed(text: str, path: Path, report: RepairReport) -> str:
             if not (shell_path or fish_path):
                 report.conflicts.append(f"{path}:{index + 1}: customized Conch managed block; retained for manual review")
                 result.extend(lines[index:end + 1])
+            elif any(line.strip() for line in lines[end + 1:]):
+                # Embedded blocks may be the sole statement in a shell body.
+                # The generated trailing block needs no placeholder (or each
+                # repair would accumulate another no-op).
+                result.append("true\n" if path.suffix == ".fish" else ":\n")
             index = end + 1
             continue
         if lines[index].strip() == _PUBLIC_MARKER and index + 1 < len(lines):
             if re.fullmatch(r'export PATH="/[^":$`\\\n]*:\$PATH"\s*', lines[index + 1]):
+                result.append("true\n" if path.suffix == ".fish" else ":\n")
                 index += 2
                 continue
         result.append(lines[index])
@@ -324,7 +330,9 @@ def _rewrite(path: Path, original: str, values: Dict[str, str], directory: Path,
                 if protected:
                     report.conflicts.append(f"{path}:{number}: Conch alias in protected env file; move it to a startup profile")
                 else:
-                    # PATH is canonical; remove only an alias which executes exactly Conch.
+                    # Keep conditional/function bodies valid while removing
+                    # only an alias which executes exactly Conch.
+                    result.append("true\n" if path.suffix == ".fish" else ":\n")
                     continue
             else:
                 report.conflicts.append(f"{path}:{number}: ambiguous conch alias; remove or update it to the selected launcher")
@@ -359,6 +367,7 @@ def _rewrite(path: Path, original: str, values: Dict[str, str], directory: Path,
             except ValueError:
                 command = []
             if len(command) == 1 and _verified(Path(command[0])) and not protected:
+                result.append("true\n")
                 continue
             report.conflicts.append(f"{path}:{number}: fish conch alias overrides PATH; remove or update it")
         if path.suffix == ".fish" and re.match(r"function\s+conch\b", stripped):

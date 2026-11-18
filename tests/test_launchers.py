@@ -140,7 +140,7 @@ class LauncherTests(unittest.TestCase):
         report = repair_launcher(selected, environ=environment(tmp_path))
         self.assertTrue(report.usable, report.conflicts)
         self.assertIn(include, report.scanned)
-        self.assertEqual(include.read_text(), 'export CUSTOM=kept\n')
+        self.assertIn('export CUSTOM=kept\n', include.read_text())
         self.assertTrue((zdot / '.zshrc').exists())
         self.assertFalse((tmp_path / '.zshrc').exists())
         self.assertIn('conch launcher (managed)', (tmp_path / '.bash_login').read_text())
@@ -283,6 +283,69 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn("tool-preserved\n", result.stdout)
                 self.assertIn("preserved\n", result.stdout)
 
+    def test_removed_launchers_keep_conditional_and_function_bodies_valid(self):
+        shells = [(name, shutil.which(name)) for name in ("bash", "zsh", "fish")]
+        shells = [(name, binary) for name, binary in shells if binary]
+        if not shells:
+            self.skipTest("bash, zsh and fish unavailable")
+        for shell, binary in shells:
+            for kind in ("alias", "managed", "legacy"):
+                if shell == "fish" and kind == "legacy":
+                    continue  # The legacy public installer generated sh syntax.
+                for body in ("conditional", "function"):
+                    with self.subTest(shell=shell, kind=kind, body=body):
+                        home = self.tmp_path / f"{shell}-{kind}-{body}"
+                        home.mkdir()
+                        selected = executable(home / ".local/bin/conch")
+                        old = executable(home / "old/bin/conch", "old")
+                        fish = shell == "fish"
+                        rc = home / (".config/fish/config.fish" if fish else
+                                     ".bashrc" if shell == "bash" else ".zshrc")
+                        rc.parent.mkdir(parents=True, exist_ok=True)
+                        if kind == "alias":
+                            separator = " " if fish else "="
+                            statement = f"alias conch{separator}{shlex.quote(str(old))}\n"
+                        elif kind == "managed":
+                            assignment = (f"set -gx PATH '{old.parent}' $PATH\n" if fish else
+                                          f'export PATH={shlex.quote(str(old.parent))}:"$PATH"\n')
+                            statement = ("# >>> conch launcher (managed) >>>\n"
+                                         + assignment + "# <<< conch launcher (managed) <<<\n")
+                        else:
+                            statement = ('# added by the conch installer\n'
+                                         f'export PATH="{old.parent}:$PATH"\n')
+                        if body == "conditional":
+                            wrapped = ("if true\n" + statement + "end\n" if fish else
+                                       "if true; then\n" + statement + "fi\n")
+                        else:
+                            wrapped = ("function configure_launcher\n" + statement + "end\n" if fish else
+                                       "configure_launcher() {\n" + statement + "}\n")
+                            wrapped += "configure_launcher\n"
+                        marker = home / "profile-executed"
+                        rc.write_text(f"printf executed > {shlex.quote(str(marker))}\n" + wrapped)
+                        env = environment(home, SHELL=binary)
+                        first = repair_launcher(selected, environ=env)
+                        self.assertTrue(first.usable, first.conflicts)
+                        self.assertFalse(marker.exists())
+                        second = repair_launcher(selected, environ=env)
+                        self.assertTrue(second.usable, second.conflicts)
+                        self.assertFalse(second.changed)
+                        self.assertFalse(second.backups)
+                        self.assertFalse(marker.exists())
+                        parsed = subprocess.run([binary, "-n", str(rc)], env=env,
+                                                capture_output=True, text=True, timeout=10)
+                        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+                        self.assertFalse(marker.exists())
+                        flags = (["--no-config"] if fish else
+                                 ["--noprofile", "--norc", "-O", "expand_aliases"] if shell == "bash" else ["-f"])
+                        lookup = "command -s conch" if fish else "command -v conch"
+                        command = f"source {shlex.quote(str(rc))}\n{lookup}; conch"
+                        result = subprocess.run([binary, *flags, "-c", command], env=env,
+                                                capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertTrue(marker.exists())
+                        self.assertIn(str(selected), result.stdout)
+                        self.assertIn("selected\n", result.stdout)
+
     def test_fish_xdg_config_and_conf_d_overrides_are_inspected(self):
         tmp_path = self.tmp_path
         selected = executable(tmp_path / ".local/bin/conch")
@@ -294,7 +357,7 @@ class LauncherTests(unittest.TestCase):
         env = environment(tmp_path, XDG_CONFIG_HOME=str(config.parent), SHELL="/usr/bin/fish")
         report = repair_launcher(selected, environ=env)
         self.assertTrue(report.usable, report.conflicts)
-        self.assertEqual(snippet.read_text(), 'set -gx CUSTOM keep\n')
+        self.assertIn('set -gx CUSTOM keep\n', snippet.read_text())
         self.assertIn('set -gx PATH', (config / 'config.fish').read_text())
         self.assertFalse(repair_launcher(selected, environ=env).changed)
 

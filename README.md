@@ -1005,7 +1005,8 @@ native login and generate a structured probe-tool response (consuming plan
 usage); their default deadline is 60 seconds. API providers use Conch's verified
 catalog and the models-list endpoint (a 1-token completion only when needed);
 Ollama uses `/api/tags` plus advertised `tools`; custom endpoints use
-`/v1/models` plus a forced tool-call probe. A pass shows `✓ verified`.
+`/v1/models` plus a forced tool-call probe with a 512-token output budget so
+reasoning models can finish the native call. A pass shows `✓ verified`.
 A failure is classified — `no API
 key`, `unreachable`, `authentication failed`, `model not found`, `timed out`,
 `failed tool-call conformance`, `rate limited`, `quota/billing exhausted`,

@@ -19,6 +19,11 @@ Releases before 0.6.0 predate this changelog.
 
 ### Fixed
 
+- Custom and llamaidx reasoning models are no longer rejected during model
+  switching because the tool-call probe ran out of tokens. The bounded probe
+  now allows reasoning before the required native tool call; prose-only
+  responses still fail validation.
+
 - Explicit `ssh …` input now offers a choice between secure interactive terminal
   handoff and model-selected execution. The model receives the original command
   when selected; cancelling sends and executes nothing. SSH options and absolute

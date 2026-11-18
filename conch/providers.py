@@ -2173,7 +2173,9 @@ def probe_custom_model(
             }
         ],
         "temperature": 0,
-        "max_tokens": 64,
+        # Reasoning tokens share this budget with the native call. A 64-token
+        # cap can cut off a tool-capable model before it emits the call.
+        "max_tokens": 512,
         "tools": [
             {
                 "type": "function",

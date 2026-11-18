@@ -9,6 +9,34 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-11-17
+
+### Added
+
+- `conch update` and `/update`: update the running installation from its Git
+  upstream or recorded package source. Checkouts fast-forward or merge by
+  default, with explicit `--rebase`, preservation of local/index work,
+  conflict recovery, and editable/dependency refresh. `--check` previews;
+  chat saves and closes before an actual update.
+- Release source distributions and wheels with SHA-256 sidecars.
+
+### Changed
+
+- Submitted prompts are distinct themed **You** blocks, with terminal-width
+  separators above and below, including multiline and queued input.
+- The website installer detects existing managed or source installations and
+  asks on the controlling terminal before updating the same copy. Decline,
+  empty input, and no terminal leave it unchanged; fresh installs stay
+  unattended. Older source checkouts bootstrap the safe updater rather than
+  passing an unsupported `update` prompt to a model.
+
+### Fixed
+
+- `/new` carries a bounded set of recent file references immediately, even
+  when session summaries are disabled or still running. Follow-ups can inspect
+  generated artifacts instead of relying on a lossy summary. The old transcript
+  and file contents are not carried over, and `/clear` removes the references.
+
 ## [0.9.3] - 2026-11-17
 
 ### Changed
@@ -504,6 +532,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.4]: https://github.com/detournement/conch/releases/tag/v0.9.4
 [0.9.3]: https://github.com/detournement/conch/releases/tag/v0.9.3
 [0.9.2]: https://github.com/detournement/conch/releases/tag/v0.9.2
 [0.9.1]: https://github.com/detournement/conch/releases/tag/v0.9.1

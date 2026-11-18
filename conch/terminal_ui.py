@@ -1016,7 +1016,18 @@ class TerminalUI:
     def _accept_messages(self, messages):
         for text in messages:
             self._history.append_string(text)
-            self._enqueue_output("> " + text + "\n", trusted=False)
+            width = max(1, self._output.get_size().columns - 1)
+            label = self._clip("── You ")
+            # One queue entry keeps the boundary and literal body together.
+            # Leave wrapping to the terminal; never clip or reflow user text.
+            self._enqueue_output([
+                ("", "\n\n"),
+                ("class:user", label),
+                ("class:rule", "─" * max(0, width - get_cwidth(label))),
+                ("", "\n" + text + "\n"),
+                ("class:rule", "─" * width),
+                ("", "\n\n"),
+            ], trusted=False)
 
     def _flush_deferred_echo(self):
         deferred, self._deferred_echo = self._deferred_echo, []
@@ -1414,7 +1425,7 @@ class TerminalUI:
                 fragments = []
                 while self._output_queue:
                     text, trusted = self._output_queue.popleft()
-                    parsed = to_formatted_text(ANSI(text)) if trusted else [("", text)]
+                    parsed = to_formatted_text(ANSI(text) if trusted else text)
                     # Parse styles only: never replay arbitrary terminal controls.
                     fragments.extend((style, _safe(value))
                                      for style, value, *rest in parsed

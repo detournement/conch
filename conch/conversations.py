@@ -204,6 +204,8 @@ class Conversation:
     # output_tokens, cost, turns, <billing kind>_turns). Empty for
     # conversations saved before per-conversation accounting existed.
     usage: Dict[str, Any] = field(default_factory=dict)
+    # Bounded file references from an explicit /new, not the old transcript.
+    previous_context: str = ""
 
     @property
     def path(self) -> Path:
@@ -220,6 +222,7 @@ class Conversation:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "usage": self.usage,
+            "previous_context": self.previous_context,
         }
 
     def storage_copy(self) -> "Conversation":
@@ -236,6 +239,7 @@ class Conversation:
             updated_at=self.updated_at,
             schema_version=self.schema_version,
             usage=dict(self.usage),
+            previous_context=_scrub_text(self.previous_context),
         )
 
     def save(self):
@@ -261,6 +265,7 @@ class Conversation:
                 schema_version=1,
             )
         usage = data.get("usage")
+        previous_context = data.get("previous_context", "")
         return cls(
             id=data["id"],
             title=data.get("title") or "New conversation",
@@ -271,6 +276,8 @@ class Conversation:
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             schema_version=data.get("schema_version", 1),
             usage=usage if isinstance(usage, dict) else {},
+            previous_context=_scrub_text(previous_context)
+            if isinstance(previous_context, str) else "",
         )
 
 
@@ -473,12 +480,14 @@ class ConversationManager:
         self._index["conversations"] = conversations
         self._save_index()
 
-    def create(self, model: str, provider: str) -> Conversation:
+    def create(self, model: str, provider: str,
+               previous: Optional[Conversation] = None) -> Conversation:
         conv = Conversation(
             id=uuid.uuid4().hex[:8],
             title="New conversation",
             model=model,
             provider=provider,
+            previous_context=_recent_file_context(previous) if previous else "",
         )
         self.save(conv)
         return conv
@@ -599,6 +608,7 @@ class ConversationManager:
             return None
         forked = self.create(model=original.model, provider=original.provider)
         forked.messages = copy.deepcopy(original.messages)
+        forked.previous_context = original.previous_context
         base = normalize_title(original.title) or "New conversation"
         forked.title = f"{base[:TITLE_MAX_CHARS - 7].rstrip()} (fork)"
         forked.usage = {}
@@ -976,6 +986,58 @@ def prompt_text(message: Dict[str, Any]) -> str:
     """What the user typed in a prompt message (turn context stripped;
     attached images as ``[image: name]``)."""
     return "\n".join(text for kind, text in display_blocks(message) if kind == "text")
+
+
+def _recent_file_context(conversation: Conversation) -> str:
+    """Carry file pointers across /new synchronously, without an LLM summary.
+
+    References are not assertions that a write succeeded or a file still
+    exists. Do not carry file contents, old instructions, or whole tool results.
+    """
+    paths: List[str] = []
+    for message in reversed(conversation.messages):
+        functions = [
+            call.get("function") or {}
+            for call in message.get("tool_calls") or []
+            if isinstance(call, dict)
+        ]
+        content = message.get("content")
+        if isinstance(content, list):
+            functions.extend(
+                {"name": block.get("name"), "arguments": block.get("input")}
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            )
+        for function in reversed(functions):
+            if function.get("name") not in ("read_file", "edit_file", "write_file"):
+                continue
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    continue
+            if not isinstance(arguments, dict):
+                continue
+            path = arguments.get("path")
+            if not isinstance(path, str):
+                continue
+            path = path.strip()
+            if (not path or len(path) > 512 or path in paths
+                    or _scrub_text(path) != path):
+                continue
+            paths.append(path)
+            if len(paths) == 5:
+                break
+        if len(paths) == 5:
+            break
+    if not paths:
+        return ""
+    return json.dumps(_scrub_json_value({
+        "conversation_id": conversation.id,
+        "title": normalize_title(conversation.title),
+        "file_references": paths,
+    }), ensure_ascii=False)
 
 
 def _export_stamp(value: Any) -> str:

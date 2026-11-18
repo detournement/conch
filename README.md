@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.3][release] ·
+[Current release: v0.9.4][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.3
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.4
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -20,8 +20,9 @@ curl -fsSL https://conch-site-gamma.vercel.app/install | sh
 The installer supports **macOS and Linux**, uses an isolated `uv`, `pipx`, or
 private-venv install, and never needs `sudo`. Native Windows is not supported;
 WSL2 follows the Linux path. The public installer currently installs the
-maintained GitHub `edge` tarball—not a PyPI package—and re-running it upgrades
-the installation.
+maintained GitHub `edge` tarball—not a PyPI package. Re-running it detects an
+existing copy and asks before updating that installation in place; no, Enter,
+or no controlling terminal leaves it unchanged.
 New here? Start with [seat sign-in and verification](#first-launch), then see
 [optional local models and subagents](docs/LOCAL-SUBAGENTS.md). No API key is
 required for Claude or ChatGPT seats; subscription limits still apply.
@@ -63,6 +64,9 @@ Options (`--new`, `--non-interactive`, `--help`, `--version`) are recognised
 only before the prompt, so words inside a prompt are never read as options;
 put `--` before a prompt whose first word starts with a dash. Unknown options
 are rejected with a usage error.
+
+Submitted prompts appear in distinct **You** blocks, with separators above
+and below, including queued guidance and multiline input.
 
 ### Conversations page
 
@@ -631,11 +635,42 @@ The installer:
 - prefers `uv`, then `pipx`, then a private venv;
 - places commands on the zsh, bash, or POSIX-shell path without `sudo`;
 - keeps using the original install method on upgrades;
+- shows an existing launcher and asks `[y/N]` on `/dev/tty` before downloads
+  or installation changes; a fresh install remains unattended;
+- updates recognized source checkouts through their configured Git upstream,
+  including older Conch versions without the `update` command, rather than
+  installing a second copy; unknown installations are left untouched;
 - installs from the GitHub `edge` branch tarball by default.
 
-`conch-shell` is not published on PyPI at v0.9.3. The release tag exists for
-source and auditability, while the website installer deliberately follows the
-maintained edge release line.
+`conch-shell` is not published on PyPI at v0.9.4. GitHub releases include a
+source distribution, wheel, and SHA-256 sidecars; the website installer follows
+`edge` by default. Set `CONCH_INSTALL_REF=v0.9.4` to install the release sdist.
+
+### Updating
+
+```bash
+conch update --check   # preview; fetches a checkout's upstream without changing local work
+conch update           # fast-forward, or merge divergent checkout history
+conch update --rebase  # explicitly rebase local commits instead
+```
+
+The updater targets the Conch installation you ran, not the repository in your
+current directory. A source checkout follows its existing branch/upstream,
+preserves staged, unstaged, and untracked work, and refreshes its editable
+installation and dependencies. Detached HEAD, unfinished Git operations, and
+unsafe file collisions are refused. Failed integration is aborted; if restoring
+local work conflicts, its recovery stash is retained with instructions.
+It never force-pushes or discards local commits.
+
+Managed/package installations reinstall from their recorded Git or download
+source in the same Python environment, not from a potentially older PyPI
+release. `--check` only reports the proposed package update. Missing or
+ambiguous provenance fails with repair guidance.
+
+Inside chat, `/update` takes the same options. `/update --check` and
+`/update --help` keep chat open; an actual update saves the conversation,
+closes the session, and then runs the updater. Restart `conch` afterward;
+other running Conch processes and services must also be restarted.
 
 ### From source
 
@@ -1201,6 +1236,13 @@ Only native tool calls are executable; repeated identical call batches stop.
   model and tool output are replaced with `[credential redacted]` before
   a transcript is written or indexed — the running session keeps the
   original; what the user typed is stored as typed.
+- `/new` also saves up to five recent file-tool references for the next
+  conversation's first turn, synchronously and independently of summaries.
+  This keeps generated files discoverable without retaining the old transcript
+  or file contents. Conch is instructed to read those files before guessing
+  about them. References are paths as supplied to the file tools, not proof
+  that a write succeeded; relative paths still use the working directory.
+  `/clear` removes this handoff as well as the current chat history.
 - Images: drag a PNG, JPEG, GIF, or WebP into the terminal (or type its path)
   and it is attached to that message; `/image` attaches the clipboard image
   (`/image <path>` a file, `/image clear` drops pending ones) to your next
@@ -1743,6 +1785,7 @@ plain sessions. This table groups the shipped commands.
 | `/checkpoint [list\|diff\|restore\|on\|off]`, `/undo` | Manage automatic Git snapshots |
 | `/schedule`, `/tasks`, `/cancel` | Scheduled prompts |
 | `/install [component]` | List or configure shell, edge, fleet, works, and capture |
+| `/update [--check\|--merge\|--rebase]` | Update this installation; saves and closes chat before an actual update |
 | `/keys [check\|set NAME\|rotate\|doctor\|import\|required\|reload\|migrate-mcp]` | See, verify, and rotate every credential; hot-reloads the session |
 | `/missions`, `/mission ...` | List and manage durable missions |
 | `/approvals`, `/approve`, `/deny` | Decide pending mission actions |

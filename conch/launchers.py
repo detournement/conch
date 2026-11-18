@@ -358,7 +358,7 @@ def _rewrite(path: Path, original: str, values: Dict[str, str], directory: Path,
                         line = "export PATH=" + ":".join(entries) + "\n"
             elif "CONCH_DIR" in assignment[2] or re.search(r"(?:^|[/\s])conch(?:[/\s]|$)", assignment[2]):
                 report.conflicts.append(f"{path}:{number}: computed Conch PATH; simplify it to literal entries and rerun")
-        if re.search(r"(?:^|[;\s])(?:function\s+conch\b|conch\s*\(\s*\))", stripped):
+        if re.search(r"(?:^|[;\s])(?:function\s+conch(?=[\s(;]|$)|conch\s*\(\s*\))", stripped):
             report.conflicts.append(f"{path}:{number}: conch shell function overrides PATH; remove or update it")
         if path.suffix == ".fish" and re.match(r"alias\s+conch\s+", stripped):
             try:
@@ -370,9 +370,9 @@ def _rewrite(path: Path, original: str, values: Dict[str, str], directory: Path,
                 result.append("true\n")
                 continue
             report.conflicts.append(f"{path}:{number}: fish conch alias overrides PATH; remove or update it")
-        if path.suffix == ".fish" and re.match(r"function\s+conch\b", stripped):
+        if path.suffix == ".fish" and re.match(r"function\s+conch(?=[\s;]|$)", stripped):
             report.conflicts.append(f"{path}:{number}: fish conch function overrides PATH; remove or update it")
-        if ("alias" in stripped and re.search(r"\bconch=", stripped) and not alias):
+        if ("alias" in stripped and re.search(r"(?:^|[\s;])conch=", stripped) and not alias):
             report.conflicts.append(f"{path}:{number}: compound conch alias; review it manually")
         result.append(line)
     rewritten = "".join(result)

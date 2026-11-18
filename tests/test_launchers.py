@@ -371,6 +371,33 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('export MY_SECRET=kept', rc.read_text())
         self.assertTrue(any(('customized' in c for c in report.conflicts)))
 
+    def test_similar_helper_names_do_not_hide_real_launcher_overrides(self):
+        for shell in ("bash", "zsh", "fish"):
+            with self.subTest(shell=shell):
+                home = self.tmp_path / shell
+                home.mkdir()
+                selected = executable(home / ".local/bin/conch")
+                rc = home / (".config/fish/config.fish" if shell == "fish" else f".{shell}rc")
+                rc.parent.mkdir(parents=True, exist_ok=True)
+                original = ("function conch-helper\n    true\nend\nalias old-conch 'echo preserved'\n"
+                            if shell == "fish" else
+                            "function conch-helper() { :; }\nalias old-conch='printf preserved'\n")
+                rc.write_text(original)
+                env = environment(home, SHELL=f"/bin/{shell}")
+                report = repair_launcher(selected, environ=env)
+                self.assertTrue(report.usable, report.conflicts)
+                self.assertIn(original, rc.read_text())
+                override = ("function conch\n    true\nend\n" if shell == "fish"
+                            else "function conch() { :; }\n")
+                rc.write_text(override)
+                self.assertFalse(repair_launcher(selected, environ=env).usable)
+                self.assertIn(override, rc.read_text())
+                if shell != "fish":
+                    compound = "alias keep=true conch='printf shadow'\n"
+                    rc.write_text(compound)
+                    self.assertFalse(repair_launcher(selected, environ=env).usable)
+                    self.assertIn(compound, rc.read_text())
+
     def test_uninspectable_helpers_are_preserved(self):
         for kind in ("unreadable", "non_utf8", "oversized", "dangling_symlink"):
             with self.subTest(kind=kind):

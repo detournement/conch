@@ -36,6 +36,8 @@ Releases before 0.6.0 predate this changelog.
   valid shell syntax inside conditional/function bodies. Experimental checkouts
   migrate only with consent and retain their local work. Existing helpers that
   cannot be inspected are not overwritten.
+- Launcher conflict checks match complete command names, so unrelated helpers
+  such as `conch-helper` and `old-conch` no longer block an upgrade.
 - Old pip is upgraded within the selected environment for editable
   `pyproject.toml` builds, avoiding the missing `setup.py` upgrade failure.
 - Subscription inference no longer conflates Codex's read-only native sandbox

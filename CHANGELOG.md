@@ -29,6 +29,8 @@ Releases before 0.6.0 predate this changelog.
   at the turn boundary, with the new model reflected in the session tools.
 - Installers verify model access even when credentials already exist and
   reopen onboarding for rejected keys. No interactive login runs headlessly.
+- Ollama recovery verifies and saves the discovery endpoint instead of reusing
+  another provider's stale URL.
 - Upgrades reconcile recognized stale shell launchers with private backups,
   preserving credentials, helper integrations, customized PATH entries, and
   valid shell syntax inside conditional/function bodies. Experimental checkouts

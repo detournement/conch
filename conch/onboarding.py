@@ -351,8 +351,8 @@ def _connect_ollama(models: Optional[List[str]]) -> Optional[StagedSetup]:
         local_endpoint_policy_error,
     )
 
+    base_url = get_ollama_base_url()
     if models is None:
-        base_url = get_ollama_base_url()
         blocked = local_endpoint_policy_error("ollama", base_url, {})
         if blocked:
             _say(f"! {blocked}", YELLOW)
@@ -369,7 +369,7 @@ def _connect_ollama(models: Optional[List[str]]) -> Optional[StagedSetup]:
              " Ollama again.", DIM)
         return False
     selected = _choose_model(models)
-    return _stage("ollama", selected)
+    return _stage("ollama", selected, ollama_base_url=base_url)
 
 
 def _connect_custom() -> Optional[StagedSetup]:

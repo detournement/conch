@@ -99,6 +99,32 @@ class TestWizardGate(OnboardingCase):
 
 
 class TestStagedWizard(OnboardingCase):
+    def test_ollama_recovery_keeps_discovered_endpoint_over_stale_custom_url(self):
+        from conch import providers
+        from tests.modelcheck_stubs import StubEndpoint
+
+        discovered = StubEndpoint(models=("recovery-model",)).start()
+        self.addCleanup(discovered.stop)
+        previous = StubEndpoint(models=("unrelated-model",)).start()
+        self.addCleanup(previous.stop)
+        config_mod.set_config_values({
+            "provider": "custom", "base_url": previous.v1,
+            "model": "unrelated-model", "chat_model": "unrelated-model",
+        })
+        with patch.dict(os.environ, {"OLLAMA_HOST": discovered.url}), \
+                patch("builtins.input", return_value=""):
+            models = providers.list_ollama_models(force_refresh=True)
+            self.assertEqual(models, ["recovery-model"])
+            setup = onboarding._connect_ollama(models)
+            outcome = onboarding._verify_staged(setup)
+            onboarding._save_setup(setup, outcome)
+        saved = config_mod.load_config()
+        self.assertTrue(outcome.saved and outcome.result.ok)
+        self.assertEqual(saved["provider"], "ollama")
+        self.assertEqual(saved["chat_model"], "recovery-model")
+        self.assertEqual(providers.get_ollama_base_url(saved), discovered.url)
+        self.assertEqual(previous.requests, [])
+
     def test_api_key_and_route_written_only_after_verified_with_private_modes(self):
         secret = "dummy-api-secret"
         def verified(provider, model, config, **kwargs):

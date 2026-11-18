@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.2][release] ·
+[Current release: v0.9.3][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.2
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.3
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -633,7 +633,7 @@ The installer:
 - keeps using the original install method on upgrades;
 - installs from the GitHub `edge` branch tarball by default.
 
-`conch-shell` is not published on PyPI at v0.9.2. The release tag exists for
+`conch-shell` is not published on PyPI at v0.9.3. The release tag exists for
 source and auditability, while the website installer deliberately follows the
 maintained edge release line.
 

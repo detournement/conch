@@ -16,7 +16,8 @@ Releases before 0.6.0 predate this changelog.
   long-turn alerts without losing the configured delay.
 - `conch setup [--check]` verifies the effective primary and offers native
   Claude/ChatGPT sign-in recovery, optional connection of both subscriptions,
-  and primary selection. Failed setup preserves existing config and keys.
+  and primary selection. Failed or interrupted saves roll back config, keys,
+  and file permissions; incomplete restoration is reported explicitly.
 
 ### Fixed
 

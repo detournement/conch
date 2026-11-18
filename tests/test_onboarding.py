@@ -29,6 +29,9 @@ class OnboardingCase(unittest.TestCase):
             "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config"),
             "PATH": "/usr/bin:/bin",
         }, clear=True))
+        self.enter.enter_context(patch.dict(config_mod._ENV_LOAD_STATE, {
+            "from_file": {}, "overrode": [], "shadowed": [],
+        }, clear=True))
         old_cwd = os.getcwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, old_cwd)
@@ -210,6 +213,272 @@ class TestStagedWizard(OnboardingCase):
                 patch("conch.onboarding.probe_model", side_effect=AssertionError("do not certify shadowed route")):
             onboarding._verify_staged(onboarding._stage("codex", "default"))
         self.assertEqual(self.snapshot(), before)
+
+
+class TestSetupPersistence(OnboardingCase):
+    secret = "new-setup-secret"
+
+    def staged(self):
+        setup = onboarding._stage("openai", "new-model")
+        setup.keys = {"OPENAI_API_KEY": self.secret, "OPENROUTER_API_KEY": "new-router-secret"}
+        outcome = modelcheck.ModelCheckOutcome(
+            "openai", "new-model", self.probe("openai", "new-model", {}),
+        )
+        return setup, outcome
+
+    def prior_state(self):
+        self.existing()
+        for path, mode in (
+            (self.env_path, 0o400),
+            (Path(config_mod.get_env_manifest_path()), 0o640),
+            (self.config_path, 0o604),
+        ):
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+            path.chmod(mode)
+        os.environ["OPENAI_API_KEY"] = "inherited-openai-secret"
+        os.environ["OPENROUTER_API_KEY"] = ""
+        config_mod._ENV_LOAD_STATE["from_file"]["OPENAI_API_KEY"] = "previously-loaded-secret"
+        config_mod._ENV_LOAD_STATE["overrode"] = ["ANTHROPIC_API_KEY"]
+        config_mod._ENV_LOAD_STATE["shadowed"] = ["UNRELATED_API_KEY"]
+
+    def assert_write_failures_restore(self, failure):
+        before, environment = self.snapshot(), dict(os.environ)
+        loaded = config_mod.env_load_state()
+        replace = os.replace
+        for target in (self.env_path, Path(config_mod.get_env_manifest_path()), self.config_path):
+            for after_replace in (False, True):
+                with self.subTest(target=target.name, after_replace=after_replace):
+                    setup, outcome = self.staged()
+                    injected = []
+                    changed_credentials = []
+
+                    def fail_write(source, destination):
+                        if Path(destination) == target and not injected:
+                            injected.append(target)
+                            if target == self.config_path:
+                                changed_credentials.append((
+                                    self.env_path.read_text(),
+                                    os.environ.get("OPENAI_API_KEY"),
+                                    config_mod.env_load_state()["from_file"].get("OPENAI_API_KEY"),
+                                ))
+                            if after_replace:
+                                replace(source, destination)
+                            raise failure(self.secret)
+                        return replace(source, destination)
+
+                    expected = StartupError if failure is OSError else failure
+                    with patch("conch.config.os.replace", side_effect=fail_write), \
+                            self.assertRaises(expected) as caught:
+                        onboarding._save_setup(setup, outcome)
+                    self.assertEqual(injected, [target])
+                    if target == self.config_path:
+                        self.assertEqual(len(changed_credentials), 1)
+                        text, current, from_file = changed_credentials[0]
+                        self.assertIn(self.secret, text)
+                        self.assertEqual(current, self.secret)
+                        self.assertEqual(from_file, self.secret)
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertEqual(dict(os.environ), environment)
+                    self.assertEqual(config_mod.env_load_state(), loaded)
+                    self.assertFalse(outcome.saved)
+                    if failure is OSError:
+                        self.assertIn("unchanged", str(caught.exception))
+                        self.assertNotIn(self.secret, str(caught.exception))
+                    self.assertNotIn(self.secret, self.output.getvalue() + self.error.getvalue())
+
+    def test_write_failure_restores_initially_absent_state(self):
+        self.assert_write_failures_restore(OSError)
+
+    def test_write_failure_restores_prior_bytes_modes_and_key_state(self):
+        self.prior_state()
+        self.assert_write_failures_restore(OSError)
+
+    def test_interrupt_restores_initially_absent_state(self):
+        self.assert_write_failures_restore(KeyboardInterrupt)
+
+    def test_interrupt_restores_prior_bytes_modes_and_key_state(self):
+        self.prior_state()
+        self.assert_write_failures_restore(KeyboardInterrupt)
+
+    def test_snapshot_failure_changes_nothing_and_hides_secret_details(self):
+        self.prior_state()
+        before, environment = self.snapshot(), dict(os.environ)
+        loaded = config_mod.env_load_state()
+        setup, outcome = self.staged()
+        open_file = Path.open
+
+        def unreadable(path, *args, **kwargs):
+            if path == self.config_path:
+                raise PermissionError(self.secret)
+            return open_file(path, *args, **kwargs)
+
+        with patch.object(Path, "open", unreadable), \
+                patch("conch.config.os.replace") as replace, \
+                self.assertRaises(StartupError) as caught:
+            onboarding._save_setup(setup, outcome)
+        replace.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(dict(os.environ), environment)
+        self.assertEqual(config_mod.env_load_state(), loaded)
+        self.assertFalse(outcome.saved)
+        self.assertIn("unchanged", str(caught.exception))
+        self.assertNotIn(self.secret, str(caught.exception))
+
+    def test_reporting_interruption_rolls_back_completed_writes(self):
+        self.prior_state()
+        before, environment = self.snapshot(), dict(os.environ)
+        loaded = config_mod.env_load_state()
+        for failure in (KeyboardInterrupt, EOFError):
+            with self.subTest(failure=failure):
+                setup, outcome = self.staged()
+
+                def interrupted(*args, **kwargs):
+                    self.assertIn(self.secret, self.env_path.read_text())
+                    self.assertIn("new-model", self.config_path.read_text())
+                    raise failure
+
+                with patch("conch.onboarding._report_saved", side_effect=interrupted), \
+                        self.assertRaises(failure):
+                    onboarding._save_setup(setup, outcome)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(dict(os.environ), environment)
+                self.assertEqual(config_mod.env_load_state(), loaded)
+                self.assertFalse(outcome.saved)
+
+    def test_keyless_setup_rolls_back_only_routing(self):
+        self.prior_state()
+        before, environment = self.snapshot(), dict(os.environ)
+        loaded = config_mod.env_load_state()
+        setup = onboarding._stage("codex", "default")
+        outcome = modelcheck.ModelCheckOutcome("codex", "default", self.probe("codex", "default", {}))
+        replace = os.replace
+        writes = []
+
+        def interrupted(source, destination):
+            writes.append(Path(destination))
+            replace(source, destination)
+            if len(writes) == 1:
+                raise KeyboardInterrupt
+
+        with patch("conch.config.os.replace", side_effect=interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            onboarding._save_setup(setup, outcome)
+        self.assertEqual(writes, [self.config_path, self.config_path])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(dict(os.environ), environment)
+        self.assertEqual(config_mod.env_load_state(), loaded)
+        self.assertFalse(outcome.saved)
+
+    def run_command(self, automatic=False):
+        states = dict.fromkeys(seats.PROVIDERS, onboarding.SEAT_MISSING)
+        results = []
+        if self.config_path.exists() and not automatic:
+            results.append(modelcheck.ProbeResult("openai", "gpt-4o-mini", modelcheck.AUTH_FAILED))
+        results.append(self.probe("openai", "new-model", {}))
+        with patch("conch.onboarding._detect", return_value=(states, None)), \
+                patch("conch.onboarding.probe_model", side_effect=results), \
+                patch("builtins.input", side_effect=["openai"]), \
+                patch("conch.onboarding.getpass.getpass", return_value=self.secret):
+            if automatic:
+                return onboarding.maybe_run_first_run_wizard()
+            return onboarding.main([])
+
+    def test_command_cancellation_after_credentials_change_restores_state(self):
+        self.existing()
+        before, environment = self.snapshot(), dict(os.environ)
+        loaded = config_mod.env_load_state()
+        replace = os.replace
+
+        def interrupted(source, destination):
+            if Path(destination) == self.config_path:
+                self.assertEqual(os.environ["OPENAI_API_KEY"], self.secret)
+                raise KeyboardInterrupt
+            return replace(source, destination)
+
+        with patch("conch.config.os.replace", side_effect=interrupted):
+            self.assertEqual(self.run_command(), 130)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(dict(os.environ), environment)
+        self.assertEqual(config_mod.env_load_state(), loaded)
+        self.assertIn("unchanged", self.error.getvalue())
+
+    def test_first_run_cancellation_removes_new_files_and_key_state(self):
+        before, environment = self.snapshot(), dict(os.environ)
+        loaded = config_mod.env_load_state()
+        replace = os.replace
+
+        def interrupted(source, destination):
+            if Path(destination) == self.config_path:
+                self.assertEqual(os.environ["OPENAI_API_KEY"], self.secret)
+                raise KeyboardInterrupt
+            return replace(source, destination)
+
+        with patch("conch.config.os.replace", side_effect=interrupted), \
+                self.assertRaises(SystemExit) as caught:
+            self.run_command(automatic=True)
+        self.assertEqual(caught.exception.code, 130)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(dict(os.environ), environment)
+        self.assertEqual(config_mod.env_load_state(), loaded)
+        self.assertIn("Setup cancelled", self.output.getvalue())
+
+    def test_rollback_write_failure_reports_partial_state_and_restores_other_resources(self):
+        self.existing()
+        before, environment = self.snapshot(), dict(os.environ)
+        loaded = config_mod.env_load_state()
+        replace = os.replace
+        rolling_back = []
+
+        def fail_write(source, destination):
+            if Path(destination) == self.config_path:
+                rolling_back.append(True)
+                raise KeyboardInterrupt(self.secret)
+            if Path(destination) == self.env_path and rolling_back:
+                raise PermissionError(self.secret)
+            return replace(source, destination)
+
+        with patch("conch.config.os.replace", side_effect=fail_write):
+            self.assertEqual(self.run_command(), modelcheck.MODEL_CHECK_EXIT_CODE)
+        after = self.snapshot()
+        self.assertIn(self.secret, self.env_path.read_text())
+        self.assertEqual({p: value for p, value in after.items() if p != self.env_path},
+                         {p: value for p, value in before.items() if p != self.env_path})
+        self.assertEqual(dict(os.environ), environment)
+        self.assertEqual(config_mod.env_load_state(), loaded)
+        message = self.error.getvalue()
+        self.assertIn("rollback was incomplete", message)
+        self.assertIn("credentials may have changed", message)
+        self.assertNotIn("unchanged", message)
+        self.assertNotIn("cancelled", message)
+        self.assertNotIn(self.secret, message + self.output.getvalue())
+
+    def test_rollback_unlink_interruption_reports_partial_first_run_state(self):
+        environment, loaded = dict(os.environ), config_mod.env_load_state()
+        replace, unlink = os.replace, Path.unlink
+
+        def interrupted_write(source, destination):
+            if Path(destination) == self.config_path:
+                raise OSError(self.secret)
+            return replace(source, destination)
+
+        def interrupted_unlink(path, *args, **kwargs):
+            if path == self.env_path:
+                raise KeyboardInterrupt(self.secret)
+            return unlink(path, *args, **kwargs)
+
+        with patch("conch.config.os.replace", side_effect=interrupted_write), \
+                patch.object(Path, "unlink", interrupted_unlink), \
+                self.assertRaises(SystemExit) as caught:
+            self.run_command(automatic=True)
+        self.assertEqual(caught.exception.code, modelcheck.MODEL_CHECK_EXIT_CODE)
+        self.assertEqual(set(self.snapshot()), {self.env_path})
+        self.assertEqual(dict(os.environ), environment)
+        self.assertEqual(config_mod.env_load_state(), loaded)
+        message = self.error.getvalue()
+        self.assertIn("rollback was incomplete", message)
+        self.assertNotIn("unchanged", message)
+        self.assertNotIn("Setup cancelled", self.output.getvalue())
+        self.assertNotIn(self.secret, message + self.output.getvalue())
 
 
 class TestSetupCommand(OnboardingCase):

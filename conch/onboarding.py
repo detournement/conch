@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import getpass
 import os
 import shutil
+import stat
 import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor
@@ -494,13 +495,82 @@ def _verify_staged(setup: StagedSetup) -> ModelCheckOutcome:
         return _verify_primary(config)
 
 
+def _snapshot_setup_file(path: Path) -> Optional[Tuple[bytes, int]]:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(), stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+    except FileNotFoundError:
+        return None
+
+
 def _save_setup(setup: StagedSetup, outcome: ModelCheckOutcome) -> ModelCheckOutcome:
-    """Only verified routing and the selected API credential are persisted."""
+    """Commit verified setup, restoring files and key state on failure."""
+    from .bootstrap import StartupError
+    from .config import _ENV_LOAD_STATE, _write_private_file, get_env_manifest_path
+
+    paths = [("routing configuration", Path(get_config_path()))]
     if setup.keys:
-        set_env_values(setup.keys, set_by="verified setup", verified="ok")
-    path = set_config_values(setup.updates, header=CONFIG_HEADER)
+        paths[:0] = [
+            ("credentials", Path(get_env_file_path())),
+            ("credential manifest", Path(get_env_manifest_path())),
+        ]
+    try:
+        snapshots = [(label, path, _snapshot_setup_file(path)) for label, path in paths]
+    except Exception:
+        raise StartupError(
+            "conch: could not read existing setup state; Conch configuration"
+            " and credentials are unchanged.", code=MODEL_CHECK_EXIT_CODE,
+        ) from None
+    key_states = [
+        (label, mapping, {name: mapping.get(name) for name in setup.keys})
+        for label, mapping in (
+            ("process credentials", os.environ),
+            ("credential reload state", _ENV_LOAD_STATE["from_file"]),
+        )
+    ]
+    try:
+        if setup.keys:
+            set_env_values(setup.keys, set_by="verified setup", verified="ok")
+        path = set_config_values(setup.updates, header=CONFIG_HEADER)
+        _report_saved(path, key_saved=bool(setup.keys))
+    except BaseException as exc:
+        # One bounded rollback pass; keep restoring other resources even if
+        # a write fails or a second interrupt arrives during restoration.
+        failed = []
+        for label, path, original in reversed(snapshots):
+            try:
+                if _snapshot_setup_file(path) == original:
+                    continue
+                if original is None:
+                    path.unlink()
+                else:
+                    _write_private_file(path, original[0], mode=original[1])
+            except BaseException:
+                failed.append(label)
+        for label, mapping, previous in key_states:
+            for name, value in previous.items():
+                try:
+                    if value is None:
+                        mapping.pop(name, None)
+                    else:
+                        mapping[name] = value
+                except BaseException:
+                    if label not in failed:
+                        failed.append(label)
+        if failed:
+            raise StartupError(
+                "conch: setup failed and rollback was incomplete; "
+                + ", ".join(failed) + " may have changed."
+                " Check Conch credential and routing files before retrying setup.",
+                code=MODEL_CHECK_EXIT_CODE,
+            ) from None
+        if isinstance(exc, (KeyboardInterrupt, EOFError)) or not isinstance(exc, Exception):
+            raise
+        raise StartupError(
+            "conch: could not save setup; existing Conch configuration"
+            " and credentials are unchanged.", code=MODEL_CHECK_EXIT_CODE,
+        ) from None
     outcome.saved = True
-    _report_saved(path, key_saved=bool(setup.keys))
     return outcome
 
 

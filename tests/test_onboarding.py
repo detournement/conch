@@ -1,675 +1,422 @@
-"""First-run onboarding: gating, key handling, and config writing.
-
-The wizard must only ever appear on a truly unconfigured interactive
-launch, must never echo a key, and must leave 0600 files that
-load_config actually honors.
-"""
+"""Setup certifies the selected route, never key presence or failed alternatives."""
 
 import io
 import os
-import re
 import stat
 import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from conch import auth
-from conch import config as config_mod
-from conch import onboarding, seats
+from conch import auth, config as config_mod, onboarding, seats, modelcheck
+from conch.bootstrap import StartupError
 
 
-class _Tty(io.StringIO):
+class Tty(io.StringIO):
     def isatty(self):
         return True
 
 
-class _NoTty(io.StringIO):
-    def isatty(self):
-        return False
-
-
 class OnboardingCase(unittest.TestCase):
-    """Fresh HOME/XDG per test so the real user config is never touched."""
-
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
-        (root / "config").mkdir()
-        self._env = patch.dict(os.environ, {
-            "HOME": str(root),
-            "XDG_CONFIG_HOME": str(root / "config"),
-        }, clear=False)
-        self._env.start()
-        # Strip every provider key + wizard override from the inherited env.
-        from conch.providers import DEFAULT_API_KEY_ENVS
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.enter = ExitStack()
+        self.addCleanup(self.enter.close)
+        self.enter.enter_context(patch.dict(os.environ, {
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config"),
+            "PATH": "/usr/bin:/bin",
+        }, clear=True))
+        old_cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, old_cwd)
+        self.enter.enter_context(patch("conch.auth.cli_installed", return_value=False))
+        self.enter.enter_context(patch("conch.onboarding.detect_ollama", return_value=None))
+        self.enter.enter_context(patch("sys.stdin", Tty()))
+        self.output = self.enter.enter_context(patch("sys.stdout", Tty()))
+        self.error = self.enter.enter_context(patch("sys.stderr", io.StringIO()))
+        self.config_path = Path(config_mod.get_config_path())
+        self.env_path = Path(config_mod.get_env_file_path())
 
-        self._removed = {}
-        for name in list(DEFAULT_API_KEY_ENVS.values()) + ["CONCH_NO_WIZARD"]:
-            if name and name in os.environ:
-                self._removed[name] = os.environ.pop(name)
-        self.addCleanup(self._restore)
-        self.addCleanup(self._tmp.cleanup)
-        # Project rc discovery walks from cwd; run from the isolated root.
-        self._cwd = os.getcwd()
-        os.chdir(str(root))
-        self.addCleanup(os.chdir, self._cwd)
-        # No official seat CLI unless a test says so: the wizard must never
-        # spawn the developer's real claude/codex from the test suite.
-        seat_cli = patch("conch.auth.cli_installed", return_value=False)
-        seat_cli.start()
-        self.addCleanup(seat_cli.stop)
+    def probe(self, provider, model, config, **kwargs):
+        return modelcheck.ProbeResult(provider, model, modelcheck.OK, "dummy verified")
 
-    def _restore(self):
-        os.environ.update(self._removed)
-        self._env.stop()
+    def walk(self, answers, keys=(), probe=None, signed_in=()):
+        states = {p: onboarding.SEAT_READY if p in signed_in else onboarding.SEAT_MISSING
+                  for p in seats.PROVIDERS}
+        with patch("conch.onboarding._detect", return_value=(states, None)), \
+                patch("conch.onboarding.seat_state", side_effect=lambda p: states[p]), \
+                patch("conch.onboarding.probe_model", side_effect=probe or self.probe) as check, \
+                patch("builtins.input", side_effect=answers), \
+                patch("conch.onboarding.getpass.getpass", side_effect=keys):
+            outcome = onboarding.run_first_run_wizard()
+        return outcome, check
+
+    def snapshot(self):
+        return {p: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode))
+                for p in self.root.rglob("*") if p.is_file()}
+
+    def existing(self):
+        config_mod.set_config_values({"provider": "openai", "model": "gpt-4o-mini",
+                                     "chat_model": "gpt-4o-mini", "send_cwd": "false"})
+        config_mod.set_env_values({"OPENAI_API_KEY": "old-openai-secret",
+                                  "ANTHROPIC_API_KEY": "old-anthropic-secret"})
+        (self.root / "session-state").write_text("preserve prior history")
 
 
-class TestShouldOfferWizard(OnboardingCase):
-    def _tty(self):
-        return patch.multiple(
-            "conch.onboarding.sys", stdin=_Tty(), stdout=_Tty()
-        )
+class TestWizardGate(OnboardingCase):
+    def test_fresh_default_is_claude_and_subscription_choices_are_first(self):
+        self.assertTrue(onboarding.should_offer_wizard())
+        self.assertEqual(onboarding.WIZARD_PROVIDERS[0][0], "claude-code")
+        self.assertEqual(onboarding.WIZARD_PROVIDERS[1][0], "codex")
+        self.assertEqual(onboarding._default_choice({}), 1)
 
-    def test_offers_on_clean_interactive_start(self):
-        with self._tty():
-            self.assertTrue(onboarding.should_offer_wizard())
-
-    def test_skips_without_tty(self):
-        with patch.multiple(
-            "conch.onboarding.sys", stdin=_NoTty(), stdout=_NoTty()
-        ):
-            self.assertFalse(onboarding.should_offer_wizard())
-
-    def test_skips_when_config_file_exists(self):
-        path = Path(config_mod.get_config_path())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("provider = openai\n")
-        with self._tty():
-            self.assertFalse(onboarding.should_offer_wizard())
-
-    def test_skips_when_env_file_exists(self):
-        path = Path(config_mod.get_env_file_path())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("OPENAI_API_KEY=sk-e2e\n")
-        with self._tty():
-            self.assertFalse(onboarding.should_offer_wizard())
-
-    def test_skips_when_conchrc_exists(self):
-        (Path.home() / ".conchrc").write_text("provider = ollama\n")
-        with self._tty():
-            self.assertFalse(onboarding.should_offer_wizard())
-
-    def test_skips_when_a_provider_key_is_set(self):
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
-            with self._tty():
+    def test_config_keys_and_no_wizard_prevent_automatic_fresh_setup(self):
+        for path in (self.config_path, self.env_path, self.root / ".conchrc"):
+            with self.subTest(path=path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# user-owned\n")
                 self.assertFalse(onboarding.should_offer_wizard())
-
-    def test_skips_when_disabled_by_env(self):
+                path.unlink()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "invalid-is-still-configured"}):
+            self.assertFalse(onboarding.should_offer_wizard())
         with patch.dict(os.environ, {"CONCH_NO_WIZARD": "1"}):
-            with self._tty():
-                self.assertFalse(onboarding.should_offer_wizard())
+            self.assertFalse(onboarding.should_offer_wizard())
+
+    def test_non_tty_never_prompts_or_signs_in(self):
+        with patch("sys.stdin", io.StringIO()), \
+                patch("builtins.input", side_effect=AssertionError("no prompts")), \
+                patch("conch.auth.sign_in", side_effect=AssertionError("no native login")):
+            self.assertFalse(onboarding.should_offer_wizard())
+            self.assertIsNone(onboarding.maybe_run_first_run_wizard())
+            with self.assertRaises(StartupError):
+                onboarding.run_first_run_wizard()
 
 
-SECRET = "sk-ant-wizard-secret-123"
+class TestStagedWizard(OnboardingCase):
+    def test_api_key_and_route_written_only_after_verified_with_private_modes(self):
+        secret = "dummy-api-secret"
+        def verified(provider, model, config, **kwargs):
+            self.assertFalse(self.config_path.exists())
+            self.assertFalse(self.env_path.exists())
+            self.assertEqual(os.environ["OPENAI_API_KEY"], secret)
+            self.assertEqual(config["api_key_env"], "OPENAI_API_KEY")
+            return self.probe(provider, model, config)
+        outcome, check = self.walk(["openai"], [secret], probe=verified)
+        self.assertTrue(outcome.checked and outcome.result.ok and outcome.saved)
+        check.assert_called_once()
+        self.assertEqual(config_mod.load_config()["provider"], "openai")
+        for path in (self.config_path, self.env_path):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertIn(secret, self.env_path.read_text())
+        self.assertNotIn(secret, self.output.getvalue() + self.error.getvalue())
 
+    def test_both_401s_then_cancel_preserves_all_files_credentials_and_environment(self):
+        self.existing()
+        before, environment = self.snapshot(), dict(os.environ)
+        def rejected(provider, model, config, **kwargs):
+            return modelcheck.ProbeResult(provider, model, modelcheck.AUTH_FAILED, "HTTP 401")
+        with self.assertRaises(KeyboardInterrupt):
+            self.walk(["openai", "y", "anthropic", "y", KeyboardInterrupt],
+                      ["new-openai-secret", "new-anthropic-secret"], probe=rejected)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(dict(os.environ), environment)
+        self.assertNotIn("new-openai-secret", self.output.getvalue())
 
-def _verified(config, **_kwargs):
-    """Stand-in for the post-setup model check: reports the configured
-    model as verified without any network (its own tests live in
-    test_modelcheck / TestWizardModelCheck below)."""
-    from conch.modelcheck import OK, ModelCheckOutcome, ProbeResult
+    def test_declining_failed_setup_keeps_preexisting_files(self):
+        self.existing()
+        before = self.snapshot()
+        def bad(provider, model, config):
+            return modelcheck.ProbeResult(provider, model, modelcheck.AUTH_FAILED)
+        with self.assertRaises(StartupError) as caught:
+            self.walk(["openai", "n"], ["bad-key"], probe=bad)
+        self.assertEqual(caught.exception.code, 69)
+        self.assertEqual(self.snapshot(), before)
 
-    provider = config.get("provider", "")
-    model = config.get("chat_model") or config.get("model") or ""
-    return ModelCheckOutcome(
-        provider, model, ProbeResult(provider, model, OK, "stubbed")
-    )
-
-
-class TestWizardFlow(OnboardingCase):
-    def _run(self, inputs, getpass_values):
-        """Run the wizard with scripted answers; return captured stdout."""
-        answers = iter(inputs)
-        keys = iter(getpass_values)
-        out = io.StringIO()
-        with patch("conch.onboarding.detect_ollama", return_value=None), \
-             patch("conch.onboarding.probe_provider",
-                   return_value=(True, "key accepted")), \
-             patch("conch.onboarding.ensure_working_model", _verified), \
-             patch("builtins.input", side_effect=lambda *_: next(answers)), \
-             patch("conch.onboarding.getpass.getpass",
-                   side_effect=lambda *_: next(keys)), \
-             patch("sys.stdout", out):
-            self.assertTrue(onboarding.run_first_run_wizard())
-        return out.getvalue()
-
-    def test_writes_provider_config_and_0600_key_file(self):
-        output = self._run(["anthropic", "y"], [SECRET])
-        config_path = Path(config_mod.get_config_path())
-        env_path = Path(config_mod.get_env_file_path())
-        self.assertIn("provider = anthropic", config_path.read_text())
-        env_text = env_path.read_text()
-        self.assertIn(f"ANTHROPIC_API_KEY={SECRET}", env_text)
-        for path in (config_path, env_path):
-            mode = stat.S_IMODE(path.stat().st_mode)
-            self.assertEqual(mode, 0o600, f"{path} mode {oct(mode)}")
-        # The secret never reaches the screen.
-        self.assertNotIn(SECRET, output)
-        # And the running process sees the key immediately.
-        self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), SECRET)
-
-    def test_ollama_path_needs_no_key(self):
-        answers = iter(["ollama", "2"])
-        with patch("conch.onboarding.detect_ollama",
-                   return_value=["qwen2.5:7b", "llama3.3:latest"]), \
-             patch("conch.onboarding.ensure_working_model", _verified), \
-             patch("builtins.input", side_effect=lambda *_: next(answers)), \
-             patch("sys.stdout", io.StringIO()):
-            self.assertTrue(onboarding.run_first_run_wizard())
-        config = Path(config_mod.get_config_path()).read_text()
-        self.assertIn("provider = ollama", config)
-        self.assertEqual(config_mod.load_config()["chat_model"], "llama3.3:latest")
-        self.assertFalse(Path(config_mod.get_env_file_path()).exists())
-
-    def test_config_written_by_wizard_loads(self):
-        self._run(["anthropic", "n"], [SECRET])
-        loaded = config_mod.load_config()
-        self.assertEqual(loaded["provider"], "anthropic")
-        self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), SECRET)
-
-
-class TestCustomEndpointFlow(OnboardingCase):
-    """The custom-provider branch must leave a config that starts clean:
-    custom_base_url + custom_model persisted, api_key_env only when a key
-    was given, and honest probe wording for a keyless endpoint."""
-
-    def _run(self, inputs, getpass_values, models=(["stub-model"], True)):
-        answers = iter(inputs)
-        keys = iter(getpass_values)
-        out = io.StringIO()
-        with patch("conch.onboarding.detect_ollama", return_value=None), \
-             patch("conch.onboarding.probe_provider",
-                   return_value=(True, "endpoint reachable (no key sent)")), \
-             patch("conch.onboarding.discover_custom_models",
-                   return_value=models) as discover, \
-             patch("conch.onboarding.ensure_working_model", _verified), \
-             patch("builtins.input", side_effect=lambda *_: next(answers)), \
-             patch("conch.onboarding.getpass.getpass",
-                   side_effect=lambda *_: next(keys)), \
-             patch("sys.stdout", out):
-            self.assertTrue(onboarding.run_first_run_wizard())
-        return out.getvalue(), discover
-
-    def test_persists_custom_model_and_base_url_without_key(self):
-        _, discover = self._run(
-            ["custom", "http://127.0.0.1:18080/v1", "n"], [""]
-        )
-        text = Path(config_mod.get_config_path()).read_text()
-        self.assertIn("custom_base_url = http://127.0.0.1:18080/v1", text)
-        self.assertIn("custom_model = stub-model", text)
-        self.assertNotIn("api_key_env", text)
-        self.assertFalse(Path(config_mod.get_env_file_path()).exists())
-        discover.assert_called_once_with("http://127.0.0.1:18080/v1", "")
-
-    def test_loaded_config_is_complete_and_keyless(self):
-        self._run(["custom", "http://127.0.0.1:18080/v1", "n"], [""])
-        loaded = config_mod.load_config()
-        self.assertEqual(loaded["provider"], "custom")
-        self.assertEqual(loaded["custom_model"], "stub-model")
-        self.assertEqual(loaded["model"], "stub-model")
-        self.assertEqual(loaded["chat_model"], "stub-model")
-        self.assertEqual(loaded["api_key_env"], "",
-                         "the Anthropic default must not leak under custom")
-
-    def test_key_is_stored_under_conch_name_and_referenced(self):
-        output, discover = self._run(
-            ["custom", "http://10.0.0.5:8000/v1", "n"], ["vllm-secret-1"]
-        )
-        text = Path(config_mod.get_config_path()).read_text()
-        self.assertIn("api_key_env = CONCH_CUSTOM_API_KEY", text)
-        env_text = Path(config_mod.get_env_file_path()).read_text()
-        self.assertIn("CONCH_CUSTOM_API_KEY=vllm-secret-1", env_text)
-        self.assertNotIn("vllm-secret-1", output)
-        discover.assert_called_once_with("http://10.0.0.5:8000/v1", "vllm-secret-1")
-        loaded = config_mod.load_config()
-        self.assertEqual(loaded["api_key_env"], "CONCH_CUSTOM_API_KEY")
-
-    def test_multiple_models_offer_a_choice(self):
-        self._run(
-            ["custom", "http://127.0.0.1:18080/v1", "n", "2"], [""],
-            models=(["alpha", "beta"], True),
-        )
-        text = Path(config_mod.get_config_path()).read_text()
-        self.assertIn("custom_model = beta", text)
-
-    def test_unreachable_endpoint_leaves_model_unset(self):
-        self._run(
-            ["custom", "http://127.0.0.1:1/v1", "n"], [""], models=(None, False)
-        )
-        text = Path(config_mod.get_config_path()).read_text()
-        self.assertIn("custom_base_url = http://127.0.0.1:1/v1", text)
-        self.assertNotIn("custom_model", text)
-
-    def test_no_conformant_model_still_persists(self):
-        self._run(
-            ["custom", "http://127.0.0.1:18080/v1", "n"], [""],
-            models=(["plain-model"], False),
-        )
-        text = Path(config_mod.get_config_path()).read_text()
-        self.assertIn("custom_model = plain-model", text)
-
-
-class TestCustomProbeWording(OnboardingCase):
-    def test_keyless_success_does_not_claim_a_key_was_accepted(self):
-        with patch("conch.onboarding._http_get", return_value=(200, "")):
-            ok, detail = onboarding.probe_provider("custom", "", "http://x/v1")
-        self.assertTrue(ok)
-        self.assertEqual(detail, "endpoint reachable (no key sent)")
-
-    def test_keyed_success_still_says_key_accepted(self):
-        with patch("conch.onboarding._http_get", return_value=(200, "")):
-            ok, detail = onboarding.probe_provider("custom", "k", "http://x/v1")
-        self.assertTrue(ok)
-        self.assertEqual(detail, "key accepted")
-
-    def test_keyless_401_explains_a_key_is_required(self):
-        with patch("conch.onboarding._http_get", return_value=(401, "")):
-            ok, detail = onboarding.probe_provider("custom", "", "http://x/v1")
-        self.assertFalse(ok)
-        self.assertEqual(detail, "the endpoint requires an API key")
-
-
-class TestCustomProviderConfigDefaults(OnboardingCase):
-    def test_custom_provider_has_empty_api_key_env_by_default(self):
-        config_mod.set_config_values({
-            "provider": "custom",
-            "custom_base_url": "http://127.0.0.1:18080/v1",
-            "custom_model": "m",
-        })
+    def test_retry_to_seat_does_not_keep_failed_api_key_or_delete_existing_keys(self):
+        self.existing()
+        def selected(provider, model, config, **kwargs):
+            status = modelcheck.OK if provider == "codex" else modelcheck.AUTH_FAILED
+            return modelcheck.ProbeResult(provider, model, status)
+        outcome, check = self.walk(["openai", "y", "codex", "n"],
+                                   ["bad-new-key"], probe=selected, signed_in=["codex"])
+        self.assertEqual(outcome.provider, "codex")
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(os.environ["OPENAI_API_KEY"], "old-openai-secret")
+        self.assertNotIn("bad-new-key", self.env_path.read_text())
+        self.assertIn("send_cwd = false", self.config_path.read_text())
         self.assertEqual(config_mod.load_config()["api_key_env"], "")
 
-    def test_explicit_api_key_env_is_kept(self):
-        config_mod.set_config_values({
-            "provider": "custom",
-            "custom_base_url": "http://127.0.0.1:18080/v1",
-            "custom_model": "m",
-            "api_key_env": "MY_VLLM_KEY",
-        })
-        self.assertEqual(config_mod.load_config()["api_key_env"], "MY_VLLM_KEY")
+    def test_connect_both_seats_and_choose_primary_without_reading_vendor_tokens(self):
+        with patch("conch.auth.select", side_effect=AssertionError("no early persistence")), \
+                patch("conch.auth.sign_in", side_effect=AssertionError("already signed in")):
+            outcome, check = self.walk(["claude-code", "y", "y"],
+                                       signed_in=seats.PROVIDERS)
+        self.assertEqual(outcome.provider, "codex")
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(config_mod.load_config()["provider"], "codex")
+        self.assertFalse(self.env_path.exists())
+
+    def test_second_seat_is_optional_and_first_probe_is_not_repeated(self):
+        outcome, check = self.walk(["claude-code", "n"], signed_in=["claude-code"])
+        self.assertEqual(outcome.provider, "claude-code")
+        check.assert_called_once()
+
+    def test_failed_second_seat_does_not_destroy_first_verified_choice(self):
+        def selected(provider, model, config, **kwargs):
+            return modelcheck.ProbeResult(provider, model,
+                                         modelcheck.OK if provider == "claude-code" else modelcheck.TIMEOUT)
+        outcome, check = self.walk(["claude-code", "y"], probe=selected,
+                                   signed_in=seats.PROVIDERS)
+        self.assertEqual(outcome.provider, "claude-code")
+        self.assertEqual(check.call_count, 2)
+
+    def test_missing_cli_has_exact_install_and_retry_guidance(self):
+        with self.assertRaises(KeyboardInterrupt), \
+                patch("conch.auth.sign_in", side_effect=AssertionError("missing binary")):
+            self.walk(["claude-code", KeyboardInterrupt])
+        self.assertIn("npm install -g @anthropic-ai/claude-code", self.output.getvalue())
+        self.assertIn("choose it again", self.output.getvalue())
+        self.assertFalse(self.config_path.exists())
+
+    def test_native_sign_in_uses_official_flow_without_selecting_early(self):
+        with patch("conch.onboarding.seat_state", return_value=onboarding.SEAT_NEEDS_LOGIN), \
+                patch("conch.auth.sign_in", return_value=(0, "")) as login, \
+                patch("conch.auth.select", side_effect=AssertionError("no select")):
+            staged = onboarding._connect_seat("codex", "ChatGPT seat", {})
+        login.assert_called_once_with("codex")
+        self.assertEqual(staged.updates["provider"], "codex")
+        self.assertFalse(self.config_path.exists())
+
+    def test_custom_keyless_selection_cannot_carry_cloud_api_key(self):
+        self.existing()
+        def verify(provider, model, config, **kwargs):
+            self.assertEqual(config["api_key_env"], "")
+            self.assertEqual(config["custom_base_url"], "http://localhost:8080/v1")
+            return self.probe(provider, model, config)
+        with patch("conch.onboarding.discover_custom_models", return_value=(["local-tools"], True)):
+            outcome, _ = self.walk(["custom", "http://localhost:8080/v1"], [""], probe=verify)
+        self.assertEqual(outcome.provider, "custom")
+        self.assertEqual(config_mod.load_config()["api_key_env"], "")
+        self.assertIn("old-openai-secret", self.env_path.read_text())
+
+    def test_higher_priority_route_conflict_is_actionable_and_saves_nothing(self):
+        self.existing()
+        (self.root / ".conchrc").write_text("provider = openai\n")
+        before = self.snapshot()
+        with self.assertRaises(StartupError), \
+                patch("conch.onboarding.probe_model", side_effect=AssertionError("do not certify shadowed route")):
+            onboarding._verify_staged(onboarding._stage("codex", "default"))
+        self.assertEqual(self.snapshot(), before)
 
 
-class TestMaybeRunGate(OnboardingCase):
-    def test_noninteractive_is_a_noop(self):
-        with patch.multiple(
-            "conch.onboarding.sys", stdin=_NoTty(), stdout=_NoTty()
-        ):
-            self.assertFalse(onboarding.maybe_run_first_run_wizard())
-        self.assertFalse(Path(config_mod.get_config_path()).exists())
+class TestSetupCommand(OnboardingCase):
+    def test_fresh_setup_offers_both_seats_before_any_default_inference(self):
+        with patch("conch.onboarding.run_first_run_wizard") as wizard, \
+                patch("conch.onboarding.probe_model", side_effect=AssertionError("no unchosen probe")):
+            self.assertEqual(onboarding.main([]), 0)
+        wizard.assert_called_once()
 
-    def test_cancelled_setup_exits_without_starting_chat_or_saving_config(self):
-        with patch("conch.onboarding.should_offer_wizard", return_value=True), \
-             patch("conch.onboarding.detect_ollama", return_value=None), \
-             patch("builtins.input", side_effect=KeyboardInterrupt), \
-             patch("sys.stdout", io.StringIO()), \
-             self.assertRaises(SystemExit) as caught:
-            onboarding.maybe_run_first_run_wizard()
-        self.assertEqual(caught.exception.code, 0)
-        self.assertFalse(Path(config_mod.get_config_path()).exists())
+    def test_good_primary_succeeds_once_without_discovering_or_prompting(self):
+        self.existing()
+        before = self.snapshot()
+        with patch("conch.onboarding.probe_model", side_effect=self.probe) as check, \
+                patch("conch.onboarding.run_first_run_wizard", side_effect=AssertionError("already good")), \
+                patch("conch.modelcheck.discover_alternatives", side_effect=AssertionError("primary only")), \
+                patch("builtins.input", side_effect=AssertionError("no prompt")):
+            self.assertEqual(onboarding.main([]), 0)
+        check.assert_called_once()
+        self.assertEqual(self.snapshot(), before)
 
+    def test_check_is_noninteractive_failure_even_with_good_fallback_and_check_optout(self):
+        self.existing()
+        config_mod.set_config_values({"model_check": "off", "fallback_models": "codex/default"})
+        before = self.snapshot()
+        result = modelcheck.ProbeResult("openai", "gpt-4o-mini", modelcheck.AUTH_FAILED, "HTTP 401")
+        with patch("conch.onboarding.probe_model", return_value=result) as check, \
+                patch("conch.onboarding.run_first_run_wizard", side_effect=AssertionError("--check never recovers")), \
+                patch("builtins.input", side_effect=AssertionError("no prompt")), \
+                patch("conch.auth.sign_in", side_effect=AssertionError("no login")):
+            self.assertEqual(onboarding.main(["--check"]), 69)
+        check.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
 
-class WizardCase(OnboardingCase):
-    """Scripted wizard walks: no network, no native CLI, no real model check."""
+    def test_local_only_cloud_config_never_transmits_credentials(self):
+        self.existing()
+        config_mod.set_config_values({"local_only": "true"})
+        with patch("conch.onboarding.probe_model", side_effect=AssertionError("no cloud probes")):
+            self.assertEqual(onboarding.main(["--check"]), 69)
+        with patch("conch.modelcheck._request", side_effect=AssertionError("no HTTP")):
+            result = modelcheck.probe_model("openai", "gpt-4o-mini", config_mod.load_config())
+        self.assertEqual(result.status, modelcheck.MISCONFIGURED)
 
-    def walk(self, inputs, keys=(), *, ollama=(None,), signed_in=(),
-             installed=(), login_exit=1, columns=80, key_accepted=True,
-             verification=()):
-        """Drive maybe_run_first_run_wizard with scripted answers.
+    def test_check_reports_invalid_primary_even_if_an_alternative_could_work(self):
+        self.existing()
+        bad = modelcheck.ProbeResult("openai", "gpt-4o-mini", modelcheck.AUTH_FAILED)
+        with patch("conch.onboarding.probe_model", return_value=bad) as probe, \
+                patch("conch.modelcheck.discover_alternatives", side_effect=AssertionError("no discovery")), \
+                patch("builtins.input", side_effect=AssertionError("no prompts")):
+            self.assertEqual(onboarding.main(["--check"]), 69)
+        probe.assert_called_once()
 
-        The script runs out into Ctrl+C, so a walk that never connects a
-        provider ends with ``exit_code == 0``. *ollama* lists successive
-        detection results (the last repeats); *signed_in*/*installed* name
-        the seats whose official CLI is on PATH; a native login exiting 0
-        signs that seat in. *verification* lists model-check results in
-        order (an exception fails that check); later checks succeed.
-        """
-        ready = set(signed_in)
-        on_path = ready | set(installed)
-        binaries = {seats.transport(provider).auth_command("login")[0]: provider
-                    for provider in seats.PROVIDERS}
-        detections = list(ollama)
+    def test_non_tty_invalid_primary_fails_without_recovery(self):
+        bad = modelcheck.ProbeResult("openai", "gpt-4o-mini", modelcheck.AUTH_FAILED)
+        with patch("conch.onboarding.probe_model", return_value=bad), \
+                patch("sys.stdin", io.StringIO()), \
+                patch("conch.auth.sign_in", side_effect=AssertionError("no pipes")), \
+                patch("builtins.input", side_effect=AssertionError("no prompts")):
+            self.assertEqual(onboarding.main([]), 69)
 
-        def detect():
-            return detections.pop(0) if len(detections) > 1 else detections[0]
+    def test_stale_auth_command_runs_wizard_once_and_uses_its_verified_outcome(self):
+        self.existing()
+        bad = modelcheck.ProbeResult("openai", "gpt-4o-mini", modelcheck.AUTH_FAILED)
+        good = modelcheck.ModelCheckOutcome("codex", "default", self.probe("codex", "default", {}))
+        with patch("conch.onboarding.probe_model", return_value=bad) as check, \
+                patch("conch.onboarding.run_first_run_wizard", return_value=good) as wizard:
+            self.assertEqual(onboarding.main([]), 0)
+        check.assert_called_once()
+        wizard.assert_called_once()
 
-        def native(argv, **_kwargs):
-            if not login_exit:
-                ready.add(binaries[argv[0]])
-            return Mock(returncode=login_exit)
+    def test_cancelled_command_is_nonzero_and_preserves_state(self):
+        self.existing()
+        before = self.snapshot()
+        bad = modelcheck.ProbeResult("openai", "gpt-4o-mini", modelcheck.AUTH_FAILED)
+        with patch("conch.onboarding.probe_model", return_value=bad), \
+                patch("conch.onboarding.run_first_run_wizard", side_effect=KeyboardInterrupt):
+            self.assertEqual(onboarding.main([]), 130)
+        self.assertEqual(self.snapshot(), before)
 
-        def status(provider, timeout=10):
-            return provider in ready, "scripted"
-
-        walk = SimpleNamespace(exit_code=None, outcome=None)
-        out = io.StringIO()
-        with ExitStack() as stack:
-            def use(target, **kwargs):
-                return stack.enter_context(patch(target, **kwargs))
-
-            use("conch.onboarding.should_offer_wizard", return_value=True)
-            use("conch.onboarding.detect_ollama", side_effect=detect)
-            use("conch.onboarding.discover_custom_models",
-                return_value=(None, False))
-            use("conch.onboarding.probe_provider",
-                return_value=(key_accepted, "scripted"))
-            use("conch.auth.cli_installed",
-                side_effect=lambda provider: provider in on_path)
-            use("conch.seats.status", side_effect=status)
-            use("conch.auth.status", side_effect=status)
-            walk.login = use("conch.auth.subprocess.run", side_effect=native)
-            checks = list(verification)
-
-            def check(config, **kwargs):
-                result = checks.pop(0) if checks else None
-                if isinstance(result, BaseException):
-                    raise result
-                return _verified(config, **kwargs)
-
-            walk.check = use("conch.onboarding.ensure_working_model",
-                             side_effect=check)
-            walk.asked = use("builtins.input",
-                             side_effect=[*inputs, KeyboardInterrupt])
-            walk.hidden = use("conch.onboarding.getpass.getpass",
-                              side_effect=list(keys))
-            stack.enter_context(
-                patch.dict(os.environ, {"COLUMNS": str(columns)})
-            )
-            use("sys.stdout", new=out)
-            try:
-                walk.outcome = onboarding.maybe_run_first_run_wizard()
-            except SystemExit as exc:
-                walk.exit_code = exc.code
-        walk.output = out.getvalue()
-        return walk
-
-    def assert_nothing_saved(self):
-        self.assertFalse(Path(config_mod.get_config_path()).exists())
-        self.assertFalse(Path(config_mod.get_env_file_path()).exists())
-
-    def assert_back_at_provider_prompt_then_cancelled(self, walk, answered):
-        """Every scripted answer was consumed, one more question was asked
-        (the provider prompt, answered by Ctrl+C), and setup exited 0
-        without saving or checking anything."""
-        self.assertEqual(walk.asked.call_count, answered + 1)
-        self.assertEqual(walk.exit_code, 0)
-        self.assertIsNone(walk.outcome)
-        walk.check.assert_not_called()
-        self.assert_nothing_saved()
+    def test_actual_probe_does_not_echo_401_body_or_key_and_distinguishes_404(self):
+        self.existing()
+        for code, status in ((401, modelcheck.AUTH_FAILED), (404, modelcheck.MODEL_NOT_FOUND)):
+            with self.subTest(code=code), \
+                    patch("conch.modelcheck._request", return_value=(code, {
+                        "error": {"message": "Authorization: Bearer old-openai-secret RAW-AUTH-BODY"}})):
+                result = modelcheck.probe_model("openai", "gpt-4o-mini", config_mod.load_config())
+            self.assertEqual(result.status, status)
+            self.assertNotIn("old-openai-secret", result.detail)
+            self.assertNotIn("RAW-AUTH-BODY", result.detail)
+            if code == 404:
+                self.assertNotIn("key", result.detail.lower())
 
 
-class TestWizardRecovery(WizardCase):
-    """A choice that cannot be connected saves nothing and returns to the
-    provider prompt instead of ending setup."""
+class TestStartupSetupRecovery(OnboardingCase):
+    def recovery(self, candidates, answers):
+        config = {"provider": "openai", "model": "gpt-4o-mini", "chat_model": "gpt-4o-mini"}
+        bad = modelcheck.ProbeResult("openai", "gpt-4o-mini", modelcheck.AUTH_FAILED, "HTTP 401")
+        good = modelcheck.ModelCheckOutcome("codex", "default", self.probe("codex", "default", {}))
+        with patch("conch.modelcheck.probe_model", return_value=bad), \
+                patch("conch.modelcheck.discover_alternatives", return_value=(candidates, [])), \
+                patch("conch.modelcheck.probe_candidates"), \
+                patch("conch.onboarding.run_first_run_wizard", return_value=good) as wizard, \
+                patch("conch.onboarding.load_config", return_value={"provider": "codex", "model": "default", "chat_model": "default", "api_key_env": ""}), \
+                patch("builtins.input", side_effect=answers):
+            outcome = modelcheck.ensure_working_model(config, interactive=True)
+        wizard.assert_called_once()
+        self.assertTrue(outcome.switched)
+        self.assertEqual(config["provider"], "codex")
+        return outcome
 
-    def test_missing_seat_cli_returns_to_the_provider_prompt(self):
-        walk = self.walk(["claude-code"])
-        self.assert_back_at_provider_prompt_then_cancelled(walk, answered=1)
-        walk.login.assert_not_called()
+    def test_all_invalid_alternatives_offer_setup_not_failed_menu(self):
+        candidate = modelcheck.Candidate("anthropic", "claude-sonnet-5", "provider",
+                                         result=modelcheck.ProbeResult("anthropic", "claude-sonnet-5", modelcheck.AUTH_FAILED))
+        self.recovery([candidate], [""])
+        self.assertIn("No verified alternatives", self.output.getvalue())
+        self.assertNotIn("Switch to [", self.output.getvalue())
 
-    def test_failed_native_sign_in_returns_to_the_provider_prompt(self):
-        walk = self.walk(["codex"], installed=["codex"], login_exit=1)
-        self.assert_back_at_provider_prompt_then_cancelled(walk, answered=1)
-        walk.login.assert_called_once()
+    def test_no_alternatives_can_reconnect_seats(self):
+        self.recovery([], ["s"])
 
-    def test_empty_api_key_returns_to_the_provider_prompt(self):
-        walk = self.walk(["openai"], keys=[""])
-        self.assert_back_at_provider_prompt_then_cancelled(walk, answered=1)
+    def test_working_alternative_does_not_hide_seat_setup(self):
+        candidate = modelcheck.Candidate("ollama", "local", "ollama",
+                                         result=self.probe("ollama", "local", {}))
+        self.recovery([candidate], ["s"])
 
-    def test_rejected_api_key_is_not_saved_unless_the_user_insists(self):
-        # Verify: yes; save anyway: no; then an empty key goes back.
-        walk = self.walk(["openai", "y", "n"], keys=[SECRET, ""],
-                         key_accepted=False)
-        self.assert_back_at_provider_prompt_then_cancelled(walk, answered=3)
-        self.assertEqual(walk.hidden.call_count, 2)
-
-    def test_rejected_api_key_is_saved_when_the_user_insists(self):
-        walk = self.walk(["openai", "y", "y"], keys=[SECRET], key_accepted=False)
-        self.assertTrue(walk.outcome)
-        self.assertIn(f"OPENAI_API_KEY={SECRET}",
-                      Path(config_mod.get_env_file_path()).read_text())
-
-    def test_unreachable_ollama_returns_to_the_provider_prompt(self):
-        walk = self.walk(["ollama"], ollama=[None])
-        self.assert_back_at_provider_prompt_then_cancelled(walk, answered=1)
-
-    def test_ollama_without_tool_models_returns_to_the_provider_prompt(self):
-        walk = self.walk(["ollama"], ollama=[[]])
-        self.assert_back_at_provider_prompt_then_cancelled(walk, answered=1)
-
-    def test_custom_endpoint_without_url_returns_to_the_provider_prompt(self):
-        walk = self.walk(["custom", ""])
-        self.assert_back_at_provider_prompt_then_cancelled(walk, answered=2)
-        walk.hidden.assert_not_called()
-
-    def test_another_provider_can_be_connected_after_a_dead_end(self):
-        walk = self.walk(["claude-code", "openai", "openai", "n"],
-                         keys=["", SECRET])
-        self.assertIsNone(walk.exit_code)
-        self.assertTrue(walk.outcome)
-        self.assertIn("provider = openai",
-                      Path(config_mod.get_config_path()).read_text())
-        self.assertIn(f"OPENAI_API_KEY={SECRET}",
-                      Path(config_mod.get_env_file_path()).read_text())
-        self.assertNotIn(SECRET, walk.output)
-
-    def test_failed_verification_can_restart_with_nothing_kept(self):
-        from conch.bootstrap import StartupError
-
-        # openai connects, its model fails; "choose different" → back to menu.
-        walk = self.walk(["openai", "n", "y"], keys=[SECRET],
-                         verification=[StartupError("no working model", code=69)])
-        self.assert_back_at_provider_prompt_then_cancelled_after_check(walk)
-        self.assertNotIn("OPENAI_API_KEY", os.environ)
-
-    def test_failed_verification_then_another_provider_starts_clean(self):
-        from conch.bootstrap import StartupError
-
-        walk = self.walk(
-            ["custom", "http://127.0.0.1:1/v1", "n", "", "anthropic", "n"],
-            keys=["endpoint-secret", SECRET],
-            verification=[StartupError("no working model", code=69)],
-        )
-        self.assertTrue(walk.outcome)
-        loaded = config_mod.load_config()
-        self.assertEqual(loaded["provider"], "anthropic")
-        self.assertNotIn("custom_base_url",
-                         Path(config_mod.get_config_path()).read_text())
-        env_text = Path(config_mod.get_env_file_path()).read_text()
-        self.assertIn(f"ANTHROPIC_API_KEY={SECRET}", env_text)
-        self.assertNotIn("endpoint-secret", env_text)
-
-    def test_declining_to_restart_keeps_the_setup_and_reports_failure(self):
-        from conch.bootstrap import StartupError
-
-        walk = self.walk(["openai", "n", "n"], keys=[SECRET],
-                         verification=[StartupError("no working model", code=69)])
-        self.assertEqual(walk.exit_code, 69)
-        self.assertIn("provider = openai",
-                      Path(config_mod.get_config_path()).read_text())
-
-    def assert_back_at_provider_prompt_then_cancelled_after_check(self, walk):
-        self.assertEqual(walk.exit_code, 0)
-        self.assertIsNone(walk.outcome)
-        walk.check.assert_called_once()
-        self.assert_nothing_saved()
-
-    def test_ollama_is_detected_again_when_chosen_again(self):
-        # Menu detection, first choice: down. Second choice: up with a model.
-        walk = self.walk(["ollama", "ollama"], ollama=[None, None, ["m1"]])
-        self.assertTrue(walk.outcome)
-        loaded = config_mod.load_config()
-        self.assertEqual(loaded["provider"], "ollama")
-        self.assertEqual(loaded["chat_model"], "m1")
+    def test_runtime_check_optout_does_not_probe_or_prompt(self):
+        with patch("conch.modelcheck.probe_model", side_effect=AssertionError("no probes")), \
+                patch("builtins.input", side_effect=AssertionError("no prompt")):
+            outcome = modelcheck.ensure_working_model({"provider": "ollama", "model": "local", "model_check": "off"}, interactive=True)
+        self.assertFalse(outcome.checked)
 
 
-class TestSeatFlow(WizardCase):
-    def _saved(self):
-        return Path(config_mod.get_config_path()).read_text()
+class TestNativeAuth(OnboardingCase):
+    def test_official_status_and_login_commands(self):
+        self.assertEqual(seats.transport("codex").auth_command("status"),
+                         ["codex", "-c", 'forced_login_method="chatgpt"', "-c", 'model_provider="openai"', "login", "status"])
+        claude = seats.transport("claude-code").auth_command("login")
+        self.assertEqual(claude[-3:], ["auth", "login", "--claudeai"])
+        self.assertNotIn("--api-key", claude)
 
-    def test_signed_in_seat_is_selected_without_a_new_login(self):
-        walk = self.walk(["codex"], signed_in=["codex"])
-        walk.login.assert_not_called()
-        walk.check.assert_called_once()
-        self.assertTrue(walk.outcome)
-        saved = self._saved()
-        self.assertIn("provider = codex", saved)
-        self.assertIn(f"chat_model = {seats.DEFAULT_MODELS['codex']}", saved)
-        self.assertFalse(Path(config_mod.get_env_file_path()).exists())
+    def test_failed_native_login_does_not_save_route(self):
+        for native, status, expected in ((Mock(returncode=7), True, 7), (Mock(returncode=0), False, 1)):
+            with patch("conch.auth.subprocess.run", return_value=native), \
+                    patch("conch.auth.status", return_value=(status, "dummy status")):
+                self.assertEqual(auth.login("codex"), expected)
+            self.assertFalse(self.config_path.exists())
 
-    def test_enter_selects_the_first_signed_in_seat(self):
-        walk = self.walk([""], signed_in=["codex"], installed=["claude-code"])
-        walk.login.assert_not_called()
-        self.assertIn("provider = codex", self._saved())
-
-    def test_enter_prefers_an_installed_seat_over_a_missing_one(self):
-        walk = self.walk([""], installed=["codex"], login_exit=0)
-        self.assertEqual(walk.login.call_args.args[0],
-                         seats.transport("codex").auth_command("login"))
-        self.assertIn("provider = codex", self._saved())
-
-    def test_successful_native_sign_in_selects_the_seat_and_verifies(self):
-        walk = self.walk(["claude-code"], installed=["claude-code"],
-                         login_exit=0)
-        walk.login.assert_called_once()
-        walk.check.assert_called_once()
-        self.assertIn("provider = claude-code", self._saved())
-
-    def test_status_failure_means_sign_in_needed_not_an_error(self):
+    def test_status_failure_is_sign_in_needed(self):
         with patch("conch.auth.cli_installed", return_value=True), \
-             patch("conch.seats.status", side_effect=RuntimeError("boom")):
-            self.assertEqual(onboarding.seat_state("codex"),
-                             onboarding.SEAT_NEEDS_LOGIN)
+                patch("conch.seats.status", side_effect=RuntimeError("private failure")):
+            self.assertEqual(onboarding.seat_state("codex"), onboarding.SEAT_NEEDS_LOGIN)
 
 
-class TestSeatCliLookup(unittest.TestCase):
-    def test_cli_is_found_on_the_path_the_transports_use(self):
-        with tempfile.TemporaryDirectory() as bin_dir:
-            binary = Path(bin_dir) / seats.transport("codex").auth_command("status")[0]
-            binary.write_text("#!/bin/sh\n")
-            binary.chmod(0o755)
-            with patch.dict(os.environ, {"PATH": bin_dir}):
-                self.assertTrue(auth.cli_installed("codex"))
-                self.assertFalse(auth.cli_installed("claude-code"))
+class TestDummyNativeStatus(OnboardingCase):
+    def test_official_cli_status_with_isolated_dummy_binaries(self):
+        import json
+        import shlex
 
-
-class TestStandaloneLogin(OnboardingCase):
-    """`conch auth login` keeps its exit codes; only success selects the seat."""
-
-    def _login(self, native, signed_in):
-        with patch("conch.auth.subprocess.run", **native), \
-             patch("conch.auth.status", return_value=(signed_in, "scripted")), \
-             patch("sys.stdout", io.StringIO()), \
-             patch("sys.stderr", io.StringIO()):
-            return auth.login("codex")
-
-    def test_failures_keep_their_exit_codes_and_select_nothing(self):
-        cases = (
-            ({"side_effect": FileNotFoundError}, False, 1),
-            ({"side_effect": PermissionError}, False, 1),
-            ({"return_value": Mock(returncode=7)}, True, 7),
-            ({"return_value": Mock(returncode=0)}, False, 1),
-        )
-        for native, signed_in, expected in cases:
-            with self.subTest(native=native, signed_in=signed_in):
-                self.assertEqual(self._login(native, signed_in), expected)
-                self.assertFalse(Path(config_mod.get_config_path()).exists())
-
-    def test_success_selects_the_seat(self):
-        self.assertEqual(
-            self._login({"return_value": Mock(returncode=0)}, True), 0
-        )
-        self.assertIn("provider = codex",
-                      Path(config_mod.get_config_path()).read_text())
-
-
-class TestWizardLayout(WizardCase):
-    ANSI = re.compile(r"\033\[[0-9;]*m")
-
-    def test_no_line_or_prompt_exceeds_the_wrap_width(self):
-        dead_ends_then_custom = dict(
-            inputs=["claude-code", "codex", "openai", "ollama", "ollama",
-                    "custom", "", "bogus", "custom", "http://127.0.0.1:1/v1",
-                    "y"],
-            keys=["", ""], installed=["codex"], ollama=[None, None, []],
-        )
-        api_key = dict(inputs=["anthropic", "y"], keys=[SECRET],
-                       ollama=[["m1", "m2"]])
-        seat = dict(inputs=[""], signed_in=["claude-code"])
-        ollama = dict(inputs=["ollama", ""], ollama=[["m1", "m2"]])
-        for columns in (80, 100):
-            for script in (dead_ends_then_custom, api_key, seat, ollama):
-                with self.subTest(columns=columns, inputs=script["inputs"]):
-                    walk = self.walk(columns=columns, **script)
-                    self.assertTrue(walk.outcome)
-                    shown = walk.output.splitlines() + [
-                        call.args[0] for call in
-                        walk.asked.call_args_list + walk.hidden.call_args_list
-                    ]
-                    limit = min(columns, onboarding.WRAP_WIDTH)
-                    for line in shown:
-                        self.assertLessEqual(
-                            len(self.ANSI.sub("", line)), limit, line
-                        )
-
-    def test_displayed_paths_abbreviate_home_but_files_stay_put(self):
-        walk = self.walk(["anthropic", "n"], keys=[SECRET])
-        home = str(Path.home())
-        config_path = config_mod.get_config_path()
-        self.assertTrue(Path(config_path).exists())
-        self.assertNotIn(home, walk.output)
-        self.assertIn("~" + config_path[len(home):], walk.output)
+        binary_dir = self.root / "bin"
+        binary_dir.mkdir()
+        responses = {
+            "codex": "Logged in using ChatGPT",
+            "claude": json.dumps({"loggedIn": True, "authMethod": "claude.ai",
+                                   "apiProvider": "firstParty", "subscriptionType": "pro"}),
+        }
+        for binary, response in responses.items():
+            path = binary_dir / binary
+            path.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(response) + "\n")
+            path.chmod(0o700)
+        with patch.dict(os.environ, {"PATH": str(binary_dir) + ":/usr/bin:/bin"}):
+            for provider in seats.PROVIDERS:
+                with self.subTest(provider=provider):
+                    ok, detail = seats.status(provider, timeout=1)
+                    self.assertTrue(ok, detail)
+                    self.assertNotIn("subscriptionType", detail)
 
 
 class TestEnvFileLoading(OnboardingCase):
     def test_env_file_precedence_by_provenance(self):
-        """A key the wizard/`conch keys` wrote is conch-managed and wins over
-        a stale shell export; a hand-added line keeps environment precedence
-        (see conch.config.load_env_file)."""
         config_mod._ENV_LOAD_STATE["from_file"].clear()
         config_mod.set_env_values({"OPENAI_API_KEY": "sk-from-file"})
-        del os.environ["OPENAI_API_KEY"]  # set_env_values mirrors; reset
+        del os.environ["OPENAI_API_KEY"]
         config_mod.load_env_file()
         self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-from-file")
         os.environ["OPENAI_API_KEY"] = "sk-real-env"
         config_mod.load_env_file()
         self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-from-file")
-        config_mod.forget_managed_key("OPENAI_API_KEY")  # now a hand-added line
+        config_mod.forget_managed_key("OPENAI_API_KEY")
         os.environ["OPENAI_API_KEY"] = "sk-real-env"
         config_mod._ENV_LOAD_STATE["from_file"].clear()
         config_mod.load_env_file()
         self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-real-env")
 
     def test_export_prefix_tolerated(self):
-        path = Path(config_mod.get_env_file_path())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("export OPENROUTER_API_KEY='sk-or-1'\n")
+        self.env_path.parent.mkdir(parents=True, exist_ok=True)
+        self.env_path.write_text("export OPENROUTER_API_KEY='sk-or-1'\n")
         config_mod.load_env_file()
         self.assertEqual(os.environ["OPENROUTER_API_KEY"], "sk-or-1")
 
 
 class TestConfigWriter(OnboardingCase):
     def test_create_update_preserve(self):
-        path = config_mod.set_config_values(
-            {"provider": "openai"}, header="# created by test"
+        config_mod.set_config_values({"provider": "openai"}, header="# created by test")
+        self.config_path.write_text(
+            self.config_path.read_text() + "# my comment\nmodel = gpt-4o-mini\n"
         )
-        Path(path).write_text(
-            Path(path).read_text() + "# my comment\nmodel = gpt-4o-mini\n"
-        )
-        config_mod.set_config_values({"provider": "anthropic",
-                                      "edge_daemon": "true"})
-        text = Path(path).read_text()
+        config_mod.set_config_values({"provider": "anthropic", "edge_daemon": "true"})
+        text = self.config_path.read_text()
         self.assertIn("provider = anthropic", text)
         self.assertNotIn("provider = openai", text)
         self.assertIn("# my comment", text)

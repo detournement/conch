@@ -172,8 +172,10 @@ api_key_env=
 # NO_COLOR and TERM=dumb override color schemes.
 #colorscheme=default
 
-# Desktop notification when an interactive turn runs at least this many
-# seconds (macOS via osascript, Linux via notify-send). 0 or off disables.
+# /notifications on|off toggles desktop alerts without losing the delay.
+# Apple Terminal banners need terminal-notifier; Linux desktops use the
+# terminal's native notifications or notify-send. A zero/off delay disables.
+#notifications=on
 #notify_after_seconds=30
 
 # Command prefixes that never prompt (comma-separated).

@@ -48,10 +48,10 @@ BUILTIN_SLASH_COMMANDS = (
     "/find", "/fork", "/forget", "/grep", "/h", "/help", "/image", "/infobar", "/install", "/keys",
     "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
-    "/models", "/new", "/note", "/notes", "/paste", "/profile", "/profiles",
+    "/models", "/new", "/note", "/notes", "/notifications", "/paste", "/profile", "/profiles",
     "/provider", "/queue", "/registry", "/reload", "/remember", "/rename", "/reset",
     "/resettools", "/retry", "/rounds", "/s", "/sandbox", "/schedule", "/search",
-    "/skill", "/skills", "/ssh", "/status", "/subagents", "/switch", "/tasks",
+    "/shortcuts", "/skill", "/skills", "/ssh", "/status", "/subagents", "/switch", "/tasks",
     "/terminal", "/tks", "/todo", "/tools", "/tty", "/undo", "/update", "/verbose",
     "/yolo",
 )
@@ -145,6 +145,8 @@ def render_user_command(template: str, arguments: str) -> str:
 
 SLASH_COMMANDS = [
     ("/help", "Show all commands"),
+    ("/shortcuts", "Keyboard shortcuts: browse keys by action or panel"),
+    ("/notifications [on|off]", "Turn desktop alerts on or off"),
     ("/ebrake [on|off|status]", "Pause all session agents at safe boundaries; off resumes"),
     ("/colorscheme [name]", "Pick and save the terminal color scheme"),
     ("/infobar [detail|progress]", "Pick and save detailed stats or a context-progress bar"),
@@ -1467,6 +1469,15 @@ def handle_slash_command(
     if command == "/infobar":
         return ("infobar", arg)
 
+    if command == "/notifications":
+        return ("notifications", arg)
+
+    if command == "/shortcuts":
+        from .shortcuts import meta_tip, shortcut_text
+
+        print(f"\nKeyboard shortcuts\n\n{shortcut_text()}\n\n{meta_tip()}\n")
+        return None
+
     if command in ("/help", "/h", "/?"):
         from .plugins import load_builtin_plugins, slash_commands
 
@@ -1478,6 +1489,8 @@ def handle_slash_command(
         )
         print(
             "\n\033[1;36mSlash commands:\033[0m\n"
+            "  \033[1m/shortcuts\033[0m           Browse keyboard shortcuts\n"
+            "  \033[1m/notifications [on|off]\033[0m  Turn desktop alerts on or off\n"
             "  \033[1m/ebrake [on|off|status]\033[0m Pause all session agents; off resumes\n"
             "  \033[1m/colorscheme [name]\033[0m  Pick and save terminal colors\n"
             "  \033[1m/infobar [detail|progress]\033[0m Pick and save the info bar style\n"
@@ -2456,7 +2469,7 @@ def handle_slash_command(
             with Spinner(f"Verifying {new_provider}/{new_model}"):
                 probe = probe_model(
                     new_provider, new_model, probe_config,
-                    timeout=model_check_timeout(config),
+                    timeout=model_check_timeout(probe_config),
                 )
             if not probe.ok:
                 print(
@@ -2607,8 +2620,11 @@ def handle_slash_command(
 
     if command == "/queue":
         if arg in ("on", "true", "1"):
+            from .shortcuts import meta_key
+
             print("\n  \033[1;32m✓ Typeahead enabled\033[0m")
-            print("  \033[2mEnter steers at the next safe boundary; Alt+Q queues a follow-up. Ctrl+Q edits pending input.\033[0m\n")
+            print(f"  \033[2mEnter steers at the next safe boundary; {meta_key('Q')} queues a follow-up. "
+                  "Ctrl+Q edits pending input.\033[0m\n")
             return "queue_on"
         if arg in ("off", "false", "0"):
             print("\n  \033[1;32m✓ Typeahead disabled\033[0m\n")

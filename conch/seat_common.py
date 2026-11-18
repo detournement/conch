@@ -12,6 +12,20 @@ import subprocess
 import time
 
 
+HOST_TOOL_SCOPE = (
+    "Conch is the separate host process that executes the listed tools. "
+    "This inference subprocess's read-only sandbox and disabled native tools "
+    "do not describe the permissions of Conch's host tools. Request host "
+    "actions through the structured tool_calls response, never native execution. "
+    "The available host tools enforce their own approval policy and OS permissions; "
+    "do not infer a session-wide write ban from this subprocess's sandbox or "
+    "one MCP server's allowed directories. Use the requested file path with an "
+    "available host file tool. A successful tool result is evidence the action "
+    "ran; a real denial must be respected, not bypassed with another tool. "
+    "Only claim a file was saved after a successful write or edit result."
+)
+
+
 class SeatError(RuntimeError):
     """A native subscription client could not complete the request."""
 

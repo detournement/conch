@@ -297,7 +297,7 @@ class InfobarRenderingTests(_DirectUI):
 
 class HintRowTests(_DirectUI):
     def hint_row(self):
-        return self.render().splitlines()[-1]
+        return self.render().rstrip().splitlines()[-1]
 
     async def test_hints_are_dropped_whole_instead_of_cut(self):
         for busy in (False, True):
@@ -316,13 +316,20 @@ class HintRowTests(_DirectUI):
 
     async def test_pending_and_detail_keys_are_listed_only_when_they_apply(self):
         self.output.size = Size(rows=12, columns=200)
-        idle = self.hint_row()
-        self.queue("guidance")
-        self.ui._detail_text = "Reasoning: thinking"
-        with_state = self.hint_row()
-        for key in ("Ctrl+Q", "Alt+R"):
-            self.assertNotIn(key, idle)
-            self.assertIn(key, with_state)
+        self.ui._busy = True
+        for platform, modifier in (("darwin", "Option"), ("linux", "Alt")):
+            with self.subTest(platform=platform), patch("sys.platform", platform):
+                self.ui._messages.clear()
+                self.ui._detail_text = ""
+                idle = self.hint_row()
+                self.assertIn(f"{modifier}+Q follow-up", idle)
+                self.assertIn(f"{modifier}+Enter newline", idle)
+                self.queue("guidance")
+                self.ui._detail_text = "Reasoning: thinking"
+                with_state = self.hint_row()
+                for key in ("Ctrl+Q", f"{modifier}+R"):
+                    self.assertNotIn(key, idle)
+                    self.assertIn(key, with_state)
 
 
 class TurnBoundaryTests(_DirectUI):
@@ -530,6 +537,55 @@ class LiveCommandTests(_DirectUI):
         self.assertEqual([(m.text, m.kind) for m in self.ui._messages],
                          [("/switch abc123", "follow-up")])
         self.assertIn("/switch abc123", self.ui._notice)
+
+    def test_pending_model_is_applied_before_chat_not_steered_past(self):
+        first = "/model one --provider codex"
+        second = "/model two --provider codex"
+        self.ui._editor.text = "queued follow-up"
+        self.ui._send(followup=True)
+        self.submit(first)  # typed while busy
+        self.ui.queue_command(second)  # live picker callback
+        self.submit("answer on the new model")
+        self.assertEqual(self.ui.take_steering(), [])
+        self.ui.set_busy(False)
+        self.assertEqual([self.ui.read_message() for _ in range(4)],
+                         [first, second, "queued follow-up", "answer on the new model"])
+
+    def test_turn_finishing_with_model_picker_open_waits_for_pick_or_cancel(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        for chosen in ("/model two --provider codex", None):
+            with self.subTest(chosen=chosen):
+                release = threading.Event()
+                def picker():
+                    release.wait(5)
+                    if chosen:
+                        self.ui.queue_command(chosen)
+
+                self.ui._live_command = lambda command: picker if command == "/models" else None
+                self.ui.set_busy(True)
+                self.submit("follow-up")
+                self.submit("/models")
+                self.assertEqual(self.ui.take_steering(), [])
+                self.ui.set_busy(False)
+                with ThreadPoolExecutor(1) as pool:
+                    # Observe read_message reaching its condition wait, not
+                    # an arbitrary sleep hoping the reader has started.
+                    waiting = threading.Event()
+                    wait = self.ui._condition.wait
+                    def record_wait(*args):
+                        waiting.set()
+                        return wait(*args)
+                    with patch.object(self.ui._condition, "wait", record_wait):
+                        first = pool.submit(self.ui.read_message)
+                        try:
+                            self.assertTrue(waiting.wait(2))
+                        finally:
+                            release.set()
+                        self.assertEqual(first.result(timeout=5), chosen or "follow-up")
+                    if chosen:
+                        self.assertEqual(self.ui.read_message(), "follow-up")
 
 
 class CaptureThreadTests(unittest.TestCase):

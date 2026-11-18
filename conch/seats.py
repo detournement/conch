@@ -8,7 +8,7 @@ import sys
 import uuid
 
 from .images import has_images, is_image_block, text_only
-from .seat_common import SeatError
+from .seat_common import HOST_TOOL_SCOPE, SeatError
 
 PROVIDERS = ("claude-code", "codex")
 DEFAULT_MODELS = {"claude-code": "sonnet", "codex": "default"}
@@ -229,6 +229,7 @@ def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
         "Never execute tools yourself. Text alone does nothing: when you say you will "
         "do something, include its tool_calls entry in this same response. Use an empty "
         "tool_calls array only for a final answer.\n"
+        + HOST_TOOL_SCOPE + "\n"
         + json.dumps({"messages": _seat_messages(provider, messages), "tools": tools or []},
                      ensure_ascii=False)
     )

@@ -509,15 +509,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     _repo_ctx = github_context.start(config)
     _repo_ctx_in_prompt = _repo_ctx is None or _repo_ctx.done.is_set()
     agent_mode_from_config = apply_agent_mode_from_config(config)
-    try:
-        provider, raw_fn = resolve_startup_provider(config)
-    except StartupError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(exc.code)
-
-    model_name, model_warnings = resolve_startup_model(config, provider)
-    for warning in model_warnings:
-        print(f"\033[33m  ⚠ {warning}\033[0m", file=sys.stderr)
 
     # Startup model check: verify the configured model before anything
     # calls it. A failure puts alternatives in front of the user (TTY) or
@@ -528,6 +519,15 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     except StartupError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(exc.code)
+    try:
+        provider, raw_fn = resolve_startup_provider(config)
+    except StartupError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(exc.code)
+
+    model_name, model_warnings = resolve_startup_model(config, provider)
+    for warning in model_warnings:
+        print(f"\033[33m  ⚠ {warning}\033[0m", file=sys.stderr)
     if model_check.switched:
         provider, model_name = model_check.provider, model_check.model
         raw_fn = RAW_FNS[provider]
@@ -634,6 +634,21 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         current_conv.model = model_name
         current_conv.title = _conversation_title(current_conv, messages)
         conv_mgr.save(current_conv)
+
+    def _refresh_model(*, normalize_history):
+        """Refresh consumers of the route that AgentSession will actually use."""
+        nonlocal provider, model_name, raw_fn, base_prompt, system_prompt
+        old_provider = provider
+        provider, model_name, raw_fn = session.provider, session.model, session.raw_fn()
+        if normalize_history and provider != old_provider:
+            from .runtime import normalize_messages_on_switch
+            normalize_messages_on_switch(messages, provider)
+        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
+        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_prompt
+        builtin_clients["conch_config"].update(provider, model_name)
+        builtin_clients["conch_introspect"].update(provider, model_name)
 
     def _switch_to(conv: Conversation):
         nonlocal current_conv, messages
@@ -1053,6 +1068,15 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 "detail": "Tokens in/out, cost, speed, context use, and model",
                 "progress": "Estimated context utilization with a progress ruler",
             }
+        elif kind == "notifications":
+            from .notify import DEFAULT_AFTER_SECONDS, notify_after_seconds
+
+            delay = notify_after_seconds(dict(config, notifications="on")) or DEFAULT_AFTER_SECONDS
+            title = "Notifications"
+            choices = {"on": f"Notify when a turn takes at least {delay:g} seconds",
+                       "off": "Do not notify when turns finish"}
+            current = current_value(config, kind)
+            choices = {current: choices[current], **choices}
         else:
             from .themes import SCHEMES
 
@@ -1084,6 +1108,11 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         """Picker selections still pass through the existing validated dispatcher."""
         head, _, argument = command.partition(" ")
         head = head.lower()
+        if head == "/shortcuts":
+            from .shortcuts import browse_shortcuts
+
+            _ui.run_panel(lambda: browse_shortcuts(config))
+            return None
         if head in ("/help", "/h", "/?"):
             needle = argument.strip().casefold()
             options = [
@@ -1118,9 +1147,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         still waits for the turn."""
         head, _, argument = command.partition(" ")
         head, argument = head.lower(), argument.strip()
-        if head in ("/ebrake", "/colorscheme", "/infobar"):
+        if head in ("/ebrake", "/colorscheme", "/infobar", "/notifications"):
             return lambda: _apply_session_control(head[1:], argument)
-        if head in ("/help", "/h", "/?") or (head == "/provider" and not argument):
+        if head in ("/help", "/h", "/?", "/shortcuts") or (head == "/provider" and not argument):
             def pick():
                 chosen = _interactive_command(command)
                 if chosen:
@@ -1404,7 +1433,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 if isinstance(result, tuple) and result[0] == "update":
                     _pending_update = result[1]
                     break
-                if isinstance(result, tuple) and result[0] in ("ebrake", "colorscheme", "infobar"):
+                if isinstance(result, tuple) and result[0] in ("ebrake", "colorscheme", "infobar", "notifications"):
                     _apply_session_control(*result)
                     continue
                 # User-defined slash command: the rendered template becomes
@@ -1592,18 +1621,11 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 elif isinstance(result, int):
                     session.budgets.max_tool_rounds = result
                 elif result is not None:
-                    old_provider = provider
-                    provider, model_name, raw_fn = result
-                    if provider != old_provider:
-                        from .runtime import normalize_messages_on_switch
-                        normalize_messages_on_switch(messages, provider)
-                    # Rebuild the system prompt on any switch so the model's
-                    # self-description (provider/model/context window) stays true.
-                    from .prompts import get_chat_prompt
-                    base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
-                    system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
-                    if messages and messages[0].get("role") == "system":
-                        messages[0]["content"] = system_prompt
+                    # /model (including a picker choice) and /provider have
+                    # validated and committed the route to session.config.
+                    _refresh_model(normalize_history=True)
+                    _backend_failed = False
+                    _save_current()
                 if _custom_prompt is None:
                     continue
                 user_input = _custom_prompt
@@ -1733,22 +1755,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
 
             _backend_failed = bool(turn_usage.get("error"))
 
-            # API fallback inside chat_turn may switch provider/model via config only
-            _pre_fb = (provider, model_name)
-            provider = (config.get("provider") or provider).lower()
-            model_name = config.get("chat_model") or config.get("model") or model_name
-            _sync_fn = RAW_FNS.get(provider)
-            if _sync_fn:
-                raw_fn = _sync_fn
-            builtin_clients["conch_config"].update(provider, model_name)
-            builtin_clients["conch_introspect"].update(provider, model_name)
-            if (provider, model_name) != _pre_fb:
-                # Keep the self-description accurate after automatic fallback.
-                base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
-                system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
-                if messages and messages[0].get("role") == "system":
-                    messages[0]["content"] = system_prompt
-
+            # A committed fallback already normalized the history in chat_turn.
+            if (session.provider, session.model) != (provider, model_name):
+                _refresh_model(normalize_history=False)
 
             if reply:
                 messages.append({"role": "assistant", "content": reply})
@@ -1862,10 +1871,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                     _registry_name = _action[4] if len(_action) > 4 else ""
                     _new_fn = RAW_FNS.get(_new_prov)
                     if _new_fn:
-                        old_provider = provider
-                        provider = _new_prov
-                        model_name = _new_mod
-                        raw_fn = _new_fn
                         config["provider"] = _new_prov
                         config["api_key_env"] = DEFAULT_API_KEY_ENVS.get(_new_prov, "")
                         config["chat_model"] = _new_mod
@@ -1874,15 +1879,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                             config["custom_model"] = _new_mod
                         if _overrides:
                             config.update(_overrides)
-                        if provider != old_provider:
-                            from .runtime import normalize_messages_on_switch
-                            normalize_messages_on_switch(messages, provider)
-                        # Any switch (even same-provider model change) must
-                        # refresh the self-description in the system prompt.
-                        base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)
-                        system_prompt = _build_system_prompt(base_prompt, _location_result[0], provider, model_name, config)
-                        if messages and messages[0].get("role") == "system":
-                            messages[0]["content"] = system_prompt
+                        _refresh_model(normalize_history=True)
                         from .runtime import append_model_switch_note
                         append_model_switch_note(
                             messages,
@@ -1891,7 +1888,6 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                             config=config,
                             registry_name=_registry_name,
                         )
-                        _cfg_client.update(provider, model_name)
                         print(f"  \033[1;32m\u2713 Now using {provider}/{model_name}\033[0m")
                 elif _action[0] == "set_rounds":
                     session.budgets.max_tool_rounds = _action[1]
@@ -1969,6 +1965,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
               "       conch convos\n"
               "       conch auth [login|status|logout] [claude-code|codex]\n"
               "       conch keys [list|check|set NAME|rotate|doctor|...]\n"
+              "       conch setup [--check]\n"
               "       conch update [--check] [--merge | --rebase]",
         description=(
             "The LLM-assisted shell. With no arguments, resumes your most"
@@ -1979,6 +1976,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "conch auth signs into Claude or ChatGPT seats through their"
             " official CLIs.\nconch keys manages API and integration keys"
             " (see conch keys --help).\n"
+            "conch setup verifies your model and repairs sign-in interactively.\n"
             "conch update updates this installation, preserving local Git work."
         ),
         epilog=(
@@ -2063,7 +2061,8 @@ def session_is_interactive(argv_flag: bool = False, stdin=None) -> bool:
 
 #: First words of argv that are subcommands, not prompts.
 SUBCOMMANDS = {"keys": "conch.keys", "auth": "conch.auth",
-               "convos": "conch.convo_browser", "update": "conch.update"}
+               "convos": "conch.convo_browser", "update": "conch.update",
+               "setup": "conch.onboarding"}
 
 
 def main():
@@ -2101,12 +2100,6 @@ def main():
         with Spinner("Starting Conch") if interactive else contextlib.nullcontext():
             config = load_config()
         apply_agent_mode_from_config(config)
-        try:
-            provider, raw_fn = resolve_startup_provider(config)
-        except StartupError as exc:
-            print(str(exc), file=sys.stderr)
-            sys.exit(exc.code)
-        model_name, _warnings = resolve_startup_model(config, provider)
         # Same startup model check as the shell: a one-shot in a terminal
         # may ask the user to pick an alternative; a piped/--non-interactive
         # one-shot walks fallback_models or fails closed. No silent swap.
@@ -2115,6 +2108,12 @@ def main():
         except StartupError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(exc.code)
+        try:
+            provider, raw_fn = resolve_startup_provider(config)
+        except StartupError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(exc.code)
+        model_name, _warnings = resolve_startup_model(config, provider)
         if model_check.switched:
             provider, model_name = model_check.provider, model_check.model
         base_prompt = config.get("chat_system_prompt") or get_chat_prompt(provider, model_name, config)

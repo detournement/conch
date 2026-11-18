@@ -56,6 +56,7 @@ else
     if ! "$PYTHON" -m pip --version &>/dev/null; then
         "$PYTHON" -m ensurepip --upgrade
     fi
+    "$PYTHON" -m pip install --upgrade --no-input "pip>=21.3"
     "$PYTHON" -m pip install -e "$CONCH_DIR"
 fi
 ok "Installed conch and terminal dependencies in ${VENV}"
@@ -78,8 +79,7 @@ printf "\n"
 if [[ -f "$CONFIG_FILE" ]]; then
     ok "Existing provider configuration preserved: ${CONFIG_FILE}"
 else
-    info "Choose Claude/ChatGPT seat sign-in or a local/API provider on first launch."
-    printf "  Run conch in a terminal to start setup; no API key is required for seats.\n"
+    info "Setup will offer Claude/ChatGPT account sign-in, local models, and optional API keys."
 fi
 
 # Optional integrations should not interrupt provider setup on first launch.
@@ -97,7 +97,7 @@ fi
 CONCH_BLOCK="
 # Conch: LLM-assisted shell (Ctrl+G = ask, Ctrl+X Ctrl+G = chat)
 export CONCH_DIR=\"${CONCH_DIR}\"
-export PATH=\"\${CONCH_DIR}/bin:\${CONCH_DIR}/.venv/bin:\$PATH\"
+export PATH=\"\${CONCH_DIR}/bin:\$PATH\"
 [[ -f \"\${CONCH_DIR}/.env\" ]] && source \"\${CONCH_DIR}/.env\"
 source \"\${CONCH_DIR}/shell/conch.zsh\"
 conch-setup"
@@ -105,7 +105,7 @@ conch-setup"
 BASH_BLOCK="
 # Conch: LLM-assisted shell
 export CONCH_DIR=\"${CONCH_DIR}\"
-export PATH=\"\${CONCH_DIR}/bin:\${CONCH_DIR}/.venv/bin:\$PATH\"
+export PATH=\"\${CONCH_DIR}/bin:\$PATH\"
 [[ -f \"\${CONCH_DIR}/.env\" ]] && source \"\${CONCH_DIR}/.env\"
 source \"\${CONCH_DIR}/shell/conch.bash\"
 conch-setup"
@@ -124,13 +124,17 @@ printf "\n"
 info "Adding Conch to shell config..."
 
 if [[ "$USER_SHELL" == "zsh" ]]; then
-    add_to_rc "$HOME/.zshrc" "$CONCH_BLOCK"
+    add_to_rc "${ZDOTDIR:-$HOME}/.zshrc" "$CONCH_BLOCK"
 elif [[ "$USER_SHELL" == "bash" ]]; then
     add_to_rc "$HOME/.bashrc" "$BASH_BLOCK"
 else
     add_to_rc "$HOME/.zshrc" "$CONCH_BLOCK"
     warn "Added to .zshrc (your shell is $USER_SHELL; adjust if needed)"
 fi
+
+# Reconcile old aliases, PATH entries and sourced integration files instead of
+# assuming the first Conch block still selects this checkout.
+"$PYTHON" -m conch.launchers --launcher "$CONCH_DIR/bin/conch"
 
 # ── Test ─────────────────────────────────────────────────────────────────────
 
@@ -146,6 +150,17 @@ else
     exit 1
 fi
 
+info "Checking the configured model and account access..."
+if ( : < /dev/tty ) 2>/dev/null; then
+    if ! "$PYTHON" -m conch.onboarding < /dev/tty > /dev/tty 2>&1; then
+        warn "Conch is installed, but setup is incomplete. Run conch setup in a terminal."
+        exit 1
+    fi
+elif ! "$PYTHON" -m conch.onboarding --check; then
+    warn "Conch is installed but unverified. Run conch setup in a terminal before chatting."
+    exit 1
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 printf "\n${BOLD}${GREEN}  ✓ Conch installed!${RST}\n\n"
@@ -158,7 +173,7 @@ printf "  ${DIM}Config:  ${CONFIG_FILE}${RST}\n"
 printf "  ${DIM}API/integration keys: ${CONFIG_DIR}/env (managed by conch keys)${RST}\n"
 printf "  ${DIM}MCP:     ${MCP_FILE}${RST}\n"
 printf "  ${DIM}Docs:    README.md → Install and first run; /help inside chat${RST}\n\n"
-printf "  ${BOLD}First run:${RST} conch opens the provider setup wizard when unconfigured.\n"
+printf "  ${BOLD}Provider setup:${RST} conch setup verifies access and repairs sign-in.\n"
 printf "  Seats use your own subscription through an official CLI (install it first):\n"
 printf "    ${CYAN}conch auth login claude-code${RST}  → Claude subscription\n"
 printf "    ${CYAN}conch auth login codex${RST}        → ChatGPT subscription\n"

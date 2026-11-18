@@ -25,9 +25,9 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # Per-message token stats line (tokens, cost, tok/s) in interactive
     # chat. On by default; /tks flips it for a session.
     "show_token_stats": "true",
-    # Interactive turns that run at least this many seconds post a desktop
-    # notification when they finish (macOS osascript, Linux notify-send).
-    # 0/off disables.
+    # /notifications toggles alerts without losing the long-turn threshold.
+    # A zero/off threshold also disables them.
+    "notifications": "on",
     "notify_after_seconds": "30",
     # Turn-level git checkpoints when cwd is a git repo: mutating turns
     # snapshot the worktree to refs/conch/checkpoints/* (user branch and
@@ -42,7 +42,6 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # interactively or walks fallback_models non-interactively. "off"
     # skips the probe. model_check_timeout bounds each probe request.
     "model_check": "on",
-    "model_check_timeout": "4",
     # Ordered, pre-approved "provider/model" entries (comma-separated) a
     # non-interactive run (pipe, cron, conch-ask, conch-edge) may switch
     # to when the configured model fails its startup check. Empty means
@@ -652,8 +651,6 @@ def load_config() -> Dict[str, str]:
             config["chat_model"] = config["model"]
     if provider in ("claude-code", "codex"):
         config["api_key_env"] = ""
-        if "model_check_timeout" not in explicit:
-            config["model_check_timeout"] = "60"
 
     if provider == "ollama":
         # base_url is shared across providers; remember it as the Ollama

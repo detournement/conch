@@ -49,6 +49,8 @@ SETTINGS: Tuple[Setting, ...] = (
             choices=("detail", "progress")),
     Setting("colorscheme", "choice", "Terminal colors for the composer and panels", "default",
             choices=tuple(SCHEMES)),
+    Setting("notifications", "choice", "Desktop alerts at the end of long interactive turns",
+            "on", choices=("on", "off")),
     Setting("notify_after_seconds", "number",
             "Desktop notification when a turn runs at least this long (0 = off)", "30",
             minimum=0),
@@ -112,6 +114,10 @@ def current_value(config: dict, key: str) -> str:
     setting = BY_KEY[key]
     if key == "colorscheme":
         return current_scheme(config)
+    if key == "notifications":
+        from .notify import notify_after_seconds
+
+        return "on" if notify_after_seconds(config) else "off"
     if key == "side_task_model":
         model = str(config.get("weak_model") or "").strip()
         if not model:
@@ -202,6 +208,13 @@ def set_setting(config: dict, key: str, raw: str, *, permissions=None) -> str:
         updates = {"weak_provider": provider, "weak_model": model}
     else:
         updates = {key: value}
+    if key == "notifications" and value == "on":
+        from .notify import DEFAULT_AFTER_SECONDS, notify_after_seconds
+
+        # Explicitly enabling legacy configurations with a zero/off delay
+        # must enable delivery. Otherwise leave the user's delay untouched.
+        if not notify_after_seconds(dict(config, **updates)):
+            updates["notify_after_seconds"] = f"{DEFAULT_AFTER_SECONDS:g}"
     path = set_config_values(updates)
     config.update(updates)
     if key == "permission_mode" and permissions is not None:

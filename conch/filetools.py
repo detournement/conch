@@ -32,6 +32,13 @@ DIFF_MAX_LINE_CHARS = 400
 REDACTION_MARKER = "[credential redacted]"
 _BINARY_SNIFF_BYTES = 8192
 
+_HOST_PATHS = (
+    "Runs on the Conch host as the current OS user, not inside the model CLI's "
+    "inference sandbox. Absolute and ~ paths are supported outside the working "
+    "directory; MCP server directory allowlists do not scope this builtin. "
+    "OS permissions and Conch's approval and sensitive-path guards still apply. "
+)
+
 
 READ_FILE_TOOL = {
     "type": "function",
@@ -43,7 +50,7 @@ READ_FILE_TOOL = {
             "contents. Returns up to `limit` lines (default 2000) starting at "
             "1-based line `offset`; continue with a larger offset for long "
             "files. Binary files and directories are refused. Relative paths "
-            "resolve against the session working directory."
+            "resolve against the session working directory. " + _HOST_PATHS
         ),
         "parameters": {
             "type": "object",
@@ -74,7 +81,7 @@ EDIT_FILE_TOOL = {
             "indentation) and be unique unless replace_all is true; include "
             "surrounding lines to make it unique. Read the file with "
             "read_file first. Use this instead of sed -i, perl -pi, or "
-            "rewriting the file through the shell. The user reviews a diff."
+            "rewriting the file through the shell. " + _HOST_PATHS
         ),
         "parameters": {
             "type": "object",
@@ -107,7 +114,7 @@ WRITE_FILE_TOOL = {
             "Create a UTF-8 text file (parent directories too) or replace an "
             "existing file's entire content. Use this instead of shell "
             "heredocs or echo redirection; prefer edit_file for changing part "
-            "of an existing file. The user reviews a diff."
+            "of an existing file. " + _HOST_PATHS
         ),
         "parameters": {
             "type": "object",

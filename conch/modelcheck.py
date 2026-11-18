@@ -196,14 +196,16 @@ def model_check_enabled(config: dict) -> bool:
     return True
 
 
-def model_check_timeout(config: dict) -> float:
-    """Per-request probe timeout in seconds (``model_check_timeout``,
-    default 4), clamped to a sane range."""
-    raw = (config or {}).get("model_check_timeout", DEFAULT_TIMEOUT)
+def model_check_timeout(config: dict, *, provider: Optional[str] = None) -> float:
+    """Per-request probe deadline; explicit settings win over provider defaults."""
+    config = config or {}
+    provider = (provider or config.get("provider") or "").lower()
+    default = 60.0 if provider in ("claude-code", "codex") else DEFAULT_TIMEOUT
+    raw = config.get("model_check_timeout", default)
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        value = DEFAULT_TIMEOUT
+        value = default
     return min(MAX_TIMEOUT, max(MIN_TIMEOUT, value))
 
 
@@ -281,7 +283,7 @@ def _request(url: str, headers: Dict[str, str], timeout: float,
         if _is_timeout(exc):
             raise _Unreachable(TIMEOUT, f"timed out after {timeout:g}s") from exc
         reason = getattr(exc, "reason", None) or exc
-        raise _Unreachable(UNREACHABLE, _short(str(reason))) from exc
+        raise _Unreachable(UNREACHABLE, f"connection failed ({type(reason).__name__})") from exc
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
     try:
         return int(status), json.loads(text) if text.strip() else {}
@@ -332,7 +334,7 @@ _PARAM_NIT_MARKERS = (
 def _classify_http(status: int, payload, model: str) -> Tuple[str, str]:
     message, code = _error_message(payload)
     low = f"{message} {code}".lower()
-    shown = message or "no error message"
+    shown = f"request for model {model!r} rejected"
     if status in (401, 403):
         return AUTH_FAILED, f"HTTP {status}: {shown}"
     if status == 402:
@@ -465,11 +467,7 @@ def _named_auth_failure(provider: str, key_env: str, status: int,
     <NAME>``) instead of a bare HTTP line."""
     from .providers import auth_rejected_message
 
-    shown = detail
-    prefix = f"HTTP {status}: "
-    if shown.startswith(prefix):
-        shown = shown[len(prefix):]
-    return auth_rejected_message(provider, key_env, status, shown)
+    return auth_rejected_message(provider, key_env, status)
 
 
 def _probe_cloud(provider: str, model: str, config: dict, timeout: float) -> ProbeResult:
@@ -481,8 +479,10 @@ def _probe_cloud(provider: str, model: str, config: dict, timeout: float) -> Pro
         return _no_key_result(provider, model, key_env)
     if not model:
         return ProbeResult(provider, model, MISCONFIGURED, "no model configured")
+    from .model_catalog import added_for
+
     known = KNOWN_MODELS.get(provider)
-    if known is not None and model not in known:
+    if known is not None and model not in known and model not in added_for(config, provider):
         suggestions = suggest_models(model, known)
         hint = f" — did you mean {', '.join(suggestions)}?" if suggestions else ""
         return ProbeResult(
@@ -547,7 +547,7 @@ def probe_key(provider: str, config: dict, *,
 
     provider = (provider or "").lower()
     config = config or {}
-    timeout = model_check_timeout(config) if timeout is None else float(timeout)
+    timeout = model_check_timeout(config, provider=provider) if timeout is None else float(timeout)
     key_env = api_key_env_for(provider, config)
     if api_key is None:
         api_key = os.environ.get(key_env, "").strip() if key_env else ""
@@ -756,12 +756,13 @@ def _probe_custom(model: str, config: dict, timeout: float) -> ProbeResult:
         return ProbeResult("custom", model, OK, f"native tool call verified at {base}")
     low = (reason or "").lower()
     if "timed out" in low:
-        return ProbeResult("custom", model, TIMEOUT, reason)
+        return ProbeResult("custom", model, TIMEOUT, "native tool-call probe timed out")
     if "unreachable" in low:
-        return ProbeResult("custom", model, UNREACHABLE, reason)
+        return ProbeResult("custom", model, UNREACHABLE, "native tool-call endpoint unreachable")
     if any(marker in low for marker in ("authentication", "api key", "unauthorized", "forbidden")):
-        return ProbeResult("custom", model, AUTH_FAILED, reason)
-    return ProbeResult("custom", model, CONFORMANCE_FAILED, reason or "no native tool call returned")
+        return ProbeResult("custom", model, AUTH_FAILED,
+                           "native tool-call authentication failed; check the configured key")
+    return ProbeResult("custom", model, CONFORMANCE_FAILED, "no native tool call returned")
 
 
 def _probe_seat(provider: str, model: str, config: dict, timeout: float) -> ProbeResult:
@@ -791,9 +792,9 @@ def _probe_seat(provider: str, model: str, config: dict, timeout: float) -> Prob
         {"role": "user", "content": "Call conch_probe with ok=true. Do not return a text answer."},
     ], [probe_tool])
     if response.get("_error"):
-        from .runtime import error_detail
-
-        return ProbeResult(provider, model, ERROR, error_detail(response))
+        return ProbeResult(provider, model, ERROR,
+                           "native model verification failed; check account access"
+                           f" or run `conch auth login {provider}`")
     for call in response.get("tool_calls") or []:
         if call["function"]["name"] == "conch_probe":
             try:
@@ -819,8 +820,11 @@ def probe_model(provider: str, model: str, config: dict, *,
     provider = (provider or "").lower()
     model = (model or "").strip()
     config = config or {}
-    timeout = model_check_timeout(config) if timeout is None else float(timeout)
+    timeout = model_check_timeout(config, provider=provider) if timeout is None else float(timeout)
     started = time.monotonic()
+    if local_only_enabled(config, provider) and provider not in ("ollama", "custom"):
+        return ProbeResult(provider, model, MISCONFIGURED,
+                           "local_only blocks this cloud route; no credentials sent")
     try:
         if provider in ("claude-code", "codex"):
             result = _probe_seat(provider, model, config, timeout)
@@ -832,8 +836,8 @@ def probe_model(provider: str, model: str, config: dict, *,
             result = _probe_cloud(provider, model, config, timeout)
         else:
             result = ProbeResult(provider, model, MISCONFIGURED, f"unknown provider '{provider}'")
-    except Exception as exc:  # a probe must never take the shell down
-        result = ProbeResult(provider, model, ERROR, f"{type(exc).__name__}: {_short(str(exc))}")
+    except Exception as exc:  # probe errors must not disclose credentials or provider bodies
+        result = ProbeResult(provider, model, ERROR, f"probe failed ({type(exc).__name__})")
     result.elapsed = time.monotonic() - started
     return result
 
@@ -1307,6 +1311,24 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
         except (EOFError, KeyboardInterrupt):
             say()
             return None
+    from . import onboarding
+
+    setup_available = (
+        onboarding._interactive_terminal()
+        and not os.environ.get("CONCH_NO_WIZARD", "").strip()
+    )
+
+    def setup() -> ModelCheckOutcome:
+        if not setup_available:
+            raise _startup_error("conch: run `conch setup` in a terminal to reconnect")
+        try:
+            outcome = onboarding.run_first_run_wizard()
+        except (KeyboardInterrupt, EOFError):
+            raise _startup_error("conch: setup cancelled; existing configuration is unchanged")
+        config.update(onboarding.load_config())
+        outcome.switched = True
+        return outcome
+
 
     explain(f"⚠ {failure.label} is not usable: {failure.describe()}", "\033[33m")
     say("\033[2m  Looking for alternatives…\033[0m")
@@ -1318,6 +1340,14 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
         probe_candidates(candidates, config, timeout=timeout)
     for note in notes:
         explain(f"({note})", "\033[2m")
+    working = any(c.result is not None and c.result.ok for c in candidates)
+    if setup_available and not working:
+        explain("No verified alternatives. Setup can reconnect Claude/ChatGPT"
+                " or choose an API/local provider.", "\033[33m")
+        answer = read("  [s=setup, q=quit, Enter=setup]: ")
+        if answer is not None and answer.lower() in ("", "s", "setup"):
+            return setup()
+        raise _startup_error("conch: no working model; run `conch setup` to reconnect")
     if not candidates:
         say("\033[31m  No alternatives found.\033[0m")
         if restart_hint:
@@ -1352,9 +1382,11 @@ def _interactive_recovery(config: dict, failure: ProbeResult, *, timeout: float,
             None,
         )
         hint = f", Enter={default}" if default else ""
-        answer = read(f"  Switch to [1-{len(remaining)}{hint}, q=quit]: ")
+        answer = read(f"  Switch to [1-{len(remaining)}{hint}, s=setup, q=quit]: ")
         if answer is None or answer.lower() in _DECLINE:
             raise _startup_error("conch: no model switch approved — exiting")
+        if answer.lower() in ("s", "setup"):
+            return setup()
         if not answer:
             if default is None:
                 say("\033[31m  Pick a number (no verified alternative to default to).\033[0m")

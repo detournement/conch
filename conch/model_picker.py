@@ -99,12 +99,13 @@ class ModelPicker:
         self.entries: List[ModelEntry] = catalog_entries(config)
         self.statuses: Dict[str, ProviderStatus] = static_status(config)
         self._pending = 0  # live sources still to answer
-        self.mode = "list"  # list | add
+        self.mode = "list"  # list | add | primary (validating)
         self.notice = ""
         self.result: Optional[ModelEntry] = None
         self.app: Optional[Application] = None
         self.rows: List[Tuple[str, object]] = []
         self.selected_key: Optional[Tuple[str, str]] = self.current
+        self._locate_current = True  # the active server/seat row may arrive later
         self._top = 0
         self._height = 10
         self._pattern: Optional[re.Pattern] = None
@@ -192,6 +193,14 @@ class ModelPicker:
                 rows += [("model", entry) for entry in models]
         self.rows = rows
         keys = [entry.key for kind, entry in rows if kind == "model"]
+        if jump:
+            self._locate_current = False
+        if self._locate_current:
+            active = next((entry.key for kind, entry in rows
+                           if kind == "model" and self.is_current(entry)), None)
+            if active is not None:
+                self.selected_key = active
+                self._locate_current = False
         if jump and words and keys:
             self.selected_key = keys[0]
         elif self.selected_key not in keys:
@@ -209,6 +218,7 @@ class ModelPicker:
         return [index for index, (kind, _) in enumerate(self.rows) if kind == "model"]
 
     def move(self, delta: int):
+        self._locate_current = False
         indexes = self._model_indexes()
         if not indexes:
             return
@@ -258,21 +268,22 @@ class ModelPicker:
             return False
         return True
 
-    def choose(self):
+    def choose(self, *, stay=False):
+        """Capture the highlighted row in the key event, before discovery or
+        another buffered key can move it. Only validation is asynchronous."""
         entry = self.selected()
-        if entry is None or not self._usable(entry):
+        if self.mode != "list" or entry is None or not self._usable(entry):
             return
+        self._locate_current = False
+        if self.on_primary is not None and not self.purpose:
+            self.mode = "primary"
+            self.notice = f"Selecting {entry.label}…"
+            return self._apply_primary(entry, close=not stay)
         self.result = entry
         if self.app is not None:
             self.app.exit()
 
-    async def set_primary(self, *, close=False):
-        entry = self.selected()
-        if (self.mode != "list" or self.purpose or self.on_primary is None
-                or entry is None or not self._usable(entry)):
-            return
-        self.mode = "primary"
-        self.notice = f"Selecting {entry.label}…"
+    async def _apply_primary(self, entry, *, close):
         try:
             applied = await run_in_terminal(
                 lambda: self.on_primary(entry), in_executor=True)
@@ -559,7 +570,7 @@ class ModelPicker:
             if self.purpose:
                 first = f"Enter sets {self.purpose}"
             else:
-                first = "Enter use after this turn" if self.busy else "Enter use"
+                first = "Enter queues primary" if self.busy else "Enter sets primary"
             hints = [first]
             if self.on_primary is not None and not self.purpose:
                 hints.append("^P primary (stay)")
@@ -626,16 +637,13 @@ class ModelPicker:
         def _page_down(event):
             self.move(page())
 
-        @keys.add("enter", filter=listing)
-        async def _choose(event):
-            if self.on_primary is not None and not self.purpose:
-                await self.set_primary(close=True)
-            else:
-                self.choose()
+        @keys.add("enter", filter=listing, eager=True)
+        def _choose(event):
+            return self.choose()
 
-        @keys.add("c-p", filter=listing)
-        async def _primary(event):
-            await self.set_primary()
+        @keys.add("c-p", filter=listing & Condition(lambda: self.on_primary is not None and not self.purpose))
+        def _primary(event):
+            return self.choose(stay=True)
 
         @keys.add("escape", filter=listing, eager=True)
         def _escape(event):

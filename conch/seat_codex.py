@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .seat_common import SeatError, environment, run
+from .seat_common import HOST_TOOL_SCOPE, SeatError, environment, run
 from .secretguard import redact_credentials
 
 logger = logging.getLogger(__name__)
@@ -361,6 +361,7 @@ def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None
                 '--sandbox', 'read-only', '--skip-git-repo-check',
                 '--ephemeral', '--ignore-user-config', '--ignore-rules',
                 '-c', 'approval_policy="never"',
+                '-c', 'developer_instructions=' + json.dumps(HOST_TOOL_SCOPE),
                 '-c', 'agents.enabled=false',
                 '-c', 'web_search="disabled"', '-c', 'tools.web_search=false',
                 '-c', 'tools.update_plan.enabled=false',

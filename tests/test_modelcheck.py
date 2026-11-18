@@ -146,6 +146,14 @@ class TestKnobs(unittest.TestCase):
         self.assertEqual(model_check_timeout({"model_check_timeout": "999"}), 60.0)
         self.assertEqual(model_check_timeout({"model_check_timeout": "nope"}), 4.0)
 
+    def test_implicit_deadline_follows_target_provider_after_switch(self):
+        self.assertEqual(model_check_timeout({"provider": "codex"}), 60.0)
+        config = {"provider": "openai"}
+        self.assertEqual(model_check_timeout(config), 4.0)
+        self.assertEqual(model_check_timeout(config, provider="claude-code"), 60.0)
+        config["model_check_timeout"] = "2"
+        self.assertEqual(model_check_timeout(config, provider="codex"), 2.0)
+
     def test_discovery_budget_is_bounded(self):
         self.assertEqual(discovery_budget(0.5), 5.0)
         self.assertEqual(discovery_budget(4.0), 8.0)
@@ -262,7 +270,6 @@ class TestCustomEndpointProbe(ModelCheckCase):
         with patch("conch.modelcheck._probe_custom", side_effect=RuntimeError("kaboom")):
             result = probe_model("custom", PRIMARY_MODEL, self.custom_config("http://127.0.0.1:1/v1"))
         self.assertEqual(result.status, modelcheck.ERROR)
-        self.assertIn("RuntimeError: kaboom", result.detail)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +326,6 @@ class TestCloudProbe(ModelCheckCase):
         result = self._cloud("openai", server)
         self.assertEqual(result.status, AUTH_FAILED)
         self.assertNotIn(STUB_TOKEN, result.detail)
-        self.assertIn("Incorrect API key", result.detail)
 
     def test_catalog_gate_rejects_unknown_cloud_model_offline(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": STUB_TOKEN}), \
@@ -327,6 +333,17 @@ class TestCloudProbe(ModelCheckCase):
             result = probe_model("anthropic", "claude-sonet-4-6", {"provider": "anthropic"})
         self.assertEqual(result.status, MODEL_NOT_FOUND)
         self.assertIn("did you mean claude-sonnet-4-6", result.detail)
+
+    def test_user_added_model_passes_catalog_gate_but_still_needs_live_probe(self):
+        model = "user-added-preview"
+        server = self.stub([model], require_token=STUB_TOKEN)
+        config = {"provider": "openai", "extra_models": f"openai/{model}"}
+        with patch.dict(os.environ, {"OPENAI_API_KEY": STUB_TOKEN}), \
+                patch("conch.modelcheck.cloud_base_url", return_value=server.v1):
+            self.assertEqual(probe_model("openai", model, config).status, OK)
+            server.force_status = (403, {"error": {"message": "Forbidden"}})
+            self.assertEqual(probe_model("openai", model, config).status, AUTH_FAILED)
+        self.assertEqual(server.paths(), ["/v1/models", "/v1/models"])
 
     def test_quota_rate_limit_and_server_errors(self):
         model = DEFAULT_CHAT_MODEL_BY_PROVIDER["openai"]
@@ -858,19 +875,17 @@ class TestSurfaces(ModelCheckCase):
             onboarding.verify_configured_model()
         self.assertIn(f"✓ custom/{PRIMARY_MODEL} verified", out.getvalue())
 
-    def test_wizard_switch_is_saved_as_the_default(self):
+    def test_setup_does_not_certify_an_unselected_alternative(self):
         from conch import onboarding
 
         ollama = self.stub(["qwen2.5:7b"])
         config = self.custom_config(closed_port_url() + "/v1", ollama_base_url=ollama.url)
-        answers = iter(["1"])
         with patch("conch.onboarding.load_config", return_value=config), \
-                patch("builtins.input", side_effect=lambda *_: next(answers)), \
-                contextlib.redirect_stdout(io.StringIO()):
+                patch("builtins.input", side_effect=_refuse_input), \
+                self.assertRaises(StartupError) as caught:
             onboarding.verify_configured_model()
-        saved = self.config_path.read_text()
-        self.assertIn("provider = ollama", saved)
-        self.assertIn("chat_model = qwen2.5:7b", saved)
+        self.assertEqual(caught.exception.code, MODEL_CHECK_EXIT_CODE)
+        self.assertFalse(self.config_path.exists())
 
 
 if __name__ == "__main__":

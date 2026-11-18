@@ -29,7 +29,8 @@ Releases before 0.6.0 predate this changelog.
 - Installers verify model access even when credentials already exist and
   reopen onboarding for rejected keys. No interactive login runs headlessly.
 - Upgrades reconcile recognized stale shell launchers with private backups,
-  preserving credentials and helper integrations. Experimental checkouts
+  preserving credentials, helper integrations, and customized PATH entries.
+  Experimental checkouts
   migrate only with consent and retain their local work.
 - Old pip is upgraded within the selected environment for editable
   `pyproject.toml` builds, avoiding the missing `setup.py` upgrade failure.

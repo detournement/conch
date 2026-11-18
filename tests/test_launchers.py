@@ -245,6 +245,44 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(second.changed)
         self.assertEqual(rc.read_text().count('# >>> conch launcher (managed) >>>'), 1)
 
+    def test_customized_legacy_path_keeps_unrelated_command(self):
+        shells = [(name, shutil.which(name)) for name in ("bash", "zsh")]
+        shells = [(name, binary) for name, binary in shells if binary]
+        if not shells:
+            self.skipTest("bash and zsh unavailable")
+        for shell, binary in shells:
+            with self.subTest(shell=shell):
+                home = self.tmp_path / shell
+                home.mkdir()
+                selected = executable(home / ".local/bin/conch")
+                old = executable(home / "old/bin/conch", "old")
+                tool = executable(home / "tools/bin/unrelated-tool", "tool-preserved")
+                rc = home / (".bashrc" if shell == "bash" else ".zshrc")
+                customized = f'export PATH="{old.parent}:{tool.parent}:$PATH"\n'
+                rc.write_text('# added by the conch installer\n' + customized
+                              + 'export CUSTOM_SECRET=preserved\n')
+                env = environment(home, SHELL=binary)
+                first = repair_launcher(selected, environ=env)
+                self.assertTrue(first.usable, first.conflicts)
+                self.assertIn(customized, rc.read_text())
+                second = repair_launcher(selected, environ=env)
+                self.assertTrue(second.usable, second.conflicts)
+                self.assertFalse(second.changed)
+                self.assertFalse(second.backups)
+                parsed = subprocess.run([binary, "-n", str(rc)], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(parsed.returncode, 0, parsed.stderr)
+                command = (f'source {shlex.quote(str(rc))}\n'
+                           'command -v conch; conch; unrelated-tool; '
+                           'printf "%s\\n" "$CUSTOM_SECRET"')
+                result = subprocess.run([binary, "-c", command], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(str(selected), result.stdout)
+                self.assertIn("selected\n", result.stdout)
+                self.assertIn("tool-preserved\n", result.stdout)
+                self.assertIn("preserved\n", result.stdout)
+
     def test_fish_xdg_config_and_conf_d_overrides_are_inspected(self):
         tmp_path = self.tmp_path
         selected = executable(tmp_path / ".local/bin/conch")

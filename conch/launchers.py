@@ -268,7 +268,7 @@ def _without_managed(text: str, path: Path, report: RepairReport) -> str:
             index = end + 1
             continue
         if lines[index].strip() == _PUBLIC_MARKER and index + 1 < len(lines):
-            if re.fullmatch(r'export PATH="[^"\n]+:\$PATH"\s*', lines[index + 1]):
+            if re.fullmatch(r'export PATH="/[^":$`\\\n]*:\$PATH"\s*', lines[index + 1]):
                 index += 2
                 continue
         result.append(lines[index])

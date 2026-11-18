@@ -371,6 +371,50 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('export MY_SECRET=kept', rc.read_text())
         self.assertTrue(any(('customized' in c for c in report.conflicts)))
 
+    def test_uninspectable_helpers_are_preserved(self):
+        for kind in ("unreadable", "non_utf8", "oversized", "dangling_symlink"):
+            with self.subTest(kind=kind):
+                home = self.tmp_path / kind
+                home.mkdir()
+                selected = executable(home / ".local/bin/conch")
+                executable(home / ".local/bin/conch-ask", "selected-ask")
+                old = checkout(home)
+                (old / "shell/conch.zsh").write_text("# CONCH_ASK_CMD\nconch-setup() { :; }\n")
+                (home / ".zshrc").write_text(
+                    f'export CONCH_DIR={shlex.quote(str(old))}\n'
+                    'source "${CONCH_DIR}/shell/conch.zsh"\nconch-setup\n')
+                helper = home / ".local/share/conch/shell-helpers/conch-ask"
+                helper.parent.mkdir(parents=True)
+                missing = home / "missing-helper"
+                content = {"unreadable": b"keep this helper", "non_utf8": b"\xff",
+                           "oversized": b"x" * 262145}.get(kind)
+                if kind == "dangling_symlink":
+                    helper.symlink_to(missing)
+                else:
+                    helper.write_bytes(content)
+                    helper.chmod(0o640)
+                original_open = Path.open
+
+                def denied(path, *args, **kwargs):
+                    if path == helper:
+                        raise PermissionError("inspection denied")
+                    return original_open(path, *args, **kwargs)
+
+                inspection = (patch.object(Path, "open", denied) if kind == "unreadable"
+                              else contextlib.nullcontext())
+                with inspection:
+                    report = repair_launcher(selected, environ=environment(home))
+                self.assertFalse(report.usable)
+                self.assertTrue(any(str(helper) in conflict for conflict in report.conflicts))
+                self.assertNotIn(helper, report.changed)
+                if kind == "dangling_symlink":
+                    self.assertTrue(helper.is_symlink())
+                    self.assertEqual(helper.readlink(), missing)
+                    self.assertFalse(missing.exists())
+                else:
+                    self.assertEqual(helper.read_bytes(), content)
+                    self.assertEqual(stat.S_IMODE(helper.stat().st_mode), 0o640)
+
     def test_legacy_widgets_forward_helpers_without_promoting_private_python(self):
         tmp_path = self.tmp_path
         selected = executable(tmp_path / ".local/bin/conch")

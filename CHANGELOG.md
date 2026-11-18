@@ -32,7 +32,8 @@ Releases before 0.6.0 predate this changelog.
 - Upgrades reconcile recognized stale shell launchers with private backups,
   preserving credentials, helper integrations, customized PATH entries, and
   valid shell syntax inside conditional/function bodies. Experimental checkouts
-  migrate only with consent and retain their local work.
+  migrate only with consent and retain their local work. Existing helpers that
+  cannot be inspected are not overwritten.
 - Old pip is upgraded within the selected environment for editable
   `pyproject.toml` builds, avoiding the missing `setup.py` upgrade failure.
 - Subscription inference no longer conflates Codex's read-only native sandbox

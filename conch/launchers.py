@@ -456,6 +456,9 @@ def _forward_helpers(launcher: Path, home: Path, report: RepairReport, check: bo
         if not _inside(path, home):
             report.conflicts.append(f"{path}: helper path resolves outside your home; not modified")
             continue
+        if original is None and (path.exists() or path.is_symlink()):
+            report.conflicts.append(f"{path}: existing helper could not be inspected; not modified")
+            continue
         if original is not None and not original.startswith(header):
             report.conflicts.append(f"{path}: unrecognized existing helper; not modified")
             continue

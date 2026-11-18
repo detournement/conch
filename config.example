@@ -156,11 +156,21 @@ api_key_env=
 # (rm, dd, git push --force, ...) always prompt, even in agent/yolo mode.
 #permission_mode=safe_auto
 
-# Per-message token stats line (tokens in/out, cost, tok/s, context gauge)
-# after every assistant reply. On by default; /tks toggles it for the
-# session. tok/s is exact when the backend reports generation time
-# (Ollama, llama.cpp timings) and a ~-labeled wall-clock estimate otherwise.
+# Info bar in the live editor; per-reply detailed stats in plain sessions.
+# /tks toggles visibility for the session. Detail shows tokens in/out, cost,
+# tok/s, context, and model. Speed is exact with backend timing, otherwise
+# a ~-labeled wall-clock estimate.
 #show_token_stats=true
+
+# /infobar opens a picker and saves the style: detail or progress.
+# Progress shows estimated context use against the compaction budget.
+#infobar=detail
+
+# Composer and panel colors; /colorscheme previews on hover or Up/Down.
+# Click/Enter saves the choice; Escape restores the configured colors.
+# default, dark, light, dracula, solarized, monochrome.
+# NO_COLOR and TERM=dumb override color schemes.
+#colorscheme=default
 
 # Desktop notification when an interactive turn runs at least this many
 # seconds (macOS via osascript, Linux via notify-send). 0 or off disables.

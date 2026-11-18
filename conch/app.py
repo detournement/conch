@@ -348,7 +348,11 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
         summary_fn, summary_config = side_task_fn(config, raw_fn, config)
         if summary_fn is None:
             return
+        from .ebrake import checkpoint
+
+        checkpoint()
         with serialized_agent_execution():
+            checkpoint()
             response = summary_fn(summary_config, summary_messages, None)
         if is_error_response(response):
             return  # never save provider errors as permanent memories
@@ -374,7 +378,8 @@ def _summarize_and_save(messages: List[dict], config: dict, raw_fn, memory: Memo
         pass
 
 
-def _summarize_and_save_async(messages: List[dict], config: dict, raw_fn, memory: MemoryStore):
+def _summarize_and_save_async(messages: List[dict], config: dict, raw_fn,
+                              memory: MemoryStore, *, session=None):
     """Fire-and-forget session summary for /new: the LLM call inside
     _summarize_and_save can block for a long time on a busy backend, and
     starting a fresh conversation must not wait on it. Snapshots the
@@ -383,9 +388,19 @@ def _summarize_and_save_async(messages: List[dict], config: dict, raw_fn, memory
     if not session_worth_summarizing(messages, config):
         return None
     snapshot = list(messages)
+
+    def summarize():
+        from .ebrake import AgentsCancelled
+
+        scope = session.agent_scope() if session is not None else contextlib.nullcontext()
+        try:
+            with scope:
+                _summarize_and_save(snapshot, config, raw_fn, memory)
+        except AgentsCancelled:
+            pass  # Session shutdown cancels best-effort background summaries.
+
     thread = threading.Thread(
-        target=_summarize_and_save,
-        args=(snapshot, config, raw_fn, memory),
+        target=summarize,
         daemon=True,
     )
     thread.start()
@@ -397,7 +412,7 @@ EXIT_SUMMARY_TIMEOUT_S = 2.5
 
 def _summarize_and_save_bounded(
     messages: List[dict], config: dict, raw_fn, memory: MemoryStore,
-    timeout: float = EXIT_SUMMARY_TIMEOUT_S,
+    timeout: float = EXIT_SUMMARY_TIMEOUT_S, *, session=None,
 ):
     """Exit-path session summary: give the LLM call a short, bounded window
     instead of blocking quit for the full generation time. Tradeoff: the
@@ -405,7 +420,7 @@ def _summarize_and_save_bounded(
     timeout the summary is lost when the interpreter exits — acceptable for
     a best-effort memory, and far better than hanging exit on a busy
     server."""
-    thread = _summarize_and_save_async(messages, config, raw_fn, memory)
+    thread = _summarize_and_save_async(messages, config, raw_fn, memory, session=session)
     if thread is not None:
         thread.join(timeout)
 
@@ -562,7 +577,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     # the conch-edge daemon) owns scheduled tasks instead; without it this
     # is the classic in-process scheduler and conch.kernel is never imported.
     sched, sched_kind = start_task_backend(
-        config, lambda: system_prompt, max_tool_rounds=MAX_TOOL_ROUNDS
+        config, lambda: system_prompt, max_tool_rounds=MAX_TOOL_ROUNDS,
+        pause_controller=session._pause_controller,
     )
 
     session_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 0}
@@ -916,9 +932,33 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         with _suspend_ui(discard=True):
             yield
 
-    def _sync_ui_context():
+    # Only retain the latest completed turn's metrics, never relabel them as
+    # usage from a different conversation or the currently selected model.
+    _infobar_turn = None
+
+    def _sync_ui_context(*, context_used=None, context_window=None):
+        nonlocal _infobar_turn
         if _ui:
             from .model_tuning import describe as describe_tuning
+            from .runtime import (
+                calibration_key, estimate_tokens, format_context_gauge, get_context_limit,
+            )
+            from .themes import current_scheme
+
+            if _infobar_turn and _infobar_turn[0] != current_conv.id:
+                _infobar_turn = None
+            if context_used is None:
+                context_used = estimate_tokens(messages, key=calibration_key(provider, config))
+            if context_window is None:
+                context_window = get_context_limit(provider, config)
+            gauge = format_context_gauge(context_used, context_window)
+            session_cost = format_session_cost(session_usage, provider, model_name, config)
+            if _infobar_turn:
+                _, usage, cost, actual_model = _infobar_turn
+                stats = format_turn_stats_line(usage, cost, gauge, actual_model, config).strip()
+            else:
+                stats = "  ".join(part for part in (session_cost, gauge, f"({model_name})") if part)
+            _ui.set_colorscheme(current_scheme(config))
 
             _ui.set_context(
                 provider=provider, model=model_name,
@@ -927,7 +967,12 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 conversation=current_conv.title, cwd=os.getcwd(),
                 repo=_repo_ctx.indicator() if _repo_ctx is not None else "",
                 tools=f"{len(chat_state.tools)}/{len(chat_state.all_tools)}",
-                session_cost=format_session_cost(session_usage, provider, model_name, config),
+                session_cost=session_cost,
+                infobar=config.get("infobar", "detail"),
+                show_token_stats=get_bool(config, "show_token_stats", default=True),
+                infobar_stats=stats,
+                context_used=context_used, context_window=context_window,
+                agents_paused=session.agents_paused,
             )
 
     def _set_foreground_policies():
@@ -952,6 +997,88 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         builtin_clients["skill_manage"].configure(
             interactive=interactive, input_fn=_safe_input
         )
+
+    def _choose_ssh_execution(command):
+        if _ui:
+            return _ui.choose(f"SSH execution · {command}", [
+                ("terminal", "Direct terminal", "Interactive SSH; input/output stays private"),
+                ("model", "Let the model handle it", "Send to the model; normal tools and permissions"),
+            ])
+        if not interactive:
+            return "model"
+        print(
+            "\n  SSH execution:\n"
+            "    1. Direct terminal — interactive, non-recording handoff\n"
+            "    2. Let the model handle it — normal tools and permissions"
+        )
+        while True:
+            try:
+                answer = _safe_input(
+                    "  SSH execution [1/2, Enter cancels]: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if answer in ("1", "terminal"):
+                return "terminal"
+            if answer in ("2", "model"):
+                return "model"
+            if not answer:
+                return None
+            print("  Choose 1 or 2, or press Enter to cancel.")
+
+    def _apply_session_control(kind, argument):
+        if kind == "ebrake":
+            action = argument.strip().lower()
+            if action in ("", "on"):
+                session.pause_agents()
+            elif action == "off":
+                session.resume_agents()
+            elif action != "status":
+                print("\n  Usage: /ebrake [on|off|status]\n")
+                return
+            paused = session.agents_paused
+            if _ui:
+                _ui.set_context(agents_paused=paused)
+            print(
+                "\n  Emergency brake ON: session agents pause before their next "
+                "request or tool. In-flight work may finish. /ebrake off resumes.\n"
+                if paused else "\n  Emergency brake OFF: session agents may run.\n"
+            )
+            return
+        from .settings_registry import current_value, set_setting
+
+        if kind == "infobar":
+            title = "Info bar"
+            choices = {
+                "detail": "Tokens in/out, cost, speed, context use, and model",
+                "progress": "Estimated context utilization with a progress ruler",
+            }
+        else:
+            from .themes import SCHEMES
+
+            title, choices = "Color scheme", SCHEMES
+        name = argument.strip()
+        if not name:
+            current = current_value(config, kind)
+            if not _ui:
+                print(f"\n  {title}: {current}")
+                for choice, description in choices.items():
+                    print(f"    {choice:<12} {description}")
+                print(f"\n  /{kind} <name> selects and saves a choice.\n")
+                return
+            name = _ui.choose(f"{title} — Enter saves, Escape cancels", [
+                (choice, choice + (" (current)" if choice == current else ""), description)
+                for choice, description in choices.items()
+            ], preview_colors=kind == "colorscheme")
+            if name is None:
+                return
+        try:
+            message = set_setting(config, kind, name)
+        except (ValueError, OSError) as exc:
+            print(f"\n  {title} unchanged: {exc}\n")
+            return
+        _sync_ui_context()
+        print(f"\n  {message}\n")
 
     def _interactive_command(command):
         """Picker selections still pass through the existing validated dispatcher."""
@@ -991,6 +1118,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         still waits for the turn."""
         head, _, argument = command.partition(" ")
         head, argument = head.lower(), argument.strip()
+        if head in ("/ebrake", "/colorscheme", "/infobar"):
+            return lambda: _apply_session_control(head[1:], argument)
         if head in ("/help", "/h", "/?") or (head == "/provider" and not argument):
             def pick():
                 chosen = _interactive_command(command)
@@ -1038,7 +1167,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         manager = ConversationManager()
         current_id = current_conv.id
         try:
-            chosen = _ui.run_panel(lambda: browse_during_turn(manager, current_id))
+            chosen = _ui.run_panel(
+                lambda: browse_during_turn(manager, current_id, config=config))
         finally:
             manager.close()
         if chosen and chosen != current_id:
@@ -1049,9 +1179,12 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         chat model is queued for when the turn ends."""
         from .model_picker import pick_model_during_turn
 
-        chosen = _ui.run_panel(lambda: pick_model_during_turn(config, provider, model_name))
-        if chosen is not None and chosen.key != (provider, model_name):
-            _ui.queue_command(chosen.switch_command())
+        def queue_primary(entry):
+            _ui.queue_command(entry.switch_command())
+            return True
+
+        _ui.run_panel(lambda: pick_model_during_turn(
+            config, provider, model_name, on_primary=queue_primary))
 
     def _run_slash_builtin(tool_name: str, arguments: dict):
         """Run a direct-user builtin through the same lifecycle hooks."""
@@ -1184,13 +1317,23 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             if not stripped:
                 continue
             _attach_loaded_tools()
+            _literal_block = False
+            if multiline.is_ssh_command(user_input):
+                execution = _choose_ssh_execution(stripped)
+                if execution == "terminal":
+                    user_input = stripped = f"/terminal {stripped}"
+                elif execution == "model":
+                    # Absolute SSH paths must remain model input, not slash commands.
+                    _literal_block = True
+                else:
+                    print("  \033[2m(cancelled — nothing sent)\033[0m\n")
+                    continue
 
             # /paste and /edit compose a literal message: the block they
             # return is never re-parsed as commands or exit words, and
             # multiline input (pasted or composed) is always chat — interior
             # lines must never dispatch as slash commands.
-            _literal_block = False
-            if multiline.is_slash_command(user_input):
+            if not _literal_block and multiline.is_slash_command(user_input):
                 _head = stripped.split(maxsplit=1)
                 _name = _head[0].lower()
                 _arg = _head[1].strip() if len(_head) > 1 else ""
@@ -1257,6 +1400,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                         messages=messages,
                         server_status=lambda: _tool_loader.statuses(),
                     )
+                if isinstance(result, tuple) and result[0] in ("ebrake", "colorscheme", "infobar"):
+                    _apply_session_control(*result)
+                    continue
                 # User-defined slash command: the rendered template becomes
                 # this turn's user message (handled by the normal flow below).
                 _custom_prompt = None
@@ -1330,6 +1476,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                           f"{_parent_id} is unchanged\033[0m\n")
                     continue
                 if isinstance(result, tuple) and result[0] == "compact_conversation":
+                    if session.agents_paused:
+                        print("\n  Agents are paused; /ebrake off before compacting.\n")
+                        continue
                     from .runtime import (
                         auto_compact, calibration_key, can_compact, estimate_tokens,
                     )
@@ -1338,14 +1487,19 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                         continue
                     _est_key = calibration_key(provider, config)
                     _before = estimate_tokens(messages, key=_est_key)
+                    if _ui:
+                        _ui.set_busy(True)
                     try:
-                        with Spinner("Compacting history"):
+                        with session.agent_scope(), Spinner("Compacting history"):
                             _compacted = auto_compact(
                                 messages, chat_state.tools, provider, config, raw_fn,
                                 force=True, focus=result[1],
                             )
                     except KeyboardInterrupt:
                         _compacted = False
+                    finally:
+                        if _ui:
+                            _ui.set_busy(False)
                     if not _compacted:
                         print("\n  \033[31mNothing compacted: the summary call failed "
                               "or was cancelled; history is unchanged.\033[0m\n")
@@ -1360,7 +1514,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                     _save_current()
                     # Summarize in the background: the LLM call would
                     # otherwise block /new for the full generation time.
-                    _summarize_and_save_async(messages, config, raw_fn, memory)
+                    _summarize_and_save_async(
+                        messages, config, raw_fn, memory, session=session)
                     current_conv = conv_mgr.create(model=model_name, provider=provider)
                     messages = [{"role": "system", "content": system_prompt}]
                     current_conv.messages = messages
@@ -1368,6 +1523,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                     print("\n  \033[1;32m✓ New conversation started\033[0m\n")
                     continue
                 if result == "clear_conversation":
+                    _infobar_turn = None
                     old_count = len([m for m in messages if m.get("role") == "user"])
                     messages.clear()
                     messages.append({"role": "system", "content": system_prompt})
@@ -1633,17 +1789,20 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 cost_str = record_session_usage(
                     session_usage, provider, used_model, in_tok, out_tok, config
                 )
-                _sync_ui_context()
                 ctx_used = estimate_tokens(
                     messages, key=calibration_key(provider, config)
                 )
                 ctx_window = get_context_limit(provider, config)
-                gauge = format_context_gauge(ctx_used, ctx_window)
-                stats_line = format_turn_stats_line(
-                    turn_usage, cost_str, gauge, used_model, config
-                )
-                if stats_line:
-                    print(stats_line)
+                if _ui:
+                    _infobar_turn = (current_conv.id, turn_usage, cost_str, used_model)
+                    _sync_ui_context(context_used=ctx_used, context_window=ctx_window)
+                else:
+                    gauge = format_context_gauge(ctx_used, ctx_window)
+                    stats_line = format_turn_stats_line(
+                        turn_usage, cost_str, gauge, used_model, config
+                    )
+                    if stats_line:
+                        print(stats_line)
                 if ctx_window and ctx_used / ctx_window >= 0.8:
                     print(
                         f"  \033[33m⚠ Context {ctx_used / ctx_window * 100:.0f}% full — "
@@ -1743,7 +1902,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             cost_label = format_session_cost(session_usage, provider, model_name, config)
             print(f"\n\033[2mSession: {turns} turns, {total_in:,} in / {total_out:,} out tokens, {cost_label}\033[0m")
         try:
-            _summarize_and_save_bounded(messages, config, raw_fn, memory)
+            if not session.agents_paused:
+                _summarize_and_save_bounded(
+                    messages, config, raw_fn, memory, session=session)
         except KeyboardInterrupt:
             pass
         sched.stop()

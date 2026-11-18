@@ -16,7 +16,6 @@ Activity: fan-out workers and delegate_task runs of this session, live;
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 from typing import Callable, List, Optional
@@ -27,21 +26,14 @@ from prompt_toolkit.input import create_input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.output import ColorDepth, create_output
-from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
 from . import settings_registry, subagent_activity
 from .convo_browser import Line, _fit, _fit_hints, _fit_right, _Pane
+from .themes import colors_disabled, current_scheme, style_for
 
 GROUP = "subagents"
 
-_STYLE = {
-    "bar": "reverse bold", "title": "bold", "column": "bold #888888",
-    "muted": "#888888", "selected": "reverse", "section": "bold #5fafff",
-    "value": "bold", "prompt": "bold", "notice": "#ffd75f",
-    "running": "bold #ffd75f", "done": "#87d787", "failed": "#ff6666",
-    "cancelled": "#888888",
-}
 
 _BLANK_VALUE = {
     "fanout_model": "session model",
@@ -398,13 +390,14 @@ class AgentsPanel:
             ConditionalContainer(self.edit_input, Condition(lambda: self.mode == "edit")),
             Window(_Pane(self._render_footer), height=1),
         ])
-        no_color = "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb"
+        scheme = current_scheme(self.config)
+        no_color = colors_disabled() or scheme == "monochrome"
         self.app = Application(
             layout=Layout(root, focused_element=self._body),
             key_bindings=self._key_bindings(), full_screen=True, mouse_support=False,
             enable_page_navigation_bindings=False, input=input, output=output,
             color_depth=ColorDepth.DEPTH_1_BIT if no_color else None,
-            style=Style.from_dict(_STYLE), refresh_interval=0.5,
+            style=style_for(scheme), refresh_interval=0.5,
         )
         self.app.ttimeoutlen = 0.05
         self.app.key_processor.before_key_press += self._clear_notice

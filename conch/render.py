@@ -274,7 +274,7 @@ def clear_active_spinners():
 
 
 class Spinner:
-    """ASCII shell activity indicator, bridged to the active terminal UI."""
+    """Shell-and-wave activity indicator, bridged to the active terminal UI."""
 
     def __init__(self, label: str):
         self.label = label
@@ -314,21 +314,45 @@ class Spinner:
 
         self._stop.clear()
         self._started = time.monotonic()
-        frames = itertools.cycle(("(@)>", "(@)v", "<(@)", "^(@)"))
+        frames = itertools.count()
+        wave = "▁▂▄▆█▆▄▂"
+        try:
+            wave.encode(sys.stderr.encoding or "utf-8")
+        except UnicodeEncodeError:
+            wave = ".:-=+=-:"
+        color = "NO_COLOR" not in os.environ
+        if "256color" in os.environ.get("TERM", "") or os.environ.get("COLORTERM"):
+            palette = tuple(f"\033[38;5;{value}m" for value in
+                            (39, 45, 51, 87, 123, 159, 183, 219, 213, 177, 141, 75))
+        else:
+            palette = ("\033[36m", "\033[96m", "\033[94m", "\033[95m",
+                       "\033[35m", "\033[95m", "\033[94m", "\033[96m")
 
         def _draw():
+            frame = next(frames)
             elapsed = int(time.monotonic() - self._started)
             width = max(0, shutil.get_terminal_size().columns - 1)
-            line = f"{next(frames)} {elapsed}s {self.label}"[:width]
-            # Erase, rather than pad, so elapsed growth and terminal resizing
-            # never leave stale characters or wrap into the following prompt.
-            # No color/style escapes are needed, including under NO_COLOR.
-            sys.stderr.write("\r\033[K" + line)
+            shell = ("(@)>", "(@)v", "<(@)", "^(@)")[(frame // 3) % 4]
+            # A traveling wave is activity, not an invented completion meter.
+            crest = frame % len(wave)
+            motion = f" {wave[crest:] + wave[:crest]}" if width >= 48 else ""
+            prefix = f"{shell}{motion}  "[:width]
+            text = f"{self.label}  {elapsed}s"[:max(0, width - len(prefix))]
+            # Clip visible text before styling: escapes must never consume the
+            # width budget or get cut short when the terminal shrinks.
+            if color:
+                prefix = "".join(
+                    palette[(index + frame // 2) % len(palette)] + char
+                    for index, char in enumerate(prefix)
+                ) + "\033[0m"
+                if len(text) > len(self.label):
+                    text = text[:len(self.label)] + "\033[2m" + text[len(self.label):] + "\033[0m"
+            sys.stderr.write("\r\033[K" + prefix + text)
             sys.stderr.flush()
             self._drawn = True
 
         def _run():
-            while not self._stop.wait(0.12):
+            while not self._stop.wait(0.1):
                 _draw()
 
         _draw()

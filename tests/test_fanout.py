@@ -230,6 +230,7 @@ class _Parent:
         self.session = AgentSession(
             self.config, interactive=interactive, permissions=permissions,
             cwd=directory.name)
+        test.addCleanup(self.session.close)
         self.session.attach_clients(clients, bind=False, chat_state=SimpleNamespace(
             tools=[{"function": {"name": name}} for name in clients]))
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "turns": 2}

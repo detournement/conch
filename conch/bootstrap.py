@@ -541,6 +541,7 @@ def build_agent_session(
     memory: Optional[MemoryStore] = None,
     use_cached_tools: bool = False,
     cwd=None,
+    pause_controller=None,
 ) -> AgentSession:
     """Construct a fully wired AgentSession without any UI.
 
@@ -555,6 +556,7 @@ def build_agent_session(
         permissions=permissions,
         memory=memory,
         cwd=cwd,
+        pause_controller=pause_controller,
     )
     builtins = make_builtin_clients(
         memory, config, interactive=interactive,
@@ -602,6 +604,7 @@ def make_scheduled_executor(
     *,
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     route_output=route_scheduled_output,
+    pause_controller=None,
 ):
     """Executor for the task scheduler: each run gets a fresh session.
 
@@ -614,7 +617,8 @@ def make_scheduled_executor(
 
     def _scheduled_executor(prompt: str, task):
         session = build_agent_session(
-            config, interactive=False, permissions=default_permissions()
+            config, interactive=False, permissions=default_permissions(),
+            pause_controller=pause_controller,
         )
         try:
             messages = [
@@ -646,7 +650,8 @@ def start_scheduler(executor):
 
 
 def start_task_backend(config: dict, get_system_prompt, *,
-                       max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS):
+                       max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+                       pause_controller=None):
     """Select the scheduled-task backend for one interactive session.
 
     Returns ``(sched, kind)`` where kind is ``"legacy"`` or ``"kernel"``.
@@ -666,7 +671,8 @@ def start_task_backend(config: dict, get_system_prompt, *,
         return KernelSchedulerAdapter(config), "kernel"
     sched = start_scheduler(
         make_scheduled_executor(
-            config, get_system_prompt, max_tool_rounds=max_tool_rounds
+            config, get_system_prompt, max_tool_rounds=max_tool_rounds,
+            pause_controller=pause_controller,
         )
     )
     return sched, "legacy"

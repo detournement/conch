@@ -227,6 +227,29 @@ class _Events:
                 index = self.current_index
             self._block(block, (identity, index))
 
+    def _user(self, message):
+        if not isinstance(message, dict) or message.get("role", "user") != "user":
+            raise SeatError("Claude returned an invalid user message")
+        content = message.get("content")
+        # SDKUserMessage / SDKUserMessageReplay carry MessageParam content:
+        # a string or blocks. The CLI also emits synthetic schema reminders
+        # (isSynthetic), not just tool results. Text is transcript input, never
+        # assistant output; neither replay nor synthetic flags authorize tools.
+        if isinstance(content, str):
+            return
+        if not isinstance(content, list):
+            raise SeatError("Claude returned invalid user content")
+        for block in content:
+            if not isinstance(block, dict):
+                raise SeatError("Claude returned an invalid user content block")
+            if block.get("type") == "text":
+                if not isinstance(block.get("text"), str):
+                    raise SeatError("Claude returned invalid user text")
+            elif block.get("type") == "tool_result":
+                self._block(block, ("", 0))
+            else:
+                raise SeatError("Claude returned an unsupported user content block")
+
     def feed(self, line):
         if not line.strip():
             return
@@ -244,7 +267,7 @@ class _Events:
             return
         if event.get("error") or event.get("is_error") or kind == "error":
             raise SeatError("Claude reported a provider error; check native login and subscription limits")
-        if event.get("parent_tool_use_id"):
+        if event.get("parent_tool_use_id") or event.get("agent_id"):
             raise SeatError("Claude attempted a native subagent")
         if kind == "result":
             if self.result is not None:
@@ -255,13 +278,7 @@ class _Events:
         elif kind == "assistant":
             self._message(event.get("message"))
         elif kind == "user":
-            message = event.get("message")
-            if not isinstance(message, dict) or not isinstance(message.get("content"), list):
-                raise SeatError("Claude returned an invalid tool result message")
-            for block in message["content"]:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    raise SeatError("Claude returned an unexpected user message")
-                self._block(block, ("", 0))
+            self._user(event.get("message"))
         elif kind == "stream_event":
             self._partial(event.get("event"))
         elif kind == "rate_limit_event":

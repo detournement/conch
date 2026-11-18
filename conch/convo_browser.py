@@ -30,7 +30,6 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.output import ColorDepth, create_output
-from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
@@ -46,6 +45,7 @@ from .conversations import (
 )
 from .providers import add_usage, format_session_cost
 from .terminal_ui import _safe
+from .themes import colors_disabled, current_scheme, style_for
 
 Line = Tuple[str, str]  # (style, text) for one display row
 
@@ -83,23 +83,24 @@ def can_browse() -> bool:
 
 
 def browse(manager: ConversationManager, current_id: Optional[str] = None,
-           *, input=None, output=None) -> Optional[str]:
+           *, config: Optional[dict] = None, input=None, output=None) -> Optional[str]:
     """Run the page; the id of the conversation chosen with Enter, or None.
 
     *current_id* marks the conversation the calling shell is in (it cannot
     be deleted from here). *input*/*output* default to the real terminal.
     """
-    return ConversationsPage(manager, current_id).run(input=input, output=output)
+    return ConversationsPage(manager, current_id, config=config).run(input=input, output=output)
 
 
 async def browse_during_turn(manager: ConversationManager,
-                             current_id: Optional[str] = None) -> Optional[str]:
+                             current_id: Optional[str] = None, *,
+                             config: Optional[dict] = None) -> Optional[str]:
     """The page opened while a turn is still running, on the live shell's
     own event loop (inside its terminal suspension, using its input and
     output). Browsing, searching, reading, and exporting work; rename,
     fork, and delete wait for the turn, and Enter picks the conversation to
     switch to once the turn ends."""
-    page = ConversationsPage(manager, current_id, busy=True)
+    page = ConversationsPage(manager, current_id, busy=True, config=config)
     await page.build().run_async(handle_sigint=False)
     return page.result
 
@@ -117,9 +118,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not can_browse():
         print("conch convos: needs an interactive terminal", file=sys.stderr)
         return 2
+    from .config import load_config
+
     manager = ConversationManager()
     try:
-        chosen = browse(manager)
+        chosen = browse(manager, config=load_config())
     finally:
         manager.close()
     if chosen is None:
@@ -372,8 +375,9 @@ class ConversationsPage:
     """State, rendering, and keys for one run of the page."""
 
     def __init__(self, manager: ConversationManager, current_id: Optional[str] = None,
-                 busy: bool = False):
+                 busy: bool = False, *, config: Optional[dict] = None):
         self.manager = manager
+        self.config = config if config is not None else {}
         self.current_id = current_id
         # A turn is running in the shell: the store is not ours to change.
         self.busy = busy
@@ -891,21 +895,15 @@ class ConversationsPage:
             # Renaming edits the title in place of the footer.
             ConditionalContainer(self.rename_input, Condition(lambda: self.mode == "rename")),
         ])
-        no_color = "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb"
+        scheme = current_scheme(self.config)
+        no_color = colors_disabled() or scheme == "monochrome"
         self.app = Application(
             layout=Layout(root, focused_element=self._list_window),
             key_bindings=self._key_bindings(), full_screen=True, mouse_support=False,
             enable_page_navigation_bindings=False,
             input=input, output=output,
             color_depth=ColorDepth.DEPTH_1_BIT if no_color else None,
-            style=Style.from_dict({
-                "bar": "reverse bold", "title": "bold", "column": "bold #888888",
-                "muted": "#888888", "rule": "#555555", "selected": "reverse",
-                "current": "bold #5fafff", "cost": "#87d787", "match": "bold #ffd75f",
-                "user": "bold #ffd75f", "assistant": "bold #5fafff", "tool": "#888888",
-                "prompt": "bold", "notice": "#ffd75f", "warning": "bold #ff8787",
-                "error": "#ff6666",
-            }),
+            style=style_for(scheme),
         )
         # Escape answers at once: the page binds no Alt/Meta sequences.
         self.app.ttimeoutlen = 0.05

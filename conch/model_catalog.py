@@ -193,17 +193,34 @@ LiveResult = Tuple[Tuple[str, ...], List[ModelEntry], Dict[str, ProviderStatus]]
 
 
 def _seat_source(provider: str):
-    """A seat's sign-in state. Its models come from the catalog, so it
-    replaces no rows (covers no provider)."""
+    """A seat's sign-in state and Codex's native account model catalog."""
     def run(config: dict) -> LiveResult:
         from . import auth, seats
+        from .seat_common import SeatError
 
         try:
             if not auth.cli_installed(provider):
                 return (), [], {provider: ProviderStatus(False, "CLI not installed")}
             ok, _detail = seats.status(provider, timeout=8)
             note = "signed in" if ok else f"not signed in: conch auth login {provider}"
-            return (), [], {provider: ProviderStatus(bool(ok), note)}
+            status = {provider: ProviderStatus(bool(ok), note)}
+            if provider != "codex" or not ok:
+                return (), [], status
+            from .seat_codex import list_models
+
+            try:
+                models = list_models(timeout=8)
+            except SeatError:
+                status[provider].note = "signed in; native model list unavailable"
+                return (), [], status
+            entries = [entry for entry in catalog_entries(config)
+                       if entry.provider == provider]
+            known = {entry.model for entry in entries}
+            for model in models:
+                if model not in known:
+                    entries.append(make_entry(provider, model, config, "server"))
+                    known.add(model)
+            return (provider,), entries, status
         except Exception as exc:
             return (), [], {provider: ProviderStatus(False, str(exc)[:80])}
     return run

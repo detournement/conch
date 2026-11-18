@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import selectors
+import signal
+import subprocess
 import tempfile
+import time
 from pathlib import Path
 
-from .seat_common import SeatError, run
+from . import __version__
+from .seat_common import SeatError, environment, run
 from .secretguard import redact_credentials
 
 logger = logging.getLogger(__name__)
@@ -59,6 +65,145 @@ def status(timeout: float = 10) -> tuple[bool, str]:
             and not any('api key' in line or 'api-key' in line for line in lines)):
         return True, 'Codex is signed in with ChatGPT.'
     return False, f'Codex requires a ChatGPT subscription login. {_LOGIN_REMEDY}'
+
+
+def list_models(timeout: float = 8.0) -> list[str]:
+    """Read the account's picker-visible models without starting a thread or turn.
+
+    App-server is interactive: initialization must finish before listing, and
+    each page supplies the cursor for the next. Keep one deadline for all pages.
+    """
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise SeatError('native client timeout must be a positive finite number')
+    deadline = time.monotonic() + timeout
+    argv = ['codex', *_AUTH_CONFIG, 'app-server', '--listen', 'stdio://']
+    process = None
+    with tempfile.TemporaryDirectory(prefix='conch-codex-models-') as directory:
+        try:
+            process = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=environment(), cwd=directory,
+                start_new_session=True,
+            )
+            with selectors.DefaultSelector() as selector:
+                for name in ('stdout', 'stderr'):
+                    pipe = getattr(process, name)
+                    os.set_blocking(pipe.fileno(), False)
+                    selector.register(pipe, selectors.EVENT_READ, name)
+                os.set_blocking(process.stdin.fileno(), False)
+                outgoing = bytearray()
+
+                def send(message):
+                    if not outgoing:
+                        selector.register(process.stdin, selectors.EVENT_WRITE, 'stdin')
+                    outgoing.extend((json.dumps(message) + '\n').encode('utf-8'))
+
+                request_id = 1
+                initializing = True
+                send({'id': request_id, 'method': 'initialize', 'params': {
+                    'clientInfo': {'name': 'conch', 'version': __version__},
+                }})
+                pending = b''
+                models = []
+                seen_models = set()
+                seen_cursors = set()
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    for key, _ in selector.select(remaining):
+                        pipe, name = key.fileobj, key.data
+                        if name == 'stdin':
+                            try:
+                                written = os.write(pipe.fileno(), outgoing[:4096])
+                            except BlockingIOError:
+                                continue
+                            del outgoing[:written]
+                            if not outgoing:
+                                selector.unregister(pipe)
+                            continue
+                        try:
+                            chunk = os.read(pipe.fileno(), 65536)
+                        except BlockingIOError:
+                            continue
+                        if name == 'stderr':
+                            # Drain diagnostics without retaining or exposing auth details.
+                            if not chunk:
+                                selector.unregister(pipe)
+                            continue
+                        if not chunk:
+                            raise SeatError('Codex model discovery ended before its response')
+                        pending += chunk
+                        while b'\n' in pending:
+                            line, pending = pending.split(b'\n', 1)
+                            if not line.strip():
+                                continue
+                            message = _decode(line.decode('utf-8'), 'model discovery JSON')
+                            if not isinstance(message, dict):
+                                raise SeatError('Codex returned an invalid model discovery response')
+                            if 'id' not in message and isinstance(message.get('method'), str):
+                                continue  # App-server notifications are not model inventory.
+                            if (type(message.get('id')) is not int
+                                    or message['id'] != request_id or 'method' in message):
+                                raise SeatError('Codex returned an unexpected model discovery response')
+                            if 'error' in message:
+                                raise SeatError('Codex model discovery request failed; '
+                                                + _LOGIN_REMEDY)
+                            result = message.get('result')
+                            if not isinstance(result, dict):
+                                raise SeatError('Codex returned an invalid model discovery result')
+                            if initializing:
+                                initializing = False
+                                send({'method': 'initialized', 'params': {}})
+                                cursor = None
+                            else:
+                                data = result.get('data')
+                                cursor = result.get('nextCursor')
+                                if (not isinstance(data, list)
+                                        or (cursor is not None
+                                            and (not isinstance(cursor, str) or not cursor))):
+                                    raise SeatError('Codex returned an invalid model inventory page')
+                                for entry in data:
+                                    if not isinstance(entry, dict):
+                                        raise SeatError('Codex returned an invalid model entry')
+                                    if entry.get('hidden') is True:
+                                        continue
+                                    model = entry.get('model', entry.get('id'))
+                                    if not isinstance(model, str) or not model.strip():
+                                        raise SeatError('Codex returned an invalid model identifier')
+                                    if model not in seen_models:
+                                        seen_models.add(model)
+                                        models.append(model)
+                                if cursor is None:
+                                    return models
+                                if cursor in seen_cursors:
+                                    raise SeatError('Codex repeated a model inventory cursor')
+                                seen_cursors.add(cursor)
+                            request_id += 1
+                            params = {'includeHidden': False, 'modelProvider': 'openai',
+                                      'limit': 100}
+                            if cursor is not None:
+                                params['cursor'] = cursor
+                            send({'id': request_id, 'method': 'model/list', 'params': params})
+        except FileNotFoundError as exc:
+            raise SeatError('codex is not installed; install the official CLI first') from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SeatError(f'Codex model discovery timed out after {timeout:g}s') from exc
+        except UnicodeError as exc:
+            raise SeatError('Codex returned invalid model discovery text encoding') from exc
+        except OSError as exc:
+            raise SeatError(f'Codex model discovery failed ({type(exc).__name__})') from exc
+        finally:
+            if process is not None:
+                # Match the inference boundary, including native helper descendants.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+                process.wait()
 
 
 def _invalid_constant(value: str):

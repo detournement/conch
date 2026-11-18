@@ -6,15 +6,16 @@ import contextlib
 import functools
 import logging
 import math
+import os
 import re
 import json
 import sys
-import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 from . import mcp as mcp_mod
+from .ebrake import AgentsCancelled, checkpoint, current_controller, serialized_execution
 from .images import IMAGE_TOKENS, is_image_block, placeholder, without_payloads
 from .render import Spinner, StreamPrinter, _get_active_ui, clear_active_spinners
 
@@ -319,9 +320,11 @@ def estimate_tokens(
 
 def format_context_gauge(used_tokens: int, window: int) -> str:
     """Compact colored context-usage gauge for the per-turn usage line."""
-    if window <= 0:
+    if not window or window <= 0:
         return ""
-    pct = used_tokens / window * 100
+    pct = max(0, used_tokens) / window * 100
+    if "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb":
+        return f"ctx {pct:.0f}%"
     color = "\033[31m" if pct >= 80 else "\033[33m" if pct >= 60 else "\033[32m"
     return f"ctx {color}{pct:.0f}%\033[0m"
 
@@ -603,6 +606,7 @@ def auto_compact(
         {"role": "user", "content": transcript},
     ]
     try:
+        checkpoint()
         response = summary_fn(summary_config, summary_messages, None)
     except Exception:
         return False
@@ -1612,6 +1616,7 @@ def _graceful_exhaustion(
     send = normalize_messages_for_provider(messages, provider)
     send.append({"role": "user", "content": prompt})
     try:
+        checkpoint()
         response = raw_fn(config, send, None)
     except Exception:
         return fallback
@@ -1948,13 +1953,10 @@ def diagnose_undispatchable_response(
     return line, shape
 
 
-_AGENT_TURN_LOCK = threading.RLock()
-
-
 @contextlib.contextmanager
 def serialized_agent_execution():
     """Serialize inference/agent state that is still process-global."""
-    with _AGENT_TURN_LOCK:
+    with serialized_execution():
         yield
 
 
@@ -2047,6 +2049,7 @@ def chat_turn(
         return guidance
 
     while True:
+        checkpoint()
         _round += 1
         wanted = int(getattr(chat_state, "requested_tool_rounds", 0) or 0)
         if wanted > round_budget:
@@ -2144,6 +2147,7 @@ def chat_turn(
         guidance = take_steering()
         messages.extend(guidance)
         send_messages.extend(guidance)
+        checkpoint()
         _call_started = time.monotonic()
         if stream_fn:
             response = stream_fn(config, send_messages, send_tools if send_tools else None, on_token)
@@ -2183,6 +2187,7 @@ def chat_turn(
                 guidance = take_steering()
                 messages.extend(guidance)
                 send_messages.extend(guidance)
+                checkpoint()
                 _call_started = time.monotonic()
                 if stream_fn:
                     response = stream_fn(
@@ -2216,6 +2221,7 @@ def chat_turn(
                 guidance = take_steering()
                 messages.extend(guidance)
                 send_messages.extend(guidance)
+                checkpoint()
                 _call_started = time.monotonic()
                 if stream_fn:
                     response = stream_fn(config, send_messages, send_tools, on_token)
@@ -2330,6 +2336,7 @@ def chat_turn(
                         _append_leading_system_context(
                             fb_messages, todo_block
                         )
+                    checkpoint()
                     _call_started = time.monotonic()
                     with Spinner(f"Retrying with {fb_provider}/{fb_model}"):
                         response = fb_fn(fb_config, fb_messages, fb_tools)
@@ -2570,6 +2577,7 @@ def chat_turn(
         from .tooling import run_hook
 
         for tool_call in tool_calls:
+            checkpoint()
             guidance.extend(take_steering())
             if guidance:
                 add_result(
@@ -2666,6 +2674,7 @@ def chat_turn(
                     print("  \033[2m(arguments rewritten by pre_tool_use hook)\033[0m",
                           file=sys.stderr)
                 tool_failed = False
+                checkpoint()
                 try:
                     if name in builtin_clients:
                         raw_result = builtin_clients[name].call_tool(name, arguments)
@@ -2693,11 +2702,15 @@ def chat_turn(
                             f"Error: {name} is no longer connected. Refresh tools "
                             "and try again."
                         )
+                except AgentsCancelled:
+                    raise
                 except KeyboardInterrupt:
                     tool_failed = True
                     result_text = "Tool execution cancelled by user."
                     if activity is None:
                         print(f"  \033[33m⚠ {name} cancelled\033[0m", file=sys.stderr)
+                    if current_controller() is not None:
+                        raise
                 except Exception as exc:
                     tool_failed = True
                     result_text = f"Error executing {name}: {exc}"

@@ -239,19 +239,27 @@ class TestRawCustom(CustomCacheTestCase):
 
 
 class TestCustomProbe(CustomCacheTestCase):
-    def test_probe_sends_tools(self):
-        recorded = {}
-
-        def side_effect(req, timeout=None):
+    def test_probe_allows_reasoning_before_native_tool_call(self):
+        def reasoning_model(req, timeout=None):
             if req.full_url.endswith("/chat/completions"):
-                recorded["body"] = json.loads(req.data.decode())
+                body = json.loads(req.data.decode())
+                # A real Qwen reasoning + probe call consumed 72 tokens.
+                if body.get("max_tokens", 0) < 72:
+                    return _FakeHTTPResponse({
+                        "choices": [{
+                            "finish_reason": "length",
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "I should call the requested tool.",
+                            },
+                        }],
+                    })
             return _custom_server()(req, timeout)
 
-        with patch("urllib.request.urlopen", side_effect=side_effect):
+        with patch("urllib.request.urlopen", side_effect=reasoning_model):
             ok, reason = probe_custom_provider(CONFIG)
-        self.assertTrue(ok)
-        self.assertIn("tools", recorded["body"])
-        self.assertIn("tool_choice", recorded["body"])
+        self.assertTrue(ok, reason)
 
     def test_probe_rejects_prose_only_response(self):
         with patch(

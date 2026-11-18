@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from .themes import SCHEMES, current_scheme
+
 
 @dataclass(frozen=True)
 class Setting:
@@ -42,7 +44,11 @@ def _rounds_default() -> str:
 
 
 SETTINGS: Tuple[Setting, ...] = (
-    Setting("show_token_stats", "bool", "Per-reply line with tokens, cost, and speed", "true"),
+    Setting("show_token_stats", "bool", "Info bar (or per-reply stats in plain sessions)", "true"),
+    Setting("infobar", "choice", "Info bar style: detailed turn stats or context progress", "detail",
+            choices=("detail", "progress")),
+    Setting("colorscheme", "choice", "Terminal colors for the composer and panels", "default",
+            choices=tuple(SCHEMES)),
     Setting("notify_after_seconds", "number",
             "Desktop notification when a turn runs at least this long (0 = off)", "30",
             minimum=0),
@@ -104,6 +110,8 @@ def default_of(setting: Setting) -> str:
 def current_value(config: dict, key: str) -> str:
     """The effective value (the default when unset)."""
     setting = BY_KEY[key]
+    if key == "colorscheme":
+        return current_scheme(config)
     if key == "side_task_model":
         model = str(config.get("weak_model") or "").strip()
         if not model:

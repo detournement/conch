@@ -3,15 +3,21 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.application.current import set_app
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
+from prompt_toolkit.formatted_text import fragment_list_to_text
 from prompt_toolkit.input import DummyInput
-from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.key_binding.key_processor import KeyPress, _Flush
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from prompt_toolkit.output import ColorDepth, DummyOutput
 from prompt_toolkit.utils import get_cwidth
 
 from conch.terminal_ui import TerminalUI
+from conch.themes import SCHEMES, style_for
 
 
 class SizedOutput(DummyOutput):
@@ -46,6 +52,8 @@ class _UICase(unittest.IsolatedAsyncioTestCase):
         cursor = screen.get_cursor_position(self.ui._editor.window)
         self.assertGreaterEqual(cursor.y, 0)
         self.assertLess(cursor.y, self.output.size.rows)
+        self.assertGreaterEqual(cursor.x, 0)
+        self.assertLess(cursor.x, self.output.size.columns)
         self.assertEqual(self.ui._editor.text, "draft-kept")
         return "\n".join(
             "".join(screen.data_buffer[y][x].char
@@ -96,6 +104,154 @@ class _DirectUI(_UICase):
         from conch.terminal_ui import _PendingMessage
 
         self.ui._messages.extend(_PendingMessage(text, kind) for text in texts)
+
+
+class ComposerStateTests(_DirectUI):
+    async def test_pause_notice_disappears_on_resume_without_losing_draft(self):
+        self.output.size = Size(rows=12, columns=80)
+        self.ui.set_context(agents_paused=True)
+        paused = self.render()
+        self.assertIn("PAUSED", paused)
+        self.assertIn("/ebrake off", paused)
+        self.ui.set_context(agents_paused=False)
+        resumed = self.render()
+        self.assertNotIn("PAUSED", resumed)
+        self.assertEqual(len(resumed.splitlines()), len(paused.splitlines()) - 1)
+
+    async def test_live_theme_switch_can_enter_and_leave_monochrome_without_losing_draft(self):
+        from prompt_toolkit.output import ColorDepth
+
+        self.ui._no_color = False
+        self.output.get_default_color_depth = lambda: ColorDepth.DEPTH_24_BIT
+        self.ui.set_colorscheme("monochrome")
+        self.assertEqual(self.ui._app.color_depth, ColorDepth.DEPTH_1_BIT)
+        self.assertIn("draft-kept", self.render())
+        self.ui.set_colorscheme("light")
+        self.assertNotEqual(self.ui._app.color_depth, ColorDepth.DEPTH_1_BIT)
+        self.assertIn("draft-kept", self.render())
+
+
+class InfobarRenderingTests(_DirectUI):
+    STATS = ("\033[2m2,037,305 in / 3,837 out  subscription seat  ~89.3 tok/s"
+             "  ctx \033[32m16%\033[0m\033[2m  (claude-sonnet-5-5)\033[0m")
+
+    def configure(self, mode="detail", **fields):
+        self.ui.set_context(
+            infobar=mode, infobar_stats=self.STATS, context_used=32_000,
+            context_window=200_000, **fields)
+
+    def assert_bar_geometry(self):
+        rows = fragment_list_to_text(self.ui._infobar_text()).splitlines()
+        self.assertLessEqual(len(rows), 2)
+        self.assertEqual(len(rows), self.ui._infobar_height())
+        self.assertTrue(all(get_cwidth(row) < self.output.size.columns for row in rows))
+        self.assertNotIn("\033", "".join(rows))
+        return rows
+
+    async def test_detail_retains_all_metrics_at_normal_terminal_widths(self):
+        self.configure()
+        for width in (80, 100):
+            with self.subTest(width=width):
+                self.output.size = Size(rows=12, columns=width)
+                rendered = " ".join(self.render().split())
+                for field in ("2,037,305 in", "3,837 out", "subscription seat",
+                              "~89.3 tok/s", "ctx 16%", "(claude-sonnet-5-5)"):
+                    self.assertIn(field, rendered)
+                self.assert_bar_geometry()
+
+    async def test_resizing_modes_and_visibility_preserve_draft_cursor_and_history(self):
+        self.ui._editor.buffer.cursor_position = 4
+        self.ui._history.append_string("previous input")
+        history = self.ui._history.get_strings()
+        self.ui._busy = True
+        self.ui._response = "Live output\n" * 20
+        self.ui._detail_text = "Reasoning\n" * 20
+        for mode in ("detail", "progress"):
+            self.configure(mode)
+            for height, width in ((12, 100), (12, 80), (6, 24), (4, 16), (2, 16)):
+                with self.subTest(mode=mode, height=height, width=width):
+                    self.output.size = Size(rows=height, columns=width)
+                    self.assertIn("draft-kept", self.render())
+                    self.assert_bar_geometry()
+                    self.assertEqual(self.ui._editor.buffer.cursor_position, 4)
+                    self.assertEqual(self.ui._history.get_strings(), history)
+            self.ui.set_context(show_token_stats=False)
+            self.assertEqual(self.ui._infobar_text(), [])
+            self.assertIn("draft-kept", self.render())
+            self.ui.set_context(show_token_stats=True)
+            self.assertTrue(self.ui._infobar_text())
+
+    async def test_progress_uses_budget_without_clamping_percentage(self):
+        self.configure("progress")
+        for width in (16, 24, 80, 100):
+            for used, percent in ((0, "0%"), (32_000, "16%"), (250_000, "125%")):
+                with self.subTest(width=width, used=used):
+                    self.output.size = Size(rows=12, columns=width)
+                    self.ui.set_context(context_used=used)
+                    rendered = self.render()
+                    self.assertIn(percent, rendered)
+                    self.assertTrue("200,000" in rendered or "200k" in rendered)
+                    rows = self.assert_bar_geometry()
+                    ruler = next(row for row in rows if "[" in row)
+                    fill = ruler.split("[", 1)[1].split("]", 1)[0]
+                    self.assertTrue(set(fill) <= {"=", "-"})
+                    if used == 0:
+                        self.assertNotIn("=", fill)
+                    elif used > 200_000:
+                        self.assertNotIn("-", fill)
+        for capacity in (None, 0):
+            self.ui.set_context(context_window=capacity)
+            self.assertNotIn("%", fragment_list_to_text(self.ui._infobar_text()))
+            self.assertNotIn("[", fragment_list_to_text(self.ui._infobar_text()))
+            self.render()
+
+    async def test_brake_remains_separate_from_either_bar_and_token_visibility(self):
+        self.output.size = Size(rows=12, columns=80)
+        for mode in ("detail", "progress"):
+            self.configure(mode, agents_paused=True)
+            self.assertIn("PAUSED", self.render())
+            self.assertIn("/ebrake off", self.render())
+            self.ui.set_context(show_token_stats=False)
+            self.assertIn("PAUSED", self.render())
+            self.ui.set_context(agents_paused=False, show_token_stats=True)
+            self.assertNotIn("PAUSED", self.render())
+            self.assertTrue(self.ui._infobar_text())
+
+    async def test_detail_severity_uses_theme_classes_instead_of_ansi_colors(self):
+        self.output.size = Size(rows=12, columns=80)
+        self.configure()
+        for scheme in ("default", "dark", "light", "dracula", "solarized", "monochrome"):
+            self.ui.set_colorscheme(scheme)
+            for color, role in ((31, "error"), (33, "warning"), (32, "ok")):
+                with self.subTest(scheme=scheme, color=color):
+                    self.ui.set_context(infobar_stats=self.STATS.replace("[32m", f"[{color}m"))
+                    self.assertIn(f"class:{role}", [style for style, _ in self.ui._infobar_text()])
+                    self.assert_bar_geometry()
+                    self.assertIn("16%", self.render())
+
+    async def test_environment_color_opt_out_applies_to_both_bars(self):
+        from prompt_toolkit.output import ColorDepth
+
+        for environment in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.ui = TerminalUI(lambda: [], os.path.join(directory, "history"))
+                    self.ui._input = DummyInput()
+                    self.ui._output = self.output
+                    with create_app_session(input=self.ui._input, output=self.output):
+                        self.ui._build()
+                    self.ui._change = lambda function, *args: function(*args)
+                    self.ui._editor.text = "draft-kept"
+                    self.ui.set_colorscheme("light")
+                    self.assertEqual(self.ui._app.color_depth, ColorDepth.DEPTH_1_BIT)
+                    for mode in ("detail", "progress"):
+                        self.configure(mode)
+                        self.assert_bar_geometry()
+                        for role in ("status", "ok", "warning", "error"):
+                            attrs = self.ui._app.style.get_attrs_for_style_str(f"class:{role}")
+                            self.assertFalse(attrs.color)
+                            self.assertFalse(attrs.bgcolor)
+                        self.assertIn("draft-kept", self.render())
 
 
 class HintRowTests(_DirectUI):
@@ -206,6 +362,78 @@ class ChoiceRowTests(_DirectUI):
         self.assertEqual(rows.index(next(row for row in rows if "/c7" in row)),
                          len(rows) - 2)
         self.assertLess(get_cwidth(rows[-1]), 30)
+
+
+class ColorSchemePickerTests(_DirectUI):
+    def setUp(self):
+        super().setUp()
+        self.output.size = Size(rows=24, columns=100)
+        self.ui.set_colorscheme("dark")
+
+    def open_picker(self):
+        return self.ui._open_modal(
+            "choose", "Color scheme",
+            [(name, name, description) for name, description in SCHEMES.items()],
+            preview_colors=True)
+
+    def key(self, key):
+        app = self.ui._app
+        with create_app_session(input=self.ui._input, output=self.output), set_app(app):
+            app.key_processor.feed_multiple([KeyPress(key), _Flush])
+            app.key_processor.process_keys()
+
+    def mouse(self, name, event_type, button=MouseButton.NONE):
+        rows = self.render().splitlines()
+        row = next(index for index, text in enumerate(rows)
+                   if text.startswith(("› ", "  ")) and name in text.split())
+        column = rows[row].index(name)
+        event = MouseEvent(Point(x=column, y=row), event_type, button, frozenset())
+        app = self.ui._app
+        with create_app_session(input=self.ui._input, output=self.output), set_app(app):
+            app.layout.update_parents_relations()
+            app.renderer.mouse_handlers.mouse_handlers[row][column](event)
+
+    async def test_hover_previews_without_committing_and_escape_restores(self):
+        result = self.open_picker()
+        self.assertTrue(self.ui._app.mouse_support())
+        self.mouse("light", MouseEventType.MOUSE_MOVE)
+        self.assertEqual(self.ui._app.style, style_for("light"))
+        self.assertEqual(self.ui._colorscheme, "dark")
+        self.assertFalse(result.done())
+        self.key(Keys.Escape)
+        self.assertIsNone(result.result(timeout=1))
+        self.assertEqual(self.ui._app.style, style_for("dark"))
+        self.assertFalse(self.ui._app.mouse_support())
+        self.assertEqual(self.ui._editor.text, "draft-kept")
+
+    async def test_click_selects_filtered_row_and_restores_until_saved(self):
+        result = self.open_picker()
+        self.ui._query.text = "solarized"
+        self.mouse("solarized", MouseEventType.MOUSE_UP, MouseButton.LEFT)
+        self.assertEqual(result.result(timeout=1), "solarized")
+        # The caller persists first; a failed save must leave the original visible.
+        self.assertEqual(self.ui._colorscheme, "dark")
+        self.assertEqual(self.ui._app.style, style_for("dark"))
+        self.assertFalse(self.ui._app.mouse_support())
+
+    async def test_keyboard_filter_and_superseding_approval_clear_preview(self):
+        result = self.open_picker()
+        self.key(Keys.Down)
+        self.assertEqual(self.ui._app.style, style_for("light"))
+        self.ui._query.text = "monochrome"
+        self.assertEqual(self.ui._app.color_depth, ColorDepth.DEPTH_1_BIT)
+        self.ui._query.text = "no-such-scheme"
+        self.assertEqual(self.ui._app.style, style_for("dark"))
+        self.key(Keys.ControlM)
+        self.assertFalse(result.done())
+        self.ui._query.text = "light"
+        approval = self.ui._open_modal("ask", "Approve")
+        self.assertIsNone(result.result(timeout=1))
+        self.assertEqual(self.ui._app.style, style_for("dark"))
+        self.assertFalse(self.ui._app.mouse_support())
+        self.ui._answer.text = "yes"
+        self.key(Keys.ControlM)
+        self.assertEqual(approval.result(timeout=1), "yes")
 
 
 class LiveCommandTests(_DirectUI):

@@ -4,7 +4,7 @@ run in one full-screen list, grouped by provider, filtered as you type.
 Each row shows context window, price per million tokens, tier, and which
 roles it holds: ● the chat model, F fan-out workers, T side tasks (titles,
 summaries, compaction). Built-in catalogs show at once; local servers, the
-llama-idx registry, and seat sign-in fill in as they answer.
+llama-idx registry, seat sign-in, and Codex's native catalog fill in as they answer.
 
 Enter makes the selection the chat model (from a running turn: once it
 ends). Ctrl+F and Ctrl+T assign the worker and side-task roles (saved to

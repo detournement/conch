@@ -2206,12 +2206,23 @@ def handle_slash_command(
     if command in ("/models", "/ls"):
         print()
         for provider_name, models in KNOWN_MODELS.items():
+            discovery_error = ""
             if provider_name == "ollama":
                 models = list_ollama_models(config, force_refresh=True)
             elif provider_name == "custom":
                 models = list_custom_models(config, force_refresh=True)
+            elif provider_name == "codex":
+                from .seat_codex import list_models
+                from .seat_common import SeatError
+
+                try:
+                    models = list(dict.fromkeys([*models, *list_models()]))
+                except SeatError:
+                    discovery_error = "native model list unavailable; showing the default alias"
             marker = " \033[1;33m← active\033[0m" if provider_name == provider else ""
             print(f"  \033[1;36m{provider_name}\033[0m{marker}")
+            if discovery_error:
+                print(f"    \033[2m({discovery_error})\033[0m")
             if provider_name == "ollama":
                 if models is None:
                     print(f"    \033[2m(unreachable at {get_ollama_base_url(config)})\033[0m")

@@ -111,6 +111,43 @@ class PickerTests(_ConfigCase):
         self.assertIn(("openai", "gpt-6-sol"),
                       [entry.key for kind, entry in picker.rows if kind == "model"])
 
+    def test_native_refresh_removes_stale_models_but_keeps_user_additions(self):
+        self.config["extra_models"] = "codex/user-model"
+        picker = ModelPicker(self.config, "codex", "default")
+        source = model_catalog._seat_source("codex")
+        with mock.patch("conch.auth.cli_installed", return_value=True), \
+             mock.patch("conch.seats.status", return_value=(True, "signed in")), \
+             mock.patch("conch.seat_codex.list_models",
+                        side_effect=[["native-old"], ["native-new"]]):
+            picker.apply_source(*source(self.config))
+            self.select(picker, "codex", "native-old")
+            picker.apply_source(*source(self.config))
+        keys = {entry.key for entry in picker.entries}
+        self.assertNotIn(("codex", "native-old"), keys)
+        self.assertNotEqual(picker.selected_key, ("codex", "native-old"))
+        self.assertIn(("codex", "native-new"), keys)
+        self.assertIn(("codex", "default"), keys)
+        self.select(picker, "codex", "user-model")
+        picker.remove_selected()
+        self.assertNotIn(("codex", "user-model"), model_catalog.added_models(self.config))
+
+    def test_native_discovery_failure_does_not_revoke_signed_in_seat(self):
+        from conch.seat_common import SeatError
+
+        picker = ModelPicker(self.config, "codex", "default")
+        source = model_catalog._seat_source("codex")
+        with mock.patch("conch.auth.cli_installed", return_value=True), \
+             mock.patch("conch.seats.status", return_value=(True, "signed in")), \
+             mock.patch("conch.seat_codex.list_models",
+                        side_effect=[["native-model"], SeatError("catalog unavailable")]):
+            picker.apply_source(*source(self.config))
+            self.select(picker, "codex", "native-model")
+            picker.apply_source(*source(self.config))
+        self.assertTrue(picker.statuses["codex"].available)
+        self.assertIn("model list unavailable", picker.statuses["codex"].note)
+        picker.choose()
+        self.assertEqual(picker.result.key, ("codex", "native-model"))
+
 
 class ModelCommandTests(_ConfigCase):
     def test_explicit_provider_wins_over_catalog_inference(self):

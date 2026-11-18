@@ -674,9 +674,12 @@ without deleting Conch's configuration.
 Each successful login selects that provider as Conch's saved default. Existing
 `.conchrc` or `CONCH_*` overrides still take precedence. Credentials and refresh
 remain entirely with the provider's CLI: Conch does not collect, read, copy, or
-store seat tokens. `claude-code` defaults to `sonnet`; `codex` uses the native
-CLI's default model (`model = default`). Native model names may be configured
-explicitly; availability is verified by the startup probe, not an API-key catalog.
+store seat tokens. `claude-code` defaults to `sonnet`; `codex` keeps the native
+CLI's default alias (`model = default`). Both the picker and textual `/models`
+list also discover the signed-in Codex account's named models, including the
+available Sol, Astra, Terra, and Luna versions. Discovery uses native `model/list`,
+not the API-key catalog or Conch reading a credential/cache file. Selecting a
+named model still runs the live tool-call probe before switching.
 
 Chat, one-shots, and `conch-ask` use schema-constrained responses from the
 unmodified native client. Conch dispatches requested tools through its existing

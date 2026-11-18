@@ -11,6 +11,12 @@ Releases before 0.6.0 predate this changelog.
 
 ### Added
 
+- Codex model discovery now lists the signed-in native client's named models
+  (including available Sol, Astra, Terra, and Luna versions) in the model picker
+  and textual `/models`, instead of offering only `default`. Discovery preserves
+  native visibility, pagination, and subscription billing; `default` remains an
+  option.
+
 - Model picker: Ctrl+E steps a model's reasoning effort and Ctrl+W its context
   window, where the provider takes them (Claude and ChatGPT seats, Anthropic,
   OpenAI reasoning models, OpenRouter, Ollama thinking and `num_ctx`). Choices

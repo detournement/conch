@@ -4,8 +4,12 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import textwrap
 import threading
+import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -283,6 +287,179 @@ class CodexTransportTests(unittest.TestCase):
                         'type': kind, 'arguments': 'private-command'}},
                     {'type': 'turn.completed'},
                 ], on_detail=lambda kind, text: self.assertNotIn('private-command', text))
+
+
+class CodexModelDiscoveryTests(unittest.TestCase):
+    @contextmanager
+    def native(self, body):
+        """Run a real stdio peer, leaving it alive for Conch to clean up."""
+        with tempfile.TemporaryDirectory(prefix='conch-model-fixture-') as directory:
+            trace = Path(directory) / 'requests.jsonl'
+            script = textwrap.dedent("""
+                import json, os, pathlib, sys, time
+                trace = pathlib.Path(sys.argv[1])
+
+                def receive(method):
+                    line = sys.stdin.readline()
+                    if not line:
+                        sys.exit(10)  # stdin must remain open while responses are pending.
+                    request = json.loads(line)
+                    with trace.open('a') as handle:
+                        handle.write(json.dumps(request) + '\\n')
+                    assert request['method'] == method
+                    return request
+
+                def emit(message):
+                    print(json.dumps(message), flush=True)
+
+                def initialize():
+                    request = receive('initialize')
+                    info = request['params']['clientInfo']
+                    assert info['name'] == 'conch' and info['version']
+                    assert 'OPENAI_API_KEY' not in os.environ
+                    assert 'CODEX_API_KEY' not in os.environ
+                    # A full diagnostic pipe must not block metadata discovery.
+                    sys.stderr.write('private diagnostic\\n' * 8192)
+                    sys.stderr.flush()
+                    emit({'id': request['id'], 'result': {'userAgent': 'fixture'}})
+                    receive('initialized')
+                    return page()
+
+                def page():
+                    request = receive('model/list')
+                    assert request['params']['includeHidden'] is False
+                    assert request['params']['modelProvider'] == 'openai'
+                    return request
+            """) + textwrap.dedent(body) + '\nwhile True: time.sleep(1)\n'
+            native_popen = subprocess.Popen
+            processes = []
+            work = []
+
+            def launch(argv, **kwargs):
+                self.assertEqual(argv[0], 'codex')
+                self.assertIn('forced_login_method="chatgpt"', argv)
+                self.assertIn('model_provider="openai"', argv)
+                self.assertIn('app-server', argv)
+                work.append(kwargs['cwd'])
+                process = native_popen([sys.executable, '-u', '-c', script, str(trace)],
+                                       **kwargs)
+                processes.append(process)
+                return process
+
+            with patch.object(seat_codex.subprocess, 'Popen', side_effect=launch), \
+                    patch.dict(os.environ, {'OPENAI_API_KEY': 'private-key',
+                                            'CODEX_API_KEY': 'private-key'}):
+                try:
+                    yield processes, trace, work
+                finally:
+                    # Avoid stranding the fixture even when a regression fails an assertion.
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+
+    def assert_cleaned_up(self, processes, work):
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        for pipe in (processes[0].stdin, processes[0].stdout, processes[0].stderr):
+            self.assertTrue(pipe.closed)
+        self.assertFalse(Path(work[0]).exists())
+
+    def test_lists_native_pages_in_order_without_hidden_or_duplicate_models(self):
+        body = """
+            request = initialize()
+            assert 'cursor' not in request['params']
+            emit({'method': 'account/updated', 'params': {'authMode': 'chatgpt'}})
+            emit({'id': request['id'], 'result': {'data': [
+                {'id': 'picker-alpha', 'model': 'seat-alpha', 'hidden': False},
+                {'id': 'hidden', 'model': 'seat-hidden', 'hidden': True},
+                {'id': 'seat-legacy'},
+            ], 'nextCursor': 'opaque-page-two'}})
+            request = page()
+            assert request['params']['cursor'] == 'opaque-page-two'
+            emit({'id': request['id'], 'result': {'data': [
+                {'model': 'seat-alpha'}, {'model': 'seat-beta'},
+                {'model': 'seat-legacy'}, {'model': 'seat-hidden', 'hidden': True},
+            ], 'nextCursor': None}})
+        """
+        with self.native(body) as (processes, trace, work):
+            self.assertEqual(seat_codex.list_models(timeout=5),
+                             ['seat-alpha', 'seat-legacy', 'seat-beta'])
+            self.assert_cleaned_up(processes, work)
+            requests = [json.loads(line) for line in trace.read_text().splitlines()]
+            self.assertEqual([request['method'] for request in requests],
+                             ['initialize', 'initialized', 'model/list', 'model/list'])
+
+    def test_rpc_errors_raise_without_exposing_native_details_and_clean_up(self):
+        for stage in ('initialize', 'model/list'):
+            with self.subTest(stage=stage):
+                body = ("request = receive('initialize')\n" if stage == 'initialize'
+                        else 'request = initialize()\n')
+                body += ("emit({'id': request['id'], 'error': "
+                         "{'code': -32603, 'message': 'private-auth-detail'}})\n")
+                with self.native(body) as (processes, trace, work):
+                    with self.assertRaisesRegex(SeatError, 'request failed') as error:
+                        seat_codex.list_models(timeout=5)
+                    self.assertNotIn('private-auth-detail', str(error.exception))
+                    self.assert_cleaned_up(processes, work)
+
+    def test_one_deadline_bounds_all_pages_and_cleans_up_timed_out_server(self):
+        body = """
+            request = initialize()
+            deadline = time.monotonic() + 3
+            number = 0
+            while time.monotonic() < deadline:
+                time.sleep(.1)
+                number += 1
+                emit({'id': request['id'], 'result': {
+                    'data': [{'model': 'seat-' + str(number)}],
+                    'nextCursor': 'page-' + str(number)}})
+                request = page()
+            emit({'id': request['id'], 'error': {
+                'code': -32603, 'message': 'deadline was reset between pages'}})
+        """
+        with self.native(body) as (processes, trace, work):
+            started = time.monotonic()
+            with self.assertRaisesRegex(SeatError, 'timed out'):
+                seat_codex.list_models(timeout=1)
+            self.assertLess(time.monotonic() - started, 2.5)
+            self.assert_cleaned_up(processes, work)
+            methods = [json.loads(line)['method'] for line in trace.read_text().splitlines()]
+            self.assertGreater(methods.count('model/list'), 1)
+
+    def test_protocol_failures_never_become_an_empty_inventory(self):
+        responses = [
+            "print('not-json', flush=True)",
+            "emit({'id': request['id'], 'result': {'data': 'not-a-list'}})",
+            "emit({'id': request['id'] + 1, 'result': {'data': []}})",
+            "emit({'id': request['id'], 'result': {'data': [{'model': None}]}})",
+            "sys.exit(0)",
+        ]
+        for response in responses:
+            with self.subTest(response=response):
+                with self.native('request = initialize()\n' + response + '\n') as (
+                        processes, trace, work):
+                    with self.assertRaises(SeatError):
+                        seat_codex.list_models(timeout=5)
+                    self.assert_cleaned_up(processes, work)
+
+    def test_repeated_cursor_is_a_protocol_error_not_partial_success(self):
+        body = """
+            request = initialize()
+            for model in ('seat-alpha', 'seat-beta'):
+                emit({'id': request['id'], 'result': {
+                    'data': [{'model': model}], 'nextCursor': 'same-page'}})
+                request = page()
+        """
+        with self.native(body) as (processes, trace, work):
+            with self.assertRaisesRegex(SeatError, 'repeated'):
+                seat_codex.list_models(timeout=5)
+            self.assert_cleaned_up(processes, work)
+
+    def test_native_launch_failure_is_not_an_empty_inventory(self):
+        with patch.object(seat_codex.subprocess, 'Popen', side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(SeatError, 'not installed'):
+                seat_codex.list_models()
 
 
 class CodexLoginTests(unittest.TestCase):

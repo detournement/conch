@@ -1415,6 +1415,19 @@ UnifiedPush; Conch can post interrupts directly to the ntfy app.
 
 ## Remote SSH operation
 
+At the interactive Conch prompt, a single-line `ssh user@host` invocation
+(including SSH options or `/usr/bin/ssh`) offers an execution choice:
+
+- **Direct terminal** — confirmed, non-recording interactive SSH.
+- **Let the model handle it** — send the original command to the model, which
+  chooses tools under the normal permissions.
+
+Escape cancels without sending or executing the command. `/terminal ssh user@host`
+skips the picker and requests direct handoff. Multiline pasted blocks remain
+chat; non-interactive sessions keep model-selected execution without a picker.
+Use `exit` in the remote shell to return to Conch; Ctrl+C interrupts the current
+remote command.
+
 `/ssh` uses your normal OpenSSH configuration and host-key policy:
 
 ```text

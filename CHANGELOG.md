@@ -19,6 +19,11 @@ Releases before 0.6.0 predate this changelog.
 
 ### Fixed
 
+- Explicit `ssh …` input now offers a choice between secure interactive terminal
+  handoff and model-selected execution. The model receives the original command
+  when selected; cancelling sends and executes nothing. SSH options and absolute
+  paths are preserved, and multiline pasted blocks stay chat.
+
 - Claude seat turns no longer fail with "Claude returned an unsupported system
   event": status events from newer Claude Code versions (thinking progress,
   notices, model fallback) are shown as progress, while events that mean

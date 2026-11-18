@@ -953,6 +953,34 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             interactive=interactive, input_fn=_safe_input
         )
 
+    def _choose_ssh_execution(command):
+        if _ui:
+            return _ui.choose(f"SSH execution · {command}", [
+                ("terminal", "Direct terminal", "Interactive SSH; input/output stays private"),
+                ("model", "Let the model handle it", "Send to the model; normal tools and permissions"),
+            ])
+        if not interactive:
+            return "model"
+        print(
+            "\n  SSH execution:\n"
+            "    1. Direct terminal — interactive, non-recording handoff\n"
+            "    2. Let the model handle it — normal tools and permissions"
+        )
+        while True:
+            try:
+                answer = _safe_input(
+                    "  SSH execution [1/2, Enter cancels]: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if answer in ("1", "terminal"):
+                return "terminal"
+            if answer in ("2", "model"):
+                return "model"
+            if not answer:
+                return None
+            print("  Choose 1 or 2, or press Enter to cancel.")
+
     def _interactive_command(command):
         """Picker selections still pass through the existing validated dispatcher."""
         head, _, argument = command.partition(" ")
@@ -1184,13 +1212,23 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
             if not stripped:
                 continue
             _attach_loaded_tools()
+            _literal_block = False
+            if multiline.is_ssh_command(user_input):
+                execution = _choose_ssh_execution(stripped)
+                if execution == "terminal":
+                    user_input = stripped = f"/terminal {stripped}"
+                elif execution == "model":
+                    # Absolute SSH paths must remain model input, not slash commands.
+                    _literal_block = True
+                else:
+                    print("  \033[2m(cancelled — nothing sent)\033[0m\n")
+                    continue
 
             # /paste and /edit compose a literal message: the block they
             # return is never re-parsed as commands or exit words, and
             # multiline input (pasted or composed) is always chat — interior
             # lines must never dispatch as slash commands.
-            _literal_block = False
-            if multiline.is_slash_command(user_input):
+            if not _literal_block and multiline.is_slash_command(user_input):
                 _head = stripped.split(maxsplit=1)
                 _name = _head[0].lower()
                 _arg = _head[1].strip() if len(_head) > 1 else ""

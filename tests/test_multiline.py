@@ -75,6 +75,33 @@ class HelperTests(unittest.TestCase):
     def test_multiline_never_a_slash_command(self):
         self.assertFalse(multiline.is_slash_command("/help\nsecond line"))
 
+    def test_ssh_invocations_are_recognized(self):
+        for command in (
+            "ssh burt",
+            "  ssh -p 2222 user@host",
+            '/usr/bin/ssh -i "key with spaces" user@host',
+            'ssh host "printf hello"',
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(multiline.is_ssh_command(command))
+
+    def test_ssh_builtin_is_not_an_executable_invocation(self):
+        self.assertFalse(multiline.is_ssh_command("/ssh connect user@host"))
+
+    def test_ssh_detection_preserves_chat_and_literal_blocks(self):
+        for text in (
+            "",
+            "explain ssh host",
+            "sshpass -p secret ssh host",
+            "ssh-agent",
+            "ssh 'unterminated",
+            "ssh host\nsecond line",
+            "ssh host\rsecond line",
+            "ssh host\n",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(multiline.is_ssh_command(text))
+
     def test_sanitize_history_entry(self):
         self.assertEqual(
             multiline.sanitize_history_entry("a\nb\r\nc"),

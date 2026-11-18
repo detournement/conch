@@ -116,6 +116,18 @@ def is_slash_command(text: str) -> bool:
     return text.lstrip().startswith("/")
 
 
+def is_ssh_command(text: str) -> bool:
+    """Recognize explicit SSH invocations, never multiline chat or paste."""
+    if "\n" in text or "\r" in text:
+        return False
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        return False
+    # /ssh is Conch's builtin command, not an OpenSSH executable path.
+    return bool(argv and argv[0] != "/ssh" and os.path.basename(argv[0]) == "ssh")
+
+
 def sanitize_history_entry(text: str) -> str:
     """Collapse a message to one line for readline history.
 

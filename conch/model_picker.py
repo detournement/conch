@@ -6,9 +6,10 @@ roles it holds: ● the chat model, F fan-out workers, T side tasks (titles,
 summaries, compaction). Built-in catalogs show at once; local servers, the
 llama-idx registry, seat sign-in, and Codex's native catalog fill in as they answer.
 
-Enter makes the selection the chat model (from a running turn: once it
-ends). Ctrl+F and Ctrl+T assign the worker and side-task roles (saved to
-config); Ctrl+E steps the model's reasoning effort and Ctrl+W its context
+Enter makes the selection the chat model and closes the picker; Ctrl+P
+sets it without closing (during a running turn, either queues the switch).
+Ctrl+F and Ctrl+T assign the worker and side-task roles (saved to config);
+Ctrl+E steps the model's reasoning effort and Ctrl+W its context
 window where the provider has them (model_tuning); Ctrl+A adds a model the
 catalog lacks, Ctrl+X removes one you added, Ctrl+R asks the servers again.
 """
@@ -16,19 +17,18 @@ catalog lacks, Ctrl+X removes one you added, Ctrl+R asks the servers again.
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import sys
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from prompt_toolkit import Application
+from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.input import create_input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.output import ColorDepth, create_output
-from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
 from .convo_browser import Line, _compact, _fit, _fit_hints, _fit_right, _highlight, _Pane
@@ -44,22 +44,17 @@ from .model_catalog import (
     remove_model,
     static_status,
 )
+from .themes import colors_disabled, current_scheme, style_for
 
-_STYLE = {
-    "bar": "reverse bold", "title": "bold", "column": "bold #888888",
-    "muted": "#888888", "selected": "reverse", "current": "bold #5fafff",
-    "provider": "bold #5fafff", "match": "bold #ffd75f", "price": "#87d787",
-    "role": "bold #ffd75f", "prompt": "bold", "notice": "#ffd75f",
-    "error": "#ff6666", "ok": "#87d787",
-}
 
 
 def pick_model(config: dict, provider: str, model: str, *, purpose: Optional[str] = None,
+               on_primary: Optional[Callable[[ModelEntry], bool]] = None,
                input=None, output=None) -> Optional[ModelEntry]:
-    """Run the picker on the terminal; the entry chosen with Enter, or None.
-    *purpose* names the setting being chosen (e.g. fanout_model) when the
-    pick is not the chat model."""
-    picker = ModelPicker(config, provider, model, purpose=purpose)
+    """Run the picker; return Enter's choice when no primary callback is supplied.
+    *on_primary* validates/applies primary changes and returns whether they worked.
+    *purpose* names a non-primary setting being chosen (e.g. fanout_model)."""
+    picker = ModelPicker(config, provider, model, purpose=purpose, on_primary=on_primary)
     if input is None:
         input = create_input(sys.stdin)
     if output is None:
@@ -69,10 +64,13 @@ def pick_model(config: dict, provider: str, model: str, *, purpose: Optional[str
 
 
 async def pick_model_during_turn(config: dict, provider: str, model: str, *,
-                                 purpose: Optional[str] = None) -> Optional[ModelEntry]:
+                                 purpose: Optional[str] = None,
+                                 on_primary: Optional[Callable[[ModelEntry], bool]] = None
+                                 ) -> Optional[ModelEntry]:
     """The picker on the live shell's own event loop while a turn runs: the
     chat-model pick is queued for when the turn ends; role changes save now."""
-    picker = ModelPicker(config, provider, model, busy=True, purpose=purpose)
+    picker = ModelPicker(config, provider, model, busy=True, purpose=purpose,
+                         on_primary=on_primary)
     await picker.build().run_async(pre_run=picker.start_live, handle_sigint=False)
     return picker.result
 
@@ -90,12 +88,14 @@ class ModelPicker:
     """State, rendering, and keys for one run of the picker."""
 
     def __init__(self, config: dict, provider: str, model: str, busy: bool = False,
-                 purpose: Optional[str] = None):
+                 purpose: Optional[str] = None,
+                 on_primary: Optional[Callable[[ModelEntry], bool]] = None):
         self.config = config
         self.current = ((provider or "").lower(), model or "")
         self.busy = busy
         # The setting this pick fills when it is not the chat model.
         self.purpose = purpose
+        self.on_primary = on_primary
         self.entries: List[ModelEntry] = catalog_entries(config)
         self.statuses: Dict[str, ProviderStatus] = static_status(config)
         self._pending = 0  # live sources still to answer
@@ -264,6 +264,29 @@ class ModelPicker:
             return
         self.result = entry
         if self.app is not None:
+            self.app.exit()
+
+    async def set_primary(self, *, close=False):
+        entry = self.selected()
+        if (self.mode != "list" or self.purpose or self.on_primary is None
+                or entry is None or not self._usable(entry)):
+            return
+        self.mode = "primary"
+        self.notice = f"Selecting {entry.label}…"
+        try:
+            applied = await run_in_terminal(
+                lambda: self.on_primary(entry), in_executor=True)
+        finally:
+            self.mode = "list"
+        if not applied:
+            self.notice = f"Primary model unchanged: {entry.label} did not pass validation."
+            return
+        if self.busy:
+            self.notice = f"Queued {entry.label} as primary after this turn."
+        else:
+            self.current = entry.key
+            self.notice = f"Primary model: {entry.label}."
+        if close and self.app is not None:
             self.app.exit()
 
     def _set(self, values: Dict[str, str]):
@@ -537,9 +560,12 @@ class ModelPicker:
                 first = f"Enter sets {self.purpose}"
             else:
                 first = "Enter use after this turn" if self.busy else "Enter use"
-            hints = [first,
-                     "type to filter", "^F fan-out", "^T side tasks", "^E effort",
-                     "^W context", "^A add", "^X remove", "^R refresh", "Esc quit"]
+            hints = [first]
+            if self.on_primary is not None and not self.purpose:
+                hints.append("^P primary (stay)")
+            hints.extend([
+                "type to filter", "^F fan-out", "^T side tasks", "^E effort",
+                "^W context", "^A add", "^X remove", "^R refresh", "Esc quit"])
         return [[("class:muted", " " + _fit_hints(hints, width - 1))]]
 
     # --- application --------------------------------------------------------------
@@ -554,13 +580,14 @@ class ModelPicker:
             ConditionalContainer(self.add_input, Condition(lambda: self.mode == "add")),
             Window(_Pane(self._render_footer), height=1),
         ])
-        no_color = "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb"
+        scheme = current_scheme(self.config)
+        no_color = colors_disabled() or scheme == "monochrome"
         self.app = Application(
             layout=Layout(root, focused_element=self.query),
             key_bindings=self._key_bindings(), full_screen=True, mouse_support=False,
             enable_page_navigation_bindings=False, input=input, output=output,
             color_depth=ColorDepth.DEPTH_1_BIT if no_color else None,
-            style=Style.from_dict(_STYLE),
+            style=style_for(scheme),
         )
         self.app.ttimeoutlen = 0.05
         self.app.key_processor.before_key_press += self._clear_notice
@@ -579,10 +606,10 @@ class ModelPicker:
 
         @keys.add("c-c", eager=True)
         def _quit(event):
-            event.app.exit()
+            if self.mode != "primary":
+                event.app.exit()
 
         @keys.add("up", filter=listing)
-        @keys.add("c-p", filter=listing)
         def _up(event):
             self.move(-1)
 
@@ -600,8 +627,15 @@ class ModelPicker:
             self.move(page())
 
         @keys.add("enter", filter=listing)
-        def _choose(event):
-            self.choose()
+        async def _choose(event):
+            if self.on_primary is not None and not self.purpose:
+                await self.set_primary(close=True)
+            else:
+                self.choose()
+
+        @keys.add("c-p", filter=listing)
+        async def _primary(event):
+            await self.set_primary()
 
         @keys.add("escape", filter=listing, eager=True)
         def _escape(event):

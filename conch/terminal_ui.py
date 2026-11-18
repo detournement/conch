@@ -17,29 +17,28 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Optional
 
 from prompt_toolkit import Application
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.application.run_in_terminal import in_terminal
-from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.input import create_input
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import (
-    ConditionalContainer, Float, FloatContainer, HSplit, Layout, Window,
-)
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.output import ColorDepth, create_output
 from prompt_toolkit.renderer import print_formatted_text
-from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
+
+from .themes import style_for
 
 _active: Optional["TerminalUI"] = None
 
@@ -58,20 +57,6 @@ def _safe(text: object) -> str:
     return "".join(c for c in str(text)
                    if c in "\n\t" or (ord(c) >= 32 and not 127 <= ord(c) < 160))
 
-
-class _Commands(Completer):
-    def __init__(self, commands):
-        self.commands = commands
-
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        if not text.startswith("/") or "\n" in text:
-            return
-        for spec, description in self.commands():
-            command = spec.split()[0]
-            if text.lower() in spec.lower() or text[1:].lower() in description.lower():
-                yield Completion(command, start_position=-len(text),
-                                 display=_safe(spec), display_meta=_safe(description))
 
 
 class _Capture:
@@ -200,6 +185,9 @@ class TerminalUI:
         self._modal_result = None
         self._modal_choices = []
         self._selection = 0
+        self._command_selection = 0
+        self._command_dismissed = None
+        self._command_restore = None
         self._output_queue = deque()
         self._write_task = None
         self._futures = set()
@@ -210,6 +198,8 @@ class TerminalUI:
         self._old_stdout = None
         self._old_stderr = None
         self._no_color = "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb"
+        self._colorscheme = "default"
+        self._preview_colorscheme = None
 
     def start(self):
         global _active
@@ -332,9 +322,9 @@ class TerminalUI:
 
     def _build(self):
         self._editor = TextArea(
-            multiline=True, history=self._history, completer=_Commands(self._commands),
-            complete_while_typing=False, prompt=[("class:prompt", "> ")],
+            multiline=True, history=self._history, prompt=[("class:prompt", "> ")],
             height=Dimension(min=1, max=7), dont_extend_height=True)
+        self._editor.buffer.on_text_changed += self._command_changed
         self._query = TextArea(multiline=False, prompt="Search: ")
         self._answer = TextArea(multiline=False, prompt="Answer: ")
         self._pending_editor = TextArea(
@@ -342,19 +332,36 @@ class TerminalUI:
             dont_extend_height=True)
         self._pending_list = self._text_window(self._pending_text, 8, focusable=True)
         self._query.buffer.on_text_changed += lambda _: self._reset_selection()
+        self._command_window = Window(
+            FormattedTextControl(self._command_text),
+            height=self._command_height, dont_extend_height=True, wrap_lines=False)
         normal = HSplit([
-            ConditionalContainer(self._text_window(self._response_text, 6),
-                                 Condition(lambda: bool(self._response))),
+            # Browsing temporarily lends the live panels' rows to the command
+            # list. Their state and routing keep running, even on short screens.
             ConditionalContainer(HSplit([
-                Window(FormattedTextControl([("class:title", "Reasoning / progress")]),
-                       height=1, wrap_lines=False),
-                self._text_window(self._details_text, 4),
-            ]), Condition(lambda: bool(self._detail_text) and self._details_visible)),
-            ConditionalContainer(self._text_window(self._activity_text, 4),
-                                 Condition(lambda: bool(self._busy or self._activities or self._tools))),
-            self._text_window(self._status_text, 3),
+                ConditionalContainer(self._text_window(self._response_text, 6),
+                                     Condition(lambda: bool(self._response))),
+                ConditionalContainer(HSplit([
+                    Window(FormattedTextControl([("class:title", "Reasoning / progress")]),
+                           height=1, wrap_lines=False),
+                    self._text_window(self._details_text, 4),
+                ]), Condition(lambda: bool(self._detail_text) and self._details_visible)),
+                ConditionalContainer(self._text_window(self._activity_text, 4),
+                                     Condition(lambda: bool(self._busy or self._activities or self._tools))),
+                self._text_window(self._status_text, 3),
+            ]), Condition(self._live_panels_visible)),
+            ConditionalContainer(
+                Window(FormattedTextControl(self._pause_text), height=1, wrap_lines=False),
+                Condition(self._pause_visible)),
+            ConditionalContainer(
+                Window(FormattedTextControl(self._infobar_text),
+                       height=self._infobar_height, dont_extend_height=True,
+                       wrap_lines=False),
+                Condition(lambda: self._infobar_height() > 0)),
             self._editor,
-            self._text_window(self._hints, 1),
+            ConditionalContainer(self._command_window, Condition(self._command_visible)),
+            ConditionalContainer(self._text_window(self._hints, 1),
+                                 Condition(self._hints_visible)),
         ])
         modal = HSplit([
             self._text_window(lambda: [("class:title", _safe(self._modal_title))], 5),
@@ -367,10 +374,10 @@ class TerminalUI:
                                  Condition(lambda: self._modal == "queue-edit")),
             self._text_window(self._modal_hints, 2),
         ])
-        root = FloatContainer(HSplit([
+        root = HSplit([
             ConditionalContainer(normal, Condition(lambda: self._modal is None)),
             ConditionalContainer(modal, Condition(lambda: self._modal is not None)),
-        ]), floats=[Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=8))])
+        ])
         keys = KeyBindings()
 
         @keys.add("enter", eager=True)
@@ -385,8 +392,8 @@ class TerminalUI:
                 self._edit_pending()
             elif self._modal == "queue-edit":
                 self._save_pending()
-            elif self._editor.buffer.complete_state is not None:
-                self._editor.buffer.complete_state = None
+            elif self._command_visible() and self._command_matches():
+                self._accept_command(execute=True)
             else:
                 self._send()
 
@@ -421,26 +428,48 @@ class TerminalUI:
                 self._details_visible = not self._details_visible
 
         @keys.add("c-p", eager=True)
-        def palette(event):
+        def commands(event):
             if self._modal is None:
-                choices = [(spec.split()[0] + (" " if " " in spec else ""), spec, desc)
-                           for spec, desc in self._commands()]
-                self._open_modal("choose", "Commands — select to fill the draft", choices,
-                                 palette=True)
+                self._open_commands()
+
+        @keys.add("tab", filter=Condition(self._command_visible), eager=True)
+        def complete_command(event):
+            self._accept_command(execute=False)
+
+        @keys.add("up", filter=Condition(self._command_visible), eager=True)
+        def previous_command(event):
+            self._move_command(-1)
+
+        @keys.add("down", filter=Condition(self._command_visible), eager=True)
+        def next_command(event):
+            self._move_command(1)
+
+        @keys.add("pageup", filter=Condition(self._command_visible), eager=True)
+        def previous_command_page(event):
+            self._move_command(-self._command_page_size())
+
+        @keys.add("pagedown", filter=Condition(self._command_visible), eager=True)
+        def next_command_page(event):
+            self._move_command(self._command_page_size())
+
+        # Do not make this eager: Escape is also the Alt+Enter/Alt+Q prefix.
+        @keys.add("escape", filter=Condition(self._command_visible))
+        def dismiss_commands(event):
+            self._dismiss_commands()
 
         @keys.add("up", filter=Condition(lambda: self._modal in ("choose", "queue")), eager=True)
         def up(event):
             if self._modal == "queue":
                 self._move_pending(-1)
             else:
-                self._selection = max(0, self._selection - 1)
+                self._select_choice(self._selection - 1)
 
         @keys.add("down", filter=Condition(lambda: self._modal in ("choose", "queue")), eager=True)
         def down(event):
             if self._modal == "queue":
                 self._move_pending(1)
             else:
-                self._selection = min(max(0, len(self._filtered_choices()) - 1), self._selection + 1)
+                self._select_choice(self._selection + 1)
 
         # Eager wherever Escape is not also the Alt prefix of a live binding;
         # otherwise cancelling waits a full second for a possible next key.
@@ -475,12 +504,155 @@ class TerminalUI:
 
         self._app = Application(
             layout=Layout(root, focused_element=self._editor), key_bindings=keys,
-            full_screen=False, mouse_support=False, erase_when_done=True,
+            full_screen=False,
+            mouse_support=Condition(lambda: self._preview_colorscheme is not None),
+            erase_when_done=True,
             input=self._input, output=self._output, refresh_interval=0.25,
-            color_depth=ColorDepth.DEPTH_1_BIT if self._no_color else None,
-            style=Style.from_dict({"prompt": "bold", "title": "bold",
-                                   "muted": "#888888", "status": "#88aaaa",
-                                   "selected": "reverse", "error": "#ff6666"}))
+            color_depth=lambda: (ColorDepth.DEPTH_1_BIT
+                                 if self._no_color or (self._preview_colorscheme
+                                                       or self._colorscheme) == "monochrome"
+                                 else None),
+            style=style_for(self._colorscheme))
+        self._app.ttimeoutlen = 0.05
+        self._app.timeoutlen = 0.3
+
+    def _command_query(self):
+        document = self._editor.buffer.document
+        text = document.text
+        if (self._modal is not None or not text.startswith("/")
+                or any(char.isspace() for char in text)
+                or document.cursor_position != len(text)
+                or self._command_dismissed == text):
+            return None
+        return text[1:].casefold()
+
+    def _command_visible(self):
+        return self._command_query() is not None
+
+    def _command_changed(self, buffer):
+        self._command_selection = 0
+        self._command_dismissed = None
+        # Once a temporary Ctrl+P query becomes ordinary input, it is the
+        # user's new draft; Escape must no longer restore an obsolete draft.
+        if not buffer.text.startswith("/") or any(c.isspace() for c in buffer.text):
+            self._command_restore = None
+
+    def _command_matches(self):
+        query = self._command_query()
+        if query is None:
+            return []
+        matches = []
+        for spec, description in self._commands():
+            parts = spec.split()
+            if not parts:
+                continue
+            name = parts[0].lstrip("/").casefold()
+            if query not in name and query not in description.casefold():
+                continue
+            rank = (0 if name == query else 1 if name.startswith(query)
+                    else 2 if query in name else 3)
+            matches.append((rank, spec, description))
+        # Stable sorting preserves the catalog's order within each rank.
+        matches.sort(key=lambda match: match[0])
+        return [(spec, description) for _, spec, description in matches]
+
+    def _open_commands(self):
+        document = self._editor.buffer.document
+        self._command_dismissed = None
+        if self._command_query() is None:
+            self._command_restore = document
+            self._editor.buffer.document = Document("/", 1)
+        self._command_selection = 0
+
+    def _dismiss_commands(self):
+        restore = self._command_restore
+        self._command_restore = None
+        if restore is not None:
+            self._editor.buffer.document = restore
+        self._command_dismissed = self._editor.text
+
+    def _move_command(self, amount):
+        self._command_selection = max(
+            0, min(len(self._command_matches()) - 1, self._command_selection + amount))
+
+    def _accept_command(self, execute):
+        matches = self._command_matches()
+        if not matches:
+            return
+        index = min(self._command_selection, len(matches) - 1)
+        parts = matches[index][0].split()
+        text = parts[0] + (" " if not execute and len(parts) > 1 else "")
+        self._command_restore = None
+        self._editor.buffer.document = Document(text, len(text))
+        self._command_dismissed = text
+        if execute:
+            self._send()
+
+    def _command_budget(self):
+        # Reserve the actual bar height, not a fixed row: detail can wrap.
+        rows = self._output.get_size().rows
+        reserved = (1 + self._hints_visible() + self._pause_visible()
+                    + self._infobar_height())
+        return min(11, max(0, rows - reserved))
+
+    def _command_page_size(self):
+        return max(1, self._command_budget() - 1)
+
+    def _command_height(self):
+        count = len(self._command_matches())
+        return min(self._command_budget(), count + 1 if count else 1)
+
+    @staticmethod
+    def _command_clip(text, width):
+        """Sanitize to a single row and truncate by terminal cells."""
+        text = "".join(" " if char.isspace() else char for char in _safe(text))
+        if width <= 0:
+            return ""
+        if get_cwidth(text) <= width:
+            return text
+        visible, used = [], 0
+        for char in text:
+            cells = get_cwidth(char)
+            if used + cells > width - 1:
+                break
+            visible.append(char)
+            used += cells
+        return "".join(visible) + "…"
+
+    def _command_text(self):
+        width = max(0, self._output.get_size().columns - 1)
+        choices = self._command_matches()
+        if not choices:
+            return [("class:muted", self._command_clip("No matches", width))]
+        self._command_selection = min(self._command_selection, len(choices) - 1)
+        page = self._command_page_size()
+        start = min(max(0, self._command_selection - page + 1),
+                    max(0, len(choices) - page))
+        visible = choices[start:start + page]
+        labels = [" ".join(_safe(spec).split()) for spec, _ in choices]
+        column = min(28, max(get_cwidth(label) for label in labels), max(1, width // 2))
+        fragments = []
+        for index, (_, description) in enumerate(visible, start):
+            selected = index == self._command_selection
+            marker = "> " if selected else "  "
+            if width < 12:
+                text = marker + labels[index]
+            else:
+                label = self._command_clip(labels[index], column)
+                gap = " " * (column - get_cwidth(label) + 2)
+                text = marker + label + gap + " ".join(_safe(description).split())
+            fragments.append(("class:selected" if selected else "",
+                              self._command_clip(text, width)))
+            if index != start + len(visible) - 1:
+                fragments.append(("", "\n"))
+        if self._command_budget() > 1:
+            position = f"{self._command_selection + 1}/{len(choices)}"
+            fragments.extend([
+                ("", "\n"),
+                ("class:muted", self._command_clip(
+                    f"{position} · {start + 1}–{start + len(visible)}", width)),
+            ])
+        return fragments
 
     @staticmethod
     def _text_window(text, maximum, focusable=False):
@@ -564,6 +736,133 @@ class TerminalUI:
             parts.append(f"tools: {fields['tools']}")
         return [("class:status", self._clip(" · ".join(parts)))]
 
+    def _hints_visible(self):
+        return self._output.get_size().rows >= 4
+
+    def _pause_visible(self):
+        return (bool(self._context_fields.get("agents_paused"))
+                and self._output.get_size().rows >= (4 if self._command_visible() else 3))
+
+    def _live_panels_visible(self):
+        if self._command_visible():
+            return False
+        minimum = (1 + bool(self._response)
+                   + 2 * bool(self._detail_text and self._details_visible)
+                   + bool(self._busy or self._activities or self._tools))
+        reserved = (1 + self._hints_visible() + self._pause_visible()
+                    + self._infobar_height())
+        return minimum <= self._output.get_size().rows - reserved
+
+    @staticmethod
+    def _wrap_infobar(fragments, width, maximum):
+        """Word-wrap styled text by display cells, bounding both dimensions."""
+        if width <= 0 or maximum <= 0:
+            return []
+        words, word = [], []
+        for style, text in fragments:
+            for char in _safe(text):
+                if char.isspace():
+                    if word:
+                        words.append(word)
+                        word = []
+                else:
+                    word.append((style, char))
+        if word:
+            words.append(word)
+        rows, row, used = [], [], 0
+        for word in words:
+            cells = sum(get_cwidth(char) for _, char in word)
+            if row and used + 1 + cells > width:
+                rows.append(row)
+                row, used = [], 0
+            elif row:
+                row.append(("class:status", " "))
+                used += 1
+            for style, char in word:
+                cells = get_cwidth(char)
+                if used + cells > width:
+                    rows.append(row)
+                    row, used = [], 0
+                if cells <= width:
+                    row.append((style, char))
+                    used += cells
+        if row:
+            rows.append(row)
+        if len(rows) > maximum:
+            rows = rows[:maximum]
+            last = rows[-1]
+            while last and sum(get_cwidth(char) for _, char in last) >= width:
+                last.pop()
+            last.append(("class:muted", "…"))
+        return rows
+
+    def _infobar_rows(self):
+        fields = self._context_fields
+        if not fields.get("show_token_stats", True):
+            return []
+        size = self._output.get_size()
+        width = max(0, size.columns - 1)
+        # On very short screens the composer and selected command win.
+        maximum = min(2, size.rows - 1 - self._hints_visible()
+                      - self._pause_visible() - self._command_visible())
+        if width <= 0 or maximum <= 0:
+            return []
+        if fields.get("infobar", "detail") == "progress":
+            capacity = fields.get("context_window")
+            if not capacity or capacity <= 0:
+                return self._wrap_infobar([("class:muted", "ctx unknown")], width, maximum)
+            used = max(0, fields.get("context_used", 0))
+            percent = used / capacity * 100
+            style = ("class:error" if percent >= 80 else
+                     "class:warning" if percent >= 60 else "class:ok")
+            summary = f"~{percent:.0f}% / {capacity:,}"
+            if len(summary) + 10 <= width:
+                ruler_width = width - len(summary) - 7
+                prefix, suffix = "ctx [", f"] {summary}"
+            else:
+                if len(summary) > width:
+                    unit, divisor = ("m", 1_000_000) if capacity >= 1_000_000 else ("k", 1_000)
+                    budget = f"{capacity / divisor:g}{unit}" if capacity >= 1_000 else str(capacity)
+                    summary = f"~{percent:.0f}% / {budget}"
+                rows = self._wrap_infobar([(style, summary)], width, 1)
+                if maximum == 1:
+                    return rows
+                ruler_width = max(0, width - 2)
+                prefix, suffix = "[", "]"
+            filled = min(ruler_width, int(ruler_width * min(1, used / capacity)))
+            ruler = [("class:muted", prefix), (style, "=" * filled),
+                     ("class:rule", "-" * (ruler_width - filled)),
+                     ("class:muted", suffix)]
+            if prefix == "[":
+                return rows + [ruler]
+            return [ruler]
+        # ANSI is a transport format only. Semantic classes keep severity while
+        # allowing live theme switches and color-free output to work normally.
+        fragments = []
+        for ansi_style, text in to_formatted_text(ANSI(fields.get("infobar_stats", ""))):
+            if "[ZeroWidthEscape]" in ansi_style:
+                continue
+            colors = ansi_style.split()
+            style = ("class:error" if "ansired" in colors else
+                     "class:warning" if "ansiyellow" in colors else
+                     "class:ok" if "ansigreen" in colors else "class:status")
+            fragments.append((style, text))
+        return self._wrap_infobar(fragments, width, maximum)
+
+    def _infobar_height(self):
+        return len(self._infobar_rows())
+
+    def _infobar_text(self):
+        fragments = []
+        for row in self._infobar_rows():
+            if fragments:
+                fragments.append(("", "\n"))
+            fragments.extend(row)
+        return fragments
+
+    def _pause_text(self):
+        return [("class:warning", self._clip("PAUSED · /ebrake off resumes"))]
+
     def _clip(self, text):
         """One terminal row of text, ending in an ellipsis when cut."""
         width = self._output.get_size().columns
@@ -584,10 +883,15 @@ class TerminalUI:
     def _hints(self):
         # Most important first: a narrow terminal drops hints from the end
         # instead of cutting one mid-word.
+        if self._command_visible():
+            return [("class:muted", self._fit_hints(
+                ["Enter runs", "Tab fills", "Escape closes", "Up/Down selects"]))]
         with self._condition:
             pending = any(isinstance(item, _PendingMessage) for item in self._messages)
         if self._notice:
             hints = [self._notice]
+        elif self._context_fields.get("agents_paused"):
+            hints = ["/ebrake off resumes", "Ctrl+C stops", "Ctrl+P commands"]
         elif self._busy and self._queue_enabled:
             hints = ["Enter steers", "Ctrl+C stops", "Alt+Q follow-up"]
         elif self._busy:
@@ -768,6 +1072,8 @@ class TerminalUI:
             hints = ["Escape closes", "Enter edits", "Delete removes", "Up/Down selects"]
         elif self._modal == "queue-edit":
             hints = ["Enter saves", "Escape restores original", "Alt+Enter newline"]
+        elif self._preview_colorscheme is not None:
+            hints = ["Escape cancels", "Click/Enter saves", "Hover/Up/Down previews", "Type to filter"]
         elif self._modal == "choose":
             hints = ["Enter chooses", "Escape cancels", "Up/Down selects", "Type to filter"]
         else:
@@ -854,12 +1160,35 @@ class TerminalUI:
         return self._change(restore)
 
     def _reset_selection(self):
-        self._selection = 0
+        self._select_choice(0)
 
     def _filtered_choices(self):
         words = self._query.text.casefold().split()
         return [choice for choice in self._modal_choices
                 if all(word in (str(choice[1]) + " " + str(choice[2])).casefold() for word in words)]
+
+    def _select_choice(self, index):
+        choices = self._filtered_choices()
+        self._selection = min(max(0, index), max(0, len(choices) - 1))
+        if self._preview_colorscheme is not None:
+            name = choices[self._selection][0] if choices else self._colorscheme
+            self._preview_colorscheme = name
+            self._app.style = style_for(name)
+
+    def _choice_mouse(self, value, event):
+        if self._modal != "choose" or self._preview_colorscheme is None:
+            return NotImplemented
+        if event.event_type != MouseEventType.MOUSE_MOVE and not (
+                event.button == MouseButton.LEFT
+                and event.event_type in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP)):
+            return NotImplemented
+        for index, choice in enumerate(self._filtered_choices()):
+            if choice[0] == value:
+                self._select_choice(index)
+                if event.event_type == MouseEventType.MOUSE_UP:
+                    self._finish_modal(value)
+                return None
+        return NotImplemented
 
     def _choice_text(self):
         choices = self._filtered_choices()
@@ -873,25 +1202,28 @@ class TerminalUI:
         column = min(28, max(get_cwidth(str(choices[index][1])) for index in visible))
         fragments = []
         for index in visible:
-            _, label, description = choices[index]
+            value, label, description = choices[index]
             style = "class:selected" if index == self._selection else ""
             gap = " " * max(0, column - get_cwidth(str(label)))
-            fragments.append((style, self._clip(
-                f"{'›' if index == self._selection else ' '} {label}{gap}  {description}") + "\n"))
+            text = self._clip(
+                f"{'›' if index == self._selection else ' '} {label}{gap}  {description}") + "\n"
+            fragments.append((style, text, partial(self._choice_mouse, value))
+                             if self._preview_colorscheme is not None else (style, text))
         return fragments
 
-    def _open_modal(self, kind, title, choices=(), palette=False):
+    def _open_modal(self, kind, title, choices=(), preview_colors=False):
         if self._modal is not None:
             # Backend approval supersedes local editing, restoring its reserved
             # message without ever submitting the editor or composer as an answer.
             self._finish_modal(exception=KeyboardInterrupt() if self._modal == "ask" else None)
         self._modal, self._modal_title = kind, title
         self._modal_choices = list(choices)
-        self._palette = palette
         self._modal_result = concurrent.futures.Future()
         self._query.buffer.reset()
         self._answer.buffer.reset()
-        self._selection = 0
+        self._preview_colorscheme = self._colorscheme if preview_colors else None
+        self._select_choice(next((index for index, choice in enumerate(self._modal_choices)
+                                  if preview_colors and choice[0] == self._colorscheme), 0))
         if kind == "queue":
             with self._condition:
                 items = self._pending_items()
@@ -904,16 +1236,16 @@ class TerminalUI:
 
     def _finish_modal(self, value=None, exception=None):
         result = self._modal_result
-        palette = self._palette
         self._release_pending()
         self._queue_selection = None
         self._modal = None
         self._modal_result = None
+        if self._preview_colorscheme is not None:
+            self._preview_colorscheme = None
+            self._app.style = style_for(self._colorscheme)
         self._answer.buffer.reset()
         self._query.buffer.reset()
         self._app.layout.focus(self._editor)
-        if palette and value is not None:
-            self._editor.buffer.document = Document(value, len(value))
         if result is not None and not result.done():
             if exception is not None:
                 result.set_exception(exception)
@@ -928,8 +1260,8 @@ class TerminalUI:
         else:
             self._finish_modal(exception=KeyboardInterrupt() if self._modal == "ask" else None)
 
-    def _modal_wait(self, kind, title, choices=()):
-        future = self._change(self._open_modal, kind, title, choices)
+    def _modal_wait(self, kind, title, choices=(), preview_colors=False):
+        future = self._change(self._open_modal, kind, title, choices, preview_colors)
         try:
             return future.result()
         finally:
@@ -943,14 +1275,24 @@ class TerminalUI:
         )
         return self._modal_wait("ask", "Input required\n" + _safe(prompt))
 
-    def choose(self, title: str, choices: list) -> Optional[str]:
-        return self._modal_wait("choose", title, choices)
+    def choose(self, title: str, choices: list, *, preview_colors=False) -> Optional[str]:
+        return self._modal_wait("choose", title, choices, preview_colors)
 
     def prefill(self, text: str):
         self._change(setattr, self._editor.buffer, "document", Document(text, len(text)))
 
     def set_context(self, **fields):
         self._change(self._context_fields.update, fields)
+
+    def set_colorscheme(self, name):
+        if name == self._colorscheme:
+            return
+
+        def update():
+            self._colorscheme = name
+            if self._preview_colorscheme is None:
+                self._app.style = style_for(name)
+        self._change(update)
 
     def set_busy(self, busy: bool):
         def update():

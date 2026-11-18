@@ -412,6 +412,7 @@ class RemoteLoop:
         messages.append({"role": "user", "content": message.text})
 
         host = None
+        session = None
         chat_state = self._chat_state
         clients_pool = self._builtin_clients
         try:
@@ -427,10 +428,12 @@ class RemoteLoop:
             # mutate the hosting session's policy. Shared clients keep their
             # own bindings (bind=False); the shell is a per-turn
             # RemoteShellClient.
+            parent = self._session or host
             session = AgentSession(
                 dict(self.config),
                 interactive=False,
                 permissions=PermissionState(),
+                pause_controller=getattr(parent, "_pause_controller", None),
             )
             session.attach_clients(
                 self._remote_clients(
@@ -446,6 +449,8 @@ class RemoteLoop:
                 max_tool_rounds=int(self.config.get("remote_rounds", 8) or 8),
             )
         finally:
+            if session is not None:
+                session.close()
             if host is not None:
                 host.close()
         if usage.get("error"):

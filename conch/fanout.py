@@ -29,11 +29,12 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import subagent_activity
+from .ebrake import AgentsCancelled, PauseController, checkpoint
 
 EFFORTS = ("light", "standard", "heavy")
 MAX_TASKS = 8
@@ -502,21 +503,43 @@ class FanOutClient:
         """Run one worker process to completion; never raises."""
         from .secretguard import redact_credentials
 
-        if self._cancelled.is_set():
-            return {"ok": False, "error": "cancelled"}
+        controller = self._session._pause_controller if self._session is not None else None
         try:
+            if controller is not None:
+                controller.wait((self._cancelled, self._session._closed_event))
+                envelope = dict(envelope, pause_path=controller.export_path())
+            if self._cancelled.is_set():
+                return {"ok": False, "error": "cancelled"}
             process = self._spawn(envelope)
+        except AgentsCancelled:
+            return {"ok": False, "error": "cancelled"}
         except OSError as exc:
             return {"ok": False, "error": f"could not start a worker ({type(exc).__name__})"}
         with self._lock:
             self._processes.add(process)
+        clock = controller.active_time if controller is not None else time.monotonic
+        started = clock()
+        payload = json.dumps(envelope)
         try:
-            try:
-                stdout, stderr = process.communicate(json.dumps(envelope), timeout=timeout)
-            except subprocess.TimeoutExpired:
-                self._kill(process)
-                process.communicate()
-                return {"ok": False, "error": f"timed out after {timeout:g}s"}
+            while True:
+                if (self._cancelled.is_set()
+                        or (controller is not None and controller.closed)
+                        or (self._session is not None and self._session._closed_event.is_set())):
+                    self._kill(process)
+                    process.communicate()
+                    return {"ok": False, "error": "cancelled"}
+                remaining = timeout - (clock() - started)
+                if remaining <= 0:
+                    self._kill(process)
+                    process.communicate()
+                    return {"ok": False, "error": f"timed out after {timeout:g}s"}
+                try:
+                    stdout, stderr = process.communicate(
+                        payload, timeout=min(PauseController.POLL_SECONDS, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    # communicate retains partial output; input is sent only once.
+                    payload = None
         finally:
             # A worker may exit while a command it started is still running.
             self._kill(process)
@@ -677,7 +700,16 @@ class FanOutClient:
         with ThreadPoolExecutor(max_workers=min(limit, len(tasks))) as pool:
             futures = [pool.submit(run, index) for index in range(len(tasks))]
             try:
-                results = [future.result() for future in futures]
+                results = []
+                for future in futures:
+                    while True:
+                        try:
+                            results.append(future.result(timeout=PauseController.POLL_SECONDS))
+                            break
+                        except FutureTimeout:
+                            # Park the calling turn too, releasing its global
+                            # execution lock while child processes are paused.
+                            checkpoint(cancelled=(self._cancelled,))
             except BaseException:
                 # Ctrl+C stops the whole fan-out, not just the wait for it.
                 self.stop()
@@ -742,6 +774,10 @@ def run_envelope(envelope: dict) -> dict:
     session = AgentSession(
         config, interactive=False, permissions=permissions,
         cwd=envelope.get("cwd") or None,
+        pause_controller=(
+            PauseController(envelope["pause_path"])
+            if envelope.get("pause_path") else None
+        ),
     )
     try:
         clients = {
@@ -768,6 +804,8 @@ def run_envelope(envelope: dict) -> dict:
             {"role": "user", "content": task if not context else f"{task}\n\nContext:\n{context}"},
         ]
         reply, usage = session.run_turn(messages, tools=tools or None, tool_map=tool_map)
+    except AgentsCancelled:
+        return {"ok": False, "error": "cancelled"}
     except Exception as exc:  # noqa: BLE001 - one bounded task per process
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:

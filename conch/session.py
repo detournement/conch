@@ -2,12 +2,11 @@
 
 ``AgentSession`` owns what used to be process-global mutable state: provider
 and model configuration, built-in tool clients, permission/agent mode, the
-working directory for executed commands, and execution budgets. It wraps
-``runtime.chat_turn`` without changing its internals, so every execution
-surface — the interactive shell, scheduled tasks, remote channel turns, and
-delegated subagents — runs from an explicit context instead of mutating
-module globals, and two simultaneous sessions cannot leak policy, cwd, or
-tool state into each other.
+working directory for executed commands, execution budgets, and a cooperative
+pause controller. It supplies ``runtime.chat_turn`` with an explicit context,
+so the interactive shell, scheduled tasks, remote channel turns, and delegated
+subagents need not mutate module globals. Independent sessions cannot leak
+policy, cwd, tool state, or their emergency-brake state into each other.
 
 The interactive CLI keeps its exact behavior by constructing its session
 around :func:`conch.tooling.default_permissions`, which the module-level
@@ -18,9 +17,11 @@ the ``A`` approval answer, and config defaults) continue to operate on.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from .ebrake import PauseController, agent_scope
 from .tooling import PermissionState
 
 _UNSET = object()
@@ -51,6 +52,7 @@ class AgentSession:
         budgets: Optional[SessionBudgets] = None,
         cwd: Optional[str] = None,
         memory=None,
+        pause_controller: Optional[PauseController] = None,
     ):
         # Live reference by design: interactive model/provider switches and
         # chat_turn's API fallback update the config dict in place.
@@ -66,6 +68,26 @@ class AgentSession:
         self.chat_state = None
         self.mcp_clients: Dict[str, Any] = {}
         self._closed = False
+        self._closed_event = threading.Event()
+        self._pause_controller = pause_controller or PauseController()
+        self._owns_pause_controller = pause_controller is None
+
+    @property
+    def agents_paused(self) -> bool:
+        """Whether this session tree is parked at its next safe boundary."""
+        return self._pause_controller.paused
+
+    def pause_agents(self) -> None:
+        """Pause new requests, dispatches and spawns without cancelling work."""
+        self._pause_controller.pause()
+
+    def resume_agents(self) -> None:
+        """Continue preserved work; closing a session cannot be undone."""
+        self._pause_controller.resume()
+
+    def agent_scope(self):
+        """Enroll synchronous nested calls (or an explicit thread target)."""
+        return agent_scope(self._pause_controller, self._closed_event)
 
     # -- derived provider/model state (always read live from config) --------
 
@@ -127,9 +149,8 @@ class AgentSession:
     ) -> tuple:
         """Run one bounded agent turn through ``runtime.chat_turn``.
 
-        This is a wrapper: chat_turn's internals (rounds, compaction,
-        budgets, tool dispatch) are unchanged; the session only supplies the
-        state that used to be threaded through by hand at every call site.
+        The session installs its pause context for the whole turn, including
+        synchronous nested skill calls, retries, compaction and summaries.
 
         ``steering_fn``, when supplied, atomically consumes pending user
         guidance at safe boundaries without interrupting inference or tools.
@@ -148,24 +169,25 @@ class AgentSession:
         from .runtime import chat_turn
 
         try:
-            return chat_turn(
-                config,
-                self.provider,
-                raw_fn,
-                messages,
-                tools,
-                tool_map,
-                self.builtin_clients,
-                max_tool_rounds=(
-                    max_tool_rounds
-                    if max_tool_rounds is not None
-                    else self.budgets.max_tool_rounds
-                ),
-                chat_state=self.chat_state,
-                on_token=on_token,
-                input_fn=input_fn,
-                steering_fn=steering_fn,
-            )
+            with self.agent_scope():
+                return chat_turn(
+                    config,
+                    self.provider,
+                    raw_fn,
+                    messages,
+                    tools,
+                    tool_map,
+                    self.builtin_clients,
+                    max_tool_rounds=(
+                        max_tool_rounds
+                        if max_tool_rounds is not None
+                        else self.budgets.max_tool_rounds
+                    ),
+                    chat_state=self.chat_state,
+                    on_token=on_token,
+                    input_fn=input_fn,
+                    steering_fn=steering_fn,
+                )
         finally:
             # A skill loaded mid-turn (skill_manage use) that declares a
             # larger rounds: budget keeps it for the rest of the session,
@@ -189,6 +211,15 @@ class AgentSession:
         if self._closed:
             return
         self._closed = True
+        self._closed_event.set()
+        if self._owns_pause_controller:
+            self._pause_controller.close()
+        fanout = self.builtin_clients.get("fan_out")
+        if hasattr(fanout, "stop"):
+            try:
+                fanout.stop()
+            except Exception:
+                pass
         ssh = self.builtin_clients.get("ssh_remote")
         if hasattr(ssh, "close"):
             try:

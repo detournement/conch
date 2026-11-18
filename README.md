@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.1][release] ·
+[Current release: v0.9.2][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.1
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.2
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -109,6 +109,7 @@ answer.
 | --- | --- |
 | Type | Filter by provider, model, tier, or billing |
 | Enter | Make it the chat model (verified first, as `/model` does) |
+| Ctrl+P | Set the highlighted model as primary, keeping the browser and filter open |
 | Ctrl+F | Fan-out workers use it (again: clear it, so workers use `subagent_model` or the session model) |
 | Ctrl+T | Side tasks use it (again: back to the chat model) |
 | Ctrl+E | Step the model's reasoning effort (each level, then back to the default) |
@@ -123,6 +124,10 @@ still runs the live model check. Role changes are saved as `fanout_model`,
 `weak_model`, and `weak_provider`. `/model <id> --provider <name>` switches to an
 exact provider when the same id exists under several. Registry models can only
 be the chat model.
+
+Ctrl+P uses the same validation as Enter; a failed check leaves the primary
+model unchanged. During a running turn, either shortcut queues the switch for
+the next safe turn boundary instead of replacing the active request's model.
 
 Effort and context are per model and apply to its next request, wherever it runs
 (chat, fan-out, side tasks). The row shows what is set (`[high · 32K ctx]`), and
@@ -167,12 +172,17 @@ multiline composer. The status line shows the permission mode, pending
 messages, session cost, the repository and branch (`🐙 owner/repo ⎇ branch` on
 GitHub; see [repository awareness](#conversations-memory-and-context)), the
 provider/model, the conversation, and active/total tools, as space allows.
+The info bar keeps the latest reply's token counts, cost, speed, context use, and
+model visible above the composer. `/infobar` selects detailed stats (the default)
+or a context-progress ruler.
 You can keep editing while a response streams. Activity shows what is
 running and elapsed time, not fabricated completion percentages or reasoning.
 
-Startup shows a rotating ASCII shell, phase label, and elapsed time while models
-and tools load. It clears before setup questions, sign-in, or the chat prompt.
-Animation is disabled for non-TTY output and `TERM=dumb`. Once loaded, a large
+Startup shows a colorful rotating shell and traveling wave, with the actual
+phase and elapsed time while models and tools load. Narrow terminals omit the
+wave; `NO_COLOR` keeps it monochrome and ASCII-only terminals get plain glyphs.
+It clears before setup questions, sign-in, or the chat prompt. Animation is
+disabled for non-TTY output and `TERM=dumb`. Once loaded, a large
 ASCII conch heads the banner when the terminal has room for it (at least 40
 columns by 31 rows); pipes and smaller windows skip it.
 
@@ -183,8 +193,14 @@ columns by 31 rows); pipes and smaller windows skip it.
 | Ctrl+Q | View pending guidance/follow-ups; Enter edits, Delete or Backspace removes |
 | Alt+R (or Escape, then R) | Hide/show provider reasoning and generation progress |
 | Alt+Enter (or Escape, then Enter) | Insert a newline |
-| Tab | Complete slash commands with descriptions |
-| Ctrl+P, `/help` | Search commands; selecting one fills the composer without executing it |
+| `/`, Ctrl+P | Open the inline command browser; type to filter names and descriptions |
+| Up/Down, Page Up/Down | Select and scroll commands without changing the draft |
+| Tab / Enter in the browser | Fill the selected command / run it |
+| Escape in the browser | Dismiss; Ctrl+P restores the previous draft |
+| `/help` | Search commands in a separate picker; selecting fills the composer |
+| `/colorscheme [name]` | Pick and save colors for the composer and panels |
+| `/infobar [detail\|progress]` | Pick and save detailed stats or a context-progress bar |
+| `/ebrake [on\|off\|status]` | Pause all session agents; `off` resumes, `status` reports |
 | `/model`, `/models` | Open the [model picker](#model-picker): every model, roles, add your own |
 | `/provider` | Choose a provider |
 | `/fanout` | Show or set the model [fan-out](#fan-out) workers use |
@@ -200,6 +216,21 @@ Tool activity is compact by default; `/verbose on` shows full returned results.
 Approval prompts use a separate input buffer: queued chat and unfinished drafts
 cannot approve a command. `/queue off` keeps the draft editable but disables
 submission during a turn. Multiline paste stays one message and Enter sends it.
+
+The command browser closes when you start entering arguments; multiline messages
+remain literal. `/colorscheme` offers `default`, `dark`, `light`, `dracula`,
+`solarized`, and `monochrome`. Hovering a row or moving with Up/Down previews
+its colors without saving. Click or Enter applies and saves it; Escape restores
+the configured scheme. Mouse tracking is enabled only while this picker is open.
+`NO_COLOR` and `TERM=dumb` override colors.
+
+`/ebrake` (or `/ebrake on`) pauses this session's foreground agent, delegated
+subagents, fan-out workers, in-process scheduled tasks, and shell-hosted remote
+turns before their next request or tool. Already-running requests/tools may
+finish; pending work is retained, not cancelled. `/ebrake off` resumes it,
+including while a turn is paused; Ctrl+C still interrupts. Paused time does not
+consume fan-out deadlines. Independent Conch sessions, external edge/fleet jobs,
+and work already submitted to remote services are not suspended.
 
 Steering takes effect after the current model request or running tool finishes.
 Unstarted tools from the old proposal are skipped, with explicit results kept in
@@ -602,7 +633,7 @@ The installer:
 - keeps using the original install method on upgrades;
 - installs from the GitHub `edge` branch tarball by default.
 
-`conch-shell` is not published on PyPI at v0.9.1. The release tag exists for
+`conch-shell` is not published on PyPI at v0.9.2. The release tag exists for
 source and auditability, while the website installer deliberately follows the
 maintained edge release line.
 
@@ -1075,8 +1106,17 @@ that holds the read token.
 
 ### Token stats
 
-After each reply, Conch shows input/output tokens, cost, context use, model,
-and exact or marked-estimated throughput. Toggle it for the session with:
+The default `detail` info bar shows the latest completed reply's input/output
+tokens, cost, exact or marked-estimated throughput, context use (`ctx N%`), and
+actual model. It wraps to two rows when needed. Before the first reply, only
+known cost, context, and model information appears; clearing or switching
+conversations clears the previous reply's metrics.
+
+`/infobar` opens the style picker. Choose directly with `/infobar detail` or
+`/infobar progress`; the choice applies immediately and is saved as `infobar`.
+Progress mode shows estimated utilization against the compaction budget, not a
+task-completion percentage. Plain sessions retain detailed per-reply stats.
+Toggle the info bar (or plain-session stats) for this session with:
 
 ```text
 /tks
@@ -1581,7 +1621,9 @@ network sandbox for tools you explicitly enable or approve.
 | `model_check_timeout` | `60` seats; `4` otherwise | Seconds per startup probe (0.5–60) |
 | `fallback_models` | unset | Ordered `provider/model` list a non-interactive run may switch to |
 | `tool_profile` | automatic | Built-in or custom tool profile |
-| `show_token_stats` | `true` | Per-reply token, cost, context, and throughput line |
+| `show_token_stats` | `true` | Show the info bar, or detailed per-reply stats in plain sessions |
+| `infobar` | `detail` | Info bar style: `detail` for full turn metrics, `progress` for context utilization |
+| `colorscheme` | `default` | Live composer/panel colors: `dark`, `light`, `dracula`, `solarized`, `monochrome`, or terminal-native `default` |
 | `repo_map` | `true` | Inject a bounded structural map in Git repositories |
 | `editor` | `$VISUAL`, `$EDITOR`, nano, vi | Editor for `/edit` and `/notes` |
 | `turn_token_budget` | off | Per-turn cap; exhaustion produces a progress summary |
@@ -1679,6 +1721,9 @@ plain sessions. This table groups the shipped commands.
 | Commands | Purpose |
 | --- | --- |
 | `/help` | Search commands in the live editor; list commands in plain sessions |
+| `/colorscheme [name]` | Pick, apply, and save the terminal color scheme |
+| `/infobar [detail\|progress]` | Pick, apply, and save the info bar style |
+| `/ebrake [on\|off\|status]` | Pause/resume all session agents at safe boundaries |
 | `/models`, `/model <name> [--provider <name>]`, `/provider <name>` | Open the model picker, or switch the validated model/provider |
 | `/fanout [auto\|default\|<provider/model>]` | Show or set the fan-out worker model |
 | `/agents`, `/subagents` | Subagent settings, skill subagents, and live worker activity |
@@ -1693,7 +1738,7 @@ plain sessions. This table groups the shipped commands.
 | `/terminal <command>` | Direct, uncaptured terminal handoff |
 | `/ssh connect\|status\|exec\|shell\|disconnect` | Validated OpenSSH control session |
 | `/verbose` | Toggle tool arguments and results |
-| `/tks [on\|off]` | Toggle per-reply token stats |
+| `/tks [on\|off]` | Toggle the info bar / plain-session token stats |
 | `/sandbox docker [image]`, `/sandbox e2b`, `/sandbox off` | Select execution backend |
 | `/checkpoint [list\|diff\|restore\|on\|off]`, `/undo` | Manage automatic Git snapshots |
 | `/schedule`, `/tasks`, `/cancel` | Scheduled prompts |

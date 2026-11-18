@@ -9,7 +9,23 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-17
+
 ### Added
+
+- An inline slash-command browser opens on `/` or Ctrl+P, filters names and
+  descriptions, and supports arrow/page navigation, Enter to run, Tab to fill,
+  and Escape to dismiss without losing the draft.
+- `/ebrake [on|off|status]` pauses and resumes the session's agents at safe
+  boundaries, preserving pending work and fan-out timeout budgets.
+- `/colorscheme [name]` selects and saves one of six shared color schemes for
+  the composer and panels, with monochrome and light-terminal support. Hover or
+  Up/Down previews a scheme; click or Enter saves it, and Escape restores the
+  configured colors.
+- `/infobar [detail|progress]` selects and saves a persistent detailed stats bar
+  (tokens, cost, throughput, context, model) or a context-utilization ruler.
+- Startup loading has a smoother, colorful shell-and-wave animation, with compact
+  rendering on narrow terminals and monochrome/ASCII fallbacks.
 
 - Codex model discovery now lists the signed-in native client's named models
   (including available Sol, Astra, Terra, and Luna versions) in the model picker
@@ -17,13 +33,26 @@ Releases before 0.6.0 predate this changelog.
   native visibility, pagination, and subscription billing; `default` remains an
   option.
 
+- Ctrl+P in the model browser sets the highlighted model as primary without
+  closing the page or clearing its filter. It uses the same validation as Enter;
+  switches requested during a running turn stay queued until a safe boundary.
+
 - Model picker: Ctrl+E steps a model's reasoning effort and Ctrl+W its context
   window, where the provider takes them (Claude and ChatGPT seats, Anthropic,
   OpenAI reasoning models, OpenRouter, Ollama thinking and `num_ctx`). Choices
   are per model, saved as `model_effort` and `model_context`, shown on the row
   and in the status bar, and never sent to a model that does not accept them.
 
+### Changed
+
+- Repository preflight now requires documentation updates and a version increment
+  before every merge to `main`, including docs-only and maintenance changes.
+
 ### Fixed
+
+- Claude seat streaming accepts the CLI's text-only user echoes and synthetic
+  structured-output reminders instead of failing with "unexpected user message".
+  Native tool results remain checked, and only the validated final answer is shown.
 
 - Custom and llamaidx reasoning models are no longer rejected during model
   switching because the tool-call probe ran out of tokens. The bounded probe
@@ -468,6 +497,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.2]: https://github.com/detournement/conch/releases/tag/v0.9.2
 [0.9.1]: https://github.com/detournement/conch/releases/tag/v0.9.1
 [0.9.0]: https://github.com/detournement/conch/releases/tag/v0.9.0
 [0.7.0]: https://github.com/detournement/conch/compare/v0.6.0...edge

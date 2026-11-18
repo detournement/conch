@@ -257,6 +257,103 @@ class ClaudeLiveDetailTests(unittest.TestCase):
         for secret in ("opaque", "private", "tool_calls", "Structured output", "hello"):
             self.assertNotIn(secret, repr(details))
 
+    def test_user_echoes_and_synthetic_schema_prompts_are_not_assistant_output(self):
+        validator = {"type": "tool_use", "name": "StructuredOutput", "id": "v", "input": RESPONSE}
+        reminder = "[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request."
+        events = [
+            {"type": "user", "message": {"role": "user", "content": "private conversation"},
+             "parent_tool_use_id": None, "isReplay": True, "uuid": "u", "session_id": "s"},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "text", "text": reminder}]}, "isSynthetic": True, "parent_tool_use_id": None},
+            {"type": "user", "message": {"role": "user", "content": reminder},
+             "isSynthetic": True, "parent_tool_use_id": None},
+            {"type": "assistant", "message": {"id": "m", "content": [validator]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "v", "content": "private validation result"}]}},
+            RESULT,
+        ]
+        details = []
+        result = self.invoke(events, lambda kind, text: details.append((kind, text)))
+        self.assertEqual(result["response"], RESPONSE)
+        self.assertEqual(details, [("progress", "Claude generation complete")])
+
+    def test_mixed_user_text_and_recognized_tool_results_are_accepted(self):
+        for name, identity, error in (("StructuredOutput", "validator", False),
+                                      ("local_shell", "refused", True)):
+            result_block = {"type": "tool_result", "tool_use_id": identity,
+                            "is_error": error, "content": "private tool result"}
+            text = {"type": "text", "text": "private schema reminder"}
+            for blocks in ([text, result_block], [result_block, text]):
+                events = [
+                    {"type": "system", "subtype": "init", "tools": ["StructuredOutput"]},
+                    {"type": "assistant", "message": {"id": "m", "content": [
+                        {"type": "tool_use", "name": name, "id": identity, "input": {}}]}},
+                    {"type": "user", "message": {"role": "user", "content": blocks},
+                     "isSynthetic": True},
+                    RESULT,
+                ]
+                details = []
+                with self.subTest(name=name, blocks=blocks):
+                    result = self.invoke(events, lambda kind, text: details.append((kind, text)))
+                    self.assertEqual(result["response"], RESPONSE)
+                    self.assertNotIn("private", repr(details))
+
+    def test_mixed_user_text_cannot_hide_unrecognized_or_executed_tool_results(self):
+        prefix = [
+            {"type": "system", "subtype": "init", "tools": ["StructuredOutput"]},
+            {"type": "assistant", "message": {"id": "m", "content": [
+                {"type": "tool_use", "name": "local_shell", "id": "refused", "input": {}}]}},
+        ]
+        for result_block in (
+            {"type": "tool_result", "tool_use_id": "unknown", "is_error": True},
+            {"type": "tool_result", "tool_use_id": "refused"},
+            {"type": "tool_result", "tool_use_id": "refused", "is_error": False},
+            {"type": "tool_result", "tool_use_id": "refused", "is_error": 1},
+            {"type": "tool_result", "tool_use_id": []},
+        ):
+            text = {"type": "text", "text": "private schema reminder"}
+            for blocks in ([text, result_block], [result_block, text]):
+                event = {"type": "user", "message": {"role": "user", "content": blocks},
+                         "isSynthetic": True, "isReplay": True}
+                with self.subTest(blocks=blocks), self.assertRaises(SeatError) as caught:
+                    self.invoke(prefix + [event, RESULT], lambda *args: None)
+                self.assertNotIn("private", str(caught.exception))
+
+    def test_user_messages_reject_malformed_text_and_unsupported_blocks(self):
+        for message in (
+            None, [], {}, {"content": None}, {"content": 42},
+            {"role": "assistant", "content": "private"},
+            {"content": ["private"]},
+            {"content": [{"type": "text"}]},
+            {"content": [{"type": "text", "text": None}]},
+            {"content": [{"type": "text", "text": {"private": "content"}}]},
+            {"content": [{"type": "text", "text": "private"},
+                         {"type": "tool_use", "name": "Bash", "id": "x", "input": {}}]},
+            {"content": [{"type": "server_tool_use", "name": "web_search", "id": "x"}]},
+            {"content": [{"type": "future_native_result", "content": "private"}]},
+        ):
+            event = {"type": "user", "message": message, "isSynthetic": True}
+            with self.subTest(message=message), self.assertRaises(SeatError) as caught:
+                self.invoke([event, RESULT], lambda *args: None)
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_user_text_does_not_bypass_subagent_or_final_result_validation(self):
+        text = {"type": "user", "message": {"role": "user", "content": "private"},
+                "isSynthetic": True}
+        for events in (
+            [{**text, "parent_tool_use_id": "native-agent"}, RESULT],
+            [{**text, "agent_id": "native-agent"}, RESULT],
+            [text],
+            [text, {**RESULT, "structured_output": None}],
+            [text, {**RESULT, "subtype": "error_max_structured_output_retries"}],
+            [text, {**RESULT, "permission_denials": [{"tool_name": "Bash"}]}],
+        ):
+            details = []
+            with self.subTest(events=events), self.assertRaises(SeatError) as caught:
+                self.invoke(events, lambda kind, text: details.append((kind, text)))
+            self.assertEqual(details, [])
+            self.assertNotIn("private", str(caught.exception))
+
     def test_native_tool_attempts_and_unmatched_results_fail_closed(self):
         for block in (
             {"type": "tool_use", "name": "Bash", "id": "x", "input": {"command": "private-command"}},

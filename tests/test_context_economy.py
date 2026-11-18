@@ -9,6 +9,7 @@
 1.5: token-aware tool-result truncation.
 """
 
+import re
 import unittest
 from unittest.mock import patch
 
@@ -160,18 +161,23 @@ class TestTokenCalibration(CalibrationTestCase):
 
 
 class TestContextGauge(unittest.TestCase):
-    def test_percentage_shown(self):
-        gauge = format_context_gauge(5000, 10000)
-        self.assertIn("50%", gauge)
-        self.assertIn("ctx", gauge)
+    def test_unknown_window_is_empty(self):
+        for window in (None, 0, -1):
+            with self.subTest(window=window):
+                self.assertEqual(format_context_gauge(10, window), "")
 
-    def test_colors_by_severity(self):
-        self.assertIn("\033[32m", format_context_gauge(10, 100))   # green
-        self.assertIn("\033[33m", format_context_gauge(65, 100))   # yellow
-        self.assertIn("\033[31m", format_context_gauge(85, 100))   # red
+    def test_negative_usage_clamps_and_over_capacity_stays_truthful(self):
+        for used, expected in ((-1, 0), (125, 125)):
+            with self.subTest(used=used):
+                gauge = format_context_gauge(used, 100)
+                self.assertEqual(int(re.search(r"(\d+)%", gauge).group(1)), expected)
 
-    def test_empty_for_zero_window(self):
-        self.assertEqual(format_context_gauge(10, 0), "")
+    def test_color_disabled_terminals_receive_plain_text(self):
+        for environment in ({"TERM": "xterm", "NO_COLOR": ""}, {"TERM": "dumb"}):
+            with patch.dict("os.environ", environment, clear=True):
+                gauge = format_context_gauge(50, 100)
+                self.assertNotIn("\x1b", gauge)
+                self.assertTrue(gauge.isascii())
 
 
 class TestToolResultTruncation(CalibrationTestCase):

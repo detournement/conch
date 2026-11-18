@@ -43,9 +43,9 @@ from .tooling import (
 
 BUILTIN_SLASH_COMMANDS = (
     "/?", "/agent", "/agents", "/approvals", "/approve", "/apps", "/cancel",
-    "/checkpoint", "/clear", "/compact", "/connect", "/convos", "/cost", "/delete",
-    "/deny", "/disable", "/edit", "/enable", "/export", "/fact", "/facts", "/fanout",
-    "/find", "/fork", "/forget", "/grep", "/h", "/help", "/image", "/install", "/keys",
+    "/checkpoint", "/clear", "/colorscheme", "/compact", "/connect", "/convos", "/cost", "/delete",
+    "/deny", "/disable", "/ebrake", "/edit", "/enable", "/export", "/fact", "/facts", "/fanout",
+    "/find", "/fork", "/forget", "/grep", "/h", "/help", "/image", "/infobar", "/install", "/keys",
     "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
     "/models", "/new", "/note", "/notes", "/paste", "/profile", "/profiles",
@@ -145,6 +145,9 @@ def render_user_command(template: str, arguments: str) -> str:
 
 SLASH_COMMANDS = [
     ("/help", "Show all commands"),
+    ("/ebrake [on|off|status]", "Pause all session agents at safe boundaries; off resumes"),
+    ("/colorscheme [name]", "Pick and save the terminal color scheme"),
+    ("/infobar [detail|progress]", "Pick and save detailed stats or a context-progress bar"),
     ("/models", "Model picker: every model, roles (fan-out, side tasks), add your own"),
     ("/model <name>", "Switch model (no name: open the model picker)"),
     ("/llamaidx", "Fleet status from the llama-idx registry (up/degraded/down boxes)"),
@@ -1453,6 +1456,15 @@ def handle_slash_command(
     command = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
+    if command == "/ebrake":
+        return ("ebrake", arg)
+
+    if command == "/colorscheme":
+        return ("colorscheme", arg)
+
+    if command == "/infobar":
+        return ("infobar", arg)
+
     if command in ("/help", "/h", "/?"):
         from .plugins import load_builtin_plugins, slash_commands
 
@@ -1464,6 +1476,9 @@ def handle_slash_command(
         )
         print(
             "\n\033[1;36mSlash commands:\033[0m\n"
+            "  \033[1m/ebrake [on|off|status]\033[0m Pause all session agents; off resumes\n"
+            "  \033[1m/colorscheme [name]\033[0m  Pick and save terminal colors\n"
+            "  \033[1m/infobar [detail|progress]\033[0m Pick and save the info bar style\n"
             "  \033[1m/models\033[0m              Model picker: every model, roles, add your own\n"
             "  \033[1m/model <name>\033[0m        Switch model (no name: open the model picker)\n"
             "  \033[1m/llamaidx\033[0m            Fleet status from the llama-idx registry\n"
@@ -1662,7 +1677,7 @@ def handle_slash_command(
         return None
 
     if command == "/tks":
-        # Session-scoped flip of the per-message token-stats line
+        # Session-scoped flip of the info bar / plain-session stats
         # (config dict is shared with chat_loop; set show_token_stats
         # in the config file to persist a preference).
         from .config import get_bool
@@ -1675,7 +1690,7 @@ def handle_slash_command(
             enabled = not get_bool(config, "show_token_stats", default=True)
         config["show_token_stats"] = "true" if enabled else "false"
         state = "\033[1;32mon\033[0m" if enabled else "\033[33moff\033[0m"
-        print(f"\n  Token stats after each message: {state}"
+        print(f"\n  Info bar / token stats: {state}"
               "  \033[2m(this session; persist with show_token_stats"
               " in the config file)\033[0m\n")
         return None
@@ -1900,7 +1915,7 @@ def handle_slash_command(
 
         current_id = current_conv.id if current_conv else None
         if can_browse():
-            chosen = browse(conv_mgr, current_id=current_id)
+            chosen = browse(conv_mgr, current_id=current_id, config=config)
             if current_conv is not None:
                 # The page may have renamed the conversation this shell is
                 # in; adopt that title so the next save keeps it.
@@ -2194,14 +2209,26 @@ def handle_slash_command(
         from .convo_browser import can_browse
 
         if can_browse():
-            # The model picker; its pick switches through /model below with
-            # the provider named exactly.
+            # Both primary shortcuts use /model's validation and config update.
+            # Keep the last successful switch even when the picker exits via Escape.
             from .model_picker import pick_model
 
-            chosen = pick_model(config, provider, model_name)
-            if chosen is None or chosen.key == (provider, model_name):
-                return None
-            command, arg = "/model", chosen.switch_command().split(" ", 1)[1]
+            primary_result = None
+
+            def set_primary(entry):
+                nonlocal primary_result
+                result = handle_slash_command(
+                    entry.switch_command(), config,
+                    config.get("provider") or provider,
+                    config.get("chat_model") or model_name,
+                    set_agent_mode, messages=messages)
+                if result is None:
+                    return False
+                primary_result = result
+                return True
+
+            pick_model(config, provider, model_name, on_primary=set_primary)
+            return primary_result
 
     if command in ("/models", "/ls"):
         print()

@@ -2,10 +2,14 @@
 provider-exact switching, roles saved to config and cleared with the model
 they name, and unusable providers refused before anything changes."""
 
+import asyncio
 import os
 import tempfile
 import unittest
 from unittest import mock
+
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from conch import model_catalog
 from conch.model_catalog import ModelEntry, ProviderStatus
@@ -147,6 +151,75 @@ class PickerTests(_ConfigCase):
         self.assertIn("model list unavailable", picker.statuses["codex"].note)
         picker.choose()
         self.assertEqual(picker.result.key, ("codex", "native-model"))
+
+
+class PrimaryPickerTests(_ConfigCase, unittest.IsolatedAsyncioTestCase):
+    async def wait_until(self, predicate):
+        async def wait():
+            while not predicate():
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(wait(), timeout=5)
+
+    def primary_picker(self):
+        from conch.commands import handle_slash_command
+
+        self.config["model_check"] = "off"
+
+        def apply(entry):
+            return handle_slash_command(
+                entry.switch_command(), self.config,
+                self.config["provider"], self.config["chat_model"],
+                lambda _on: None) is not None
+
+        return ModelPicker(self.config, "anthropic", "claude-sonnet-5",
+                           on_primary=apply)
+
+    async def test_ctrl_p_switches_primary_and_keeps_filter_and_role_controls_live(self):
+        picker = self.primary_picker()
+        picker.query.text = "gpt-6-sol"
+        picker.selected_key = ("openai", "gpt-6-sol")
+        with create_pipe_input() as input:
+            app = picker.build(input=input, output=DummyOutput())
+            task = asyncio.create_task(app.run_async())
+            try:
+                await self.wait_until(lambda: app.is_running)
+                input.send_text("\x10")
+                await self.wait_until(lambda: picker.current == ("openai", "gpt-6-sol"))
+                self.assertTrue(app.is_running)
+                self.assertEqual(self.config["chat_model"], "gpt-6-sol")
+                self.assertEqual(picker.query.text, "gpt-6-sol")
+                self.assertEqual(picker.selected_key, picker.current)
+                input.send_text("\x14")
+                await self.wait_until(lambda: self.config.get("weak_model") == "gpt-6-sol")
+                self.assertEqual(self.saved()["weak_provider"], "openai")
+                self.assertTrue(app.is_running)
+                input.send_text("\x03")
+                await asyncio.wait_for(task, timeout=5)
+                self.assertEqual(self.config["provider"], "openai")
+            finally:
+                if not task.done():
+                    app.exit()
+                    await task
+
+    async def test_failed_primary_validation_keeps_previous_model_and_picker_open(self):
+        picker = self.primary_picker()
+        picker.entries.append(ModelEntry("openai", "not-a-known-model"))
+        picker.query.text = "not-a-known-model"
+        original = dict(self.config)
+        with create_pipe_input() as input:
+            app = picker.build(input=input, output=DummyOutput())
+            task = asyncio.create_task(app.run_async())
+            try:
+                await self.wait_until(lambda: app.is_running)
+                input.send_text("\x10")
+                await self.wait_until(lambda: "unchanged" in picker.notice)
+                self.assertEqual(self.config, original)
+                self.assertEqual(picker.current, ("anthropic", "claude-sonnet-5"))
+                self.assertTrue(app.is_running)
+            finally:
+                if not task.done():
+                    app.exit()
+                await asyncio.wait_for(task, timeout=5)
 
 
 class ModelCommandTests(_ConfigCase):

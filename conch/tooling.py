@@ -2701,6 +2701,9 @@ class DelegateTaskClient:
         from .providers import RAW_FNS
         from .runtime import truncate_tool_result
         from .session import AgentSession
+        from .ebrake import checkpoint, current_controller
+
+        checkpoint()
 
         config, provider = self._subagent_config(
             preferred_model=(skill or {}).get("model", ""),
@@ -2765,6 +2768,10 @@ class DelegateTaskClient:
                 else default_permissions()
             ),
             cwd=(parent.cwd if parent is not None else None),
+            pause_controller=(
+                parent._pause_controller if parent is not None
+                else current_controller()
+            ),
         )
         child.budgets.max_tool_rounds = rounds
         child.attach_clients(sub_clients, bind=False)
@@ -2776,6 +2783,8 @@ class DelegateTaskClient:
             )
         except Exception as exc:
             return self._text(f"Error: subagent failed: {exc}")
+        finally:
+            child.close()
         if not (reply or "").strip():
             return self._text("Subagent finished without a summary (likely a provider error).")
         reply = truncate_tool_result(reply, provider, config)

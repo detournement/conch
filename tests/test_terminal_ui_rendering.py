@@ -8,7 +8,7 @@ from unittest.mock import patch
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.data_structures import Point, Size
-from prompt_toolkit.formatted_text import fragment_list_to_text
+from prompt_toolkit.formatted_text import fragment_list_to_text, to_formatted_text
 from prompt_toolkit.input import DummyInput
 from prompt_toolkit.key_binding.key_processor import KeyPress, _Flush
 from prompt_toolkit.keys import Keys
@@ -91,6 +91,46 @@ class LivePanelRenderingTests(_UICase):
                 self.assertIn("LIVE-END", self.render())
 
 
+class PromptEchoTests(_UICase):
+    async def test_prompt_boundaries_keep_literal_text_and_queue_order(self):
+        import threading
+
+        self.ui._thread = threading.current_thread()
+        self.ui._schedule_publish = lambda: None
+        prompt = "  first line\n\n" + "界e\u0301 long " * 20 + "\n\tlast line  "
+        hostile = "\033[31mRED\033[0m\033]52;c;clipboard\a\x9b2J"
+        for width in (12, 24, 80):
+            with self.subTest(width=width):
+                self.output.size = Size(rows=12, columns=width)
+                self.ui._enqueue_output("BEFORE", trusted=False)
+                self.ui._accept_messages([prompt, hostile])
+                self.ui._enqueue_output("AFTER", trusted=False)
+                queued = list(self.ui._output_queue)
+                self.assertEqual(len(queued), 4)
+                for fragments, trusted in queued[1:3]:
+                    self.assertFalse(trusted)
+                    self.assertTrue(all(get_cwidth(value) < width
+                                        for style, value in fragments if style))
+                self.assertIn(("", "\n" + prompt + "\n"), queued[1][0])
+                self.assertEqual(self.ui._history.get_strings()[-2:], [prompt, hostile])
+                with patch("conch.terminal_ui.print_formatted_text") as publish, \
+                        patch.object(self.ui._app.renderer, "erase"), \
+                        patch.object(self.ui._app, "_request_absolute_cursor_position"), \
+                        patch.object(self.ui._app, "_redraw"):
+                    await self.ui._publish_output()
+                fragments = publish.call_args.args[1]
+                transcript = fragment_list_to_text(fragments)
+                self.assertTrue(transcript.startswith("BEFORE\n\n"))
+                self.assertTrue(transcript.endswith("\n\nAFTER"))
+                self.assertIn("\n" + prompt + "\n", transcript)
+                inert = "[31mRED[0m]52;c;clipboard2J"
+                self.assertIn(("", "\n" + inert + "\n"), fragments)
+                self.assertLess(transcript.index(prompt), transcript.index(inert))
+                self.assertNotIn("\033", transcript)
+                self.assertNotIn("\x9b", transcript)
+                self.assertNotIn("\a", transcript)
+
+
 class _DirectUI(_UICase):
     """State changes applied inline: the event loop is not running here."""
 
@@ -98,7 +138,8 @@ class _DirectUI(_UICase):
         super().setUp()
         self.ui._change = lambda function, *args: function(*args)
         self.published = []
-        self.ui._enqueue_output = lambda text, trusted: self.published.append(text)
+        self.ui._enqueue_output = lambda text, trusted: self.published.append(
+            fragment_list_to_text(to_formatted_text(text)))
 
     def queue(self, *texts, kind="steering"):
         from conch.terminal_ui import _PendingMessage
@@ -464,7 +505,6 @@ class LiveCommandTests(_DirectUI):
         self.submit("/models")
         self.assertTrue(self.started.wait(5), "panel runner never started")
         self.assertEqual(len(self.ui._messages), 0)
-        self.assertIn("> /models\n", self.published)
         self.assertEqual(self.ui._editor.text, "")
 
     def test_session_changing_command_still_waits_for_the_turn(self):

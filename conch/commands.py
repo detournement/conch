@@ -52,7 +52,7 @@ BUILTIN_SLASH_COMMANDS = (
     "/provider", "/queue", "/registry", "/reload", "/remember", "/rename", "/reset",
     "/resettools", "/retry", "/rounds", "/s", "/sandbox", "/schedule", "/search",
     "/skill", "/skills", "/ssh", "/status", "/subagents", "/switch", "/tasks",
-    "/terminal", "/tks", "/todo", "/tools", "/tty", "/undo", "/verbose",
+    "/terminal", "/tks", "/todo", "/tools", "/tty", "/undo", "/update", "/verbose",
     "/yolo",
 )
 
@@ -197,6 +197,8 @@ SLASH_COMMANDS = [
      "List conch components or set one up (edge, fleet, works)"),
     ("/keys [check|set NAME|rotate|doctor|import|required|reload]",
      "See, verify, and rotate every credential conch uses (hot-reloads this session)"),
+    ("/update [--check] [--merge|--rebase]",
+     "Update Conch safely; saves and closes this session before installing"),
     ("/todo [add|done|due|list|show|work|escalate ...]",
      "Personal todo list (bare /todo = today view)"),
     ("/list <space> [verb ...]",
@@ -1522,6 +1524,7 @@ def handle_slash_command(
             "  \033[1m/missions\033[0m            List durable missions (edge daemon)\n"
             "  \033[1m/mission show|new|pause|resume|abort|input|verify\033[0m  Manage a mission / verify the journal\n"
             "  \033[1m/install [component]\033[0m List or set up components (edge, fleet, works, capture)\n"
+            "  \033[1m/update [--check] [--merge|--rebase]\033[0m  Update Conch; save and close the session first\n"
             "  \033[1m/keys [check|set NAME|rotate|doctor]\033[0m  See, verify, rotate credentials (hot-reloads this session)\n"
             "  \033[1m/todo\033[0m                Today's personal todos (due, overdue, most urgent)\n"
             "  \033[1m/todo add <title> [due:...] [p1-5] [#tag] [-- body]\033[0m  Capture a todo\n"
@@ -2747,6 +2750,23 @@ def handle_slash_command(
 
     if command == "/reload":
         return "reload_tools"
+
+    if command == "/update":
+        from .update import build_parser, main as update_main
+
+        try:
+            argv = shlex.split(arg)
+            options = build_parser(prog="/update").parse_args(argv)
+        except ValueError as exc:
+            print(f"\n  Invalid update arguments: {exc}\n")
+            return None
+        except SystemExit:
+            return None  # Help and usage errors must not close the chat.
+        if options.check:
+            update_main(argv, prog="/update")
+            return None
+        # The shell must save and shut down before its source files change.
+        return ("update", argv)
 
     if command == "/keys":
         # The credential manager, in-session: same code as `conch keys`,

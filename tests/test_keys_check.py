@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 from conch import config as config_mod
 from conch.keys import cli
+from conch.modelcheck import AUTH_FAILED, OK, QUOTA, probe_key
 from tests.keys_fakes import FakeServices
 from tests.modelcheck_stubs import StubEndpoint, closed_port_url
 
@@ -188,6 +189,65 @@ class TestCheckClassification(KeysCase):
         code, data = self.run_json(["check"], {"CONCH_OPENROUTER_API_BASE": closed_port_url() + "/v1"})
         self.assertEqual(self.row(data, "OPENROUTER_API_KEY")["status"], "unreachable")
         self.assertEqual(code, 0)
+
+    def test_completion_fallback_rejects_credentials_without_echoing_key(self):
+        payloads = (
+            {"error": {"message": f"Invalid API key: {STALE_OR}"}},
+            {"detail": f"Invalid API key: {STALE_OR}"},
+            {"error": {"message": f"Invalid API key: {STALE_OR}; max_tokens is not supported"}},
+            {"error": {"message": f"{STALE_OR} " + "x" * 200 + " invalid API key"}},
+            {"error": {"code": "invalid_api_key"}},
+            {"error": {"type": "authentication_error"}},
+            {"code": "invalid_api_key"},
+            {"error": {"code": "invalid_token"}},
+        )
+        self.write_env(f"OPENROUTER_API_KEY={STALE_OR}\n")
+        for status in (400, 422):
+            for payload in payloads:
+                with self.subTest(status=status, payload=payload):
+                    server = StubEndpoint([], force_status=(status, payload)).start()
+                    try:
+                        env = {"CONCH_OPENROUTER_API_BASE": server.v1}
+                        with patch.dict(os.environ, env):
+                            result = probe_key("openrouter", {}, api_key=STALE_OR, timeout=3)
+                        self.assertEqual(result.status, AUTH_FAILED)
+                        self.assertNotIn(STALE_OR, result.detail)
+                        code, text = self.run_keys(["check", "OPENROUTER_API_KEY", "--json"], env)
+                        self.assertEqual(code, 1)
+                        self.assertNotIn(STALE_OR, text)
+                        row = self.row(json.loads(text), "OPENROUTER_API_KEY")
+                        self.assertEqual(row["status"], "rejected")
+                        code, text = self.run_keys(["check", "OPENROUTER_API_KEY"], env)
+                        self.assertEqual(code, 1)
+                        self.assertNotIn(STALE_OR, text)
+                        self.assertTrue(any(method == "POST" for method, _ in server.requests))
+                    finally:
+                        server.stop()
+
+    def test_completion_fallback_accepts_model_and_body_rejections(self):
+        payloads = (
+            {"error": {"code": "model_not_found"}},
+            {"error": {"message": "max_tokens must be a positive integer"}},
+            {"error": {"message": "messages must not be empty"}},
+        )
+        for status in (400, 422):
+            for payload in payloads:
+                with self.subTest(status=status, payload=payload):
+                    server = StubEndpoint([], force_status=(status, payload)).start()
+                    try:
+                        with patch.dict(os.environ, {"CONCH_OPENROUTER_API_BASE": server.v1}):
+                            result = probe_key("openrouter", {}, api_key=GOOD_OR, timeout=3)
+                        self.assertEqual(result.status, OK)
+                        self.assertTrue(any(method == "POST" for method, _ in server.requests))
+                    finally:
+                        server.stop()
+
+    def test_completion_fallback_preserves_quota_rejection(self):
+        server = StubEndpoint([], force_status=(400, {"error": {"code": "insufficient_quota"}})).start()
+        self.addCleanup(server.stop)
+        with patch.dict(os.environ, {"CONCH_OPENROUTER_API_BASE": server.v1}):
+            result = probe_key("openrouter", {}, api_key=GOOD_OR, timeout=3)
+        self.assertEqual(result.status, QUOTA)
 
     def test_check_verifies_both_values_of_a_stale_duplicate(self):
         self.write_env(f"OPENROUTER_API_KEY={GOOD_OR}\n")

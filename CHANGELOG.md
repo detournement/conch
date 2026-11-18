@@ -31,6 +31,8 @@ Releases before 0.6.0 predate this changelog.
   reopen onboarding for rejected keys. No interactive login runs headlessly.
 - Ollama recovery verifies and saves the discovery endpoint instead of reusing
   another provider's stale URL.
+- API-key checks classify provider rejection codes before redacting diagnostics,
+  so HTTP 400/422 authentication failures cannot appear as accepted credentials.
 - Upgrades reconcile recognized stale shell launchers with private backups,
   preserving credentials, helper integrations, customized PATH entries, and
   valid shell syntax inside conditional/function bodies. Experimental checkouts

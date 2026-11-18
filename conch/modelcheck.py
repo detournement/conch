@@ -291,33 +291,28 @@ def _request(url: str, headers: Dict[str, str], timeout: float,
         return int(status), text
 
 
-def _short(text: str, limit: int = 160) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
 def _error_message(payload) -> Tuple[str, str]:
     """(message, code) pulled from the usual provider error envelopes."""
     if isinstance(payload, str):
-        return _short(payload), ""
+        return payload, ""
     if not isinstance(payload, dict):
         return "", ""
     err = payload.get("error")
     if isinstance(err, dict):
-        message = err.get("message") or err.get("msg") or json.dumps(err)[:200]
+        message = err.get("message") or err.get("msg") or json.dumps(err)
         code = str(err.get("code") or err.get("type") or "")
-        return _short(str(message)), code
+        return str(message), code
     if err is not None:
-        return _short(str(err)), ""
+        return str(err), str(payload.get("code") or payload.get("type") or "")
     for key in ("message", "detail", "msg"):
         if payload.get(key):
-            return _short(str(payload[key])), str(payload.get("code") or "")
-    return "", ""
+            return str(payload[key]), str(payload.get("code") or payload.get("type") or "")
+    return "", str(payload.get("code") or payload.get("type") or "")
 
 
 _AUTH_TEXT_MARKERS = (
-    "api key", "api-key", "x-api-key", "unauthorized", "authentication", "forbidden",
-    "credential", "bearer", "token",
+    "api key", "unauthorized", "authentication", "forbidden", "credential", "bearer",
+    "invalid token", "expired token", "token expired", "token invalid", "access token",
 )
 _MODEL_MISSING_MARKERS = (
     "not found", "does not exist", "doesn't exist", "unknown model", "no such",
@@ -346,6 +341,12 @@ def _classify_http(status: int, payload, model: str) -> Tuple[str, str]:
     if status == 404:
         return MODEL_NOT_FOUND, f"HTTP 404: {shown}"
     if status == 400 or status == 422:
+        # Classify the original envelope, never the redacted display detail.
+        # Normalize code spellings (invalid_api_key / invalid-token) without
+        # mistaking completion parameters such as max_tokens for credentials.
+        auth_text = low.replace("_", " ").replace("-", " ")
+        if any(marker in auth_text for marker in _AUTH_TEXT_MARKERS):
+            return AUTH_FAILED, f"HTTP {status}: {shown}"
         if code == "model_not_found" or (
             "model" in low and any(marker in low for marker in _MODEL_MISSING_MARKERS)
         ):
@@ -462,7 +463,7 @@ def _no_key_result(provider: str, model: str, key_env: str) -> ProbeResult:
 
 def _named_auth_failure(provider: str, key_env: str, status: int,
                         detail: str) -> str:
-    """Rewrite a classified 401/403 so it names the key variable and the
+    """Rewrite a classified auth failure so it names the key variable and the
     fix (``<NAME> was rejected by <service> (401) — run: conch keys set
     <NAME>``) instead of a bare HTTP line."""
     from .providers import auth_rejected_message
@@ -530,7 +531,7 @@ def probe_key(provider: str, config: dict, *,
               api_key: Optional[str] = None) -> ProbeResult:
     """The *credential* verdict for a cloud provider, independent of the
     configured model: ``ok`` when the key is accepted, ``auth_failed`` on
-    401/403, ``no_key`` when the variable is unset, else the transport
+    credential rejection, ``no_key`` when the variable is unset, else the transport
     or server class. Used by ``conch keys check``; the same request
     plumbing and classes as :func:`probe_model`, no second probe.
 
@@ -626,8 +627,7 @@ def probe_key(provider: str, config: dict, *,
                 if klass == AUTH_FAILED:
                     detail = _named_auth_failure(provider, key_env, status, detail)
                 elif klass in (MODEL_NOT_FOUND, CONFORMANCE_FAILED) or (
-                    status in (400, 404, 422)
-                    and not any(marker in detail.lower() for marker in _AUTH_TEXT_MARKERS)
+                    klass == ERROR and status in (400, 404, 422)
                 ):
                     # The request was authenticated and then rejected on its
                     # body (model id, parameters): the credential is valid.

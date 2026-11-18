@@ -572,7 +572,7 @@ class ActiveSessionSwitchTests(unittest.TestCase):
             requests = []
             def invoke(model, prompt, schema, timeout, **kwargs):
                 self.assertEqual(model, new.model)
-                payload = json.loads(prompt.split("\n", 1)[1])
+                payload = json.loads(prompt.rsplit("\n", 1)[1])
                 tool_names = {t["function"]["name"] for t in payload["tools"]}
                 calls = []
                 if tool_names == {"conch_probe"}:

@@ -216,6 +216,18 @@ CHAT_PROMPTS = {
 }
 
 
+FILE_LINK_GUIDANCE = (
+    "File and link presentation: always try to make files and links clickable. "
+    "Show complete http(s) URLs and absolute file:/// URIs for local files "
+    "and directories, with spaces and special path characters percent-encoded. "
+    "Keep destinations visible in prose, not only in Markdown labels, inline "
+    "code, or code fences. Use known, real destinations; never invent an "
+    "upload URL or present a remote-machine path as a local file. "
+    "Do not emit terminal escape sequences. Leave executable code, commands, "
+    "and tool arguments unchanged."
+)
+
+
 def build_self_description(provider: str, model: str, config: dict = None) -> str:
     """One-line self-knowledge blurb for the system prompt.
 

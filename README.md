@@ -1166,6 +1166,11 @@ Only native tool calls are executable; repeated identical call batches stop.
   the text alone, with a warning either way.
 - `/remember` and the `save_memory` tool write searchable memory. `/fact`
   appends bounded, always-loaded facts to `~/.config/conch/facts.md`.
+- Shared runtime instructions ask models to present files and links as clickable
+  destinations: complete web URLs and absolute, percent-encoded `file:///` links
+  for local files and directories, visible outside code blocks. This also applies
+  to custom prompts, subagents, and fallback models; actual click support depends
+  on your terminal. Executable code, commands, and tool arguments stay unchanged.
 - On `/new` and exit, a `[Session summary]` memory is written only when the
   session had substance: at least `session_summary_min_turns` user turns
   (default 3) or any tool use. A summary near-identical to one already

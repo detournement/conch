@@ -9,6 +9,13 @@ Releases before 0.6.0 predate this changelog.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-11-17
+
+### Changed
+
+- Maintenance release with updated version metadata and current-release
+  documentation. Functionality is unchanged from 0.9.2.
+
 ## [0.9.2] - 2026-11-17
 
 ### Added
@@ -497,6 +504,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.3]: https://github.com/detournement/conch/releases/tag/v0.9.3
 [0.9.2]: https://github.com/detournement/conch/releases/tag/v0.9.2
 [0.9.1]: https://github.com/detournement/conch/releases/tag/v0.9.1
 [0.9.0]: https://github.com/detournement/conch/releases/tag/v0.9.0

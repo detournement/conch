@@ -210,6 +210,75 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(protected.read_text(), original)
         self.assertFalse(marker.exists())
 
+    def test_single_line_command_substitution_does_not_block_launcher_repair(self):
+        home = self.tmp_path
+        selected = executable(home / ".local/bin/conch")
+        old = executable(home / "old/bin/conch", "old")
+        marker = home / "profile-executed"
+        rc = home / ".bashrc"
+        initialization = (f'eval "$(touch {shlex.quote(str(marker))}; '
+                          "printf '%s' 'export CUSTOM=kept')\"\n"
+                          f'eval "`touch {shlex.quote(str(marker))}; '
+                          "printf '%s' 'export LEGACY=kept'`\"\n")
+        rc.write_text(initialization + f"alias conch={shlex.quote(str(old))}\n")
+        report = repair_launcher(selected, environ=environment(home))
+        self.assertTrue(report.usable, report.conflicts)
+        self.assertIn(rc, report.changed)
+        self.assertFalse(marker.exists())
+        self.assertTrue(repair_launcher(selected, check=True, environ=environment(home)).usable)
+
+    def test_literal_startup_data_is_not_scanned_or_rewritten(self):
+        containers = (
+            ("quoted-heredoc", "cat <<'SCRIPT'\n", "SCRIPT\n"),
+            ("unquoted-heredoc", "cat <<SCRIPT\n", "SCRIPT\n"),
+            ("indented-heredoc", "cat <<-SCRIPT\n", "\tSCRIPT\n"),
+            ("single-quoted", "generated='\n", "'\n"),
+            ("ansi-quoted", "generated=$'escaped\\'\n", "'\n"),
+            ("double-quoted", 'generated="\n', '"\n'),
+            ("nested-substitution", "generated=\"$(printf '%s' \"\n", "\")\"\n"),
+            ("nested-backtick", "generated=\"`printf '%s' \"\n", "\"`\"\n"),
+        )
+        for name, opening, closing in containers:
+            for profile in (".zshenv", ".bashrc"):
+                with self.subTest(container=name, profile=profile):
+                    home = self.tmp_path / f"{name}-{profile}"
+                    home.mkdir()
+                    selected = executable(home / ".local/bin/conch")
+                    old = executable(home / "old/bin/conch", "old")
+                    fake_source = home / "literal-source"
+                    alias = f"alias conch={old}\n"
+                    fake_source.write_text(alias)
+                    redirected = home / "literal-zdotdir"
+                    redirected.mkdir()
+                    redirected_rc = redirected / ".zshrc"
+                    redirected_rc.write_text(alias)
+                    marker = home / "profile-executed"
+                    payload = (f"export ZDOTDIR={redirected}\n"
+                               f"source {fake_source}\n"
+                               + alias
+                               + "# >>> conch launcher (managed) >>>\n"
+                               + f'export PATH={old.parent}:"$PATH"\n'
+                               + "# <<< conch launcher (managed) <<<\n"
+                               + "# added by the conch installer\n"
+                               + f'export PATH="{old.parent}:$PATH"\n'
+                               + "literal-sensitive-value\n")
+                    rc = home / profile
+                    original = (f"touch {marker}\n" + opening + payload + closing).replace("\n", "\r\n").encode()
+                    rc.write_bytes(original)
+                    for check in (True, False, False):
+                        report = repair_launcher(selected, check=check, environ=environment(home))
+                        self.assertFalse(report.usable)
+                        self.assertTrue(any(str(rc) in conflict for conflict in report.conflicts))
+                        self.assertNotIn("literal-sensitive-value", "\n".join(report.conflicts))
+                        self.assertEqual(rc.read_bytes(), original)
+                        self.assertNotIn(rc, report.changed)
+                        self.assertNotIn(rc, report.pending)
+                        self.assertNotIn(fake_source, report.scanned)
+                        self.assertNotIn(redirected_rc, report.scanned)
+                        self.assertEqual(fake_source.read_text(), alias)
+                        self.assertEqual(redirected_rc.read_text(), alias)
+                        self.assertFalse(marker.exists())
+
     def test_outside_home_symlinked_profile_and_foreign_launcher_are_preserved(self):
         tmp_path = self.tmp_path
         home = tmp_path / "home"

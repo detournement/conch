@@ -17,7 +17,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 _START = "# >>> conch launcher (managed) >>>"
 _END = "# <<< conch launcher (managed) <<<"
@@ -134,6 +134,64 @@ def _credential_file(path: Path) -> bool:
             or path.suffix == ".env" or bool(third_party.intersection(path.parts)))
 
 
+def _ambiguous_profile(text: str, path: Path, report: RepairReport) -> bool:
+    """Refuse multiline shell data before any line-oriented interpretation."""
+    fish = path.suffix == ".fish"
+    for line in text.splitlines(keepends=True):
+        quote = ""
+        substitutions: List[Tuple[str, str]] = []
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if char == "\\" and (quote != "'" or fish):
+                if index + 1 < len(line) and line[index + 1] not in "\r\n":
+                    index += 2
+                    continue
+                break  # A continued physical line is also unsafe to split.
+            if quote not in ("'", "$'") and line.startswith("$(", index):
+                substitutions.append((")", quote))
+                quote = ""
+                index += 2
+                continue
+            if char == "`" and quote not in ("'", "$'"):
+                if substitutions and substitutions[-1][0] == "`":
+                    _, quote = substitutions.pop()
+                else:
+                    substitutions.append(("`", quote))
+                    quote = ""
+                index += 1
+                continue
+            if not quote and substitutions and char in "()":
+                if char == "(":
+                    substitutions.append((")", ""))
+                elif substitutions[-1][0] == ")":
+                    _, quote = substitutions.pop()
+                index += 1
+                continue
+            if char in ("'", '"'):
+                if not quote:
+                    quote = "$'" if char == "'" and index and line[index - 1] == "$" else char
+                elif quote == char or (quote == "$'" and char == "'"):
+                    quote = ""
+            elif not quote:
+                if char == "#" and (index == 0 or line[index - 1] in " \t;|&()"):
+                    break
+                if line.startswith("<<", index):
+                    break  # Includes quoted delimiters, <<- and here-strings.
+            if char in "\r\n" and (quote or substitutions):
+                break
+            index += 1
+        else:
+            if not quote and not substitutions:
+                continue
+        if quote or substitutions or line[index:index + 1] != "#":
+            report.conflicts.append(
+                f"{path}: multiline or ambiguous shell data; move it to a separate script "
+                "and configure launcher selection manually (not inspected or rewritten)")
+            return True
+    return False
+
+
 class _Profiles:
     def __init__(self, home: Path, env: Mapping[str, str], report: RepairReport):
         self.home, self.env, self.report = home, env, report
@@ -159,6 +217,8 @@ class _Profiles:
         self.files[path] = text
         self.variables[path] = dict(values)
         self.report.scanned.append(path)
+        if _ambiguous_profile(text, path, self.report):
+            return values
         for number, line in enumerate(text.splitlines(), 1):
             if line.lstrip().startswith("#"):
                 continue
@@ -297,6 +357,8 @@ def _block(directory: Path, fish: bool, ask: Optional[Path] = None) -> str:
 
 def _rewrite(path: Path, original: str, values: Dict[str, str], directory: Path,
              target: bool, home: Path, report: RepairReport, ask: Optional[Path] = None) -> str:
+    if _ambiguous_profile(original, path, report):
+        return original
     text = _without_managed(original, path, report)
     lines = text.splitlines(keepends=True)
     result: List[str] = []

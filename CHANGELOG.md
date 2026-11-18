@@ -33,6 +33,8 @@ Releases before 0.6.0 predate this changelog.
   another provider's stale URL.
 - API-key checks classify provider rejection codes before redacting diagnostics,
   so HTTP 400/422 authentication failures cannot appear as accepted credentials.
+- Launcher repair leaves profiles with ambiguous multiline shell data unchanged
+  and reports manual action rather than modifying quoted or generated scripts.
 - Upgrades reconcile recognized stale shell launchers with private backups,
   preserving credentials, helper integrations, customized PATH entries, and
   valid shell syntax inside conditional/function bodies. Experimental checkouts

@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.4][release] ·
+[Current release: v0.9.5][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.4
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.5
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -112,7 +112,7 @@ answer.
 | Key | Action |
 | --- | --- |
 | Type | Filter by provider, model, tier, or billing |
-| Enter | Make it the chat model (verified first, as `/model` does) |
+| Enter | Set the highlighted primary chat model and close (verified as with `/model`) |
 | Ctrl+P | Set the highlighted model as primary, keeping the browser and filter open |
 | Ctrl+F | Fan-out workers use it (again: clear it, so workers use `subagent_model` or the session model) |
 | Ctrl+T | Side tasks use it (again: back to the chat model) |
@@ -193,15 +193,17 @@ columns by 31 rows); pipes and smaller windows skip it.
 | Key or command | Action |
 | --- | --- |
 | Enter | Send; while busy, steer the active turn at its next safe boundary |
-| Alt+Q (or Escape, then Q) | Queue a follow-up for after the current turn |
+| Option+Q (Mac) / Alt+Q | Queue a follow-up for after the current turn |
 | Ctrl+Q | View pending guidance/follow-ups; Enter edits, Delete or Backspace removes |
-| Alt+R (or Escape, then R) | Hide/show provider reasoning and generation progress |
-| Alt+Enter (or Escape, then Enter) | Insert a newline |
+| Option+R / Alt+R | Hide/show provider reasoning and generation progress |
+| Option+Enter / Alt+Enter | Insert a newline |
 | `/`, Ctrl+P | Open the inline command browser; type to filter names and descriptions |
 | Up/Down, Page Up/Down | Select and scroll commands without changing the draft |
 | Tab / Enter in the browser | Fill the selected command / run it |
 | Escape in the browser | Dismiss; Ctrl+P restores the previous draft |
 | `/help` | Search commands in a separate picker; selecting fills the composer |
+| `/shortcuts` | Open a searchable keyboard reference, grouped by where each key works |
+| `/notifications [on\|off]` | Open the desktop alerts menu, or set and save On/Off directly |
 | `/colorscheme [name]` | Pick and save colors for the composer and panels |
 | `/infobar [detail\|progress]` | Pick and save detailed stats or a context-progress bar |
 | `/ebrake [on\|off\|status]` | Pause all session agents; `off` resumes, `status` reports |
@@ -215,6 +217,11 @@ columns by 31 rows); pipes and smaller windows skip it.
 | `/image [path\|clear]` | Attach the clipboard image (or a file) to your next message; dragging an image file in works too |
 | Ctrl+C | Stop active work and return pending messages to the composer; when idle, clear/cancel input (twice to exit) |
 | Ctrl+D | Exit with an empty composer |
+
+On macOS the modifier is **Option**; on Linux it is **Alt**. Both send the
+terminal's Escape prefix. If Option types `œ` or `®`, enable **Use Option as
+Meta key** in Terminal → Settings → Profiles → Keyboard (iTerm2: set an Option
+key to **Esc+**). Without changing settings, press Esc, then `q`, `r`, or Enter.
 
 Tool activity is compact by default; `/verbose on` shows full returned results.
 Approval prompts use a separate input buffer: queued chat and unfinished drafts
@@ -244,7 +251,7 @@ the turn ends; they are not injected into the model as guidance. Existing turn
 and token budgets still apply.
 
 Panels open right away during a turn instead of waiting: `/models`, `/provider`,
-`/help`, `/convos` (and `/switch` with no id), `/agents`, plus the read-only reports
+`/help`, `/shortcuts`, `/notifications`, `/convos` (and `/switch` with no id), `/agents`, plus the read-only reports
 `/status`, `/cost`, `/tools`, `/profiles`, `/skills`, `/facts`, `/memories`, and
 `/tasks`. The turn keeps running behind a full-screen panel and its output appears
 when the panel closes. A pick that changes the session (a chat model, provider,
@@ -252,13 +259,13 @@ or conversation) is queued and runs as soon as the turn ends; the conversations
 page holds back rename, fork, and delete until then. Model roles chosen in the
 picker apply at once.
 
-In the pending-message editor, Enter saves, Alt+Enter inserts a newline, and
+In the pending-message editor, Enter saves, Option+Enter (Alt+Enter on Linux) inserts a newline, and
 Escape restores the original. Your composer draft is preserved. A message being
 edited is reserved against delivery; messages already delivered cannot be edited.
 Approval prompts remain separate and can supersede the queue editor safely.
 
 Provider-supplied reasoning and generation progress are visible by default in a
-bounded panel, separate from final answers and tool results. Alt+R hides the
+bounded panel, separate from final answers and tool results. Option+R (Alt+R on Linux) hides the
 panel without discarding its text; it can be shown again, including after the
 turn ends. A new turn clears the previous details. Conch displays only what the
 provider exposes, never decrypts opaque reasoning, and does not enable extra
@@ -267,11 +274,25 @@ Subscription CLIs publish available progress/reasoning while running; their
 schema-constrained final answers appear only after validation. Native tool
 arguments and credential output are not shown as generation details.
 
-A turn that runs 30 seconds or longer posts a desktop notification when it
-finishes, naming the conversation and quoting the reply's first line (macOS via
-`osascript`, Linux via `notify-send`; nothing elsewhere). `notify_after_seconds`
-changes the threshold; `0` turns it off. Piped and `--non-interactive` sessions
-never notify.
+**Desktop alerts.** By default a turn taking at least 30 seconds posts the
+conversation name and first line of the reply. Open `/notifications` to turn
+alerts off or on, including during a turn. The choice is saved; switching off
+keeps your `notify_after_seconds` delay. A delay of `0` or `off` still disables
+alerts; explicitly switching back on from that setting restores 30 seconds.
+Piped and `--non-interactive` sessions never notify.
+
+- **Apple Terminal:** install `terminal-notifier` (`brew install terminal-notifier`)
+  for clickable banners. On click, Conch selects the originating tab and raises its
+  window, even if you have since switched tabs. Allow notifications and, if macOS
+  asks, allow the click handler to control Terminal. Without the helper, the tab
+  rings its bell instead. Conch does not post Script Editor banners.
+- **iTerm2, Ghostty, kitty and WezTerm:** the terminal posts its own alert for
+  the originating terminal session. Its notification settings control delivery
+  and click behavior.
+- **Other Linux desktop terminals:** Conch uses `notify-send` (e.g. `libnotify-bin`
+  on Debian/Ubuntu) and the desktop notification service. Click-to-focus isn't
+  portable across desktops. Conch skips native terminal sequences inside tmux
+  or screen and doesn't post remote SSH conversations on the host's desktop.
 
 The editor uses `prompt_toolkit` on a real terminal. Pipes, one-shot commands,
 `--non-interactive`, and `TERM=dumb` retain the plain input/output path.
@@ -634,17 +655,31 @@ The installer:
 - requires Python 3.9 or newer;
 - prefers `uv`, then `pipx`, then a private venv;
 - places commands on the zsh, bash, or POSIX-shell path without `sudo`;
-- keeps using the original install method on upgrades;
+- keeps using the original managed install method on upgrades;
 - shows an existing launcher and asks `[y/N]` on `/dev/tty` before downloads
-  or installation changes; a fresh install remains unattended;
-- updates recognized source checkouts through their configured Git upstream,
-  including older Conch versions without the `update` command, rather than
-  installing a second copy; unknown installations are left untouched;
-- installs from the GitHub `edge` branch tarball by default.
+  or installation changes;
+- updates official checkouts tracking the selected `edge`/`main` upstream in
+  place, including older versions without the `update` command;
+- offers a separate, consented managed-install migration for experimental
+  branches, forks, and different release lines; the checkout and local work
+  stay untouched rather than merging unrelated branches;
+- installs from the GitHub `edge` branch tarball by default;
+- repairs recognized stale Conch aliases and PATH entries in zsh, bash, and
+  fish startup files, including literal sourced files and `ZDOTDIR`, with
+  private backups. Credentials, unrelated shell settings, and source helpers
+  are preserved. Ambiguous functions, activated environments, and protected
+  files are reported rather than silently called fixed;
+- verifies the configured model, not just the presence of keys. Interactive
+  failures reopen seat-first setup on the controlling terminal; headless
+  installs report unverified access and tell you to run `conch setup`.
 
-`conch-shell` is not published on PyPI at v0.9.4. GitHub releases include a
+For a read-only launcher inventory, run the installer with `--check`.
+Existing shells retain aliases and command hashes: use the printed absolute
+launcher immediately, then open a new terminal for the repaired startup files.
+
+`conch-shell` is not published on PyPI at v0.9.5. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v0.9.4` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v0.9.5` to install the release sdist.
 
 ### Updating
 
@@ -661,6 +696,10 @@ installation and dependencies. Detached HEAD, unfinished Git operations, and
 unsafe file collisions are refused. Failed integration is aborted; if restoring
 local work conflicts, its recovery stash is retained with instructions.
 It never force-pushes or discards local commits.
+Editable installs use a PEP 660-capable installer: old pip (before 21.3) is
+upgraded in the same isolated/user environment, or `uv` is used. System pip
+is never automatically upgraded. Successful updates reconcile startup
+launcher selection; unrelated environments and checkouts are not deleted.
 
 Managed/package installations reinstall from their recorded Git or download
 source in the same Python environment, not from a potentially older PyPI
@@ -684,16 +723,20 @@ The source installer creates or updates `.venv`, installs Conch and its terminal
 dependencies there, and wires the repository's shell integration. The source
 `bin/conch` and `bin/conch-chat` launchers use that environment when present,
 without requiring shell activation or modifying system Python.
-Existing credentials/configuration are preserved. New installs choose a provider
-through the same first-launch wizard below; the installer does not ask for model
-API keys. This is the developer path; the website one-liner is the end-user path.
+Existing credentials/configuration are preserved. Installation verifies the
+configured model and offers the same setup below if access fails; API keys are
+optional. The venv's Python is not added to your global PATH. This is the
+developer path; the website one-liner is the end-user path.
 
-### First launch
+### Provider setup and first launch
 
-The first interactive launch lists **Claude seats** and **ChatGPT seats** before
-API-key providers and shows each seat's state: signed in, installed but not
-signed in, or CLI not installed. Enter selects the first usable seat. Choose
-**one** of the following paths.
+Run `conch setup` to verify or repair your primary provider, or
+`conch setup --check` for verification without prompts or file changes.
+The installer and an unconfigured interactive launch offer **Claude seats**
+and **ChatGPT seats** before API-key providers, showing native sign-in state.
+Enter defaults to a signed-in seat, then an installed seat, then Claude.
+After verifying one subscription, you can connect the other and choose which
+is primary. Tokens remain with the providers' official CLIs.
 
 Setup has three steps: choose a provider, connect it (native sign-in or a
 hidden API-key prompt), and verify a model. Ollama and custom endpoints offer
@@ -702,13 +745,12 @@ so setup does not immediately repeat the same model check. The first chat screen
 shows example requests, model/command discovery, and the active approval policy.
 
 A choice that cannot be completed saves nothing and returns to the provider
-menu: a missing provider CLI (with its install command), a failed sign-in, an
-empty API key, an unreachable Ollama, or an empty custom URL. A key the provider
-rejects is saved only if you confirm (custom-endpoint key checks are advisory).
-If the final model check fails, setup offers another provider: accepting
-discards the failed attempt, declining keeps its saved settings. Ctrl+C cancels
-setup without starting a broken session; existing configuration skips the wizard.
-The installer does not ask for optional integration credentials.
+menu: a missing CLI (with its install command), failed sign-in, rejected API
+key, unreachable Ollama, or empty custom URL. Routing and new API keys are
+staged until the chosen model verifies. Failed retries and Ctrl+C preserve
+preexisting configuration and credentials; no broken session is started.
+Existing settings do not count as proof of access: failed startup checks
+offer setup again. Optional integration credentials are not requested.
 
 With Node.js and npm available, install the official CLI and sign in:
 
@@ -754,6 +796,9 @@ and search are disabled or isolated; Codex's residual patch tool is denied by
 read-only/never-approval policy. Enterprise-managed Codex MCP configurations are
 not supported by this isolation boundary. Final answers are buffered; published
 reasoning and generation progress appear while the request runs.
+That sandbox applies only to native CLI execution, not Conch's host tools.
+The inference bridge explicitly separates those scopes: file actions still go
+through Conch's approval policy and the current OS user's permissions.
 Subscription limits still apply; token statistics label seat usage rather than
 estimating API charges. Seat sessions do not automatically fall back to API-key
 billing. An explicitly configured startup `fallback_models` list remains prior consent.
@@ -769,8 +814,12 @@ options. Their hidden-input wizard stores keys in `~/.config/conch/env` with mod
 `0600`; Conch loads that file itself. [`conch keys`](#rotating-api-keys) manages
 API and integration credentials, not subscription tokens.
 
-The wizard ends with the [startup model check](#startup-model-check).
-`CONCH_NO_WIZARD=1` suppresses it; non-interactive contexts never show it.
+Setup verifies the effective primary using the
+[startup model check](#startup-model-check), without silently selecting a
+fallback. `CONCH_NO_WIZARD=1` suppresses automatic recovery; non-interactive
+contexts never launch browser sign-in. `model_check=off` skips normal startup
+probes, but `conch setup --check` reports that route as unverified (exit 69).
+Choosing a route interactively explicitly approves its verification.
 
 #### Setup troubleshooting
 
@@ -1094,6 +1143,8 @@ key`, `unreachable`, `authentication failed`, `model not found`, `timed out`,
   endpoint, and the key *variable name*; keys are never written or printed).
   `q` or Ctrl-C exits cleanly with status 69. Nothing switches without that
   approval.
+  `s=setup` reconnects accounts even when a working alternative exists. If none
+  verify, Conch offers setup directly instead of a menu of unusable choices.
 - **Non-interactively**, see [Non-interactive runs](#non-interactive-runs):
   `fallback_models` or fail closed.
 
@@ -1184,6 +1235,11 @@ fan-out workers included, appear on the [conversations page](#conversations-page
   and keep the file mode; `edit_file` also keeps CRLF line endings. Inside a Git
   repository with checkpoints on, `/undo` covers them. Remote channel sessions
   can read but not edit.
+  Host file tools accept absolute, `~`, and relative paths, including paths
+  outside the working directory. `write_file` creates missing parent
+  directories. A filesystem MCP server's `list_allowed_directories` describes
+  that server only; it is not a global Conch workspace restriction. OS access
+  failures and Conch's guarded-path approvals still apply.
 - **Web:** `web_fetch` reads an http(s) page as text (HTML stripped to
   headings, paragraphs, and links; JSON pretty-printed; binary types refused),
   capped at 2 MB downloaded. `prompt_all` asks per URL (`a` allows the host
@@ -1676,6 +1732,7 @@ network sandbox for tools you explicitly enable or approve.
 | `fanout_concurrency` | `4` | Workers running at once; workers on one local server run one at a time unless this key is set |
 | `fanout_rounds`, `fanout_timeout` | `subagent_rounds`, `600` | Tool rounds and seconds allowed per fan-out task |
 | `ssh_control_persist` | `600` | OpenSSH ControlMaster persistence in seconds |
+| `notifications` | `on` | `/notifications on` or `off`; preserves the configured delay |
 | `notify_after_seconds` | `30` | Desktop notification after an interactive turn this long; `0` disables |
 | `github_context` | `true` | Load the GitHub repository's PRs, issues, and checks at startup |
 | `extra_models` | unset | Comma-separated `provider/model` entries added in the model picker |

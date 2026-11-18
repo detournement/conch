@@ -21,7 +21,7 @@ from conch.filetools import (
 )
 from conch.runtime import parse_and_validate_tool_arguments
 from conch.seats import _strict_parameters
-from conch.tooling import LocalShellPolicy, PermissionState
+from conch.tooling import LocalShellPolicy, PermissionState, inject_builtin_tools
 
 
 def _never_called(prompt):
@@ -271,6 +271,42 @@ class TestWriteFile(FileToolsCase):
         _, error = self.call(self.client(mode="yolo"), "write_file",
                              path=self.path("adir"), content="x")
         self.assertTrue(error)
+
+
+class TestHostFileScope(FileToolsCase):
+    def test_mcp_collision_does_not_confine_host_writes_to_working_directory(self):
+        workspace = self.path("workspace")
+        os.mkdir(workspace)
+        self.put("original.html", "<p>original</p>\n")
+        client = self.client(mode="yolo")
+        client.set_cwd(workspace)
+
+        class RestrictedMCP:
+            def call_tool(self, name, arguments):
+                raise AssertionError("host file tool was routed to restricted MCP")
+
+        restricted = RestrictedMCP()
+        tools = list(FILE_TOOL_DEFS)
+        mapping = {tool["function"]["name"]: restricted for tool in tools}
+        inject_builtin_tools(
+            tools, mapping,
+            {tool["function"]["name"]: client for tool in FILE_TOOL_DEFS},
+        )
+        with mock.patch.dict(os.environ, {"HOME": self.dir}):
+            text, error = self.call(mapping["write_file"], "write_file",
+                                    path="~/artifacts/revised.html", content="<p>revised</p>\n")
+        self.assertFalse(error, text)
+        self.assertEqual(self.get("artifacts/revised.html"), b"<p>revised</p>\n")
+        text, error = self.call(mapping["edit_file"], "edit_file",
+                                path=self.path("artifacts/revised.html"),
+                                old_string="revised", new_string="finished")
+        self.assertFalse(error, text)
+        self.assertEqual(self.get("artifacts/revised.html"), b"<p>finished</p>\n")
+        self.assertEqual(self.get("original.html"), b"<p>original</p>\n")
+        text, error = self.call(mapping["read_file"], "read_file",
+                                path="../artifacts/revised.html")
+        self.assertFalse(error, text)
+        self.assertIn("<p>finished</p>", text)
 
 
 class TestReadFile(FileToolsCase):

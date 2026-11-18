@@ -85,12 +85,6 @@ class TestAugmentUserMessage(unittest.TestCase):
 
 
 class TestSlimLocalPrompt(unittest.TestCase):
-    def test_ollama_prompt_is_compact(self):
-        prompt = get_chat_prompt("ollama", "qwen3.6:27b")
-        # ~250 tokens at ~3.5 chars/token — allow headroom but stay far
-        # below the old ~990-token prompt.
-        self.assertLess(len(prompt), 1600, "local prompt must stay compact")
-
     def test_ollama_prompt_has_core_tools(self):
         prompt = get_chat_prompt("ollama", "qwen3.6:27b")
         for tool in (

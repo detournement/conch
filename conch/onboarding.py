@@ -1,34 +1,24 @@
-"""First-run onboarding: the interactive provider/key wizard.
+"""Verified provider setup and recovery.
 
-Runs once on a truly unconfigured interactive launch, in three steps:
-choose a provider, connect it, verify a model. The default path uses
-provider sign-in through the official Claude Code or Codex CLI.
-API-key providers remain explicit alternatives; their keys use hidden
-input and the private ``~/.config/conch/env`` file. Subscription tokens
-remain entirely in the native CLI's credential store. Conch writes only
-the provider/model selection to ``~/.config/conch/config`` (0600).
-
-A choice that cannot be completed (CLI missing, sign-in failed, no key,
-Ollama down, no URL) saves nothing and returns to the provider menu;
-nothing is written until a provider is actually connected.
-
-Non-interactive contexts (pipes, daemons, workers, CI) never see the
-wizard: it requires a real TTY on stdin and stdout, and honors
-``CONCH_NO_WIZARD=1``. It never overwrites existing configuration —
-any configured surface disables it entirely.
+Subscription seats use official Claude Code and Codex CLIs; Conch never
+reads their tokens. API keys and routing are staged in memory and saved
+only after a bounded model probe. Pipes and --check never start login.
 """
 
 from __future__ import annotations
 
+import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import getpass
 import os
 import shutil
+import stat
 import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib import error, request
 
 from . import auth, seats
 from .config import (
@@ -36,13 +26,11 @@ from .config import (
     find_project_rc,
     get_config_path,
     get_env_file_path,
-    get_env_manifest_path,
     load_config,
-    remove_env_values,
     set_config_values,
     set_env_values,
 )
-from .modelcheck import ModelCheckOutcome, ensure_working_model
+from .modelcheck import MODEL_CHECK_EXIT_CODE, ModelCheckOutcome, probe_model
 from .render import Spinner
 
 CYAN = "\033[1;36m"
@@ -112,13 +100,6 @@ def _confirm(question: str, default: bool) -> bool:
     return default if not answer else answer in ("y", "yes")
 
 
-def _http_get(url: str, headers: dict, timeout: float = 12.0) -> Tuple[int, bytes]:
-    req = request.Request(url, headers=headers, method="GET")
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read()
-    except error.HTTPError as exc:
-        return exc.code, b""
 
 
 def detect_ollama() -> Optional[List[str]]:
@@ -154,47 +135,6 @@ def _detect() -> Tuple[Dict[str, str], Optional[List[str]]]:
         return states, ollama.result()
 
 
-def probe_provider(provider: str, api_key: str,
-                   base_url: str = "") -> Tuple[bool, str]:
-    """One read-only reachability/auth probe. The key travels only in a
-    request header; nothing about it is ever printed or logged."""
-    try:
-        if provider == "anthropic":
-            status, _ = _http_get(
-                "https://api.anthropic.com/v1/models",
-                {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
-            )
-        elif provider == "openai":
-            status, _ = _http_get(
-                "https://api.openai.com/v1/models",
-                {"Authorization": f"Bearer {api_key}"},
-            )
-        elif provider == "openrouter":
-            status, _ = _http_get(
-                "https://openrouter.ai/api/v1/key",
-                {"Authorization": f"Bearer {api_key}"},
-            )
-        elif provider == "custom":
-            headers = (
-                {"Authorization": f"Bearer {api_key}"} if api_key else {}
-            )
-            status, _ = _http_get(
-                f"{base_url.rstrip('/')}/models", headers
-            )
-        else:
-            return False, f"no probe for provider {provider!r}"
-    except Exception as exc:
-        return False, f"unreachable ({type(exc).__name__})"
-    if status in (401, 403):
-        if provider == "custom" and not api_key:
-            return False, "the endpoint requires an API key"
-        return False, "the API rejected this key"
-    if 200 <= status < 300:
-        if provider == "custom" and not api_key:
-            # Nothing was authenticated: say what was actually checked.
-            return True, "endpoint reachable (no key sent)"
-        return True, "key accepted"
-    return False, f"unexpected response (HTTP {status})"
 
 
 def should_offer_wizard() -> bool:
@@ -356,11 +296,6 @@ def _choose_model(models: List[str]) -> str:
         _say(f"Pick a number between 1 and {shown}.", RED)
 
 
-def _probe(provider: str, key: str, base_url: str = "") -> bool:
-    with Spinner("Verifying provider reachability"):
-        ok, detail = probe_provider(provider, key, base_url)
-    _say(f"✓ {detail}" if ok else f"! {detail}", GREEN if ok else YELLOW)
-    return ok
 
 
 def _report_saved(config_path: str, key_saved: bool = False) -> None:
@@ -383,45 +318,41 @@ def _seat_cli_missing(provider: str, label: str) -> bool:
 
 
 def _connect_seat(provider: str, label: str,
-                  seat_states: Dict[str, str]) -> bool:
-    """Select a signed-in seat, running the native sign-in only when needed.
-    The state is re-read on every choice that was not already signed in, so
-    installing or signing in elsewhere and choosing again just works."""
-    if seat_states.get(provider) != SEAT_READY:
-        with Spinner(f"Checking {label} sign-in"):
-            seat_states[provider] = seat_state(provider)
+                  seat_states: Dict[str, str]) -> Optional[StagedSetup]:
+    """Connect natively without selecting a default or touching token files."""
+    with Spinner(f"Checking {label} sign-in"):
+        seat_states[provider] = seat_state(provider)
     if seat_states[provider] == SEAT_MISSING:
-        return _seat_cli_missing(provider, label)
+        _seat_cli_missing(provider, label)
+        return None
     if seat_states[provider] != SEAT_READY:
-        _say("Starting the provider's own sign-in; finish it in your"
-             " browser.", DIM)
+        if not _interactive_terminal():
+            _say("Sign-in needs a terminal. Run `conch setup` there.", YELLOW)
+            return None
+        _say("Starting the provider's own sign-in; finish it in your browser.", DIM)
         try:
-            code, reason = auth.sign_in(provider)
+            code, _reason = auth.sign_in(provider)
         except FileNotFoundError:
             seat_states[provider] = SEAT_MISSING
-            return _seat_cli_missing(provider, label)
+            _seat_cli_missing(provider, label)
+            return None
         if code:
-            _say(f"! {reason or 'Sign-in did not complete.'}", YELLOW)
-            _say("Choose it again to retry, or pick another provider.", DIM)
-            return False
+            _say("! Native sign-in did not complete. Retry or choose another provider.", YELLOW)
+            return None
         seat_states[provider] = SEAT_READY
-    model, config_path = auth.select(provider)
-    _say(f"✓ {label} is signed in.", GREEN)
-    _say(f"Saved {provider}/{model} to {display_path(config_path)}; your"
-         " sign-in stays with the provider's CLI.", DIM)
-    return True
+    return _stage(provider, seats.DEFAULT_MODELS[provider])
 
 
-def _connect_ollama(models: Optional[List[str]]) -> bool:
-    """Save the chosen local model, or say what to run when there is none."""
+def _connect_ollama(models: Optional[List[str]]) -> Optional[StagedSetup]:
+    """Stage a local model, or explain how to make one available."""
     from .providers import (
         DEFAULT_CHAT_MODEL_BY_PROVIDER,
         get_ollama_base_url,
         local_endpoint_policy_error,
     )
 
+    base_url = get_ollama_base_url()
     if models is None:
-        base_url = get_ollama_base_url()
         blocked = local_endpoint_policy_error("ollama", base_url, {})
         if blocked:
             _say(f"! {blocked}", YELLOW)
@@ -438,142 +369,275 @@ def _connect_ollama(models: Optional[List[str]]) -> bool:
              " Ollama again.", DIM)
         return False
     selected = _choose_model(models)
-    _report_saved(set_config_values(
-        {"provider": "ollama", "model": selected, "chat_model": selected},
-        header=CONFIG_HEADER,
-    ))
-    return True
+    return _stage("ollama", selected, ollama_base_url=base_url)
 
 
-def _connect_custom() -> bool:
+def _connect_custom() -> Optional[StagedSetup]:
     base_url = input(
         f"{INDENT}Base URL (e.g. http://localhost:8080/v1): "
     ).strip().rstrip("/")
     if not base_url:
         _say("! No URL entered, so nothing was saved.", YELLOW)
-        return False
+        return None
     key = getpass.getpass(
         f"{INDENT}API key for it, if any (Enter for none): "
     ).strip()
-    if _confirm("Verify with one live request?", True):
-        _probe("custom", key, base_url)
-    updates = {"provider": "custom", "custom_base_url": base_url}
-    custom_model = _choose_custom_model(base_url, key)
-    if custom_model:
-        updates["custom_model"] = custom_model
+    model = _choose_custom_model(base_url, key)
+    if not model:
+        return None
+    setup = _stage("custom", model, custom_base_url=base_url,
+                   custom_model=model, api_key_env=CUSTOM_KEY_ENV if key else "")
     if key:
-        # Custom endpoints read OPENAI_API_KEY-style bearer via api_key_env;
-        # store under a conch-specific name and point config at it.
-        updates["api_key_env"] = CUSTOM_KEY_ENV
-    config_path = set_config_values(updates, header=CONFIG_HEADER)
-    if key:
-        set_env_values({CUSTOM_KEY_ENV: key}, set_by="first-run setup")
-    _report_saved(config_path, key_saved=bool(key))
-    return True
+        setup.keys[CUSTOM_KEY_ENV] = key
+    return setup
 
 
-def _connect_api_key(provider: str, env_name: str) -> bool:
-    while True:
-        key = _collect_key(env_name)
-        if not key:
-            _say("! No key entered, so nothing was saved.", YELLOW)
-            return False
-        if (not _confirm("Verify with one live request?", True)
-                or _probe(provider, key)
-                or _confirm("Save this key anyway?", False)):
-            break
-        _say("Enter the key again, or press Enter to pick another"
-             " provider.", DIM)
-    config_path = set_config_values({"provider": provider},
-                                    header=CONFIG_HEADER)
-    # Same write path as `conch keys set`: the key becomes conch-managed
-    # (authoritative over a stale shell export) and shows up in
-    # `conch keys list` with its provenance.
-    set_env_values({env_name: key}, set_by="first-run setup")
-    _report_saved(config_path, key_saved=True)
-    return True
+def _connect_api_key(provider: str, env_name: str) -> Optional[StagedSetup]:
+    from .providers import DEFAULT_CHAT_MODEL_BY_PROVIDER
+
+    key = _collect_key(env_name)
+    if not key:
+        _say("! No key entered, so nothing was saved.", YELLOW)
+        return None
+    setup = _stage(provider, DEFAULT_CHAT_MODEL_BY_PROVIDER[provider])
+    setup.keys[env_name] = key
+    return setup
+
+
+@dataclass
+class StagedSetup:
+    updates: Dict[str, str]
+    keys: Dict[str, str] = field(default_factory=dict, repr=False)
+
+
+def _stage(provider: str, model: str, **overrides) -> StagedSetup:
+    from .modelcheck import Candidate
+
+    return StagedSetup(Candidate(provider, model, "provider",
+                                 overrides=overrides).config_updates())
+
+
+def _interactive_terminal() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+@contextmanager
+def _temporary_keys(keys):
+    previous = {name: os.environ.get(name) for name in keys}
+    os.environ.update(keys)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _verify_primary(config: dict) -> ModelCheckOutcome:
+    """Certify only the effective primary, respecting explicit offline policy."""
+    from .bootstrap import StartupError
+    from .config import local_only_enabled
+    from .modelcheck import model_check_enabled
+
+    if not model_check_enabled(config):
+        raise StartupError(
+            "conch: model_check=off; the primary is unverified (no request sent)."
+            " Run `conch setup` in a terminal to explicitly select and verify a route.",
+            code=MODEL_CHECK_EXIT_CODE,
+        )
+    if local_only_enabled(config) and config.get("provider") not in ("ollama", "custom"):
+        raise StartupError(
+            "conch: local_only blocks the configured cloud route (no credentials sent)."
+            " Choose a local provider with `conch setup`, or explicitly change local_only.",
+            code=MODEL_CHECK_EXIT_CODE,
+        )
+
+    provider = config.get("provider", "")
+    model = config.get("chat_model") or config.get("model") or ""
+    result = probe_model(provider, model, config)
+    if not result.ok:
+        raise StartupError(
+            f"conch: {result.label} is not usable: {result.describe()}"
+            " — run `conch setup` in a terminal to reconnect or choose a provider.",
+            code=MODEL_CHECK_EXIT_CODE,
+        )
+    return ModelCheckOutcome(provider, model, result)
+
+
+def _verify_staged(setup: StagedSetup) -> ModelCheckOutcome:
+    from .config import ENV_CONFIG_KEYS, _parse_config_file
+    from .bootstrap import StartupError
+
+    # Preview higher-priority routing without writing or deleting overrides.
+    higher = _parse_config_file(Path.home() / ".conchrc")
+    project = find_project_rc()
+    if project is not None:
+        higher.update(_parse_config_file(project))
+    higher.update({key: os.environ[name].strip()
+                  for name, key in ENV_CONFIG_KEYS.items() if name in os.environ})
+    if any(key in higher and higher[key] != value
+           for key, value in setup.updates.items()):
+        raise StartupError(
+            "conch: ~/.conchrc, project .conchrc, or CONCH_* overrides the selected"
+            " routing. Update that override or run setup outside this project;"
+            " no files were changed.", code=MODEL_CHECK_EXIT_CODE,
+        )
+    config = load_config()
+    config.update(setup.updates)
+    # Choosing a route explicitly approves its probe, not a runtime policy change.
+    config["model_check"] = "on"
+    with _temporary_keys(setup.keys), Spinner("Verifying selected model"):
+        return _verify_primary(config)
+
+
+def _snapshot_setup_file(path: Path) -> Optional[Tuple[bytes, int]]:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(), stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+    except FileNotFoundError:
+        return None
+
+
+def _save_setup(setup: StagedSetup, outcome: ModelCheckOutcome) -> ModelCheckOutcome:
+    """Commit verified setup, restoring files and key state on failure."""
+    from .bootstrap import StartupError
+    from .config import _ENV_LOAD_STATE, _write_private_file, get_env_manifest_path
+
+    paths = [("routing configuration", Path(get_config_path()))]
+    if setup.keys:
+        paths[:0] = [
+            ("credentials", Path(get_env_file_path())),
+            ("credential manifest", Path(get_env_manifest_path())),
+        ]
+    try:
+        snapshots = [(label, path, _snapshot_setup_file(path)) for label, path in paths]
+    except Exception:
+        raise StartupError(
+            "conch: could not read existing setup state; Conch configuration"
+            " and credentials are unchanged.", code=MODEL_CHECK_EXIT_CODE,
+        ) from None
+    key_states = [
+        (label, mapping, {name: mapping.get(name) for name in setup.keys})
+        for label, mapping in (
+            ("process credentials", os.environ),
+            ("credential reload state", _ENV_LOAD_STATE["from_file"]),
+        )
+    ]
+    try:
+        if setup.keys:
+            set_env_values(setup.keys, set_by="verified setup", verified="ok")
+        path = set_config_values(setup.updates, header=CONFIG_HEADER)
+        _report_saved(path, key_saved=bool(setup.keys))
+    except BaseException as exc:
+        # One bounded rollback pass; keep restoring other resources even if
+        # a write fails or a second interrupt arrives during restoration.
+        failed = []
+        for label, path, original in reversed(snapshots):
+            try:
+                if _snapshot_setup_file(path) == original:
+                    continue
+                if original is None:
+                    path.unlink()
+                else:
+                    _write_private_file(path, original[0], mode=original[1])
+            except BaseException:
+                failed.append(label)
+        for label, mapping, previous in key_states:
+            for name, value in previous.items():
+                try:
+                    if value is None:
+                        mapping.pop(name, None)
+                    else:
+                        mapping[name] = value
+                except BaseException:
+                    if label not in failed:
+                        failed.append(label)
+        if failed:
+            raise StartupError(
+                "conch: setup failed and rollback was incomplete; "
+                + ", ".join(failed) + " may have changed."
+                " Check Conch credential and routing files before retrying setup.",
+                code=MODEL_CHECK_EXIT_CODE,
+            ) from None
+        if isinstance(exc, (KeyboardInterrupt, EOFError)) or not isinstance(exc, Exception):
+            raise
+        raise StartupError(
+            "conch: could not save setup; existing Conch configuration"
+            " and credentials are unchanged.", code=MODEL_CHECK_EXIT_CODE,
+        ) from None
+    outcome.saved = True
+    return outcome
 
 
 def run_first_run_wizard() -> ModelCheckOutcome:
-    """Choose a provider, connect it, and return its startup verification
-    outcome. A choice that cannot be connected saves nothing and returns to
-    the provider menu, and so can one whose model then fails verification."""
+    """Stage, verify, then commit; failed retries never delete user state."""
     from .bootstrap import StartupError
+    if not _interactive_terminal():
+        raise StartupError("conch: setup needs a terminal; use `conch setup --check`"
+                           " for non-interactive verification.", code=MODEL_CHECK_EXIT_CODE)
 
     seat_states, ollama_models = _detect()
     print()
     _say("Welcome to Conch", CYAN)
-    _say("Three steps: choose a provider, connect it, verify a model."
-         " Ctrl+C exits setup; run conch again to return.")
-    print()
-    _say("Claude and ChatGPT seats use your subscription through the"
-         " provider's official CLI. API keys are optional and billed"
-         " separately. You can change providers later with /provider.")
+    _say("Choose a provider, connect it, then verify a model. Ctrl+C cancels;"
+         " run `conch setup` to return.")
+    _say("Claude and ChatGPT subscriptions use official native sign-in."
+         " You can connect both and choose your primary. API keys are optional"
+         " and billed separately; local models are available too.")
     while True:
         _step(1, "Choose a provider")
         _print_menu(seat_states, ollama_models)
-        print()
         provider, env_name, label = _ask_provider(_default_choice(seat_states))
         _step(2, f"Connect {label}")
         if provider in seat_states:
-            connected = _connect_seat(provider, label, seat_states)
+            setup = _connect_seat(provider, label, seat_states)
         elif provider == "ollama":
             if not ollama_models:
-                with Spinner("Detecting local models"):
-                    ollama_models = detect_ollama()
-            connected = _connect_ollama(ollama_models)
+                ollama_models = detect_ollama()
+            setup = _connect_ollama(ollama_models)
         elif provider == "custom":
-            connected = _connect_custom()
+            setup = _connect_custom()
         else:
-            connected = _connect_api_key(provider, env_name)
-        if connected:
-            _step(3, "Verify a model")
-            try:
-                return verify_configured_model()
-            except StartupError:
-                try:
-                    again = _confirm("Choose a different provider?", True)
-                except (KeyboardInterrupt, EOFError):
-                    again = False
-                if not again:
-                    raise
-                _discard_setup()
-                _say("Nothing from that attempt was kept.", DIM)
-
-
-def _discard_setup() -> None:
-    """Remove what this run wrote, so another provider starts clean. The
-    wizard only runs when none of these files exist, so nothing of the
-    user's own is ever deleted."""
-    names = [row[1] for row in WIZARD_PROVIDERS if row[1]] + [CUSTOM_KEY_ENV]
-    for name in remove_env_values(names):
-        os.environ.pop(name, None)
-    for path in (get_config_path(), get_env_file_path(),
-                 get_env_manifest_path()):
+            setup = _connect_api_key(provider, env_name)
+        if not setup:
+            continue
+        _step(3, "Verify a model")
         try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+            outcome = _verify_staged(setup)
+        except StartupError as exc:
+            _say(str(exc), YELLOW)
+            _say("No Conch files or credentials were changed.", DIM)
+            if _confirm("Choose a different provider?", True):
+                continue
+            raise
+        _say(f"✓ {outcome.label} verified", GREEN)
+        if provider in seats.PROVIDERS:
+            other = next(name for name in seats.PROVIDERS if name != provider)
+            other_label = next(row[2] for row in WIZARD_PROVIDERS if row[0] == other)
+            if _confirm(f"Also connect {other_label}? (optional)", False):
+                second = _connect_seat(other, other_label, seat_states)
+                if second:
+                    try:
+                        second_outcome = _verify_staged(second)
+                    except StartupError as exc:
+                        _say(str(exc), YELLOW)
+                        _say("Keeping the first verified provider.", DIM)
+                    else:
+                        _say(f"✓ {second_outcome.label} verified", GREEN)
+                        if _confirm(f"Use {other_label} as primary?", False):
+                            setup, outcome = second, second_outcome
+        return _save_setup(setup, outcome)
 
 
 def verify_configured_model() -> ModelCheckOutcome:
-    """Run the startup model check on the configuration the wizard just
-    wrote, so first run ends in a verified-working state — or in the same
-    approved alternatives flow the shell uses. Because the wizard is the
-    step that writes config, an approved pick is saved as the default
-    (``persist_mode="always"``); declining raises StartupError for the
-    gatekeeper to turn into a clean non-zero exit."""
-    config = load_config()
-    label = f"{config.get('provider')}/{config.get('chat_model') or config.get('model')}"
-    _say(f"Checking {label} …", DIM)
-    outcome = ensure_working_model(config, interactive=True, persist_mode="always",
-                                   restart_hint=False)
-    if not outcome.checked:
-        _say(f"model check is off (model_check=off); {label} unverified", DIM)
-    elif not outcome.switched:
-        detail = outcome.result.detail if outcome.result is not None else ""
-        _say(f"✓ {outcome.label} verified"
-             + (f" — {detail}" if detail else ""), GREEN)
+    """Verify the effective primary without spending on unrelated routes."""
+    outcome = _verify_primary(load_config())
+    _say(f"✓ {outcome.label} verified", GREEN)
     return outcome
 
 
@@ -591,14 +655,42 @@ def maybe_run_first_run_wizard() -> Optional[ModelCheckOutcome]:
     except (KeyboardInterrupt, EOFError):
         print()
         _say("Setup cancelled. Run `conch` again when ready.", DIM)
-        sys.exit(0)
+        sys.exit(130)
     except StartupError as exc:
-        # The post-setup model check found nothing working (or the user
-        # declined every alternative): the config is saved; exit cleanly
-        # so the next launch re-checks instead of chatting with a model
-        # that is known not to answer.
         print(str(exc), file=sys.stderr)
-        _say(f"Setup is saved in {display_path(get_config_path())}. Run"
-             " `conch` again once the model is reachable, or edit that"
-             " file.", DIM)
         sys.exit(exc.code)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="conch setup", description="Verify or reconnect your primary provider."
+    )
+    parser.add_argument("--check", action="store_true",
+                        help="verify the effective primary without prompting or changing files")
+    args = parser.parse_args(argv)
+    from .bootstrap import StartupError
+
+    try:
+        if not args.check and should_offer_wizard():
+            run_first_run_wizard()
+            return 0
+        try:
+            verify_configured_model()
+            return 0
+        except StartupError as exc:
+            print(str(exc), file=sys.stderr)
+            if args.check or not _interactive_terminal() or os.environ.get("CONCH_NO_WIZARD", "").strip():
+                return exc.code
+        run_first_run_wizard()
+        return 0
+    except (KeyboardInterrupt, EOFError):
+        print("conch: setup cancelled; existing Conch configuration is unchanged.",
+              file=sys.stderr)
+        return 130
+    except StartupError as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

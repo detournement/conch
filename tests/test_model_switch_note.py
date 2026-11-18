@@ -538,6 +538,91 @@ class MidHistorySystemNoteWireTests(unittest.TestCase):
         self.assertEqual(len(mid_system), 1)
 
 
+class ActiveSessionSwitchTests(unittest.TestCase):
+    def test_picker_commit_reaches_next_seat_request_and_its_identity_tools(self):
+        """Exercise the real command → chat loop → AgentSession → seat path."""
+        import contextlib
+        import json
+
+        from conch import app
+        from conch.conversations import ConversationManager
+        from conch.model_catalog import ModelEntry
+        from conch.modelcheck import ModelCheckOutcome
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "HOME": tmp, "XDG_STATE_HOME": tmp, "XDG_CONFIG_HOME": tmp,
+                "OPENAI_API_KEY": "test-key", "CONCH_PROVIDER": "openai",
+            }, clear=True))
+            stack.enter_context(patch("conch.config.find_project_rc", return_value=None))
+            old = "gpt-4o-mini"
+            new = ModelEntry("codex", "selected-seat-model")
+            manager = ConversationManager()
+            stack.callback(manager.close)
+            conv = manager.create(model=old, provider="openai")
+            conv.messages = _history()
+            manager.save(conv)
+
+            def pick(config, provider, model, *, on_primary):
+                self.assertEqual((provider, model), ("openai", old))
+                self.assertTrue(on_primary(new))
+                # A rejected later attempt (then Escape) must not undo the pick.
+                self.assertFalse(on_primary(ModelEntry("openai", "nonexistent-model")))
+
+            requests = []
+            def invoke(model, prompt, schema, timeout, **kwargs):
+                self.assertEqual(model, new.model)
+                payload = json.loads(prompt.rsplit("\n", 1)[1])
+                tool_names = {t["function"]["name"] for t in payload["tools"]}
+                calls = []
+                if tool_names == {"conch_probe"}:
+                    self.assertGreater(timeout, 4, "seat probe inherited the API deadline")
+                    calls = [{"name": "conch_probe", "arguments": {"ok": True}}]
+                else:
+                    requests.append(payload["messages"])
+                    if len(requests) == 1:
+                        calls = [{"name": "conch_config", "arguments": {"action": "get"}},
+                                 {"name": "conch_introspect", "arguments": {"action": "config"}}]
+                return {"response": {"content": "" if calls else "done", "tool_calls": calls}}
+
+            config = app.load_config()
+            config.update(github_context="false", repo_map="false", git_checkpoints="false",
+                          session_summary_min_turns="off")
+            def inputs():
+                yield "/models"
+                # Already saved while idle, before another turn or a clean exit.
+                saved = manager.load(conv.id)
+                self.assertEqual((saved.provider, saved.model), new.key)
+                yield "check the active config"
+                yield "/q"
+
+            stack.enter_context(patch.object(app, "load_config", return_value=config))
+            stack.enter_context(patch.object(app, "readline"))
+            stack.enter_context(patch("conch.mcp.create_clients", return_value={}))
+            stack.enter_context(patch("conch.github_context.start", return_value=None))
+            stack.enter_context(patch("conch.convo_browser.can_browse", return_value=True))
+            stack.enter_context(patch("conch.model_picker.pick_model", side_effect=pick))
+            stack.enter_context(patch("conch.seat_codex.status", return_value=(True, "signed in")))
+            stack.enter_context(patch("conch.seat_codex.invoke", side_effect=invoke))
+            stack.enter_context(patch("conch.multiline.read_user_message", side_effect=inputs()))
+            stack.enter_context(patch("urllib.request.urlopen", side_effect=AssertionError("network")))
+            stack.enter_context(_quiet())
+            stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
+            app.chat_loop(interactive=False, resume_id=conv.id,
+                          startup_check=ModelCheckOutcome("openai", old, None, checked=False))
+            self.assertEqual(len(requests), 2)
+            self.assertIn(_history()[1], requests[0])
+            self.assertIn(_history()[2], requests[0])
+            self.assertIn("check the active config", requests[0][-1]["content"])
+            self.assertIn(new.model, requests[0][0]["content"])
+            results = [m["content"] for m in requests[1] if m["role"] == "tool"]
+            self.assertEqual(len(results), 2)
+            for result in results:
+                self.assertIn("provider: codex", result)
+                self.assertIn(f"model: {new.model}", result)
+            self.assertEqual(manager.load(conv.id).messages[-1]["content"], "done")
+
+
 class NotePersistenceTests(unittest.TestCase):
     def test_note_survives_save_and_load(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(

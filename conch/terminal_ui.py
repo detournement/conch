@@ -38,6 +38,7 @@ from prompt_toolkit.renderer import print_formatted_text
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
+from .shortcuts import meta_key
 from .themes import style_for
 
 _active: Optional["TerminalUI"] = None
@@ -143,6 +144,13 @@ class _PendingMessage:
     kind: str
     reserved: bool = False
 
+    @property
+    def selects_model(self):
+        if "\n" in self.text:
+            return False
+        head = self.text.split(None, 1)
+        return bool(head and head[0].lower() in ("/model", "/models", "/ls"))
+
 
 class TerminalUI:
     def __init__(self, commands: Callable, history_file: str,
@@ -160,6 +168,7 @@ class TerminalUI:
         self._routing = threading.RLock()
         self._condition = threading.Condition()
         self._messages = deque()
+        self._open_model_pickers = 0
         self._queue_selection = None
         self._editing_message = None
         self._detail_text = ""
@@ -893,7 +902,7 @@ class TerminalUI:
         elif self._context_fields.get("agents_paused"):
             hints = ["/ebrake off resumes", "Ctrl+C stops", "Ctrl+P commands"]
         elif self._busy and self._queue_enabled:
-            hints = ["Enter steers", "Ctrl+C stops", "Alt+Q follow-up"]
+            hints = ["Enter steers", "Ctrl+C stops", f"{meta_key('Q')} follow-up"]
         elif self._busy:
             hints = ["Queue off · draft kept", "Ctrl+C stops"]
         else:
@@ -901,9 +910,9 @@ class TerminalUI:
         if pending:
             hints.append("Ctrl+Q pending")
         if self._detail_text:
-            hints.append("Alt+R details")
+            hints.append(f"{meta_key('R')} details")
         if not self._notice:
-            hints.append("Alt+Enter newline")
+            hints.append(f"{meta_key('Enter')} newline")
         return [("class:muted", self._fit_hints(hints))]
 
     def _fit_hints(self, hints):
@@ -919,6 +928,20 @@ class TerminalUI:
         return ("\n" in text or
                 not (text.lstrip().startswith("/") or text.strip().lower() in ("exit", "quit")))
 
+    def _enqueue_message(self, text, kind, *, between_turns=False):
+        item = _PendingMessage(text, kind)
+        with self._condition:
+            at = len(self._messages)
+            if between_turns and item.selects_model:
+                # Apply the selection before still-undelivered chat, but
+                # never reorder slash commands, exit requests or interrupts.
+                while at and isinstance(self._messages[at - 1], _PendingMessage):
+                    if not self._can_steer(self._messages[at - 1].text):
+                        break
+                    at -= 1
+            self._messages.insert(at, item)
+            self._condition.notify_all()
+
     def _send(self, followup=False):
         text = self._editor.text
         if not text.strip():
@@ -931,11 +954,9 @@ class TerminalUI:
             return
         self._notice = ""
         self._editor.buffer.reset()
-        with self._condition:
-            kind = ("steering" if self._busy and not followup and self._can_steer(text)
-                    else "follow-up")
-            self._messages.append(_PendingMessage(text, kind))
-            self._condition.notify_all()
+        kind = ("steering" if self._busy and not followup and self._can_steer(text)
+                else "follow-up")
+        self._enqueue_message(text, kind, between_turns=self._busy)
 
     def _start_live(self, text) -> bool:
         """Run a panel or read-only command now instead of after the turn.
@@ -949,6 +970,12 @@ class TerminalUI:
         self._notice = ""
         self._editor.buffer.reset()
         self._accept_messages([command])
+        model_picker = command.lower() in ("/model", "/models", "/ls")
+        if model_picker:
+            # Reserve the turn boundary before starting the panel thread.
+            # The request may finish while the operator is still choosing.
+            with self._condition:
+                self._open_model_pickers += 1
 
         def run():
             try:
@@ -957,6 +984,11 @@ class TerminalUI:
                 pass  # the UI closed or the panel was cancelled
             except Exception as exc:
                 print(f"  \033[31m✗ {command.split()[0]} failed: {exc}\033[0m")
+            finally:
+                if model_picker:
+                    with self._condition:
+                        self._open_model_pickers -= 1
+                        self._condition.notify_all()
 
         threading.Thread(target=run, name="conch-panel", daemon=True).start()
         return True
@@ -965,9 +997,7 @@ class TerminalUI:
         """Queue *command* to run between turns: right away when idle, after
         the running turn otherwise (a panel's pick that changes the session)."""
         def queue():
-            with self._condition:
-                self._messages.append(_PendingMessage(command, "follow-up"))
-                self._condition.notify_all()
+            self._enqueue_message(command, "follow-up", between_turns=True)
             if self._busy:
                 self._notice = f"{command} runs when this turn ends · Ctrl+Q pending"
         self._change(queue)
@@ -999,7 +1029,7 @@ class TerminalUI:
     def read_message(self) -> str:
         with self._condition:
             while not self._stopped.is_set():
-                if self._messages:
+                if self._messages and not self._open_model_pickers:
                     first = self._messages[0]
                     if not isinstance(first, _PendingMessage) or not first.reserved:
                         break
@@ -1038,8 +1068,10 @@ class TerminalUI:
         def take():
             messages = []
             with self._condition:
+                if self._open_model_pickers:
+                    return []
                 for item in tuple(self._messages):
-                    if isinstance(item, BaseException):
+                    if isinstance(item, BaseException) or item.selects_model:
                         break
                     if item.kind != "steering":
                         continue
@@ -1082,7 +1114,7 @@ class TerminalUI:
         if self._modal == "queue":
             hints = ["Escape closes", "Enter edits", "Delete removes", "Up/Down selects"]
         elif self._modal == "queue-edit":
-            hints = ["Enter saves", "Escape restores original", "Alt+Enter newline"]
+            hints = ["Enter saves", "Escape restores original", f"{meta_key('Enter')} newline"]
         elif self._preview_colorscheme is not None:
             hints = ["Escape cancels", "Click/Enter saves", "Hover/Up/Down previews", "Type to filter"]
         elif self._modal == "choose":

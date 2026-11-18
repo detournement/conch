@@ -7,7 +7,49 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
-## [Unreleased]
+## [0.9.5] - 2026-11-18
+
+### Added
+
+- `/shortcuts` opens a searchable in-terminal keyboard reference. Shortcut hints
+  use Option on macOS and Alt on Linux. `/notifications` enables or disables
+  long-turn alerts without losing the configured delay.
+- `conch setup [--check]` verifies the effective primary and offers native
+  Claude/ChatGPT sign-in recovery, optional connection of both subscriptions,
+  and primary selection. Failed or interrupted saves roll back config, keys,
+  and file permissions; incomplete restoration is reported explicitly.
+
+### Fixed
+
+- macOS alert clicks no longer open Script Editor. Apple Terminal banners
+  target the originating tab via `terminal-notifier`; supported terminal
+  emulators deliver their own notifications. Linux desktops retain `notify-send`.
+- Enter selects the highlighted primary model and closes the picker; Ctrl+P
+  keeps it open. A switch selected during a turn applies before pending chat
+  at the turn boundary, with the new model reflected in the session tools.
+- Installers verify model access even when credentials already exist and
+  reopen onboarding for rejected keys. No interactive login runs headlessly.
+- Ollama recovery verifies and saves the discovery endpoint instead of reusing
+  another provider's stale URL.
+- API-key checks classify provider rejection codes before redacting diagnostics,
+  so HTTP 400/422 authentication failures cannot appear as accepted credentials.
+- Launcher repair leaves profiles with ambiguous multiline shell data unchanged
+  and reports manual action rather than modifying quoted or generated scripts.
+- Source checkouts expose companion commands through Conch-only shims without
+  adding their private Python or pip to PATH, including symlinked launchers.
+- Upgrades reconcile recognized stale shell launchers with private backups,
+  preserving credentials, helper integrations, customized PATH entries, and
+  valid shell syntax inside conditional/function bodies. Experimental checkouts
+  migrate only with consent and retain their local work. Existing helpers that
+  cannot be inspected are not overwritten.
+- Launcher conflict checks match complete command names, so unrelated helpers
+  such as `conch-helper` and `old-conch` no longer block an upgrade.
+- Old pip is upgraded within the selected environment for editable
+  `pyproject.toml` builds, avoiding the missing `setup.py` upgrade failure.
+- Subscription inference no longer conflates Codex's read-only native sandbox
+  with Conch's host file tools or an MCP server's allowed-directory list.
+  Requested host paths remain available under OS permissions and existing
+  approval guards; saved-file claims require a successful tool result.
 
 ## [0.9.4] - 2026-11-17
 
@@ -532,6 +574,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.5]: https://github.com/detournement/conch/releases/tag/v0.9.5
 [0.9.4]: https://github.com/detournement/conch/releases/tag/v0.9.4
 [0.9.3]: https://github.com/detournement/conch/releases/tag/v0.9.3
 [0.9.2]: https://github.com/detournement/conch/releases/tag/v0.9.2

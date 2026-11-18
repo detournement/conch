@@ -89,6 +89,17 @@ class PickerTests(_ConfigCase):
         self.assertTrue(all("kimi" in label for label in labels))
         self.assertEqual(picker.selected().label, labels[0])
 
+    def test_late_current_model_receives_highlight_unless_user_has_moved(self):
+        active = ModelEntry("ollama", "local:latest")
+        for moved in (False, True):
+            with self.subTest(moved=moved):
+                picker = ModelPicker(self.config, "ollama", active.model)
+                if moved:
+                    picker.move(1)
+                previous = picker.selected_key
+                picker.apply_live([active], {"ollama": ProviderStatus(True, "ready")})
+                self.assertEqual(picker.selected_key, previous if moved else active.key)
+
     def test_roles_save_to_config_and_clear_with_a_removed_model(self):
         picker = self.picker()
         picker.start_add()
@@ -173,6 +184,22 @@ class PrimaryPickerTests(_ConfigCase, unittest.IsolatedAsyncioTestCase):
 
         return ModelPicker(self.config, "anthropic", "claude-sonnet-5",
                            on_primary=apply)
+
+    async def test_enter_applies_highlighted_row_once_then_closes(self):
+        picker = self.primary_picker()
+        picker.query.text = "gpt-6-sol"
+        picker.selected_key = ("openai", "gpt-6-sol")
+        with create_pipe_input() as input:
+            app = picker.build(input=input, output=DummyOutput())
+            # A repeated Return/arrow in the same input batch must not move
+            # the selection out from under the asynchronous validation.
+            input.send_text("\r\x1b[B\r")
+            with mock.patch.object(picker, "on_primary", wraps=picker.on_primary) as apply:
+                await asyncio.wait_for(app.run_async(), timeout=5)
+                self.assertEqual([call.args[0].key for call in apply.call_args_list],
+                                 [("openai", "gpt-6-sol")])
+        self.assertEqual((self.config["provider"], self.config["chat_model"]), picker.current)
+        self.assertEqual(picker.current, ("openai", "gpt-6-sol"))
 
     async def test_ctrl_p_switches_primary_and_keeps_filter_and_role_controls_live(self):
         picker = self.primary_picker()

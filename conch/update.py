@@ -472,7 +472,27 @@ def _installed_source(dist) -> Tuple[str, str]:
 def _installer_command(spec: str, *, editable: bool = False, user: bool = False) -> List[str]:
     probe = _run([sys.executable, "-m", "pip", "--version"], timeout=30,
                  operation="Checking this interpreter's pip", allow_failure=True)
-    if probe.returncode == 0:
+    pip_usable = probe.returncode == 0
+    if editable and pip_usable:
+        version = re.match(r"pip (\d+)\.(\d+)", probe.stdout)
+        if not version:
+            raise UpdateError("Cannot determine pip's editable-build support; repair this interpreter's pip first.")
+        if tuple(map(int, version.groups())) < (21, 3):
+            if not user and shutil.which("uv"):
+                pip_usable = False
+            elif sys.prefix == sys.base_prefix and not user:
+                raise UpdateError(
+                    "This system Python's pip predates editable pyproject builds. "
+                    "Use this checkout's virtual environment or install uv; system pip was not changed."
+                )
+            else:
+                print("Upgrading this environment's pip for editable pyproject builds.")
+                bootstrap = [sys.executable, "-m", "pip", "install", "--upgrade",
+                             "--no-input", "--disable-pip-version-check"]
+                if user:
+                    bootstrap.append("--user")
+                _install(bootstrap + ["pip>=21.3"], Path(sys.prefix))
+    if pip_usable:
         command = [sys.executable, "-m", "pip", "install", "--upgrade", "--no-input",
                    "--disable-pip-version-check"]
         if user:
@@ -599,6 +619,25 @@ def main(argv=None, *, prog: str = "conch update") -> int:
             command = _installer_command(spec, user=_user_install(pkg, dist))
             _install(command, Path(sys.prefix))
             _refresh_source_record(spec)
+        invoked = shutil.which(sys.argv[0]) or sys.argv[0]
+        launcher = Path(invoked).absolute()
+        if launcher.name != "conch" or not launcher.is_file():
+            launcher = root / "bin/conch" if root else Path(sysconfig.get_path("scripts")) / "conch"
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ("PYTHONPATH", "PYTHONHOME")}
+        # Load the freshly installed repair code, not modules from this process.
+        repair = _run(
+            [sys.executable, "-m", "conch.launchers", "--launcher", str(launcher)],
+            cwd=Path.home(), env=environment, timeout=60,
+            operation="Reconciling shell startup launchers", allow_failure=True,
+        )
+        print(repair.stdout, end="")
+        if repair.returncode:
+            raise UpdateError(
+                "Package updated, but launcher selection still needs attention. "
+                + _safe_text(repair.stderr)
+                + "\nResolve the reported startup conflicts before opening a new terminal."
+            )
         print("Conch and dependencies updated. No modules were hot-reloaded. Exit this process and start `conch` again "
               "(using the same launcher/environment); restart any long-running Conch services separately.")
         return 0

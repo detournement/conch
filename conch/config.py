@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 
 DEFAULT_CONFIG: Dict[str, str] = {
@@ -25,9 +25,9 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # Per-message token stats line (tokens, cost, tok/s) in interactive
     # chat. On by default; /tks flips it for a session.
     "show_token_stats": "true",
-    # Interactive turns that run at least this many seconds post a desktop
-    # notification when they finish (macOS osascript, Linux notify-send).
-    # 0/off disables.
+    # /notifications toggles alerts without losing the long-turn threshold.
+    # A zero/off threshold also disables them.
+    "notifications": "on",
     "notify_after_seconds": "30",
     # Turn-level git checkpoints when cwd is a git repo: mutating turns
     # snapshot the worktree to refs/conch/checkpoints/* (user branch and
@@ -42,7 +42,6 @@ DEFAULT_CONFIG: Dict[str, str] = {
     # interactively or walks fallback_models non-interactively. "off"
     # skips the probe. model_check_timeout bounds each probe request.
     "model_check": "on",
-    "model_check_timeout": "4",
     # Ordered, pre-approved "provider/model" entries (comma-separated) a
     # non-interactive run (pipe, cron, conch-ask, conch-edge) may switch
     # to when the configured model fails its startup check. Empty means
@@ -383,20 +382,23 @@ def reload_env_file() -> List[str]:
     return load_env_file()
 
 
-def _write_private_file(path: Path, text: str) -> None:
-    """Write *text* to *path* atomically with 0600 perms (0700 parent):
-    a temp file in the same directory, fsync, then rename over the
-    target — so a crash mid-write never leaves a truncated key file, and
-    keys never transit a world-readable state."""
+def _write_private_file(path: Path, text: Union[str, bytes], *,
+                        mode: int = 0o600) -> None:
+    """Write text or bytes atomically, privately by default (0700 parent).
+
+    A same-directory temp file, fsync, then rename prevents truncation.
+    Rollback may supply the original mode; the temp stays 0600 while
+    writing, and its final permissions are installed before replacement.
+    """
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "wb" if isinstance(text, bytes) else "w") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(str(tmp), 0o600)
+        os.chmod(str(tmp), mode)
         os.replace(str(tmp), str(path))
     except BaseException:
         try:
@@ -405,7 +407,7 @@ def _write_private_file(path: Path, text: str) -> None:
             pass
         raise
     try:
-        os.chmod(str(path), 0o600)
+        os.chmod(str(path), mode)
     except OSError:
         pass
 
@@ -652,8 +654,6 @@ def load_config() -> Dict[str, str]:
             config["chat_model"] = config["model"]
     if provider in ("claude-code", "codex"):
         config["api_key_env"] = ""
-        if "model_check_timeout" not in explicit:
-            config["model_check_timeout"] = "60"
 
     if provider == "ollama":
         # base_url is shared across providers; remember it as the Ollama

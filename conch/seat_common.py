@@ -147,3 +147,25 @@ def run(argv: list, *, prompt: str | None = None, timeout: float = 120,
                 if pipe is not None and not pipe.closed:
                     pipe.close()
             process.wait()
+
+
+def reject_native_evaluation(provider: str) -> None:
+    """Reject before launch when CLI controls cannot guarantee eval isolation.
+
+    Claude's startup policy cannot currently be established free of managed
+    execution; disableAllHooks cannot override managed hooks:
+    https://code.claude.com/docs/en/hooks#hook-locations
+    Codex read-only plus never approval prevents native patch writes, but
+    patch verification reads targets before denial, and exec JSON output
+    does not expose every denied native attempt.
+    Keep native auth stores intact rather than pretending a new cwd is an OS
+    sandbox or relying on rejecting an execution event after its side effect.
+    """
+    from .eval_policy import EvaluationError
+
+    detail = (
+        "Claude Code evaluation isolation cannot be established before native startup: managed execution may remain"
+        if provider == "claude-code" else
+        "Codex patch verification can read non-fixture files before write denial, and exec JSON omits some denied native attempts"
+    )
+    raise EvaluationError("unsupported", detail)

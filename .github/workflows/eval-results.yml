@@ -1,0 +1,42 @@
+name: Eval results ingestion
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Existing evaluation issue to retry (failures remain in the inbox)
+        required: true
+        type: string
+
+# These permissions belong only to trusted default-branch code. Submitters need
+# permission to open public issues, not labels, Actions, or repository writes.
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  ingest:
+    if: >-
+      github.repository == 'detournement/conch' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted ingestion code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate issue and publish immutable data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          GH_PROMPT_DISABLED: '1'
+        # All issue/input data is read from GITHUB_EVENT_PATH by Python. Never
+        # interpolate issue text, titles, author names, or dispatch inputs here.
+        run: python tools/ingest_eval_result.py

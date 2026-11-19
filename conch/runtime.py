@@ -18,6 +18,7 @@ from . import mcp as mcp_mod
 from .ebrake import AgentsCancelled, checkpoint, current_controller, serialized_execution
 from .images import IMAGE_TOKENS, is_image_block, placeholder, without_payloads
 from .render import Spinner, StreamPrinter, _get_active_ui, clear_active_spinners
+from .eval_policy import EvaluationError
 
 logger = logging.getLogger("conch.runtime")
 
@@ -1989,6 +1990,7 @@ def chat_turn(
     on_token=None,
     input_fn=None,
     steering_fn=None,
+    evaluation=None,
 ) -> tuple:
     """Returns (reply_text, usage_info) where usage_info is a dict with
     input_tokens, output_tokens, and model.
@@ -2001,6 +2003,16 @@ def chat_turn(
     replace unexecuted tool calls with explicit results before adding guidance.
     """
     from .providers import STREAM_FNS, PROVIDER_TOOL_LIMITS
+
+    if evaluation is not None:
+        config = evaluation.configure(config, provider)
+        if chat_state is not None or steering_fn is not None or on_token is not None:
+            raise EvaluationError("harness", "Evaluation requires fresh state and nonstreaming requests")
+        if raw_fn is None:
+            raise EvaluationError("unsupported", "Evaluation provider has no request adapter")
+        # Both maps contain caller-supplied fixture clients, never MCP bootstrap.
+        builtin_clients = dict(tool_map, **(builtin_clients or {}))
+        tool_map = {}
 
     stream_printer = getattr(on_token, "__self__", None)
     ui_stream = (
@@ -2060,12 +2072,16 @@ def chat_turn(
             )
             round_budget = wanted
         if _round >= round_budget:
+            if evaluation is not None:
+                raise EvaluationError("limit", "Evaluation turn round budget exhausted")
             break
         if (
             token_budget
             and _round
             and total_usage["input_tokens"] + total_usage["output_tokens"] >= token_budget
         ):
+            if evaluation is not None:
+                raise EvaluationError("limit", "Evaluation turn token budget exhausted")
             print(
                 f"  \033[33m⚠ Turn token budget ({token_budget:,}) exhausted — "
                 f"summarizing progress\033[0m",
@@ -2082,14 +2098,14 @@ def chat_turn(
         if chat_state and getattr(chat_state, "needs_tool_refresh", False):
             tools = chat_state.tools
             chat_state.needs_tool_refresh = False
-        send_tools = select_request_tools(
+        send_tools = tools if evaluation is not None else select_request_tools(
             tools, provider, messages, PROVIDER_TOOL_LIMITS,
             getattr(chat_state, "pinned_tools", None),
             query="\n".join(relevance),
         )
         # Model-generated compaction first (plan 1.4); char-capping
         # compress_context stays as the cheap backstop below.
-        if raw_fn is not None:
+        if raw_fn is not None and evaluation is None:
             try:
                 if auto_compact(
                     messages, send_tools, provider, config, raw_fn
@@ -2097,7 +2113,7 @@ def chat_turn(
                     print("  \033[2m(older history auto-compacted)\033[0m", file=sys.stderr)
             except Exception:
                 pass
-        compressed = compress_context(
+        compressed = messages if evaluation is not None else compress_context(
             messages, send_tools, provider, config
         )
         if len(compressed) < len(messages):
@@ -2115,13 +2131,14 @@ def chat_turn(
         active_model = config.get(
             "chat_model", config.get("model", "")
         )
-        _append_leading_system_context(
-            send_messages,
-            "[Current runtime state] "
-            + build_self_description(
-                provider, active_model, config
-            ),
-        )
+        if evaluation is None:
+            _append_leading_system_context(
+                send_messages,
+                "[Current runtime state] "
+                + build_self_description(
+                    provider, active_model, config
+                ),
+            )
 
         # Few-shot tool-call anchor + corrective reminder for local models
         # (transient: added to the request only, never persisted).
@@ -2138,7 +2155,7 @@ def chat_turn(
 
         # Re-inject the plan scratchpad every round (plan 2.5) — it lives
         # outside compactable history so it survives auto-compaction.
-        todo_client = (builtin_clients or {}).get("todo_list")
+        todo_client = (builtin_clients or {}).get("todo_list") if evaluation is None else None
         todo_block = todo_client.render() if hasattr(todo_client, "render") else ""
         if todo_block:
             _append_leading_system_context(send_messages, todo_block)
@@ -2148,6 +2165,8 @@ def chat_turn(
         messages.extend(guidance)
         send_messages.extend(guidance)
         checkpoint()
+        if evaluation is not None:
+            evaluation.begin_call(config, provider)
         _call_started = time.monotonic()
         if stream_fn:
             response = stream_fn(config, send_messages, send_tools if send_tools else None, on_token)
@@ -2155,6 +2174,14 @@ def chat_turn(
             with Spinner("Thinking"):
                 response = raw_fn(config, send_messages, send_tools if send_tools else None)
 
+        if evaluation is not None:
+            evaluation.observe(response)
+            evaluation.record_attempts(response.get("_evaluation_attempts", response.get("tool_calls")))
+            evaluation.check_deadline()
+            if response.get("_unknown_blocks"):
+                raise EvaluationError("unsupported", "Evaluation provider returned unsupported native content")
+            if is_error_response(response):
+                evaluation.provider_error(error_detail(response))
         usage = response.get("_usage", {})
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)
@@ -2162,7 +2189,7 @@ def chat_turn(
         record_call_timing(total_usage, usage, time.monotonic() - _call_started)
         # Calibrate char->token estimates against the provider's real prompt
         # token count (Ollama reports prompt_eval_count on every response).
-        if usage.get("input_tokens"):
+        if evaluation is None and usage.get("input_tokens"):
             record_token_calibration(
                 char_count(send_messages, send_tools),
                 usage["input_tokens"],
@@ -2443,6 +2470,10 @@ def chat_turn(
             reply = response.get("content") or ""
             textual = looks_like_textual_tool_call(reply)
             if textual:
+                if evaluation is not None:
+                    attempted = extract_textual_tool_use_blocks(reply, None)
+                    evaluation.record_attempts(attempted or [{"name": "[malformed textual tool call]", "arguments": reply}])
+                    raise EvaluationError("limit", "Evaluation model emitted a non-native tool request")
                 note_textual_tool_call(chat_state)
                 total_usage["tool_protocol_error"] = (
                     "model emitted a textual tool call"
@@ -2492,7 +2523,8 @@ def chat_turn(
                 continue
             from .tooling import run_hook
 
-            run_hook("on_turn_end", {"reply": reply}, config)
+            if evaluation is None:
+                run_hook("on_turn_end", {"reply": reply}, config)
             return reply, total_usage
 
         if ui_stream is not None:
@@ -2512,7 +2544,7 @@ def chat_turn(
             if _tool_name(tool)
         }
         allowed_tool_names = set(tool_definitions)
-        round_result_budget = max(
+        round_result_budget = 32768 if evaluation is not None else max(
             256,
             int(
                 get_context_limit(provider, config)
@@ -2578,6 +2610,8 @@ def chat_turn(
 
         for tool_call in tool_calls:
             checkpoint()
+            if evaluation is not None:
+                evaluation.check_deadline()
             guidance.extend(take_steering())
             if guidance:
                 add_result(
@@ -2635,7 +2669,7 @@ def chat_turn(
                         )
                     add_result(tool_call, result_text)
                     continue
-                allowed, hook_out = run_hook(
+                allowed, hook_out = (True, "") if evaluation is not None else run_hook(
                     "pre_tool_use", {"tool": name, "arguments": arguments}, config
                 )
                 if not allowed:
@@ -2692,6 +2726,8 @@ def chat_turn(
                         else:
                             result_text = str(content_blocks)
                     elif name in tool_map:
+                        if evaluation is not None:
+                            raise EvaluationError("harness", "Evaluation tools must be explicit fixture clients")
                         if activity is not None:
                             result_text = mcp_mod.execute_tool(tool_map, name, arguments)
                         else:
@@ -2702,6 +2738,8 @@ def chat_turn(
                             f"Error: {name} is no longer connected. Refresh tools "
                             "and try again."
                         )
+                except EvaluationError:
+                    raise
                 except AgentsCancelled:
                     raise
                 except KeyboardInterrupt:
@@ -2720,11 +2758,12 @@ def chat_turn(
                             file=sys.stderr,
                         )
                 result_text = str(result_text or "(no output)")
-                run_hook(
-                    "post_tool_use",
-                    {"tool": name, "arguments": arguments, "result": result_text},
-                    config,
-                )
+                if evaluation is None:
+                    run_hook(
+                        "post_tool_use",
+                        {"tool": name, "arguments": arguments, "result": result_text},
+                        config,
+                    )
                 is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
                 if activity is None:
                     _print_tool_result(result_text, verbose=_verbose_tools, error=is_error)
@@ -2761,6 +2800,8 @@ def chat_turn(
             # A superseded proposal is not a repeated execution attempt.
             previous_batch = ""
             identical_batches = 0
+    if evaluation is not None:
+        raise EvaluationError("limit", "Evaluation turn round budget exhausted")
     # Round budget exhausted: summarize progress instead of a bare marker
     # (plan 2.6).
     print(

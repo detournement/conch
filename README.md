@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.5][release] ·
+[Current release: v0.9.6][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.5
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.6
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -152,6 +152,75 @@ Choices are saved as `model_effort` and `model_context`; a value a model does no
 accept is never sent. For Ollama they win over `ollama_think` and
 `ollama_num_ctx`, which still apply to other models.
 
+### Model evaluations
+
+`/eval` opens a **selection-only** model picker: Enter chooses the evaluation
+target without changing your primary model, roles, tuning, or conversation.
+Opening or refreshing this picker can fetch model metadata, but never runs
+capability inference or native seat CLIs. You can also name a target directly:
+
+```text
+/eval openai/gpt-6-sol
+/eval ollama/qwen3:8b --timeout 600
+/eval results
+/eval results <run-id>
+/eval share <run-id>
+```
+
+After a default-no confirmation, **Conch Lite v1** runs 12 fixed synthetic cases:
+literal shell quoting, explanation without execution, typed tool arguments,
+dependent lookups, surgical editing, saving outside cwd within an allowed root,
+grounded answers, calculations, tool-error recovery, follow-up changes, prompt
+injection, and truthful handling of a denied write. These are practical smoke
+measurements, not a comprehensive safety certification or model ranking.
+
+Each case gets a fresh temporary fixture root and subprocess, at most four
+inference calls and twelve tool calls. The default whole-run deadline is 300
+seconds (`--timeout` accepts 1–3600); output is capped at 1024 tokens per call
+where supported. Calls use the selected Conch adapter without fallback, retries,
+helper models, ambient chat history, MCP servers, hooks, or real shell execution.
+API charges can apply. Ctrl+C stops only the evaluation and saves its partial
+result; the active chat remains unchanged.
+
+Results distinguish task failures from authentication, transport, timeout, and
+harness errors. Incomplete runs receive no overall verdict; trust-case failures
+are highlighted separately. Provider-observed model identity is distinguished
+from an unverified requested label. Missing usage or pricing stays unknown, not
+zero. A passed tool dependency requires a later model response that could have
+seen its prerequisite; follow-up grading preserves the actual first-turn file.
+
+**Subscription seats:** Claude Code and Codex evaluations are currently
+unavailable before inference. Their native CLI controls cannot guarantee the
+fixture-only isolation and complete tool-attempt observation this suite needs.
+Normal subscription chat and sign-in are unchanged; API and local adapters are
+available for evaluation.
+
+Private JSON reports are saved atomically in
+`$XDG_STATE_HOME/conch/evals` (default `~/.local/state/conch/evals`), with private
+directory/file permissions. They include bounded synthetic traces and replies,
+with credential-shaped strings redacted. `/eval results` browses saved reports;
+interrupted, corrupt, and newer-schema files remain visible rather than silently
+disappearing.
+
+**Sharing is optional and public.** Nothing uploads automatically. After a run,
+press `s`, or use `/eval share <run-id>`. Conch previews the exact allowlisted JSON,
+the signed-in GitHub account, and the public destination before a second
+default-no confirmation. Use an existing `gh` login; Conch does not start login
+or ask for repository-write access. Custom/local model IDs require a public label.
+The export contains suite/version/hash, model label and adapter, selected
+non-secret settings, case outcomes, timings, call counts, and usage—not transcripts,
+raw errors, file paths, endpoints, credentials, or configuration. `local_only`
+blocks sharing.
+
+Submissions open issues in [`detournement/conch`](https://github.com/detournement/conch/issues).
+A trusted default-branch Action validates them and writes immutable,
+**self-reported** records to the
+[`eval-results` branch](https://github.com/detournement/conch/tree/eval-results),
+under `results/<suite-version>/<GitHub-author-id>/<run-id>.json`. An opened issue
+is only **submitted**, not **accepted**: sharing again checks the verified stored
+record. Failed submissions stay local and in the issue inbox; explicit retries
+reuse the issue without overwriting accepted data.
+
 ### Subagent panel
 
 `/agents` (or `/subagents`) shows how Conch delegates work and lets you tune it:
@@ -208,6 +277,7 @@ columns by 31 rows); pipes and smaller windows skip it.
 | `/infobar [detail\|progress]` | Pick and save detailed stats or a context-progress bar |
 | `/ebrake [on\|off\|status]` | Pause all session agents; `off` resumes, `status` reports |
 | `/model`, `/models` | Open the [model picker](#model-picker): every model, roles, add your own |
+| `/eval [provider/model]`, `/eval results`, `/eval share <run-id>` | Run the [lightweight model evaluations](#model-evaluations), browse private results, or preview optional public sharing |
 | `/provider` | Choose a provider |
 | `/fanout` | Show or set the model [fan-out](#fan-out) workers use |
 | `/agents`, `/subagents` | Open the [subagent panel](#subagent-panel): worker and subagent settings, skills, live activity |
@@ -677,9 +747,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v0.9.5. GitHub releases include a
+`conch-shell` is not published on PyPI at v0.9.6. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v0.9.5` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v0.9.6` to install the release sdist.
 
 ### Updating
 
@@ -1965,6 +2035,7 @@ conch/
 ├── config.py, settings_registry.py   config loading and validated live settings
 ├── model_catalog.py, model_picker.py model discovery, additions, and the picker
 ├── model_tuning.py                   per-model reasoning effort and context window
+├── evals/, eval_policy.py            isolated model evaluations and opt-in public results
 ├── convo_browser.py, agents_panel.py conversations page and subagent panel
 ├── fanout.py, subagent_activity.py   parallel workers and their live activity
 ├── filetools.py, webfetch.py         approved file edits and page fetching

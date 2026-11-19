@@ -213,6 +213,7 @@ def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
     from .render import emit_generation_detail
 
     provider = config.get("provider", "")
+    evaluation = config.get("_evaluation_policy")
     model = config.get("chat_model") or config.get("model") or DEFAULT_MODELS.get(provider, "")
     try:
         timeout = float(config.get("seat_timeout", 120))
@@ -244,10 +245,14 @@ def complete(config: dict, messages: list, tools=None, on_token=None) -> dict:
         # the CLI keeps its own default.
         effort = effort_for(config, provider, model)
         extra = {"effort": effort} if effort else {}
+        if evaluation is not None:
+            extra["evaluation"] = evaluation
         result = transport(provider).invoke(
             model, prompt, response_schema(tools), timeout, on_detail=on_detail, **extra)
         reply = normalize(result["response"], tools)
     except SeatError as exc:
+        if evaluation is not None:
+            evaluation.provider_error(str(exc))
         return error_response(f"{provider}: {exc}")
     reply["_usage"] = result.get("usage") or {"input_tokens": 0, "output_tokens": 0}
     reply["_model"] = result.get("model") or model

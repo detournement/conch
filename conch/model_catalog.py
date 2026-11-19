@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 EXTRA_MODELS_KEY = "extra_models"
@@ -158,8 +159,8 @@ def catalog_entries(config: dict) -> List[ModelEntry]:
     return entries
 
 
-def static_status(config: dict) -> Dict[str, ProviderStatus]:
-    """What can be said about each provider without touching the network."""
+def static_status(config: dict, *, metadata_only: bool = False) -> Dict[str, ProviderStatus]:
+    """What can be said without network access or executing credentials."""
     from .config import local_only_enabled
     from .llamaidx import get_llamaidx_url
     from .providers import DEFAULT_API_KEY_ENVS, SEAT_PROVIDERS, _has_key, get_custom_base_url
@@ -168,7 +169,8 @@ def static_status(config: dict) -> Dict[str, ProviderStatus]:
     statuses: Dict[str, ProviderStatus] = {}
     for provider in PROVIDER_ORDER:
         if provider in SEAT_PROVIDERS:
-            statuses[provider] = ProviderStatus(None, "checking sign-in…")
+            note = "sign-in not checked (metadata only)" if metadata_only else "checking sign-in…"
+            statuses[provider] = ProviderStatus(None, note)
         elif provider == "ollama":
             statuses[provider] = ProviderStatus(None, "asking the server…")
         elif provider == "custom":
@@ -241,11 +243,12 @@ def _ollama_source(config: dict) -> LiveResult:
         {"ollama": status}
 
 
-def _custom_source(config: dict) -> LiveResult:
+def _custom_source(config: dict, *, metadata_only: bool = False) -> LiveResult:
     from .providers import get_custom_base_url, list_custom_models
 
     try:
-        models = list_custom_models(config, force_refresh=True)
+        models = list_custom_models(config, force_refresh=True,
+                                    tool_capable_only=not metadata_only)
     except Exception:
         models = None
     if models is None:
@@ -270,21 +273,22 @@ def _registry_source(config: dict) -> LiveResult:
     return (REGISTRY,), entries, {REGISTRY: ProviderStatus(bool(registry), get_llamaidx_url(config))}
 
 
-def live_sources(config: dict) -> list:
-    """Callables (config → LiveResult) for what needs the network or a CLI:
-    seat sign-in, the Ollama server, the custom endpoint, the registry. Run
-    them independently so a slow one never holds up the rest; each never
-    raises, a failure becomes its status."""
+def live_sources(config: dict, *, metadata_only: bool = False) -> list:
+    """Independent discovery callables (config → LiveResult), never raising.
+
+    Metadata-only discovery skips native CLIs and custom inference probes.
+    Ollama's tags/show and the registry catalog only read model metadata.
+    """
     from .config import local_only_enabled
     from .llamaidx import get_llamaidx_url
     from .providers import SEAT_PROVIDERS, get_custom_base_url
 
     sources: list = []
-    if not local_only_enabled(config, config.get("provider", "")):
+    if not metadata_only and not local_only_enabled(config, config.get("provider", "")):
         sources += [_seat_source(provider) for provider in SEAT_PROVIDERS]
     sources.append(_ollama_source)
     if get_custom_base_url(config):
-        sources.append(_custom_source)
+        sources.append(partial(_custom_source, metadata_only=metadata_only))
     if get_llamaidx_url(config):
         sources.append(_registry_source)
     return sources

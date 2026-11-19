@@ -146,6 +146,7 @@ class AgentSession:
         on_token=None,
         input_fn=None,
         steering_fn=None,
+        evaluation=None,
     ) -> tuple:
         """Run one bounded agent turn through ``runtime.chat_turn``.
 
@@ -157,6 +158,9 @@ class AgentSession:
         """
         raw_fn = self.raw_fn()
         if raw_fn is None:
+            if evaluation is not None:
+                from .eval_policy import EvaluationError
+                raise EvaluationError("unsupported", "Evaluation provider has no request adapter")
             raise RuntimeError(f"unknown provider '{self.provider}'")
         if tools is _UNSET:
             tools = getattr(self.chat_state, "tools", None)
@@ -187,6 +191,7 @@ class AgentSession:
                     on_token=on_token,
                     input_fn=input_fn,
                     steering_fn=steering_fn,
+                    evaluation=evaluation,
                 )
         finally:
             # A skill loaded mid-turn (skill_manage use) that declares a
@@ -195,7 +200,7 @@ class AgentSession:
             wanted = int(
                 getattr(self.chat_state, "requested_tool_rounds", 0) or 0
             )
-            if wanted > self.budgets.max_tool_rounds:
+            if evaluation is None and wanted > self.budgets.max_tool_rounds:
                 self.budgets.max_tool_rounds = wanted
 
     # -- lifecycle -----------------------------------------------------------

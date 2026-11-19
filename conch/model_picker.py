@@ -50,11 +50,13 @@ from .themes import colors_disabled, current_scheme, style_for
 
 def pick_model(config: dict, provider: str, model: str, *, purpose: Optional[str] = None,
                on_primary: Optional[Callable[[ModelEntry], bool]] = None,
-               input=None, output=None) -> Optional[ModelEntry]:
+               selection_only: bool = False, input=None, output=None) -> Optional[ModelEntry]:
     """Run the picker; return Enter's choice when no primary callback is supplied.
     *on_primary* validates/applies primary changes and returns whether they worked.
-    *purpose* names a non-primary setting being chosen (e.g. fanout_model)."""
-    picker = ModelPicker(config, provider, model, purpose=purpose, on_primary=on_primary)
+    *purpose* names a non-primary setting being chosen (e.g. fanout_model).
+    *selection_only* disables persisted changes, inference probes and native CLIs."""
+    picker = ModelPicker(config, provider, model, purpose=purpose,
+                         on_primary=on_primary, selection_only=selection_only)
     if input is None:
         input = create_input(sys.stdin)
     if output is None:
@@ -89,15 +91,18 @@ class ModelPicker:
 
     def __init__(self, config: dict, provider: str, model: str, busy: bool = False,
                  purpose: Optional[str] = None,
-                 on_primary: Optional[Callable[[ModelEntry], bool]] = None):
-        self.config = config
+                 on_primary: Optional[Callable[[ModelEntry], bool]] = None,
+                 selection_only: bool = False):
+        self.selection_only = selection_only
+        self.config = dict(config) if selection_only else config
         self.current = ((provider or "").lower(), model or "")
         self.busy = busy
         # The setting this pick fills when it is not the chat model.
         self.purpose = purpose
-        self.on_primary = on_primary
+        self.on_primary = None if selection_only else on_primary
         self.entries: List[ModelEntry] = catalog_entries(config)
-        self.statuses: Dict[str, ProviderStatus] = static_status(config)
+        self.statuses: Dict[str, ProviderStatus] = static_status(
+            config, metadata_only=selection_only)
         self._pending = 0  # live sources still to answer
         self.mode = "list"  # list | add | primary (validating)
         self.notice = ""
@@ -125,7 +130,7 @@ class ModelPicker:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        sources = live_sources(self.config)
+        sources = live_sources(self.config, metadata_only=self.selection_only)
         self._pending += len(sources)
 
         def work(source):
@@ -166,10 +171,13 @@ class ModelPicker:
 
     def refresh(self):
         for provider, status in self.statuses.items():
+            if self.selection_only and provider in ("claude-code", "codex"):
+                continue
             if status.available is None or provider in ("ollama", "custom", REGISTRY):
                 self.statuses[provider] = ProviderStatus(None, "asking again…")
         self.start_live()
-        self.notice = "Refreshing local servers, the registry, and seats…"
+        self.notice = ("Refreshing model metadata…" if self.selection_only else
+                       "Refreshing local servers, the registry, and seats…")
 
     def _words(self) -> List[str]:
         return [word for word in self.query.text.casefold().split() if word]
@@ -300,13 +308,23 @@ class ModelPicker:
         if close and self.app is not None:
             self.app.exit()
 
+    def _editing_allowed(self) -> bool:
+        if self.selection_only:
+            self.notice = "Evaluation selection only; settings are unchanged."
+            return False
+        return True
+
     def _set(self, values: Dict[str, str]):
+        if not self._editing_allowed():
+            return
         from .config import set_config_values
 
         set_config_values(values)
         self.config.update(values)
 
     def toggle_fanout(self):
+        if not self._editing_allowed():
+            return
         entry = self.selected()
         if entry is None:
             return
@@ -323,6 +341,8 @@ class ModelPicker:
         self.notice = f"Fan-out workers use {entry.label}."
 
     def toggle_side(self):
+        if not self._editing_allowed():
+            return
         entry = self.selected()
         if entry is None:
             return
@@ -340,6 +360,8 @@ class ModelPicker:
 
     def cycle_effort(self):
         """Next effort level for the selected model, then back to default."""
+        if not self._editing_allowed():
+            return
         from . import model_tuning
 
         entry = self.selected()
@@ -361,6 +383,8 @@ class ModelPicker:
 
     def cycle_context(self):
         """Next context window for the selected model, then back to default."""
+        if not self._editing_allowed():
+            return
         from . import model_tuning
 
         entry = self.selected()
@@ -383,6 +407,8 @@ class ModelPicker:
         return describe(self.config, entry.provider, entry.model)
 
     def start_add(self):
+        if not self._editing_allowed():
+            return
         entry = self.selected()
         provider = (entry.provider if entry and entry.provider not in
                     ("ollama", "custom", REGISTRY) else "openai")
@@ -393,6 +419,8 @@ class ModelPicker:
             self.app.layout.focus(self.add_input)
 
     def finish_add(self, save: bool):
+        if not self._editing_allowed():
+            return
         text = self.add_input.text
         self.mode = "list"
         if self.app is not None:
@@ -417,6 +445,8 @@ class ModelPicker:
         self._refresh_rows()
 
     def remove_selected(self):
+        if not self._editing_allowed():
+            return
         entry = self.selected()
         if entry is None:
             return
@@ -537,10 +567,11 @@ class ModelPicker:
         if model_tuning.effort_levels(entry.provider, entry.model, self.config, probe=False):
             effort = model_tuning.effort_for(self.config, entry.provider, entry.model)
             what = "thinking" if entry.provider == "ollama" else "effort"
-            parts.append(f"{what} {effort or 'default'} (^E)")
+            parts.append(f"{what} {effort or 'default'}" + ("" if self.selection_only else " (^E)"))
         if entry.provider == "ollama":
             context = model_tuning.context_for(self.config, entry.provider, entry.model)
-            parts.append(f"context {model_tuning.context_label(context) if context else 'server default'} (^W)")
+            parts.append(f"context {model_tuning.context_label(context) if context else 'server default'}"
+                         + ("" if self.selection_only else " (^W)"))
         source = {"catalog": "built-in catalog", "added": "added by you",
                   "server": "reported by the server", "registry": "llama-idx registry"}
         parts.append(source.get(entry.source, entry.source))
@@ -564,6 +595,9 @@ class ModelPicker:
     def _render_footer(self, width: int, height: int) -> List[List[Line]]:
         if self.notice:
             return [[("class:notice", _fit(" " + self.notice, width))]]
+        if self.selection_only:
+            hints = ["Enter selects for eval", "type to filter", "^R refresh", "Esc quit"]
+            return [[("class:muted", " " + _fit_hints(hints, width - 1))]]
         if self.mode == "add":
             hints = ["Enter adds", "Esc cancels", "OpenRouter ids keep their slash: openrouter/vendor/model"]
         else:
@@ -611,6 +645,13 @@ class ModelPicker:
         keys = KeyBindings()
         listing = Condition(lambda: self.mode == "list")
         adding = Condition(lambda: self.mode == "add")
+        editable = listing & Condition(lambda: not self.selection_only)
+        if self.selection_only:
+            def _blocked_mutation(event):
+                self._editing_allowed()
+
+            for key in ("c-p", "c-f", "c-t", "c-a", "c-x", "c-e", "c-w"):
+                keys.add(key, filter=listing, eager=True)(_blocked_mutation)
 
         def page() -> int:
             return max(1, self._height - 2)
@@ -652,27 +693,27 @@ class ModelPicker:
             else:
                 event.app.exit()
 
-        @keys.add("c-f", filter=listing)
+        @keys.add("c-f", filter=editable)
         def _fanout(event):
             self.toggle_fanout()
 
-        @keys.add("c-t", filter=listing)
+        @keys.add("c-t", filter=editable)
         def _side(event):
             self.toggle_side()
 
-        @keys.add("c-a", filter=listing)
+        @keys.add("c-a", filter=editable)
         def _add(event):
             self.start_add()
 
-        @keys.add("c-x", filter=listing)
+        @keys.add("c-x", filter=editable)
         def _remove(event):
             self.remove_selected()
 
-        @keys.add("c-e", filter=listing)
+        @keys.add("c-e", filter=editable)
         def _effort(event):
             self.cycle_effort()
 
-        @keys.add("c-w", filter=listing)
+        @keys.add("c-w", filter=editable)
         def _context(event):
             self.cycle_context()
 

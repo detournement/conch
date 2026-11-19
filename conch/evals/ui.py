@@ -61,7 +61,10 @@ def _share(report, config, input_fn):
         print("Not shared. Your local report is unchanged.")
         return
     try:
-        report["sharing"] = submit_report(payload, identity=identity)
+        report["sharing"] = submit_report(
+            payload, identity=identity,
+            previous=previous if previous and previous.get("issue_number") else None,
+        )
         save_report(report)
         report["sharing"] = refresh_submission(report["sharing"])
         save_report(report)

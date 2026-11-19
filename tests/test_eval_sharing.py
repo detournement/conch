@@ -54,6 +54,7 @@ class GitHubStore:
         self.head = None
         self.contents_write = True
         self.auth_error = False
+        self.search_visible = True
         self.race_once = False
         self.always_conflict = False
         self.foreign_path = "results/1/999/4dc64619-8c74-48a0-bf30-95e9351acf04.json"
@@ -109,7 +110,8 @@ class GitHubStore:
         if method == "GET" and route == "/search/issues":
             assert "repo:" + sharing.REPOSITORY in query["q"][0]
             assert "author:alice" in query["q"][0]
-            return {"items": copy.deepcopy(list(self.issues.values())), "incomplete_results": False}
+            return {"items": copy.deepcopy(list(self.issues.values())) if self.search_visible else [],
+                    "incomplete_results": False}
         if method == "GET" and route.startswith(root + "/actions/runs/"):
             return copy.deepcopy(self.runs[int(route.rsplit("/", 1)[1])])
         if route == root + "/issues" and method == "POST":
@@ -358,6 +360,29 @@ class GitHubSharingTests(unittest.TestCase):
         self.assertEqual(sharing.parse_envelope(writes[1][1]["body"]), self.payload)
         self.assertEqual(len(self.store.issues), 1)
         self.assertEqual(sharing.github_identity(), "alice")
+
+    def test_saved_retry_reuses_issue_before_search_index_catches_up(self):
+        metadata = self.submit()
+        self.store.search_visible = False
+        self.store.contents_write = False
+        before = len(self.store.calls)
+        retried = sharing.submit_report(self.payload, identity="alice", previous=metadata)
+        self.assertEqual(retried["issue_number"], metadata["issue_number"])
+        self.assertNotEqual(retried["attempt_id"], metadata["attempt_id"])
+        self.assertEqual(len(self.store.issues), 1)
+        self.assertFalse(any(path.startswith("/search/issues")
+                             for _, path, _ in self.store.calls[before:]))
+        self.assertEqual(sharing.refresh_submission(retried)["status"], "submitted")
+
+    def test_saved_retry_cannot_retarget_another_account_or_payload(self):
+        metadata = self.submit()
+        for changed in ({"author_id": 999}, {"payload_sha256": "b" * 64}):
+            with self.subTest(changed=changed):
+                before = len(self.store.calls)
+                with self.assertRaisesRegex(sharing.SharingError, "different account or report"):
+                    sharing.submit_report(self.payload, identity="alice", previous=dict(metadata, **changed))
+                self.assertTrue(all(method == "GET" for method, _, _ in self.store.calls[before:]))
+                self.assertEqual(len(self.store.issues), 1)
 
     def test_comments_never_prove_acceptance_but_real_dataset_does(self):
         metadata = self.submit()

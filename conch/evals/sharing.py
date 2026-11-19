@@ -342,7 +342,15 @@ def _metadata(issue: dict, payload: dict, *, author_id: int) -> dict:
             "submitted_at": datetime.now(timezone.utc).isoformat()}
 
 
-def submit_report(payload: dict, *, identity: str) -> dict:
+def _retry_issue(api, number: int, payload: dict, author_id: int) -> dict:
+    updated = api.request("PATCH", API_ROOT + "/issues/%d" % number,
+                          {"body": encode_envelope(payload)})
+    if not isinstance(updated, dict) or updated.get("number") != number or updated.get("user", {}).get("id") != author_id:
+        raise SharingError("GitHub returned an inconsistent retry issue.")
+    return _metadata(updated, payload, author_id=author_id)
+
+
+def submit_report(payload: dict, *, identity: str, previous: dict = None) -> dict:
     """UI owns final confirmation; recheck account before any possible write."""
     payload = validate_public_report(payload)
     if not isinstance(identity, str) or not _LOGIN.fullmatch(identity):
@@ -359,6 +367,16 @@ def submit_report(payload: dict, *, identity: str) -> dict:
         metadata = _metadata(source_issue, payload, author_id=user["id"])
         metadata.update(status="accepted", dataset_url=existing[1])
         return metadata
+    if previous is not None:
+        if (not isinstance(previous, dict) or previous.get("author_id") != user["id"]
+                or previous.get("payload_sha256") != payload_hash(payload)):
+            raise SharingError("Saved submission belongs to a different account or report. Existing results will not be overwritten.")
+        metadata = _refresh(api, previous)
+        if metadata["status"] == "accepted":
+            return metadata
+        # GitHub search is eventually consistent. A saved issue handle is
+        # authoritative after _refresh validates its author and payload.
+        return _retry_issue(api, previous["issue_number"], payload, user["id"])
     title = "Conch eval: " + payload["run_id"]
     query = 'repo:%s is:issue author:%s in:title "%s"' % (REPOSITORY, user["login"], title)
     results = api.request("GET", "/search/issues?" + urlencode({"q": query, "per_page": 100}))
@@ -380,11 +398,7 @@ def submit_report(payload: dict, *, identity: str) -> dict:
             # A fresh nonce schedules `issues: edited` and makes earlier or
             # still-in-flight attempts' rejection receipts irrelevant.
             # Keep the issue and all failure comments; never require labels.
-            body = encode_envelope(payload)
-            updated = api.request("PATCH", API_ROOT + "/issues/%d" % issue["number"], {"body": body})
-            if not isinstance(updated, dict) or updated.get("number") != issue["number"] or updated.get("user", {}).get("id") != user["id"]:
-                raise SharingError("GitHub returned an inconsistent retry issue.")
-            return _metadata(updated, payload, author_id=user["id"])
+            return _retry_issue(api, issue["number"], payload, user["id"])
     issue = api.request("POST", API_ROOT + "/issues", {"title": title, "body": encode_envelope(payload)})
     if not isinstance(issue, dict):
         raise SharingError("GitHub returned an invalid submission issue")

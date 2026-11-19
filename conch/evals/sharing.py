@@ -113,22 +113,32 @@ def _run_gh(args: list, data: bytes = None, *, token: str = None) -> tuple:
             pass
 
     reader = threading.Thread(target=receive, daemon=True)
-    reader.start()
-    writer = None
-    if data is not None:
-        writer = threading.Thread(target=send, daemon=True)
-        writer.start()
+    writer = threading.Thread(target=send, daemon=True) if data is not None else None
     try:
+        reader.start()
+        if writer is not None:
+            writer.start()
         process.wait(timeout=30)
     except subprocess.TimeoutExpired as exc:
         process.kill()
         process.wait()
         raise SharingError("GitHub request timed out. Retry explicitly; your local report is retained.") from exc
     finally:
-        reader.join(timeout=2)
-        if writer is not None:
+        # Cancellation must stop and reap the request before closing its pipes.
+        # The remote write may already have landed; retries recover by run ID.
+        if process.returncode is None:
+            process.kill()
+            process.wait()
+        if reader.ident is not None:
+            reader.join(timeout=2)
+        if writer is not None and writer.ident is not None:
             writer.join(timeout=2)
         process.stdout.close()
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
     if oversized.is_set() or reader.is_alive():
         raise SharingError("GitHub response exceeded the safe size limit.")
     return process.returncode, output.decode("utf-8", errors="replace")

@@ -25,6 +25,8 @@ Releases before 0.6.0 predate this changelog.
   disables fallback, retries, helper inference, hooks, ambient context, and
   real-world tools. Claude Code/Codex seat evaluations fail before inference
   while native isolation remains unverifiable; normal seat chat is unchanged.
+- Reports use Ollama's clamped request context rather than its configured
+  override. Cancelling sharing terminates and reaps the GitHub CLI request.
 
 ## [0.9.5] - 2026-11-18
 

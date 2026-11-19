@@ -6,8 +6,10 @@ import copy
 import hashlib
 import io
 import json
+import os
 import re
 import subprocess
+import sys
 import unittest
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
@@ -600,6 +602,39 @@ class GitHubTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(sharing.SharingError, "timed out"):
                 sharing._run_gh(["api", "/user"])
         self.assertTrue(slow.killed)
+
+    @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX child reaping")
+    def test_interrupt_terminates_and_reaps_the_active_github_process(self):
+        spawn = subprocess.Popen
+        children = []
+
+        def interrupt_wait(*args, **kwargs):
+            child = spawn(*args, **kwargs)
+            children.append(child)
+            wait = child.wait
+
+            def interrupted(timeout=None):
+                if timeout == 30:
+                    raise KeyboardInterrupt
+                return wait(timeout=timeout)
+
+            child.wait = interrupted
+            return child
+
+        try:
+            with patch.object(sharing.shutil, "which", return_value=sys.executable), \
+                    patch.object(sharing.subprocess, "Popen", side_effect=interrupt_wait):
+                with self.assertRaises(KeyboardInterrupt):
+                    sharing._run_gh(["-c", "import time; time.sleep(60)"], b"request body")
+            self.assertEqual(len(children), 1)
+            self.assertEqual(children[0].returncode, -9)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(children[0].pid, os.WNOHANG)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
 
 
 if __name__ == "__main__":

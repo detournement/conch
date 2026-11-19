@@ -188,6 +188,8 @@ are highlighted separately. Provider-observed model identity is distinguished
 from an unverified requested label. Missing usage or pricing stays unknown, not
 zero. A passed tool dependency requires a later model response that could have
 seen its prerequisite; follow-up grading preserves the actual first-turn file.
+Ollama context is recorded from request options after model-limit clamping;
+server-managed or inconsistent context is left unspecified.
 
 **Subscription seats:** Claude Code and Codex evaluations are currently
 unavailable before inference. Their native CLI controls cannot guarantee the
@@ -220,6 +222,9 @@ under `results/<suite-version>/<GitHub-author-id>/<run-id>.json`. An opened issu
 is only **submitted**, not **accepted**: sharing again checks the verified stored
 record. Failed submissions stay local and in the issue inbox; explicit retries
 reuse the issue without overwriting accepted data.
+Ctrl+C stops and reaps the local GitHub request process. It cannot undo a write
+already received by GitHub; sharing the same saved result again recovers that
+submission.
 
 ### Subagent panel
 

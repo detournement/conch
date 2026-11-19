@@ -101,7 +101,7 @@ def execute(payload: dict) -> dict:
         if session is not None:
             session.close()
         snapshot = policy.snapshot()
-        for key in ("calls", "usage", "observed_models", "identity"):
+        for key in ("calls", "usage", "observed_models", "identity", "context_lengths"):
             row[key] = snapshot[key]
         if row["error_kind"] in ("cancelled", "timeout", "harness"):
             row["usage"]["complete"] = False

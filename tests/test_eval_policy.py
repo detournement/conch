@@ -253,6 +253,16 @@ class EvaluationObservationTests(unittest.TestCase):
         self.assertEqual(policy.snapshot()["usage"]["input_tokens"], 5)
         self.assertEqual(policy.snapshot()["identity"], "unverified")
 
+    def test_inflight_context_does_not_inherit_the_previous_requests_value(self):
+        policy = EvaluationPolicy("ollama", "requested")
+        config = {"chat_model": "requested"}
+        policy.begin_call(config, "ollama")
+        policy.record_context_length(4096)
+        policy.begin_call(config, "ollama")
+        self.assertEqual(policy.snapshot()["context_lengths"], [4096, None])
+        policy.record_context_length(2048)
+        self.assertEqual(policy.snapshot()["context_lengths"], [4096, 2048])
+
     def test_explicit_fallback_is_not_comparable(self):
         policy = EvaluationPolicy("openai", "requested")
         policy.begin_call({"chat_model": "requested"}, "openai")

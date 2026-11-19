@@ -1778,6 +1778,7 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         body["tools"] = _sanitize_tools_for_openai(tools)
     if config.get("_evaluation_policy"):
         body.setdefault("options", {})["num_predict"] = config["_evaluation_policy"].output_tokens
+        config["_evaluation_policy"].record_context_length(body["options"].get("num_ctx"))
     elif body.get("options", {}).get("num_predict"):
         body["options"]["num_predict"] = _clamp_output_to_context(
             body["options"]["num_predict"],

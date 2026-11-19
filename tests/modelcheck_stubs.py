@@ -47,7 +47,8 @@ class StubEndpoint:
     def __init__(self, models=("stub-model",), tool_capable=None, *,
                  require_token: str = "", hang: float = 0.0,
                  force_status: Optional[Tuple[int, dict]] = None,
-                 ask_commands: Optional[Dict[str, str]] = None):
+                 ask_commands: Optional[Dict[str, str]] = None,
+                 ollama_context_length: Optional[int] = None):
         self.models: List[str] = list(models)
         self.tool_capable = set(self.models if tool_capable is None else tool_capable)
         self.require_token = require_token
@@ -56,6 +57,8 @@ class StubEndpoint:
         self.ask_commands: Dict[str, str] = dict(ask_commands or {})
         self.requests: List[Tuple[str, str]] = []
         self.chat_tools: List[List[str]] = []
+        self.ollama_context_length = ollama_context_length
+        self.ollama_chat_options: List[dict] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         stub = self
@@ -122,8 +125,13 @@ class StubEndpoint:
                     caps = ["completion"]
                     if name in stub.tool_capable:
                         caps.append("tools")
-                    return self._send(200, {"capabilities": caps})
+                    payload = {"capabilities": caps}
+                    if stub.ollama_context_length is not None:
+                        payload["model_info"] = {"stub.context_length": stub.ollama_context_length}
+                    return self._send(200, payload)
                 if method == "POST" and path == "/api/chat":
+                    with stub._lock:
+                        stub.ollama_chat_options.append(body.get("options", {}))
                     name = body.get("model") or ""
                     if name not in stub.models:
                         return self._send(404, {"error": f"model '{name}' not found"})

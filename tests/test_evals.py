@@ -189,7 +189,8 @@ class EvaluationSettingsTests(StateCase):
         original = copy.deepcopy(config)
         selected, target = select_target(config, "ollama", "gpt-oss:20b")
         body = {}
-        apply_ollama_request_options(body, selected, "gpt-oss:20b")
+        with mock.patch("conch.providers.get_ollama_context_length", return_value=32768):
+            apply_ollama_request_options(body, selected, "gpt-oss:20b")
         report = new_report(target)
         report["status"] = "cancelled"
         payload = public_report(report, model_label="Public fixture model")
@@ -214,6 +215,37 @@ class EvaluationSettingsTests(StateCase):
         })
         self.assertEqual(wire, "high")
         self.assertEqual(published, "high")
+
+    def test_ollama_report_uses_clamped_request_context_after_consent(self):
+        from conch.evals.public import public_report
+
+        for overrides in ({"ollama_num_ctx": "8192"},
+                          {"ollama_num_ctx": "2048", "model_context": "ollama/eval-fixture=8192"}):
+            with self.subTest(overrides=overrides):
+                endpoint = self.endpoint(ollama_context_length=4096)
+                config = dict(overrides, provider="ollama", ollama_base_url=endpoint.url)
+                original = copy.deepcopy(config)
+                selected, target = select_target(config, "ollama", "eval-fixture")
+                self.assertEqual(endpoint.paths(), [])
+                self.assertNotIn("context_length", target["settings"])
+                report = run_suite(selected, target, deadline_seconds=30)
+                self.assertEqual(report["status"], "complete")
+                self.assertEqual({options["num_ctx"] for options in endpoint.ollama_chat_options}, {4096})
+                self.assertEqual(load_report(report["run_id"])["target"]["settings"]["context_length"], 4096)
+                self.assertEqual(public_report(report, model_label="Fixture")["settings"]["context_length"], 4096)
+                self.assertEqual(config, original)
+
+    def test_ollama_server_managed_context_remains_unspecified(self):
+        from conch.evals.public import public_report
+
+        endpoint = self.endpoint(ollama_context_length=4096)
+        selected, target = select_target({"provider": "ollama", "ollama_base_url": endpoint.url},
+                                         "ollama", "eval-fixture")
+        report = run_suite(selected, target, deadline_seconds=30)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual({options.get("num_ctx") for options in endpoint.ollama_chat_options}, {None})
+        self.assertNotIn("context_length", load_report(report["run_id"])["target"]["settings"])
+        self.assertNotIn("context_length", public_report(report, model_label="Fixture")["settings"])
 
 
 class EvaluationConsentTests(StateCase):

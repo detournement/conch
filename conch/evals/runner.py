@@ -84,9 +84,8 @@ def select_target(config: dict, provider: str, model: str) -> tuple:
             settings["reasoning_effort"] = think
     if context:
         values["model_context"] = f"{provider}/{model}={context}"
-        settings["context_length"] = context
-    elif provider == "ollama" and values.get("ollama_num_ctx"):
-        settings["context_length"] = int(values["ollama_num_ctx"])
+        if provider != "ollama":
+            settings["context_length"] = context
     elif provider == "custom" and values.get("custom_context_window"):
         settings["context_length"] = int(values["custom_context_window"])
     values["max_output_tokens"] = "1024"
@@ -271,6 +270,12 @@ def run_suite(config: dict, target: dict, *, deadline_seconds: int = 300,
                         if model not in report["target"]["observed_models"]:
                             report["target"]["observed_models"].append(model)
                     attempted = [item for item in report["cases"] if item["status"] != "not_run"]
+                    if config["provider"] == "ollama":
+                        lengths = {length for item in attempted
+                                   for length in item.get("context_lengths") or [None]}
+                        report["target"]["settings"].pop("context_length", None)
+                        if len(lengths) == 1 and None not in lengths:
+                            report["target"]["settings"]["context_length"] = lengths.pop()
                     identities = {item["identity"] for item in attempted}
                     report["target"]["identity"] = ("fallback" if "fallback" in identities else
                                                          "observed" if identities == {"observed"} else "unverified")

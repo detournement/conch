@@ -45,6 +45,7 @@ class EvaluationPolicy:
         self._responses = 0
         self._usage_complete = True
         self._tokens = {"input_tokens": None, "output_tokens": None}
+        self._context_lengths = []
 
     def check_deadline(self):
         if self.deadline and time.monotonic() >= self.deadline:
@@ -119,6 +120,10 @@ class EvaluationPolicy:
             raise EvaluationError("limit", "Evaluation tool-attempt budget exhausted; batch not executed")
         self.check_deadline()
 
+    def record_context_length(self, value):
+        """Record each request's context; None means server-managed."""
+        self._context_lengths.append(value)
+
     def observe(self, response):
         self._responses += 1
         metadata = response.get("_evaluation", {})
@@ -168,4 +173,5 @@ class EvaluationPolicy:
                 "usage": dict(self._tokens, complete=complete),
                 "observed_models": list(self.observed_models),
                 "identity": identity,
+                "context_lengths": self._context_lengths + [None] * (self.calls - len(self._context_lengths)),
                 "attempts": copy.deepcopy(self.attempts)}

@@ -74,8 +74,14 @@ def select_target(config: dict, provider: str, model: str) -> tuple:
     if effort:
         values["model_effort"] = f"{provider}/{model}={effort}"
         settings["reasoning_effort"] = effort
-    elif provider == "ollama" and values.get("ollama_think"):
-        settings["reasoning_effort"] = str(values["ollama_think"])
+    elif provider == "ollama" and "ollama_think" in values:
+        think = str(values["ollama_think"]).strip().lower()
+        if think in ("true", "1", "yes", "on"):
+            think = "on"
+        elif think in ("false", "0", "no", "off"):
+            think = "off"
+        if think:
+            settings["reasoning_effort"] = think
     if context:
         values["model_context"] = f"{provider}/{model}={context}"
         settings["context_length"] = context

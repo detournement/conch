@@ -181,6 +181,41 @@ class RunnerLifecycleTests(StateCase):
         self.assertEqual(config, before)
 
 
+class EvaluationSettingsTests(StateCase):
+    def exported_setting(self, config):
+        from conch.evals.public import public_report
+        from conch.providers import apply_ollama_request_options
+
+        original = copy.deepcopy(config)
+        selected, target = select_target(config, "ollama", "gpt-oss:20b")
+        body = {}
+        apply_ollama_request_options(body, selected, "gpt-oss:20b")
+        report = new_report(target)
+        report["status"] = "cancelled"
+        payload = public_report(report, model_label="Public fixture model")
+        self.assertEqual(config, original)
+        return body["think"], payload["settings"]["reasoning_effort"]
+
+    def test_ollama_boolean_aliases_remain_shareable_and_match_wire_behavior(self):
+        for value, enabled in (("true", True), ("false", False), ("1", True), ("0", False),
+                               (" YES ", True), (" No ", False), (True, True), (False, False),
+                               (1, True), (0, False)):
+            with self.subTest(value=value):
+                wire, published = self.exported_setting({
+                    "provider": "ollama", "ollama_num_ctx": "8192", "ollama_think": value,
+                })
+                self.assertIs(wire, enabled)
+                self.assertEqual(published, "on" if enabled else "off")
+
+    def test_per_model_effort_wins_over_global_thinking_alias(self):
+        wire, published = self.exported_setting({
+            "provider": "ollama", "ollama_num_ctx": "8192", "ollama_think": "false",
+            "model_effort": "ollama/gpt-oss:20b=high",
+        })
+        self.assertEqual(wire, "high")
+        self.assertEqual(published, "high")
+
+
 class EvaluationConsentTests(StateCase):
     def test_declined_run_never_contacts_selected_endpoint_or_changes_primary(self):
         endpoint = self.endpoint()

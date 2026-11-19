@@ -18,7 +18,8 @@ _LOGIN_REMEDY = "Run conch auth login claude-code."
 # Safe mode, unlike --bare, preserves native subscription authentication. It
 # disables customizations including installed plugins, LSP, memory and helpers.
 # Restricted mode also ignores user/project/local settings; explicit settings
-# disable hooks while leaving the native credential store in place.
+# disable non-managed hooks while leaving the native credential store in place.
+# Managed hooks cannot be disabled here; strict evaluations reject before launch.
 # Keep a flag after variadic --mcp-config so it cannot consume auth subcommands.
 _ISOLATION = (
     "--restricted", "--setting-sources", "",
@@ -363,8 +364,11 @@ class _Events:
 
 
 def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None,
-           effort: str = "") -> dict:
+           effort: str = "", evaluation=None) -> dict:
     """Generate one schema-constrained response without executing native tools."""
+    if evaluation is not None:
+        from .seat_common import reject_native_evaluation
+        reject_native_evaluation("claude-code")
     if not math.isfinite(timeout) or timeout <= 0:
         raise SeatError("Claude requires a positive finite timeout")
     started = time.monotonic()

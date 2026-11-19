@@ -1433,6 +1433,15 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 if isinstance(result, tuple) and result[0] == "update":
                     _pending_update = result[1]
                     break
+                if isinstance(result, tuple) and result[0] == "eval":
+                    from .evals.ui import run_eval_command
+
+                    # Non-live slash commands already queue until the active
+                    # turn ends. Evaluation owns stdin, never the chat session.
+                    with _suspend_ui():
+                        run_eval_command(result[1], config, provider, model_name,
+                                         input_fn=_safe_input)
+                    continue
                 if isinstance(result, tuple) and result[0] in ("ebrake", "colorscheme", "infobar", "notifications"):
                     _apply_session_control(*result)
                     continue

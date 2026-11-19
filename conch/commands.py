@@ -44,7 +44,7 @@ from .tooling import (
 BUILTIN_SLASH_COMMANDS = (
     "/?", "/agent", "/agents", "/approvals", "/approve", "/apps", "/cancel",
     "/checkpoint", "/clear", "/colorscheme", "/compact", "/connect", "/convos", "/cost", "/delete",
-    "/deny", "/disable", "/ebrake", "/edit", "/enable", "/export", "/fact", "/facts", "/fanout",
+    "/deny", "/disable", "/ebrake", "/edit", "/enable", "/eval", "/export", "/fact", "/facts", "/fanout",
     "/find", "/fork", "/forget", "/grep", "/h", "/help", "/image", "/infobar", "/install", "/keys",
     "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
@@ -152,6 +152,7 @@ SLASH_COMMANDS = [
     ("/infobar [detail|progress]", "Pick and save detailed stats or a context-progress bar"),
     ("/models", "Model picker: every model, roles (fan-out, side tasks), add your own"),
     ("/model <name>", "Switch model (no name: open the model picker)"),
+    ("/eval [provider/model|results|share]", "Evaluate one model on 12 Conch tasks; save locally and optionally share"),
     ("/llamaidx", "Fleet status from the llama-idx registry (up/degraded/down boxes)"),
     ("/registry [set <url>|off]", "Show, wire, or remove the llama-idx registry (llamaidx_url)"),
     ("/provider <name>", "Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)"),
@@ -1472,6 +1473,9 @@ def handle_slash_command(
     if command == "/notifications":
         return ("notifications", arg)
 
+    if command == "/eval":
+        return ("eval", arg)
+
     if command == "/shortcuts":
         from .shortcuts import meta_tip, shortcut_text
 
@@ -1496,6 +1500,7 @@ def handle_slash_command(
             "  \033[1m/infobar [detail|progress]\033[0m Pick and save the info bar style\n"
             "  \033[1m/models\033[0m              Model picker: every model, roles, add your own\n"
             "  \033[1m/model <name>\033[0m        Switch model (no name: open the model picker)\n"
+            "  \033[1m/eval [provider/model]\033[0m Run 12 model checks; results browses, share publishes with consent\n"
             "  \033[1m/llamaidx\033[0m            Fleet status from the llama-idx registry\n"
             "  \033[1m/registry [set <url>|off]\033[0m  Show, wire, or remove the llama-idx registry\n"
             "  \033[1m/provider <name>\033[0m     Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)\n"

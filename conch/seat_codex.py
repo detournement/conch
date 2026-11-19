@@ -342,8 +342,11 @@ class _Events:
 
 
 def invoke(model: str, prompt: str, schema: dict, timeout: float, on_detail=None,
-           effort: str = '') -> dict:
+           effort: str = '', evaluation=None) -> dict:
     """Generate structured content only; never delegate Conch tools to Codex."""
+    if evaluation is not None:
+        from .seat_common import reject_native_evaluation
+        reject_native_evaluation("codex")
     with tempfile.TemporaryDirectory(prefix='conch-codex-') as directory:
         root = Path(directory)
         schema_path = root / 'response-schema.json'

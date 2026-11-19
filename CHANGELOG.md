@@ -7,6 +7,27 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [0.9.6] - 2026-11-19
+
+### Added
+
+- `/eval` selects a model without changing chat settings and runs 12 fixed
+  Conch Lite cases through the real adapters. Per-case fixture subprocesses,
+  inference/tool budgets, a whole-run deadline, and cancellation bound the run.
+- Private, atomic evaluation reports and `/eval results` browsing, including
+  partial-run recovery, explicit transport errors, observed model identity,
+  unknown-usage handling, and separate trust-case failures.
+- Opt-in public sharing through GitHub issues after an exact payload/account
+  preview. Trusted ingestion validates bounded self-reported measurements and
+  stores immutable data on `eval-results`; retries retain their issue and cannot
+  overwrite an accepted record.
+- Selection-only discovery does not probe models or launch seat CLIs. Evaluation
+  disables fallback, retries, helper inference, hooks, ambient context, and
+  real-world tools. Claude Code/Codex seat evaluations fail before inference
+  while native isolation remains unverifiable; normal seat chat is unchanged.
+- Reports use Ollama's clamped request context rather than its configured
+  override. Cancelling sharing terminates and reaps the GitHub CLI request.
+
 ## [0.9.5] - 2026-11-18
 
 ### Added
@@ -574,6 +595,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.6]: https://github.com/detournement/conch/releases/tag/v0.9.6
 [0.9.5]: https://github.com/detournement/conch/releases/tag/v0.9.5
 [0.9.4]: https://github.com/detournement/conch/releases/tag/v0.9.4
 [0.9.3]: https://github.com/detournement/conch/releases/tag/v0.9.3

@@ -3,10 +3,13 @@ provider-exact switching, roles saved to config and cleared with the model
 they name, and unusable providers refused before anything changes."""
 
 import asyncio
+import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
@@ -162,6 +165,141 @@ class PickerTests(_ConfigCase):
         self.assertIn("model list unavailable", picker.statuses["codex"].note)
         picker.choose()
         self.assertEqual(picker.result.key, ("codex", "native-model"))
+
+
+class DiscoveryPickerTests(_ConfigCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        from conch.providers import clear_local_model_caches
+
+        clear_local_model_caches()
+        self.addCleanup(clear_local_model_caches)
+        self.requests = []
+        requests = self.requests
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def respond(self, payload, status=200):
+                data = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                requests.append(("GET", self.path, None))
+                if self.path == "/v1/models":
+                    self.respond({"data": [{"id": "tool-model"}, {"id": "text-model"}]})
+                elif self.path == "/api/tags":
+                    self.respond({"models": [{"name": "ollama-model", "digest": "test"}]})
+                elif self.path == "/v1/inference?tools=true":
+                    self.respond({"registry_version": "0.1", "providers": [{
+                        "name": "box", "status": "up", "flavor": "openai",
+                        "base_url": "http://127.0.0.1:1/v1",
+                        "models": [{"id": "registry-model", "tools": True}],
+                    }]})
+                else:
+                    self.respond({}, 404)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append(("POST", self.path, body))
+                if self.path == "/api/show":
+                    self.respond({"capabilities": ["tools"]})
+                elif self.path == "/v1/chat/completions":
+                    message = {"content": "not a tool caller"}
+                    if body["model"] == "tool-model":
+                        message = {"tool_calls": [{"type": "function", "function": {
+                            "name": "conch_tool_probe",
+                            "arguments": '{"token":"conch-ok"}',
+                        }}]}
+                    self.respond({"choices": [{"message": message}]})
+                else:
+                    self.respond({}, 404)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+        self.config.update(custom_base_url=base + "/v1", ollama_base_url=base,
+                           llamaidx_url=base, local_only="false")
+
+    async def wait_until(self, predicate):
+        async def wait():
+            while not predicate():
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(wait(), timeout=5)
+
+    async def test_selection_only_open_and_refresh_use_metadata_without_native_processes(self):
+        original = dict(self.config)
+        with mock.patch("subprocess.Popen", side_effect=AssertionError("native process")) as popen, \
+             mock.patch("conch.seats.status") as seat_status, \
+             mock.patch("conch.seat_codex.list_models") as native_models:
+            picker = ModelPicker(self.config, "anthropic", "claude-sonnet-5",
+                                 selection_only=True)
+            with create_pipe_input() as input:
+                app = picker.build(input=input, output=DummyOutput())
+                task = asyncio.create_task(app.run_async(pre_run=picker.start_live))
+                try:
+                    await self.wait_until(lambda: app.is_running and not picker.loading)
+                    keys = {entry.key for entry in picker.entries}
+                    self.assertTrue({
+                        ("custom", "tool-model"), ("custom", "text-model"),
+                        ("ollama", "ollama-model"), ("llamaidx", "llamaidx/box/registry-model"),
+                        ("codex", "default"), ("claude-code", "opus"),
+                    }.issubset(keys))
+                    input.send_text("\x12")  # Ctrl-R uses the same safe discovery mode.
+                    await self.wait_until(lambda: (
+                        sum(path == "/v1/models" for _, path, _ in self.requests) == 2
+                        and not picker.loading))
+                    self.assertEqual(picker.statuses["codex"].note,
+                                     "sign-in not checked (metadata only)")
+                    self.assertEqual(self.config, original)
+                    picker.query.text = "text-model"
+                    input.send_text("\r")
+                    await asyncio.wait_for(task, timeout=5)
+                    self.assertEqual(picker.result.key, ("custom", "text-model"))
+                finally:
+                    if not task.done():
+                        app.exit()
+                    await asyncio.wait_for(task, timeout=5)
+            seat_status.assert_not_called()
+            native_models.assert_not_called()
+            popen.assert_not_called()
+        paths = [(method, path) for method, path, _ in self.requests]
+        self.assertEqual(paths.count(("GET", "/v1/models")), 2)
+        self.assertEqual(paths.count(("GET", "/api/tags")), 2)
+        self.assertEqual(paths.count(("GET", "/v1/inference?tools=true")), 2)
+        self.assertTrue(set(paths).issubset({
+            ("GET", "/v1/models"), ("GET", "/api/tags"),
+            ("GET", "/v1/inference?tools=true"), ("POST", "/api/show"),
+        }), paths)
+
+    async def test_normal_picker_still_probes_custom_models_and_discovers_native_seats(self):
+        with mock.patch("conch.auth.cli_installed", return_value=True), \
+             mock.patch("conch.seats.status", return_value=(True, "signed in")) as seats, \
+             mock.patch("conch.seat_codex.list_models", return_value=["native-model"]) as models:
+            picker = ModelPicker(self.config, "anthropic", "claude-sonnet-5")
+            picker.start_live()
+            await self.wait_until(lambda: not picker.loading)
+        keys = {entry.key for entry in picker.entries}
+        self.assertIn(("custom", "tool-model"), keys)
+        self.assertNotIn(("custom", "text-model"), keys)
+        self.assertIn(("codex", "native-model"), keys)
+        self.assertEqual({call.args[0] for call in seats.call_args_list},
+                         {"claude-code", "codex"})
+        models.assert_called_once()
+        self.assertEqual(
+            [body["model"] for method, path, body in self.requests
+             if (method, path) == ("POST", "/v1/chat/completions")],
+            ["tool-model", "text-model"],
+        )
 
 
 class PrimaryPickerTests(_ConfigCase, unittest.IsolatedAsyncioTestCase):

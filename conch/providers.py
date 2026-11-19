@@ -1495,6 +1495,37 @@ def get_fallback_model(provider: str, config: Optional[dict] = None) -> str:
     return models[0] if models else ""
 
 
+def _evaluation_metadata(config: dict, data: dict, provider: str) -> dict:
+    """Preserve only wire-observed identity and counters, not display defaults."""
+    if config.get("_evaluation_policy") is None:
+        return {}
+    if data.get("error"):
+        config["_evaluation_policy"].provider_error(data["error"])
+    usage = data.get("usage") or {}
+    if provider == "ollama":
+        counts = {"input_tokens": data.get("prompt_eval_count"),
+                  "output_tokens": data.get("eval_count")}
+    elif provider == "anthropic":
+        counts = {"input_tokens": usage.get("input_tokens"),
+                  "output_tokens": usage.get("output_tokens")}
+        if type(counts["input_tokens"]) is int:
+            for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+                value = usage.get(key, 0)
+                if type(value) is not int or value < 0:
+                    counts["input_tokens"] = None
+                    break
+                counts["input_tokens"] += value
+    else:
+        counts = {"input_tokens": usage.get("prompt_tokens"),
+                  "output_tokens": usage.get("completion_tokens")}
+    observed = data.get("model")
+    return {"_evaluation": {
+        "observed_models": [observed] if isinstance(observed, str) and observed else [],
+        "usage": counts,
+        "complete": all(type(value) is int and value >= 0 for value in counts.values()),
+    }}
+
+
 def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     api_key = os.environ.get(config.get("api_key_env", "CEREBRAS_API_KEY"), "").strip()
     if not api_key:
@@ -1504,7 +1535,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
         "model": config.get("chat_model", config.get("model", "gpt-oss-120b")),
         "messages": _wire_images("cerebras", messages),
         "temperature": 0.7,
-        "max_completion_tokens": 16384,
+        "max_completion_tokens": config["_evaluation_policy"].output_tokens if config.get("_evaluation_policy") else 16384,
         # Preserve prior thinking/tool context for agentic flows.
         "clear_thinking": False,
     }
@@ -1535,6 +1566,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
         "tool_calls": message.get("tool_calls"),
         "_usage": _normalize_usage(data, "cerebras"),
         "_model": body["model"],
+        **_evaluation_metadata(config, data, "cerebras"),
     }
 
 
@@ -1547,7 +1579,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         model,
         _wire_images("openai", messages),
         temperature=0.7,
-        max_completion_tokens=16384,
+        max_completion_tokens=config["_evaluation_policy"].output_tokens if config.get("_evaluation_policy") else 16384,
         tools=tools,
         reasoning_effort=_model_effort(config, "openai", model),
     )
@@ -1579,6 +1611,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         "tool_calls": message.get("tool_calls"),
         "_usage": _normalize_usage(data, "openai"),
         "_model": body["model"],
+        **_evaluation_metadata(config, data, "openai"),
     }
 
 
@@ -1596,7 +1629,7 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
     model = config.get("chat_model", config.get("model", "claude-sonnet-5"))
     body: Dict[str, Any] = {
         "model": model,
-        "max_tokens": _anthropic_max_tokens(model),
+        "max_tokens": config["_evaluation_policy"].output_tokens if config.get("_evaluation_policy") else _anthropic_max_tokens(model),
         "system": system,
         "messages": _wire_images("anthropic", user_messages),
     }
@@ -1641,22 +1674,31 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
             text_parts.append(block.get("text", ""))
         elif btype == "tool_use":
             tool_calls.append({
-                "id": block["id"],
+                "id": block.get("id", "") if config.get("_evaluation_policy") else block["id"],
                 "type": "function",
                 "function": {
-                    "name": block["name"],
+                    "name": block.get("name", "") if config.get("_evaluation_policy") else block["name"],
                     "arguments": json.dumps(block.get("input", {})),
                 },
             })
         elif btype not in ANTHROPIC_KNOWN_BLOCK_TYPES:
             unknown_blocks.append(str(btype))
+    evaluation_attempts = {}
+    if config.get("_evaluation_policy"):
+        evaluation_attempts["_evaluation_attempts"] = [
+            {"name": block.get("name", block.get("type", "")), "arguments": block.get("input")}
+            for block in raw_content if "tool" in str(block.get("type", ""))
+            and block.get("type") != "tool_result"
+        ]
     return {
         "role": "assistant",
         "content": "\n".join(text_parts).strip(),
         "tool_calls": tool_calls if tool_calls else None,
         "_anthropic_content": raw_content,
+        **evaluation_attempts,
         "_usage": _normalize_usage(data, "anthropic"),
         "_model": body["model"],
+        **_evaluation_metadata(config, data, "anthropic"),
         "_provider": "anthropic",
         "_stop_reason": data.get("stop_reason"),
         "_stop_details": data.get("stop_details"),
@@ -1718,9 +1760,14 @@ def _convert_ollama_tool_calls(raw_tool_calls: list) -> Optional[List[dict]]:
 def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
     base_url = get_ollama_base_url(config)
     model = config.get("chat_model", config.get("model", "llama3.3"))
-    ok, reason = validate_ollama_model(model, config)
-    if ok is not True:
-        return error_response(reason or f"Ollama model '{model}' is not verified")
+    if config.get("_evaluation_policy") is None:
+        ok, reason = validate_ollama_model(model, config)
+        if ok is not True:
+            return error_response(reason or f"Ollama model '{model}' is not verified")
+    else:
+        policy_error = local_endpoint_policy_error("ollama", base_url, config)
+        if policy_error:
+            return error_response(policy_error)
     body: Dict[str, Any] = {
         "model": model,
         "messages": _wire_images("ollama", messages),
@@ -1729,7 +1776,10 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     apply_ollama_request_options(body, config, model)
     if tools:
         body["tools"] = _sanitize_tools_for_openai(tools)
-    if body.get("options", {}).get("num_predict"):
+    if config.get("_evaluation_policy"):
+        body.setdefault("options", {})["num_predict"] = config["_evaluation_policy"].output_tokens
+        config["_evaluation_policy"].record_context_length(body["options"].get("num_ctx"))
+    elif body.get("options", {}).get("num_predict"):
         body["options"]["num_predict"] = _clamp_output_to_context(
             body["options"]["num_predict"],
             get_ollama_effective_context(model, config),
@@ -1755,9 +1805,10 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     return {
         "role": "assistant",
         "content": strip_think_blocks((message.get("content") or "").strip()),
-        "tool_calls": _convert_ollama_tool_calls(message.get("tool_calls")),
+        "tool_calls": message.get("tool_calls") if config.get("_evaluation_policy") else _convert_ollama_tool_calls(message.get("tool_calls")),
         "_usage": _normalize_usage(data, "ollama"),
         "_model": body["model"],
+        **_evaluation_metadata(config, data, "ollama"),
     }
 
 
@@ -1798,7 +1849,7 @@ def _bedrock_body(config: dict, messages: List[dict], tools: Optional[List[dict]
         "model": config.get("chat_model", config.get("model", "moonshotai.kimi-k2.5")),
         "messages": _wire_images("bedrock", messages),
         "temperature": 0.7,
-        "max_tokens": 16384,
+        "max_tokens": config["_evaluation_policy"].output_tokens if config.get("_evaluation_policy") else 16384,
     }
     if tools:
         body["tools"] = _sanitize_tools_for_openai(tools)
@@ -1836,6 +1887,7 @@ def raw_bedrock(config: dict, messages: List[dict], tools: Optional[List[dict]] 
         "tool_calls": message.get("tool_calls"),
         "_usage": _normalize_usage(data, "bedrock"),
         "_model": body["model"],
+        **_evaluation_metadata(config, data, "bedrock"),
     }
 
 
@@ -1926,7 +1978,7 @@ def _openrouter_body(config: dict, messages: List[dict], tools: Optional[List[di
     body: Dict[str, Any] = {
         "model": model,
         "messages": _wire_images("openrouter", messages),
-        "max_tokens": 16384,
+        "max_tokens": config["_evaluation_policy"].output_tokens if config.get("_evaluation_policy") else 16384,
         # Low reasoning effort and NO temperature: at the default (max)
         # effort with temperature set, Kimi K3 sometimes answers in prose
         # instead of emitting tool_calls; with effort=low it tool-calls
@@ -1972,6 +2024,7 @@ def raw_openrouter(config: dict, messages: List[dict], tools: Optional[List[dict
         "tool_calls": message.get("tool_calls"),
         "_usage": _normalize_usage(data, "openrouter"),
         "_model": body["model"],
+        **_evaluation_metadata(config, data, "openrouter"),
     }
 
 
@@ -2398,7 +2451,7 @@ def _custom_body(config: dict, messages: List[dict], tools: Optional[List[dict]]
         or config.get("model")
         or config.get("custom_model", "")
     )
-    context_window = get_custom_context_window(config, model)
+    context_window = 128000 if config.get("_evaluation_policy") else get_custom_context_window(config, model)
     try:
         max_tokens = int(
             config.get(
@@ -2442,11 +2495,12 @@ def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] =
     if policy_error:
         return error_response(policy_error)
     body = _custom_body(config, messages, tools)
-    ok, reason = validate_custom_model(body["model"], config)
-    if ok is not True:
-        return error_response(
-            reason or f"custom model '{body['model']}' is not verified"
-        )
+    if config.get("_evaluation_policy") is None:
+        ok, reason = validate_custom_model(body["model"], config)
+        if ok is not True:
+            return error_response(
+                reason or f"custom model '{body['model']}' is not verified"
+            )
     req = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode(),
@@ -2470,6 +2524,7 @@ def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         "tool_calls": message.get("tool_calls"),
         "_usage": _normalize_usage(data, "openai"),
         "_model": body["model"],
+        **_evaluation_metadata(config, data, "openai"),
     }
 
 

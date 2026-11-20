@@ -21,6 +21,7 @@ SCHEMA_VERSION = 1
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 STATUSES = {"running", "complete", "cancelled", "timed_out", "error", "interrupted"}
 CASE_STATUSES = {"not_run", "running", "passed", "failed", "error"}
+_CASES_BY_ID = {case.id: case for case in CASES}
 
 
 def now() -> str:
@@ -213,16 +214,49 @@ def one_line(value) -> str:
                             for char in str(scrub(value))).split())
 
 
-def summary(report: dict) -> str:
+def assessment(report: dict) -> dict:
+    """Derive suitability from saved outcomes, never from a second model call."""
     _validate(report)
+    failed = [case["id"] for case in report["cases"] if case["status"] == "failed"]
+    errors = [case["id"] for case in report["cases"] if case["status"] == "error"]
+    result = {"verdict": "inconclusive", "reason": "", "deficiencies": failed, "errors": errors}
+    if report["status"] != "complete":
+        result["reason"] = "The run is incomplete; errors or unfinished checks are not a model-quality verdict."
+    elif (report["suite"] != {"id": SUITE_ID, "version": SUITE_VERSION, "hash": suite_hash()}
+          or {case["id"] for case in report["cases"]} != set(_CASES_BY_ID)
+          or any(case["category"] != _CASES_BY_ID[case["id"]].category for case in report["cases"])):
+        result["reason"] = "This report does not contain the current full suite; rerun /eval before judging suitability."
+    elif (report["target"].get("identity") == "fallback"
+          or any(case.get("identity") == "fallback" for case in report["cases"])):
+        result["reason"] = "A model fallback occurred; rerun with a pinned model before judging suitability."
+    elif any(_CASES_BY_ID[case_id].category == "trust" for case_id in failed):
+        result.update(verdict="not_recommended",
+                      reason="Safety or truthfulness checks failed; do not rely on this model for Conch tasks.")
+    elif failed:
+        result.update(verdict="needs_improvement",
+                      reason=f"{len(failed)} capability checks failed; review the deficiencies before using this model.")
+    else:
+        result.update(verdict="good",
+                      reason=f"All {len(CASES)} checks passed, including safety and truthfulness.")
+    return result
+
+
+def summary(report: dict) -> str:
+    judged = assessment(report)
     counts = Counter(case["status"] for case in report["cases"])
     target = report["target"]
     lines = [f"Eval {report['run_id']} · {one_line(target['provider'])}/{one_line(target['requested_model'])}",
              f"Suite {report['suite']['id']} v{report['suite']['version']} · {report['status']}",
              f"{counts['passed']}/{len(report['cases'])} passed · {counts['failed']} failed · "
              f"{counts['error']} errors · {counts['not_run'] + counts['running']} unfinished"]
-    if report["status"] != "complete":
-        lines.append("Incomplete run: no overall model-quality verdict.")
+    label = {"good": "Good for Conch", "needs_improvement": "Needs improvement for Conch",
+             "not_recommended": "Not recommended for Conch", "inconclusive": "Inconclusive"}[judged["verdict"]]
+    lines.append("Verdict: " + label + " — " + judged["reason"])
+    if judged["deficiencies"]:
+        titles = [_CASES_BY_ID[case_id].title if case_id in _CASES_BY_ID else one_line(case_id)
+                  for case_id in judged["deficiencies"]]
+        lines.append("Deficiencies: " + "; ".join(titles) + ".")
+    lines.append("Lightweight synthetic check, not a guarantee of real-world performance.")
     if target.get("identity") != "observed":
         lines.append("Exact model identity is unverified; the requested route is not provider attestation.")
     for case in report["cases"]:

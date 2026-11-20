@@ -7,6 +7,17 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [0.9.7] - 2026-11-20
+
+### Added
+
+- Evaluation summaries give a Conch suitability verdict and identify deficient
+  capabilities. Trust failures override the aggregate score; incomplete runs,
+  unsupported suites, and model fallback stay inconclusive. Saved reports
+  receive the same assessment without extra model calls.
+- `/eval` briefly explains the battery before confirmation and describes each
+  case while it runs.
+
 ## [0.9.6] - 2026-11-19
 
 ### Added
@@ -595,6 +606,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.7]: https://github.com/detournement/conch/releases/tag/v0.9.7
 [0.9.6]: https://github.com/detournement/conch/releases/tag/v0.9.6
 [0.9.5]: https://github.com/detournement/conch/releases/tag/v0.9.5
 [0.9.4]: https://github.com/detournement/conch/releases/tag/v0.9.4

@@ -15,8 +15,8 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from conch.config import get_config_path, set_config_values
-from conch.evals.results import (list_reports, load_report, new_report, report_path,
-                                 run_lock, save_report)
+from conch.evals.results import (assessment, list_reports, load_report, new_report,
+                                 report_path, run_lock, save_report)
 from conch.evals.runner import run_suite, select_target
 from conch.evals.ui import run_eval_command
 from conch.model_picker import ModelPicker
@@ -92,6 +92,76 @@ class ResultRecoveryTests(StateCase):
         report["cases"][0]["usage"]["complete"] = True
         with self.assertRaises(ValueError):
             save_report(report)
+
+
+class EvaluationAssessmentTests(StateCase):
+    def complete_report(self):
+        report = new_report(self.target())
+        report["status"] = "complete"
+        for case in report["cases"]:
+            case["status"] = "passed"
+        return report
+
+    def fail_case(self, report, case_id):
+        case = next(row for row in report["cases"] if row["id"] == case_id)
+        case.update(status="failed", failures=["A required behavior was not demonstrated."])
+
+    def test_all_checks_must_pass_for_a_positive_verdict(self):
+        report = self.complete_report()
+        before = copy.deepcopy(report)
+        result = assessment(report)
+        self.assertEqual(result["verdict"], "good")
+        self.assertEqual(result["deficiencies"], [])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(report, before)
+        save_report(report)
+        self.assertEqual(assessment(load_report(report["run_id"])), result)
+
+    def test_task_failures_name_the_specific_deficiencies(self):
+        report = self.complete_report()
+        self.fail_case(report, "shell-quoting")
+        self.fail_case(report, "follow-up-change")
+        result = assessment(report)
+        self.assertEqual(result["verdict"], "needs_improvement")
+        self.assertEqual(result["deficiencies"], ["shell-quoting", "follow-up-change"])
+        self.assertEqual(result["errors"], [])
+
+    def test_trust_failure_outweighs_an_otherwise_high_score(self):
+        for case_id in ("prompt-injection", "denied-write-honesty"):
+            with self.subTest(case_id=case_id):
+                report = self.complete_report()
+                self.fail_case(report, case_id)
+                result = assessment(report)
+                self.assertEqual(result["verdict"], "not_recommended")
+                self.assertEqual(result["deficiencies"], [case_id])
+
+    def test_partial_and_provider_failures_do_not_become_bad_model_verdicts(self):
+        for status in ("running", "cancelled", "timed_out", "error", "interrupted"):
+            with self.subTest(status=status):
+                report = self.complete_report()
+                report["status"] = status
+                self.fail_case(report, "surgical-edit")
+                report["cases"][-1].update(status="error", error_kind="auth",
+                                          failures=["Selected transport authentication failed."])
+                result = assessment(report)
+                self.assertEqual(result["verdict"], "inconclusive")
+                self.assertEqual(result["deficiencies"], ["surgical-edit"])
+                self.assertEqual(result["errors"], ["denied-write-honesty"])
+
+    def test_incomplete_suite_or_fallback_cannot_claim_suitability(self):
+        changes = (
+            lambda report: report["suite"].update(version=999),
+            lambda report: report["suite"].update(hash="0" * 64),
+            lambda report: report["cases"].pop(),
+            lambda report: report["cases"][0].update(category="trust"),
+            lambda report: report["target"].update(identity="fallback"),
+            lambda report: report["cases"][0].update(identity="fallback"),
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                report = self.complete_report()
+                change(report)
+                self.assertEqual(assessment(report)["verdict"], "inconclusive")
 
 
 class RunnerLifecycleTests(StateCase):

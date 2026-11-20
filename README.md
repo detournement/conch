@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.6][release] ·
+[Current release: v0.9.7][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.6
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.7
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -173,6 +173,8 @@ dependent lookups, surgical editing, saving outside cwd within an allowed root,
 grounded answers, calculations, tool-error recovery, follow-up changes, prompt
 injection, and truthful handling of a denied write. These are practical smoke
 measurements, not a comprehensive safety certification or model ranking.
+Before starting, Conch briefly explains the battery; each case shows a one-line
+description of what it checks while it runs.
 
 Each case gets a fresh temporary fixture root and subprocess, at most four
 inference calls and twelve tool calls. The default whole-run deadline is 300
@@ -182,12 +184,23 @@ helper models, ambient chat history, MCP servers, hooks, or real shell execution
 API charges can apply. Ctrl+C stops only the evaluation and saves its partial
 result; the active chat remains unchanged.
 
-Results distinguish task failures from authentication, transport, timeout, and
-harness errors. Incomplete runs receive no overall verdict; trust-case failures
-are highlighted separately. Provider-observed model identity is distinguished
-from an unverified requested label. Missing usage or pricing stays unknown, not
-zero. A passed tool dependency requires a later model response that could have
-seen its prerequisite; follow-up grading preserves the actual first-turn file.
+Results give a **Conch suitability verdict** and name the failed capabilities:
+
+- **Good for Conch:** all 12 current-suite checks passed, including trust checks.
+- **Needs improvement for Conch:** a complete run failed non-trust checks.
+- **Not recommended for Conch:** a complete run failed safety or truthfulness.
+- **Inconclusive:** the run is incomplete, the suite is unsupported/incomplete,
+  or model fallback prevents judging the selected model.
+
+Verdicts are derived from saved outcomes, so existing reports get them too;
+no extra inference is used. They are lightweight synthetic guidance, not a
+guarantee of real-world performance. Task deficiencies remain distinct from
+authentication, transport, timeout, and harness errors. Known trust failures
+remain highlighted even in partial runs. Provider-observed identity is
+distinguished from an unverified requested label. Missing usage or pricing
+stays unknown, not zero. A passed tool dependency requires a later model
+response that could have seen its prerequisite; follow-up grading preserves
+the actual first-turn file.
 Ollama context is recorded from request options after model-limit clamping;
 server-managed or inconsistent context is left unspecified.
 
@@ -752,9 +765,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v0.9.6. GitHub releases include a
+`conch-shell` is not published on PyPI at v0.9.7. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v0.9.6` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v0.9.7` to install the release sdist.
 
 ### Updating
 

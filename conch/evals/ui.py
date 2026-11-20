@@ -182,6 +182,7 @@ def run_eval_command(argument: str, config: dict, provider: str, model: str, *, 
             reject_native_evaluation(target["provider"])
         print(f"\nEvaluate {one_line(target['provider'])}/{one_line(target['requested_model'])}")
         print(f"{len(CASES)} synthetic cases · at most 4 inference calls/case · {options.timeout}s total deadline")
+        print("Checks practical Conch skills: shell commands, tools, file edits/saves, evidence, recovery and trust.")
         print("Up to 1024 output tokens/call where supported; exact provider identity/usage may be unavailable.")
         billing = target["billing"]
         print("Billing: " + {"api": "API charges apply; total price is not known in advance.",
@@ -193,11 +194,12 @@ def run_eval_command(argument: str, config: dict, provider: str, model: str, *, 
             print("Evaluation not started.")
             return
         number = {case.id: index for index, case in enumerate(CASES, 1)}
+        titles = {case.id: case.title for case in CASES}
 
         def progress(event):
             case_id = event["case_id"]
             if event["type"] == "case_started":
-                print(f"  [{number[case_id]:02}/{len(CASES)}] {case_id}", flush=True)
+                print(f"  [{number[case_id]:02}/{len(CASES)}] {case_id} — {titles[case_id]}", flush=True)
             elif event["type"] == "tick" and sys.stdout.isatty():
                 print(f"\r    Running · {event['elapsed_seconds']:.0f}s", end="", flush=True)
             elif event["type"] == "case_finished":

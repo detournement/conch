@@ -17,6 +17,8 @@ Releases before 0.6.0 predate this changelog.
   and restarts into that same conversation only after a successful update.
   Notices fit compact terminal layouts, terminal handoffs cancel queued
   updates, and restart excludes implicit working-directory imports.
+  Restoring unsent input or a picked command cancels any queued update and
+  keeps the composer editable.
 
 ## [0.9.7] - 2026-11-20
 

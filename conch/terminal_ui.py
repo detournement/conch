@@ -941,10 +941,18 @@ class TerminalUI:
             if not self._stopped.is_set():
                 raise
 
+    def _cancel_queued_update(self):
+        with self._condition:
+            for message in self._messages:
+                if isinstance(message, UpdateRequested):
+                    self._messages.remove(message)
+                    break
+            self._update_requested = False
+
     def cancel_update_request(self, reason: str):
         """Return to editing if backend-only pending input prevents shutdown."""
         def cancel():
-            self._update_requested = False
+            self._cancel_queued_update()
             self._notice = _safe(reason)
         self._change(cancel)
 
@@ -1383,7 +1391,10 @@ class TerminalUI:
         return self._modal_wait("choose", title, choices, preview_colors)
 
     def prefill(self, text: str):
-        self._change(setattr, self._editor.buffer, "document", Document(text, len(text)))
+        def restore():
+            self._cancel_queued_update()
+            self._editor.buffer.document = Document(text, len(text))
+        self._change(restore)
 
     def set_context(self, **fields):
         self._change(self._context_fields.update, fields)

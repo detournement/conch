@@ -231,6 +231,21 @@ class UpdateNoticeTests(_DirectUI):
         with self.assertRaises(UpdateRequested):
             self.ui.read_message()
 
+    async def test_prefill_cancels_update_and_preserves_restored_input_and_queue(self):
+        self.ui._editor.text = ""
+        self.ui.set_update_available("1.10.0")
+        self.press(Keys.Escape, "u")
+        self.queue("pending prompt")
+        self.ui.prefill("  unsent\nretry this  ")
+        self.assertEqual(self.ui._editor.text, "  unsent\nretry this  ")
+        self.assertEqual([message.text for message in self.ui._messages], ["pending prompt"])
+        self.press("!", Keys.ControlM)
+        self.assertEqual(
+            [message.text for message in self.ui._messages],
+            ["pending prompt", "  unsent\nretry this  !"])
+        self.assertEqual(self.ui.read_message(), "pending prompt")
+        self.assertEqual(self.ui.read_message(), "  unsent\nretry this  !")
+
     async def test_shortcut_preserves_draft_queue_turn_and_attachments(self):
         self.ui.set_update_available("1.10.0")
         for blocked in ("draft", "whitespace", "turn", "queue", "picker", "attachments"):

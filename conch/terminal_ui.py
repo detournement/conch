@@ -152,6 +152,10 @@ class _PendingMessage:
         return bool(head and head[0].lower() in ("/model", "/models", "/ls"))
 
 
+class UpdateRequested(Exception):
+    """The user requested an update at a safe composer boundary."""
+
+
 class TerminalUI:
     def __init__(self, commands: Callable, history_file: str,
                  live_command: Optional[Callable[[str], Optional[Callable[[], None]]]] = None):
@@ -190,6 +194,8 @@ class TerminalUI:
         self._tools = {}
         self._response = ""
         self._notice = ""
+        self._update_available = ""
+        self._update_requested = False
         self._modal = None
         self._modal_result = None
         self._modal_choices = []
@@ -332,7 +338,8 @@ class TerminalUI:
     def _build(self):
         self._editor = TextArea(
             multiline=True, history=self._history, prompt=[("class:prompt", "> ")],
-            height=Dimension(min=1, max=7), dont_extend_height=True)
+            height=Dimension(min=1, max=7), dont_extend_height=True,
+            read_only=Condition(lambda: self._update_requested))
         self._editor.buffer.on_text_changed += self._command_changed
         self._query = TextArea(multiline=False, prompt="Search: ")
         self._answer = TextArea(multiline=False, prompt="Answer: ")
@@ -367,6 +374,10 @@ class TerminalUI:
                        height=self._infobar_height, dont_extend_height=True,
                        wrap_lines=False),
                 Condition(lambda: self._infobar_height() > 0)),
+            ConditionalContainer(
+                Window(FormattedTextControl(self._update_text), height=1, wrap_lines=False),
+                Condition(lambda: bool(self._update_available)
+                          and self._output.get_size().rows >= 5)),
             self._editor,
             ConditionalContainer(self._command_window, Condition(self._command_visible)),
             ConditionalContainer(self._text_window(self._hints, 1),
@@ -435,6 +446,11 @@ class TerminalUI:
         def toggle_details(event):
             if self._modal is None:
                 self._details_visible = not self._details_visible
+
+        @keys.add("escape", "u", eager=True,
+                  filter=Condition(lambda: self._modal is None and bool(self._update_available)))
+        def update_and_restart(event):
+            self._request_update()
 
         @keys.add("c-p", eager=True)
         def commands(event):
@@ -889,6 +905,46 @@ class TerminalUI:
         return [("class:muted", self._tail_text(self._detail_text, 4)),
                 ("[SetCursorPosition]", "")]
 
+    def _update_text(self):
+        action = "Updating..." if self._update_requested else f"{meta_key('U')} update & restart"
+        return [("class:warning", self._fit_hints(
+            [action, f"Update available: {self._update_available}"]))]
+
+    def _request_update(self):
+        if self._update_requested or not self._update_available or self._modal is not None:
+            return
+        if self._busy:
+            self._notice = "Finish or stop the current turn before updating"
+        elif self._editor.text:
+            self._notice = "Send or clear the draft before updating"
+        elif self._context_fields.get("pending_attachments"):
+            self._notice = "Send attached images or /image clear before updating"
+        else:
+            with self._condition:
+                if self._messages or self._open_model_pickers:
+                    self._notice = "Finish pending messages and close pickers before updating"
+                else:
+                    self._update_requested = True
+                    self._messages.append(UpdateRequested())
+                    self._condition.notify_all()
+
+    def set_update_available(self, label: str):
+        """Publish the background result, even if shutdown won the race."""
+        if self._stopped.is_set():
+            return
+        try:
+            self._change(setattr, self, "_update_available", " ".join(_safe(label).split()))
+        except (EOFError, RuntimeError):
+            if not self._stopped.is_set():
+                raise
+
+    def cancel_update_request(self, reason: str):
+        """Return to editing if backend-only pending input prevents shutdown."""
+        def cancel():
+            self._update_requested = False
+            self._notice = _safe(reason)
+        self._change(cancel)
+
     def _hints(self):
         # Most important first: a narrow terminal drops hints from the end
         # instead of cutting one mid-word.
@@ -943,6 +999,8 @@ class TerminalUI:
             self._condition.notify_all()
 
     def _send(self, followup=False):
+        if self._update_requested:
+            return
         text = self._editor.text
         if not text.strip():
             self._editor.buffer.reset()

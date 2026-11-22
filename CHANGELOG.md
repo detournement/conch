@@ -7,6 +7,15 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [Unreleased]
+
+### Added
+
+- Interactive startup checks for updates in the background using the running
+  installation's source, with a persistent update notice and Option+U / Alt+U
+  shortcut. The shortcut protects unfinished input, saves the conversation,
+  and restarts into that same conversation only after a successful update.
+
 ## [0.9.7] - 2026-11-20
 
 ### Added

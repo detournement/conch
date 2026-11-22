@@ -17,6 +17,7 @@ def shortcut_text(query: str = "") -> str:
             ("Enter", "Send; during a turn, steer at the next safe boundary"),
             (meta_key("Q"), "Queue a follow-up instead of steering"),
             (meta_key("R"), "Hide or show reasoning and progress"),
+            (meta_key("U"), "When an update is available: save, update and restart (idle, no draft or pending input)"),
             (meta_key("Enter"), "Insert a newline"),
             ("Ctrl+Q", "Open pending messages"),
             ("/ or Ctrl+P", "Browse commands"),

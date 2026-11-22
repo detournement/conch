@@ -482,6 +482,42 @@ def _startup_conversation(conv_mgr, model_name, provider, system_prompt,
     return current_conv, messages
 
 
+def _restart_after_update(conversation_id: str) -> int:
+    """Replace this closed session only after its installation updates cleanly."""
+    from .keys.identity import package_dir
+    from .update import main as update_main
+
+    # Keep the interpreter and import root, not whichever `conch` is on PATH
+    # or in the working directory. Never replay --new or a launch-time prompt.
+    package_root = str(package_dir().parent)
+    launcher = sys.argv[0]
+    print("Conversation saved. Updating Conch before restarting...")
+    status = update_main([], prog="conch update")
+    if status:
+        print("Update did not complete; not restarting. Your conversation is saved.",
+              file=sys.stderr)
+        return status
+    print("Restarting Conch and resuming the saved conversation...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    bootstrap = (
+        "import sys; "
+        "sys.path.insert(0, sys.argv[1]); "
+        "from conch.app import chat_loop; "
+        "conversation_id = sys.argv[2]; "
+        "sys.argv = [sys.argv[3]]; "
+        "chat_loop(resume_id=conversation_id)"
+    )
+    try:
+        os.execv(sys.executable, [
+            sys.executable, "-c", bootstrap, package_root, conversation_id, launcher,
+        ])
+    except OSError as exc:
+        print(f"Conch updated, but restart failed: {exc}. Start conch again to resume.",
+              file=sys.stderr)
+        return 1
+
+
 def chat_loop(new_conversation=False, interactive=True, startup_check=None,
               resume_id=None):
     # Startup wiring lives in conch.bootstrap so headless modes can reuse it;
@@ -988,6 +1024,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 infobar_stats=stats,
                 context_used=context_used, context_window=context_window,
                 agents_paused=session.agents_paused,
+                pending_attachments=len(_pending_images),
             )
 
     def _set_foreground_policies():
@@ -1301,6 +1338,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     # /image attachments waiting for the next message (canonical blocks).
     _pending_images: List[dict] = []
     _pending_update = None
+    _restart_update = False
+    from .terminal_ui import UpdateRequested
+
     try:
         if _use_terminal_ui:
             from .terminal_ui import TerminalUI
@@ -1315,6 +1355,16 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 # message: show its PR and check state without waiting.
                 _repo_ctx.on_ready(lambda: _ui.set_context(repo=_repo_ctx.indicator()))
         _print_banner()
+        if _ui:
+            def _check_for_update():
+                from .update import check_for_update
+
+                available = check_for_update()
+                if available:
+                    _ui.set_update_available(available)
+
+            threading.Thread(target=_check_for_update, name="conch-update-check",
+                             daemon=True).start()
         while True:
             # MCP tools that finished loading since the last turn attach
             # here, before the prompt (and again after input is read, for
@@ -1328,6 +1378,16 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                     user_input = multiline.read_user_message(
                         "\033[1;33myou:\033[0m ", drain_fn=_drain_fn,
                     )
+            except UpdateRequested:
+                # Attachments can arrive from a slash command between the
+                # UI's safety check and this prompt boundary.
+                if _pending_images:
+                    _ui.cancel_update_request(
+                        "Send attached images or /image clear before updating")
+                    continue
+                _pending_update = []
+                _restart_update = True
+                break
             except EOFError:
                 print()
                 break
@@ -1946,6 +2006,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         conv_mgr.close()
 
     if _pending_update is not None:
+        if _restart_update:
+            raise SystemExit(_restart_after_update(current_conv.id))
         from .update import main as update_main
 
         print("Conversation saved. Run conch again after the update to resume.")

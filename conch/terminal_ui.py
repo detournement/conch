@@ -376,8 +376,7 @@ class TerminalUI:
                 Condition(lambda: self._infobar_height() > 0)),
             ConditionalContainer(
                 Window(FormattedTextControl(self._update_text), height=1, wrap_lines=False),
-                Condition(lambda: bool(self._update_available)
-                          and self._output.get_size().rows >= 5)),
+                Condition(self._update_visible)),
             self._editor,
             ConditionalContainer(self._command_window, Condition(self._command_visible)),
             ConditionalContainer(self._text_window(self._hints, 1),
@@ -617,7 +616,7 @@ class TerminalUI:
         # Reserve the actual bar height, not a fixed row: detail can wrap.
         rows = self._output.get_size().rows
         reserved = (1 + self._hints_visible() + self._pause_visible()
-                    + self._infobar_height())
+                    + self._infobar_height() + self._update_visible())
         return min(11, max(0, rows - reserved))
 
     def _command_page_size(self):
@@ -764,6 +763,9 @@ class TerminalUI:
     def _hints_visible(self):
         return self._output.get_size().rows >= 4
 
+    def _update_visible(self):
+        return bool(self._update_available) and self._output.get_size().rows >= 5
+
     def _pause_visible(self):
         return (bool(self._context_fields.get("agents_paused"))
                 and self._output.get_size().rows >= (4 if self._command_visible() else 3))
@@ -775,7 +777,7 @@ class TerminalUI:
                    + 2 * bool(self._detail_text and self._details_visible)
                    + bool(self._busy or self._activities or self._tools))
         reserved = (1 + self._hints_visible() + self._pause_visible()
-                    + self._infobar_height())
+                    + self._infobar_height() + self._update_visible())
         return minimum <= self._output.get_size().rows - reserved
 
     @staticmethod
@@ -829,7 +831,8 @@ class TerminalUI:
         width = max(0, size.columns - 1)
         # On very short screens the composer and selected command win.
         maximum = min(2, size.rows - 1 - self._hints_visible()
-                      - self._pause_visible() - self._command_visible())
+                      - self._pause_visible() - self._command_visible()
+                      - self._update_visible())
         if width <= 0 or maximum <= 0:
             return []
         if fields.get("infobar", "detail") == "progress":

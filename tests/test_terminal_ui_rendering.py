@@ -272,10 +272,12 @@ class InfobarRenderingTests(_DirectUI):
         self.ui._busy = True
         self.ui._response = "Live output\n" * 20
         self.ui._detail_text = "Reasoning\n" * 20
-        for mode in ("detail", "progress"):
+        for mode, notice in (("detail", None), ("detail", "1.10.0"),
+                             ("progress", None), ("progress", "1.10.0")):
             self.configure(mode)
-            for height, width in ((12, 100), (12, 80), (6, 24), (4, 16), (2, 16)):
-                with self.subTest(mode=mode, height=height, width=width):
+            self.ui._update_available = notice
+            for height, width in ((12, 100), (9, 80), (6, 24), (5, 24), (4, 16), (2, 16)):
+                with self.subTest(mode=mode, notice=notice, height=height, width=width):
                     self.output.size = Size(rows=height, columns=width)
                     self.assertIn("draft-kept", self.render())
                     self.assert_bar_geometry()

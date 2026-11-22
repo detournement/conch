@@ -7,6 +7,20 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [0.9.8] - 2026-11-22
+
+### Added
+
+- Interactive startup checks for updates in the background using the running
+  installation's source, with a persistent update notice and Option+U / Alt+U
+  shortcut. The shortcut protects unfinished input, saves the conversation,
+  and restarts into that same conversation only after a successful update.
+  Notices fit compact terminal layouts, terminal handoffs cancel queued
+  updates, and restart excludes implicit working-directory imports.
+  Restoring unsent input or a picked command cancels any queued update and
+  keeps the composer editable.
+  Updates wait for live picker selections to be restored as input or queued.
+
 ## [0.9.7] - 2026-11-20
 
 ### Added
@@ -606,6 +620,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.8]: https://github.com/detournement/conch/releases/tag/v0.9.8
 [0.9.7]: https://github.com/detournement/conch/releases/tag/v0.9.7
 [0.9.6]: https://github.com/detournement/conch/releases/tag/v0.9.6
 [0.9.5]: https://github.com/detournement/conch/releases/tag/v0.9.5

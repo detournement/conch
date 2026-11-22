@@ -258,16 +258,20 @@ class CommandBrowserTests(unittest.IsolatedAsyncioTestCase):
             infobar_stats=("2,037,305 in / 3,837 out  subscription seat  ~89.3 tok/s"
                            "  ctx 16%  (claude-sonnet-5-5)"),
             context_used=32_000, context_window=200_000, agents_paused=True)
-        for mode in ("detail", "progress"):
+        for mode, notice in (("detail", None), ("detail", "1.10.0"),
+                             ("progress", None), ("progress", "1.10.0")):
             self.ui._context_fields["infobar"] = mode
-            for rows, columns in ((3, 16), (4, 16), (6, 24), (12, 80), (12, 100)):
-                with self.subTest(mode=mode, rows=rows, columns=columns):
+            self.ui._update_available = notice
+            for rows, columns in ((3, 16), (4, 16), (5, 24), (6, 24), (12, 80), (12, 100)):
+                with self.subTest(mode=mode, notice=notice, rows=rows, columns=columns):
                     self.output.size = Size(rows=rows, columns=columns)
                     self.press(Keys.PageDown)
                     selected = self.ui._command_selection
                     rendered = self.render()
                     self.assertTrue(any(row.startswith("> /") for row in rendered))
                     self.assertTrue(any(row.startswith(f"> /item{selected:02}") for row in rendered))
+                    if notice and columns >= 80:
+                        self.assertIn(notice, "\n".join(rendered))
                     budget = self.ui._command_budget()
                     bar_height = self.ui._infobar_height()
                     self.assertLessEqual(

@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.7][release] ·
+[Current release: v0.9.8][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.7
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.8
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -283,6 +283,7 @@ columns by 31 rows); pipes and smaller windows skip it.
 | Option+Q (Mac) / Alt+Q | Queue a follow-up for after the current turn |
 | Ctrl+Q | View pending guidance/follow-ups; Enter edits, Delete or Backspace removes |
 | Option+R / Alt+R | Hide/show provider reasoning and generation progress |
+| Option+U / Alt+U | When an update is available, save, update, and restart into this conversation |
 | Option+Enter / Alt+Enter | Insert a newline |
 | `/`, Ctrl+P | Open the inline command browser; type to filter names and descriptions |
 | Up/Down, Page Up/Down | Select and scroll commands without changing the draft |
@@ -309,7 +310,7 @@ columns by 31 rows); pipes and smaller windows skip it.
 On macOS the modifier is **Option**; on Linux it is **Alt**. Both send the
 terminal's Escape prefix. If Option types `œ` or `®`, enable **Use Option as
 Meta key** in Terminal → Settings → Profiles → Keyboard (iTerm2: set an Option
-key to **Esc+**). Without changing settings, press Esc, then `q`, `r`, or Enter.
+key to **Esc+**). Without changing settings, press Esc, then `q`, `r`, `u`, or Enter.
 
 Tool activity is compact by default; `/verbose on` shows full returned results.
 Approval prompts use a separate input buffer: queued chat and unfinished drafts
@@ -765,11 +766,26 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v0.9.7. GitHub releases include a
+`conch-shell` is not published on PyPI at v0.9.8. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v0.9.7` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v0.9.8` to install the release sdist.
 
 ### Updating
+
+The interactive composer checks for updates once at startup in the background,
+without delaying input. An available update stays visible with **Option+U**
+on macOS or **Alt+U** on Linux (or press Esc, then `u`).
+The shortcut requires an idle session with no draft, pending messages, or
+unsent image attachments. It saves the conversation, closes the session,
+runs the existing updater, and restarts with the same Python installation
+and the exact saved conversation. Failed updates do not restart; the saved
+conversation remains available after fixing the reported problem.
+
+Automatic checks follow a checkout's configured upstream or an installed Git
+source's moving branch. Official `edge`/`main` downloads compare their published
+version with the running version. Pinned, unsupported, and unreachable sources
+stay quiet; no packages or checkout files change until you request an update.
+One-shot commands and non-interactive sessions do not run the background check.
 
 ```bash
 conch update --check   # preview; fetches a checkout's upstream without changing local work

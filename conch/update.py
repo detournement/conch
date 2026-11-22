@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -15,11 +16,14 @@ import sysconfig
 import tempfile
 import uuid
 from datetime import datetime, timezone
+from http.client import HTTPException
 from importlib import metadata
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from . import __version__
 from .keys import identity
 from .secretguard import credential_findings, redact_credentials
 
@@ -28,6 +32,8 @@ _OFFICIAL_REPOSITORY = "https://github.com/detournement/conch"
 _OFFICIAL_SOURCE = _OFFICIAL_REPOSITORY + "/archive/refs/heads/edge.tar.gz"
 _GIT_TIMEOUT = 180
 _INSTALL_TIMEOUT = 600
+_CHECK_TIMEOUT = 3
+_CHECK_MAX_BYTES = 64 * 1024
 _OPERATIONS = (
     "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge",
     "rebase-apply", "sequencer", "BISECT_LOG", "index.lock",
@@ -66,7 +72,8 @@ def _run(command: List[str], *, cwd: Optional[Path] = None,
 
 
 def _git(root: Path, *args: str, allow_failure: bool = False,
-         input_text: Optional[str] = None) -> subprocess.CompletedProcess:
+         input_text: Optional[str] = None, timeout: int = _GIT_TIMEOUT,
+         read_only: bool = False) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     # A caller's shell may be inside another repository or use an alternate
     # index. Those variables must never redirect an installation update.
@@ -76,11 +83,22 @@ def _git(root: Path, *args: str, allow_failure: bool = False,
         env.pop(key, None)
     env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
                GIT_MERGE_AUTOEDIT="no", GIT_EDITOR="true", GIT_SEQUENCE_EDITOR="true")
+    options = []
+    if read_only:
+        # Avoid interactive helpers, SSH host-key writes, and implicit fetches
+        # from partial clones. An inaccessible source simply has no notice.
+        env.update(GIT_NO_LAZY_FETCH="1", GIT_ASKPASS="true", SSH_ASKPASS="true",
+                   GIT_SSH_COMMAND="ssh -oBatchMode=yes -oStrictHostKeyChecking=yes "
+                   "-oConnectTimeout=3 -oControlMaster=no -oControlPath=none "
+                   "-oUpdateHostKeys=no -oPermitLocalCommand=no")
+        options = ["-c", "credential.helper=", "-c", "core.askPass=true",
+                   "-c", "protocol.ext.allow=never", "-c", "gc.auto=0",
+                   "-c", "maintenance.auto=false"]
     return _run(
         ["git", "-c", "merge.autoStash=false", "-c", "rebase.autoStash=false",
          "-c", "rerere.enabled=false", "-c", "rebase.updateRefs=false",
-         "-C", str(root), *args], env=env, allow_failure=allow_failure,
-        input_text=input_text, operation=f"git {args[0]}",
+         *options, "-C", str(root), *args], env=env, allow_failure=allow_failure,
+        input_text=input_text, timeout=timeout, operation=f"git {args[0]}",
     )
 
 
@@ -467,6 +485,168 @@ def _installed_source(dist) -> Tuple[str, str]:
         "No update source is recorded for this installation. Reinstall it from its original Git/direct URL source; "
         "Conch will not guess a fork's branch or fall back to an old PyPI package."
     )
+
+
+def _check_git(root: Path, *args: str, allow_failure: bool = False,
+                input_text: Optional[str] = None):
+    return _git(root, *args, allow_failure=allow_failure, input_text=input_text,
+                timeout=_CHECK_TIMEOUT, read_only=True)
+
+
+def _remote_refs(root: Path, source: str, *refs: str) -> dict:
+    result = _check_git(root, "ls-remote", "--", source, *refs)
+    found = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", fields[0]):
+            if fields[1] in refs:
+                found[fields[1]] = fields[0]
+    return found
+
+
+def _checkout_update_available(root: Path) -> Optional[str]:
+    if not (root / ".git").exists():
+        return None
+    if Path(_check_git(root, "rev-parse", "--show-toplevel").stdout.strip()).resolve() != root:
+        return None
+    branch = _check_git(root, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    remote = _check_git(root, "config", "--get", f"branch.{branch}.remote").stdout.strip()
+    refs = _check_git(root, "config", "--get-all", f"branch.{branch}.merge").stdout.splitlines()
+    if not remote or len(refs) != 1 or not refs[0].startswith("refs/heads/"):
+        return None
+    tip = _remote_refs(root, remote, refs[0]).get(refs[0])
+    if not tip:
+        return None
+    head = _check_git(root, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+    if head == tip:
+        return None
+    # A tip absent from our object database cannot be an ancestor in a full
+    # clone. Never fetch just to answer this question, even in a partial clone.
+    kind = _check_git(root, "cat-file", "--batch-check=%(objecttype)",
+                       input_text=tip + "\n").stdout.strip()
+    if kind == "commit":
+        ancestor = _check_git(root, "merge-base", "--is-ancestor", tip, head,
+                              allow_failure=True)
+        if ancestor.returncode != 1:
+            return None
+    elif kind == tip + " missing":
+        shallow = _check_git(root, "rev-parse", "--is-shallow-repository").stdout.strip()
+        if shallow != "false":
+            return None
+    else:
+        return None
+    return f"upstream {tip[:12]}"
+
+
+def _installed_git_update(pkg: Path, direct: dict) -> Optional[str]:
+    vcs = direct["vcs_info"]
+    commit = vcs.get("commit_id", "")
+    revision = vcs.get("requested_revision", "")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        return None
+    if revision and (re.fullmatch(r"[0-9a-fA-F]{7,64}", revision)
+                     or revision.startswith("refs/tags/")):
+        return None
+    if revision.startswith("refs/") and not revision.startswith("refs/heads/"):
+        return None
+    ref = revision if revision.startswith("refs/heads/") else (
+        "refs/heads/" + revision if revision else "HEAD"
+    )
+    # An unqualified tag must not accidentally track a same-named branch.
+    tag = "refs/tags/" + revision if revision and not revision.startswith("refs/") else ""
+    source = direct["url"].removeprefix("git+")
+    refs = _remote_refs(pkg, source, ref, *([tag] if tag else []))
+    if tag and tag in refs:
+        return None
+    tip = refs.get(ref)
+    return f"source {tip[:12]}" if tip and tip != commit else None
+
+
+def _version_key(version: str) -> Optional[tuple]:
+    """Order numeric PEP 440 releases/pre/post/dev; unknown/local forms abstain."""
+    match = re.fullmatch(
+        r"v?(?:(\d+)!)?(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?"
+        r"(?:\.post(\d+))?(?:\.dev(\d+))?", version, re.IGNORECASE,
+    )
+    if not match:
+        return None
+    epoch, release, pre, pre_number, post, dev = match.groups()
+    numbers = [int(part) for part in release.split(".")]
+    while len(numbers) > 1 and numbers[-1] == 0:
+        numbers.pop()
+    if pre:
+        prerelease = ({"a": 0, "b": 1, "rc": 2}[pre.lower()], int(pre_number))
+    else:
+        prerelease = (-1, 0) if dev is not None and post is None else (3, 0)
+    return (int(epoch or 0), tuple(numbers), prerelease,
+            int(post) if post is not None else -1,
+            int(dev) if dev is not None else float("inf"))
+
+
+class _CheckRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlsplit(newurl)
+        if parsed.scheme != "https" or parsed.netloc != "raw.githubusercontent.com":
+            raise UpdateError("Unsupported update-check redirect.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _archive_update_available(source: str) -> Optional[str]:
+    match = re.fullmatch(
+        re.escape(_OFFICIAL_REPOSITORY) + r"/archive/refs/heads/(edge|main)\.tar\.gz",
+        source,
+    )
+    current = _version_key(__version__)
+    if not match or current is None:
+        return None
+    url = ("https://raw.githubusercontent.com/detournement/conch/"
+           + match[1] + "/conch/__init__.py")
+    request = Request(url, headers={"User-Agent": "conch-update-check"})
+    with build_opener(_CheckRedirectHandler()).open(request, timeout=_CHECK_TIMEOUT) as response:
+        content = response.read(_CHECK_MAX_BYTES + 1)
+    if len(content) > _CHECK_MAX_BYTES:
+        return None
+    # Parse a literal, never import/exec remote Python or trust a global
+    # installer commit that may describe a different installation.
+    tree = ast.parse(content.decode("utf-8"))
+    versions = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__version__"
+            for target in node.targets
+        ):
+            if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+                return None
+            versions.append(node.value.value)
+    if len(versions) != 1:
+        return None
+    available = _version_key(versions[0])
+    return versions[0] if available is not None and available > current else None
+
+
+def check_for_update() -> Optional[str]:
+    """Quiet, read-only background check of this installation's update source.
+
+    No fetch/install/cache writes. Git commands and HTTPS reads have short
+    timeouts; unavailable, pinned, ambiguous or unsupported sources abstain.
+    Archive checks only compare literal versions on official edge/main.
+    """
+    try:
+        pkg = identity.package_dir().resolve()
+        root = identity.checkout_root(pkg)
+        if root is not None:
+            return _checkout_update_available(Path(root).resolve())
+        dist = _running_distribution(pkg)
+        if dist is None:
+            return None
+        # Keep exactly the same source precedence and validation as installation.
+        spec, _ = _installed_source(dist)
+        direct = _direct_url(dist)
+        if direct and direct.get("vcs_info") is not None:
+            return _installed_git_update(pkg, direct)
+        return _archive_update_available(spec.split(" @ ", 1)[1])
+    except (UpdateError, OSError, HTTPException, ValueError, TypeError, SyntaxError, RecursionError):
+        return None
 
 
 def _installer_command(spec: str, *, editable: bool = False, user: bool = False) -> List[str]:

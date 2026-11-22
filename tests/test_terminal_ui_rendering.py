@@ -172,6 +172,102 @@ class ComposerStateTests(_DirectUI):
         self.assertIn("draft-kept", self.render())
 
 
+class UpdateNoticeTests(_DirectUI):
+    def press(self, *keys):
+        app = self.ui._app
+        with create_app_session(input=self.ui._input, output=self.output), set_app(app):
+            app.key_processor.feed_multiple([*(KeyPress(key) for key in keys), _Flush])
+            app.key_processor.process_keys()
+
+    async def test_notice_survives_turns_and_transient_hints_without_touching_draft(self):
+        from conch.shortcuts import meta_key
+
+        self.output.size = Size(rows=12, columns=100)
+        self.ui.set_update_available("1.10.0")
+        self.ui._editor.buffer.cursor_position = 4
+        for busy in (True, False):
+            self.ui.set_busy(busy)
+            self.ui._notice = "Transient notice"
+            shown = self.render()
+            self.assertIn("1.10.0", shown)
+            self.assertIn(meta_key("U"), shown)
+            self.assertEqual(self.ui._editor.buffer.cursor_position, 4)
+        self.ui.set_update_available("1.10.0\033]52;c;ignored\a\x9b2J\nnext")
+        fragments = fragment_list_to_text(self.ui._update_text())
+        self.assertFalse(any(char in fragments for char in ("\033", "\x9b", "\a", "\n")))
+        self.assertIn("1.10.0", self.render())
+
+    async def test_shortcut_requests_once_and_freezes_input_until_backend_cancels(self):
+        from conch.terminal_ui import UpdateRequested
+
+        self.ui._editor.text = ""
+        self.press(Keys.Escape, "u")
+        self.assertEqual(list(self.ui._messages), [])
+        self.ui.set_update_available("1.10.0")
+        self.press(Keys.Escape, "u")
+        self.press(Keys.Escape, "u")
+        self.press("x", Keys.ControlM)
+        self.assertEqual(self.ui._editor.text, "")
+        with self.assertRaises(UpdateRequested):
+            self.ui.read_message()
+        self.assertEqual(list(self.ui._messages), [])
+        self.ui.cancel_update_request("Attachments arrived at the turn boundary")
+        self.press("y")
+        self.assertEqual(self.ui._editor.text, "y")
+
+    async def test_handoff_discard_cancels_update_and_restores_submission(self):
+        from conch.terminal_ui import UpdateRequested
+
+        self.ui._editor.text = ""
+        self.ui.set_update_available("1.10.0")
+        self.press(Keys.Escape, "u")
+        self.assertTrue(self.ui._discard())
+        self.press("o", "k")
+        self.assertEqual(self.ui._editor.text, "ok")
+        self.press(Keys.ControlM)
+        self.assertEqual([message.text for message in self.ui._messages], ["ok"])
+        self.assertEqual(self.ui.read_message(), "ok")
+        self.press(Keys.Escape, "u")
+        with self.assertRaises(UpdateRequested):
+            self.ui.read_message()
+
+    async def test_prefill_cancels_update_and_preserves_restored_input_and_queue(self):
+        self.ui._editor.text = ""
+        self.ui.set_update_available("1.10.0")
+        self.press(Keys.Escape, "u")
+        self.queue("pending prompt")
+        self.ui.prefill("  unsent\nretry this  ")
+        self.assertEqual(self.ui._editor.text, "  unsent\nretry this  ")
+        self.assertEqual([message.text for message in self.ui._messages], ["pending prompt"])
+        self.press("!", Keys.ControlM)
+        self.assertEqual(
+            [message.text for message in self.ui._messages],
+            ["pending prompt", "  unsent\nretry this  !"])
+        self.assertEqual(self.ui.read_message(), "pending prompt")
+        self.assertEqual(self.ui.read_message(), "  unsent\nretry this  !")
+
+    async def test_shortcut_preserves_draft_queue_turn_and_attachments(self):
+        self.ui.set_update_available("1.10.0")
+        for blocked in ("draft", "whitespace", "turn", "queue", "picker", "attachments"):
+            with self.subTest(blocked=blocked):
+                self.ui._editor.text = {"draft": "unsent", "whitespace": " \n "}.get(blocked, "")
+                self.ui._busy = blocked == "turn"
+                self.ui._open_pickers = int(blocked == "picker")
+                self.ui.set_context(pending_attachments=int(blocked == "attachments"))
+                self.ui._messages.clear()
+                if blocked == "queue":
+                    self.queue("undelivered")
+                draft = self.ui._editor.text
+                pending = list(self.ui._messages)
+                self.press(Keys.Escape, "u")
+                self.assertEqual(self.ui._editor.text, draft)
+                self.assertEqual(list(self.ui._messages), pending)
+                self.assertFalse(self.ui._update_requested)
+                self.assertEqual(self.ui._busy, blocked == "turn")
+                self.assertEqual(self.ui._context_fields["pending_attachments"],
+                                 int(blocked == "attachments"))
+
+
 class InfobarRenderingTests(_DirectUI):
     STATS = ("\033[2m2,037,305 in / 3,837 out  subscription seat  ~89.3 tok/s"
              "  ctx \033[32m16%\033[0m\033[2m  (claude-sonnet-5-5)\033[0m")
@@ -207,10 +303,12 @@ class InfobarRenderingTests(_DirectUI):
         self.ui._busy = True
         self.ui._response = "Live output\n" * 20
         self.ui._detail_text = "Reasoning\n" * 20
-        for mode in ("detail", "progress"):
+        for mode, notice in (("detail", None), ("detail", "1.10.0"),
+                             ("progress", None), ("progress", "1.10.0")):
             self.configure(mode)
-            for height, width in ((12, 100), (12, 80), (6, 24), (4, 16), (2, 16)):
-                with self.subTest(mode=mode, height=height, width=width):
+            self.ui._update_available = notice
+            for height, width in ((12, 100), (9, 80), (6, 24), (5, 24), (4, 16), (2, 16)):
+                with self.subTest(mode=mode, notice=notice, height=height, width=width):
                     self.output.size = Size(rows=height, columns=width)
                     self.assertIn("draft-kept", self.render())
                     self.assert_bar_geometry()
@@ -550,6 +648,43 @@ class LiveCommandTests(_DirectUI):
         self.ui.set_busy(False)
         self.assertEqual([self.ui.read_message() for _ in range(4)],
                          [first, second, "queued follow-up", "answer on the new model"])
+
+    def test_update_waits_until_live_session_picker_selection_is_queued(self):
+        self.ui.set_update_available("1.10.0")
+        for command, selected in (("/provider", "/provider ollama"),
+                                  ("/convos", "/switch first"),
+                                  ("/switch", "/switch second")):
+            with self.subTest(command=command):
+                self.ui._live_command = lambda text: lambda: self.ui.queue_command(selected)
+                self.ui.set_busy(True)
+                # Hold the worker in the panel-close/selection-queue gap.
+                with patch("conch.terminal_ui.threading.Thread") as thread:
+                    self.submit(command)
+                self.ui.set_busy(False)
+                self.ui._request_update()
+                self.assertFalse(self.ui._update_requested)
+                thread.call_args.kwargs["target"]()
+                self.assertEqual(self.ui._open_pickers, 0)
+                self.assertEqual([message.text for message in self.ui._messages], [selected])
+                self.assertEqual(self.ui.read_message(), selected)
+
+    def test_update_waits_until_live_help_draft_is_restored(self):
+        self.ui.set_update_available("1.10.0")
+        for command in ("/help", "/help model", "/h", "/?"):
+            with self.subTest(command=command):
+                self.ui._live_command = lambda text: lambda: self.ui.prefill("/model ")
+                self.ui.set_busy(True)
+                with patch("conch.terminal_ui.threading.Thread") as thread:
+                    self.submit(command)
+                self.ui.set_busy(False)
+                self.ui._request_update()
+                self.assertFalse(self.ui._update_requested)
+                thread.call_args.kwargs["target"]()
+                self.assertEqual(self.ui._open_pickers, 0)
+                self.assertEqual(self.ui._editor.text, "/model ")
+                self.ui._request_update()
+                self.assertFalse(self.ui._update_requested)
+                self.assertEqual(list(self.ui._messages), [])
 
     def test_turn_finishing_with_model_picker_open_waits_for_pick_or_cancel(self):
         import threading

@@ -152,6 +152,10 @@ class _PendingMessage:
         return bool(head and head[0].lower() in ("/model", "/models", "/ls"))
 
 
+class UpdateRequested(Exception):
+    """The user requested an update at a safe composer boundary."""
+
+
 class TerminalUI:
     def __init__(self, commands: Callable, history_file: str,
                  live_command: Optional[Callable[[str], Optional[Callable[[], None]]]] = None):
@@ -168,7 +172,7 @@ class TerminalUI:
         self._routing = threading.RLock()
         self._condition = threading.Condition()
         self._messages = deque()
-        self._open_model_pickers = 0
+        self._open_pickers = 0
         self._queue_selection = None
         self._editing_message = None
         self._detail_text = ""
@@ -190,6 +194,8 @@ class TerminalUI:
         self._tools = {}
         self._response = ""
         self._notice = ""
+        self._update_available = ""
+        self._update_requested = False
         self._modal = None
         self._modal_result = None
         self._modal_choices = []
@@ -332,7 +338,8 @@ class TerminalUI:
     def _build(self):
         self._editor = TextArea(
             multiline=True, history=self._history, prompt=[("class:prompt", "> ")],
-            height=Dimension(min=1, max=7), dont_extend_height=True)
+            height=Dimension(min=1, max=7), dont_extend_height=True,
+            read_only=Condition(lambda: self._update_requested))
         self._editor.buffer.on_text_changed += self._command_changed
         self._query = TextArea(multiline=False, prompt="Search: ")
         self._answer = TextArea(multiline=False, prompt="Answer: ")
@@ -367,6 +374,9 @@ class TerminalUI:
                        height=self._infobar_height, dont_extend_height=True,
                        wrap_lines=False),
                 Condition(lambda: self._infobar_height() > 0)),
+            ConditionalContainer(
+                Window(FormattedTextControl(self._update_text), height=1, wrap_lines=False),
+                Condition(self._update_visible)),
             self._editor,
             ConditionalContainer(self._command_window, Condition(self._command_visible)),
             ConditionalContainer(self._text_window(self._hints, 1),
@@ -435,6 +445,11 @@ class TerminalUI:
         def toggle_details(event):
             if self._modal is None:
                 self._details_visible = not self._details_visible
+
+        @keys.add("escape", "u", eager=True,
+                  filter=Condition(lambda: self._modal is None and bool(self._update_available)))
+        def update_and_restart(event):
+            self._request_update()
 
         @keys.add("c-p", eager=True)
         def commands(event):
@@ -601,7 +616,7 @@ class TerminalUI:
         # Reserve the actual bar height, not a fixed row: detail can wrap.
         rows = self._output.get_size().rows
         reserved = (1 + self._hints_visible() + self._pause_visible()
-                    + self._infobar_height())
+                    + self._infobar_height() + self._update_visible())
         return min(11, max(0, rows - reserved))
 
     def _command_page_size(self):
@@ -748,6 +763,9 @@ class TerminalUI:
     def _hints_visible(self):
         return self._output.get_size().rows >= 4
 
+    def _update_visible(self):
+        return bool(self._update_available) and self._output.get_size().rows >= 5
+
     def _pause_visible(self):
         return (bool(self._context_fields.get("agents_paused"))
                 and self._output.get_size().rows >= (4 if self._command_visible() else 3))
@@ -759,7 +777,7 @@ class TerminalUI:
                    + 2 * bool(self._detail_text and self._details_visible)
                    + bool(self._busy or self._activities or self._tools))
         reserved = (1 + self._hints_visible() + self._pause_visible()
-                    + self._infobar_height())
+                    + self._infobar_height() + self._update_visible())
         return minimum <= self._output.get_size().rows - reserved
 
     @staticmethod
@@ -813,7 +831,8 @@ class TerminalUI:
         width = max(0, size.columns - 1)
         # On very short screens the composer and selected command win.
         maximum = min(2, size.rows - 1 - self._hints_visible()
-                      - self._pause_visible() - self._command_visible())
+                      - self._pause_visible() - self._command_visible()
+                      - self._update_visible())
         if width <= 0 or maximum <= 0:
             return []
         if fields.get("infobar", "detail") == "progress":
@@ -889,6 +908,54 @@ class TerminalUI:
         return [("class:muted", self._tail_text(self._detail_text, 4)),
                 ("[SetCursorPosition]", "")]
 
+    def _update_text(self):
+        action = "Updating..." if self._update_requested else f"{meta_key('U')} update & restart"
+        return [("class:warning", self._fit_hints(
+            [action, f"Update available: {self._update_available}"]))]
+
+    def _request_update(self):
+        if self._update_requested or not self._update_available or self._modal is not None:
+            return
+        if self._busy:
+            self._notice = "Finish or stop the current turn before updating"
+        elif self._editor.text:
+            self._notice = "Send or clear the draft before updating"
+        elif self._context_fields.get("pending_attachments"):
+            self._notice = "Send attached images or /image clear before updating"
+        else:
+            with self._condition:
+                if self._messages or self._open_pickers:
+                    self._notice = "Finish pending messages and close pickers before updating"
+                else:
+                    self._update_requested = True
+                    self._messages.append(UpdateRequested())
+                    self._condition.notify_all()
+
+    def set_update_available(self, label: str):
+        """Publish the background result, even if shutdown won the race."""
+        if self._stopped.is_set():
+            return
+        try:
+            self._change(setattr, self, "_update_available", " ".join(_safe(label).split()))
+        except (EOFError, RuntimeError):
+            if not self._stopped.is_set():
+                raise
+
+    def _cancel_queued_update(self):
+        with self._condition:
+            for message in self._messages:
+                if isinstance(message, UpdateRequested):
+                    self._messages.remove(message)
+                    break
+            self._update_requested = False
+
+    def cancel_update_request(self, reason: str):
+        """Return to editing if backend-only pending input prevents shutdown."""
+        def cancel():
+            self._cancel_queued_update()
+            self._notice = _safe(reason)
+        self._change(cancel)
+
     def _hints(self):
         # Most important first: a narrow terminal drops hints from the end
         # instead of cutting one mid-word.
@@ -943,6 +1010,8 @@ class TerminalUI:
             self._condition.notify_all()
 
     def _send(self, followup=False):
+        if self._update_requested:
+            return
         text = self._editor.text
         if not text.strip():
             self._editor.buffer.reset()
@@ -970,12 +1039,14 @@ class TerminalUI:
         self._notice = ""
         self._editor.buffer.reset()
         self._accept_messages([command])
-        model_picker = command.lower() in ("/model", "/models", "/ls")
-        if model_picker:
+        picker = command.split(maxsplit=1)[0].lower() in (
+            "/model", "/models", "/ls", "/provider", "/convos", "/switch",
+            "/help", "/h", "/?")
+        if picker:
             # Reserve the turn boundary before starting the panel thread.
             # The request may finish while the operator is still choosing.
             with self._condition:
-                self._open_model_pickers += 1
+                self._open_pickers += 1
 
         def run():
             try:
@@ -985,9 +1056,9 @@ class TerminalUI:
             except Exception as exc:
                 print(f"  \033[31m✗ {command.split()[0]} failed: {exc}\033[0m")
             finally:
-                if model_picker:
+                if picker:
                     with self._condition:
-                        self._open_model_pickers -= 1
+                        self._open_pickers -= 1
                         self._condition.notify_all()
 
         threading.Thread(target=run, name="conch-panel", daemon=True).start()
@@ -1029,7 +1100,7 @@ class TerminalUI:
     def read_message(self) -> str:
         with self._condition:
             while not self._stopped.is_set():
-                if self._messages and not self._open_model_pickers:
+                if self._messages and not self._open_pickers:
                     first = self._messages[0]
                     if not isinstance(first, _PendingMessage) or not first.reserved:
                         break
@@ -1068,7 +1139,7 @@ class TerminalUI:
         def take():
             messages = []
             with self._condition:
-                if self._open_model_pickers:
+                if self._open_pickers:
                     return []
                 for item in tuple(self._messages):
                     if isinstance(item, BaseException) or item.selects_model:
@@ -1322,7 +1393,10 @@ class TerminalUI:
         return self._modal_wait("choose", title, choices, preview_colors)
 
     def prefill(self, text: str):
-        self._change(setattr, self._editor.buffer, "document", Document(text, len(text)))
+        def restore():
+            self._cancel_queued_update()
+            self._editor.buffer.document = Document(text, len(text))
+        self._change(restore)
 
     def set_context(self, **fields):
         self._change(self._context_fields.update, fields)
@@ -1490,6 +1564,7 @@ class TerminalUI:
         with self._condition:
             discarded = discarded or bool(self._messages)
             self._messages.clear()
+            self._update_requested = False
             self._editing_message = None
             self._condition.notify_all()
         if self._modal is not None:

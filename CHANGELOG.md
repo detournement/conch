@@ -15,6 +15,8 @@ Releases before 0.6.0 predate this changelog.
   installation's source, with a persistent update notice and Option+U / Alt+U
   shortcut. The shortcut protects unfinished input, saves the conversation,
   and restarts into that same conversation only after a successful update.
+  Notices fit compact terminal layouts, terminal handoffs cancel queued
+  updates, and restart excludes implicit working-directory imports.
 
 ## [0.9.7] - 2026-11-20
 

@@ -1551,6 +1551,7 @@ class TerminalUI:
         with self._condition:
             discarded = discarded or bool(self._messages)
             self._messages.clear()
+            self._update_requested = False
             self._editing_message = None
             self._condition.notify_all()
         if self._modal is not None:

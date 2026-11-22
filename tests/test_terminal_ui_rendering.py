@@ -215,6 +215,22 @@ class UpdateNoticeTests(_DirectUI):
         self.press("y")
         self.assertEqual(self.ui._editor.text, "y")
 
+    async def test_handoff_discard_cancels_update_and_restores_submission(self):
+        from conch.terminal_ui import UpdateRequested
+
+        self.ui._editor.text = ""
+        self.ui.set_update_available("1.10.0")
+        self.press(Keys.Escape, "u")
+        self.assertTrue(self.ui._discard())
+        self.press("o", "k")
+        self.assertEqual(self.ui._editor.text, "ok")
+        self.press(Keys.ControlM)
+        self.assertEqual([message.text for message in self.ui._messages], ["ok"])
+        self.assertEqual(self.ui.read_message(), "ok")
+        self.press(Keys.Escape, "u")
+        with self.assertRaises(UpdateRequested):
+            self.ui.read_message()
+
     async def test_shortcut_preserves_draft_queue_turn_and_attachments(self):
         self.ui.set_update_available("1.10.0")
         for blocked in ("draft", "whitespace", "turn", "queue", "picker", "attachments"):

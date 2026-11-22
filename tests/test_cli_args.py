@@ -5,6 +5,11 @@ dash, and prompt words never mistaken for options."""
 
 import contextlib
 import io
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -236,6 +241,50 @@ class TestConchAsk(unittest.TestCase):
             ["list files with -la", "-la listing please"],
         )
         self.assertEqual(stdout.getvalue().splitlines(), ["ls -la", "ls -la"])
+
+
+class TestUpdateRestart(unittest.TestCase):
+    def test_restart_ignores_working_directory_modules_and_resumes_exact_conversation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".config" / "conch"
+            config.mkdir(parents=True)
+            (config / "config").write_text(
+                "provider=ollama\nmodel=unused\nchat_model=unused\nmodel_check=off\n")
+            (home / "argparse.py").write_text(
+                "raise RuntimeError('Restart imported working-directory code')\n")
+            env = dict(os.environ, HOME=str(home),
+                       XDG_CONFIG_HOME=str(home / ".config"),
+                       XDG_STATE_HOME=str(home / ".local" / "state"),
+                       XDG_DATA_HOME=str(home / ".local" / "share"),
+                       XDG_CACHE_HOME=str(home / ".cache"))
+            env.pop("PYTHONPATH", None)
+            env.pop("PYTHONSAFEPATH", None)
+            script = (
+                "import sys\n"
+                "sys.path[0] = sys.argv[1]\n"
+                "from conch import app, update\n"
+                "from conch.conversations import ConversationManager\n"
+                "manager = ConversationManager()\n"
+                "target = manager.create(model='unused', provider='ollama')\n"
+                "target.title = 'Restart target'\n"
+                "target.messages = [{'role': 'user', 'content': 'Saved fixture'}]\n"
+                "manager.save(target)\n"
+                "newer = manager.create(model='unused', provider='ollama')\n"
+                "newer.title = 'Wrong newer conversation'\n"
+                "newer.messages = [{'role': 'user', 'content': 'Not the target'}]\n"
+                "manager.save(newer)\n"
+                "manager.close()\n"
+                "update.main = lambda *args, **kwargs: 0\n"
+                "raise SystemExit(app._restart_after_update(target.id))\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(Path(conch.__file__).resolve().parent.parent)],
+                cwd=home, env=env, input="/exit\n", text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Resumed: Restart target", result.stdout)
+            self.assertNotIn("Resumed: Wrong newer conversation", result.stdout)
 
 
 if __name__ == "__main__":

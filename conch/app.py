@@ -502,6 +502,7 @@ def _restart_after_update(conversation_id: str) -> int:
     sys.stderr.flush()
     bootstrap = (
         "import sys; "
+        "sys.path[:] = [entry for entry in sys.path if entry]; "
         "sys.path.insert(0, sys.argv[1]); "
         "from conch.app import chat_loop; "
         "conversation_id = sys.argv[2]; "

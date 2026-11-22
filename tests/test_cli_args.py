@@ -245,6 +245,8 @@ class TestConchAsk(unittest.TestCase):
 
 class TestUpdateRestart(unittest.TestCase):
     def test_restart_ignores_working_directory_modules_and_resumes_exact_conversation(self):
+        from conch.conversations import ConversationManager
+
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             config = home / ".config" / "conch"
@@ -263,6 +265,7 @@ class TestUpdateRestart(unittest.TestCase):
             script = (
                 "import sys\n"
                 "sys.path[0] = sys.argv[1]\n"
+                "from pathlib import Path\n"
                 "from conch import app, update\n"
                 "from conch.conversations import ConversationManager\n"
                 "manager = ConversationManager()\n"
@@ -270,6 +273,7 @@ class TestUpdateRestart(unittest.TestCase):
                 "target.title = 'Restart target'\n"
                 "target.messages = [{'role': 'user', 'content': 'Saved fixture'}]\n"
                 "manager.save(target)\n"
+                "Path('expected-conversation').write_text(target.id)\n"
                 "newer = manager.create(model='unused', provider='ollama')\n"
                 "newer.title = 'Wrong newer conversation'\n"
                 "newer.messages = [{'role': 'user', 'content': 'Not the target'}]\n"
@@ -280,11 +284,13 @@ class TestUpdateRestart(unittest.TestCase):
             )
             result = subprocess.run(
                 [sys.executable, "-c", script, str(Path(conch.__file__).resolve().parent.parent)],
-                cwd=home, env=env, input="/exit\n", text=True,
+                cwd=home, env=env, input="exit\n", text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout)
-            self.assertIn("Resumed: Restart target", result.stdout)
-            self.assertNotIn("Resumed: Wrong newer conversation", result.stdout)
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    contextlib.closing(ConversationManager()) as manager:
+                self.assertEqual(
+                    manager.get_most_recent().id, (home / "expected-conversation").read_text())
 
 
 if __name__ == "__main__":

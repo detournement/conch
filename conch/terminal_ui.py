@@ -172,7 +172,7 @@ class TerminalUI:
         self._routing = threading.RLock()
         self._condition = threading.Condition()
         self._messages = deque()
-        self._open_model_pickers = 0
+        self._open_pickers = 0
         self._queue_selection = None
         self._editing_message = None
         self._detail_text = ""
@@ -924,7 +924,7 @@ class TerminalUI:
             self._notice = "Send attached images or /image clear before updating"
         else:
             with self._condition:
-                if self._messages or self._open_model_pickers:
+                if self._messages or self._open_pickers:
                     self._notice = "Finish pending messages and close pickers before updating"
                 else:
                     self._update_requested = True
@@ -1039,12 +1039,13 @@ class TerminalUI:
         self._notice = ""
         self._editor.buffer.reset()
         self._accept_messages([command])
-        model_picker = command.lower() in ("/model", "/models", "/ls")
-        if model_picker:
+        picker = command.lower() in (
+            "/model", "/models", "/ls", "/provider", "/convos", "/switch")
+        if picker:
             # Reserve the turn boundary before starting the panel thread.
             # The request may finish while the operator is still choosing.
             with self._condition:
-                self._open_model_pickers += 1
+                self._open_pickers += 1
 
         def run():
             try:
@@ -1054,9 +1055,9 @@ class TerminalUI:
             except Exception as exc:
                 print(f"  \033[31m✗ {command.split()[0]} failed: {exc}\033[0m")
             finally:
-                if model_picker:
+                if picker:
                     with self._condition:
-                        self._open_model_pickers -= 1
+                        self._open_pickers -= 1
                         self._condition.notify_all()
 
         threading.Thread(target=run, name="conch-panel", daemon=True).start()
@@ -1098,7 +1099,7 @@ class TerminalUI:
     def read_message(self) -> str:
         with self._condition:
             while not self._stopped.is_set():
-                if self._messages and not self._open_model_pickers:
+                if self._messages and not self._open_pickers:
                     first = self._messages[0]
                     if not isinstance(first, _PendingMessage) or not first.reserved:
                         break
@@ -1137,7 +1138,7 @@ class TerminalUI:
         def take():
             messages = []
             with self._condition:
-                if self._open_model_pickers:
+                if self._open_pickers:
                     return []
                 for item in tuple(self._messages):
                     if isinstance(item, BaseException) or item.selects_model:

@@ -19,6 +19,7 @@ Releases before 0.6.0 predate this changelog.
   updates, and restart excludes implicit working-directory imports.
   Restoring unsent input or a picked command cancels any queued update and
   keeps the composer editable.
+  Updates wait for live picker selections to be queued.
 
 ## [0.9.7] - 2026-11-20
 

@@ -252,7 +252,7 @@ class UpdateNoticeTests(_DirectUI):
             with self.subTest(blocked=blocked):
                 self.ui._editor.text = {"draft": "unsent", "whitespace": " \n "}.get(blocked, "")
                 self.ui._busy = blocked == "turn"
-                self.ui._open_model_pickers = int(blocked == "picker")
+                self.ui._open_pickers = int(blocked == "picker")
                 self.ui.set_context(pending_attachments=int(blocked == "attachments"))
                 self.ui._messages.clear()
                 if blocked == "queue":
@@ -648,6 +648,25 @@ class LiveCommandTests(_DirectUI):
         self.ui.set_busy(False)
         self.assertEqual([self.ui.read_message() for _ in range(4)],
                          [first, second, "queued follow-up", "answer on the new model"])
+
+    def test_update_waits_until_live_session_picker_selection_is_queued(self):
+        self.ui.set_update_available("1.10.0")
+        for command, selected in (("/provider", "/provider ollama"),
+                                  ("/convos", "/switch first"),
+                                  ("/switch", "/switch second")):
+            with self.subTest(command=command):
+                self.ui._live_command = lambda text: lambda: self.ui.queue_command(selected)
+                self.ui.set_busy(True)
+                # Hold the worker in the panel-close/selection-queue gap.
+                with patch("conch.terminal_ui.threading.Thread") as thread:
+                    self.submit(command)
+                self.ui.set_busy(False)
+                self.ui._request_update()
+                self.assertFalse(self.ui._update_requested)
+                thread.call_args.kwargs["target"]()
+                self.assertEqual(self.ui._open_pickers, 0)
+                self.assertEqual([message.text for message in self.ui._messages], [selected])
+                self.assertEqual(self.ui.read_message(), selected)
 
     def test_turn_finishing_with_model_picker_open_waits_for_pick_or_cancel(self):
         import threading

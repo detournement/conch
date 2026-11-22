@@ -1039,8 +1039,9 @@ class TerminalUI:
         self._notice = ""
         self._editor.buffer.reset()
         self._accept_messages([command])
-        picker = command.lower() in (
-            "/model", "/models", "/ls", "/provider", "/convos", "/switch")
+        picker = command.split(maxsplit=1)[0].lower() in (
+            "/model", "/models", "/ls", "/provider", "/convos", "/switch",
+            "/help", "/h", "/?")
         if picker:
             # Reserve the turn boundary before starting the panel thread.
             # The request may finish while the operator is still choosing.

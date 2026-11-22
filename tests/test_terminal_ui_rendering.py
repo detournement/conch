@@ -668,6 +668,24 @@ class LiveCommandTests(_DirectUI):
                 self.assertEqual([message.text for message in self.ui._messages], [selected])
                 self.assertEqual(self.ui.read_message(), selected)
 
+    def test_update_waits_until_live_help_draft_is_restored(self):
+        self.ui.set_update_available("1.10.0")
+        for command in ("/help", "/help model", "/h", "/?"):
+            with self.subTest(command=command):
+                self.ui._live_command = lambda text: lambda: self.ui.prefill("/model ")
+                self.ui.set_busy(True)
+                with patch("conch.terminal_ui.threading.Thread") as thread:
+                    self.submit(command)
+                self.ui.set_busy(False)
+                self.ui._request_update()
+                self.assertFalse(self.ui._update_requested)
+                thread.call_args.kwargs["target"]()
+                self.assertEqual(self.ui._open_pickers, 0)
+                self.assertEqual(self.ui._editor.text, "/model ")
+                self.ui._request_update()
+                self.assertFalse(self.ui._update_requested)
+                self.assertEqual(list(self.ui._messages), [])
+
     def test_turn_finishing_with_model_picker_open_waits_for_pick_or_cancel(self):
         import threading
         from concurrent.futures import ThreadPoolExecutor

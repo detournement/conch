@@ -7,7 +7,7 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
-## [0.9.8] - 2026-11-21
+## [0.9.8] - 2026-11-22
 
 ### Added
 
@@ -19,7 +19,7 @@ Releases before 0.6.0 predate this changelog.
   updates, and restart excludes implicit working-directory imports.
   Restoring unsent input or a picked command cancels any queued update and
   keeps the composer editable.
-  Updates wait for live picker selections to be queued.
+  Updates wait for live picker selections to be restored as input or queued.
 
 ## [0.9.7] - 2026-11-20
 

@@ -605,10 +605,8 @@ class ToolRuntimeState:
     # survive the per-request relevance cap like PINNED_TOOL_NAMES do, so a
     # later "continue" turn that never mentions the tool keeps it.
     pinned_tools: Set[str] = field(default_factory=set)
-    # A skill's declared ``rounds:`` budget requested mid-turn (skill_manage
-    # use): runtime.chat_turn raises the running turn's round budget to it
-    # and AgentSession carries it into the session budget — the same effect
-    # /skill has before a turn starts. Only ever raised, never lowered.
+    # Skills may raise finite turn/session budgets, never cap an unlimited
+    # session. An explicit /rounds command clears this pending request.
     requested_tool_rounds: int = 0
     # Per-MCP-server discovery status (name -> mcp.ServerStatus): ready /
     # loading / unreachable / error, for /tools and the startup notices.
@@ -2394,8 +2392,7 @@ class SkillManageClient:
         return "\n\n".join(notes)
 
     def _request_rounds(self, skill: dict) -> str:
-        """Honour the skill's ``rounds:`` budget the way /skill does: the
-        running turn (and then the session) is raised to it, never cut."""
+        """Request a larger finite budget without limiting unlimited turns."""
         try:
             wanted = int(skill.get("rounds") or 0)
         except (TypeError, ValueError):
@@ -2408,7 +2405,8 @@ class SkillManageClient:
             state.requested_tool_rounds = wanted
         return (
             f"(this skill declares a budget of {wanted} tool rounds; the "
-            "session's round budget is raised to it if lower)"
+            "session's finite round budget is raised to it if lower; "
+            "unlimited sessions stay unlimited)"
         )
 
     def _confirm(self, prompt: str) -> bool:
@@ -3012,7 +3010,8 @@ CONCH_CONFIG_TOOL = {
                     "type": "string",
                     "description": (
                         "The value to set (model name, provider name, "
-                        "registry URL, on/off, number, setting value)"
+                        "registry URL, on/off, number, setting value). "
+                        "set_rounds accepts 0 for unlimited rounds."
                     ),
                 },
             },
@@ -3515,12 +3514,13 @@ class ConchConfigClient:
         if action == "set_rounds":
             try:
                 n = int(value)
-                if n < 1:
+                if n < 0:
                     raise ValueError
             except (ValueError, TypeError):
                 return self._text(f"Invalid number: '{value}'")
             self.pending_actions.append(("set_rounds", n))
-            return self._text(f"Max tool rounds set to {n}.")
+            limit = str(n) if n else "unlimited"
+            return self._text(f"Max tool rounds set to {limit}.")
 
         if action == "clear_history":
             self.pending_actions.append(("clear_history",))

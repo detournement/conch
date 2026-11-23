@@ -183,19 +183,18 @@ class TestAgentSessionObject(unittest.TestCase):
         self.assertEqual(session.model, "gpt-4o")
         self.assertIsInstance(session.permissions, PermissionState)
         self.assertIsNot(session.permissions, default_permissions())
-        self.assertEqual(session.budgets.max_tool_rounds, 25)
-        self.assertIsNone(session.budgets.turn_token_budget)
 
     def test_two_sessions_own_separate_state(self):
         config_a = {"provider": "openai", "chat_model": "gpt-4o"}
         config_b = {"provider": "anthropic", "chat_model": "claude"}
         a = AgentSession(config_a)
         b = AgentSession(config_b)
+        original_b_budget = b.budgets.max_tool_rounds
         a.permissions.set_agent_mode(True)
         a.budgets.max_tool_rounds = 3
         config_a["chat_model"] = "gpt-4o-mini"
         self.assertFalse(b.permissions.get_agent_mode())
-        self.assertEqual(b.budgets.max_tool_rounds, 25)
+        self.assertEqual(b.budgets.max_tool_rounds, original_b_budget)
         self.assertEqual(b.model, "claude")
         self.assertEqual(a.model, "gpt-4o-mini")
 

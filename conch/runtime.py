@@ -1985,7 +1985,7 @@ def chat_turn(
     tools: Optional[List[dict]],
     tool_map: Dict[str, Any],
     builtin_clients: Dict[str, Any],
-    max_tool_rounds: int = 25,
+    max_tool_rounds: int = 0,
     chat_state=None,
     on_token=None,
     input_fn=None,
@@ -1994,6 +1994,10 @@ def chat_turn(
 ) -> tuple:
     """Returns (reply_text, usage_info) where usage_info is a dict with
     input_tokens, output_tokens, and model.
+
+    ``max_tool_rounds=0`` continues until completion, cancellation or another
+    safety limit. Positive values impose an explicit round cap. Context is
+    compacted independently of the number of tool rounds.
 
     When *on_token* is a callable, the reply is streamed token-by-token
     through that callback instead of blocking behind a spinner.
@@ -2021,7 +2025,7 @@ def chat_turn(
         else None
     )
     total_usage = {"input_tokens": 0, "output_tokens": 0, "model": ""}
-    # Optional per-turn token budget alongside the round budget (plan 2.6)
+    # Optional per-turn token budget, independent of the round limit.
     try:
         token_budget = int(config.get("turn_token_budget", 0) or 0)
     except (TypeError, ValueError):
@@ -2040,9 +2044,8 @@ def chat_turn(
         max_parallel_tool_calls = 16
     previous_batch = ""
     identical_batches = 0
-    # The round budget is mutable: a skill loaded mid-turn (skill_manage
-    # use) may declare a larger ``rounds:`` budget, which raises this
-    # turn's bound exactly as /skill raises it before a turn starts.
+    # Skills can raise a finite round budget, but must not turn an unlimited
+    # foreground session into a bounded one.
     round_budget = int(max_tool_rounds)
     _round = -1
 
@@ -2064,14 +2067,14 @@ def chat_turn(
         checkpoint()
         _round += 1
         wanted = int(getattr(chat_state, "requested_tool_rounds", 0) or 0)
-        if wanted > round_budget:
+        if 0 < round_budget < wanted:
             print(
                 f"  \033[2m(tool round budget raised to {wanted} for this "
                 f"turn by a skill's declared rounds)\033[0m",
                 file=sys.stderr,
             )
             round_budget = wanted
-        if _round >= round_budget:
+        if round_budget and _round >= round_budget:
             if evaluation is not None:
                 raise EvaluationError("limit", "Evaluation turn round budget exhausted")
             break
@@ -2116,7 +2119,7 @@ def chat_turn(
         compressed = messages if evaluation is not None else compress_context(
             messages, send_tools, provider, config
         )
-        if len(compressed) < len(messages):
+        if compressed is not messages:
             messages.clear()
             messages.extend(compressed)
             if provider == "anthropic":
@@ -2574,19 +2577,6 @@ def chat_turn(
             )
             remaining_result_count = max(0, remaining_result_count - 1)
 
-        if too_many_tool_calls and not guidance:
-            reason = (
-                f"Rejected tool batch: the model exceeded the "
-                f"{max_parallel_tool_calls}-call per-round safety limit."
-            )
-            for tool_call in tool_calls:
-                add_result(tool_call, reason)
-            if provider == "anthropic":
-                append_results_anthropic(messages, response, results)
-            else:
-                append_results_openai(messages, response, results)
-            continue
-
         if identical_batches >= max_identical_batches and not guidance:
             reason = (
                 "Rejected repeated identical tool-call batch; inspect the "
@@ -2604,6 +2594,19 @@ def chat_turn(
                     "the same tool calls without making progress.",
                     total_usage,
                 )
+            continue
+
+        if too_many_tool_calls and not guidance:
+            reason = (
+                f"Rejected tool batch: the model exceeded the "
+                f"{max_parallel_tool_calls}-call per-round safety limit."
+            )
+            for tool_call in tool_calls:
+                add_result(tool_call, reason)
+            if provider == "anthropic":
+                append_results_anthropic(messages, response, results)
+            else:
+                append_results_openai(messages, response, results)
             continue
 
         from .tooling import run_hook

@@ -221,7 +221,7 @@ SLASH_COMMANDS = [
     ("/apps", "List connectable services"),
     ("/reload", "Reload MCP tools"),
     ("/resettools", "Reset tool-calling if the model drifts to textual calls"),
-    ("/rounds <n>", "Set max tool call rounds"),
+    ("/rounds <n>", "Set tool round limit; 0 = unlimited (default)"),
     ("/queue on|off", "Enable/disable busy submissions; Ctrl+Q edits pending messages"),
     ("/paste", "Paste lines literally; end with a lone '.' or Ctrl+D"),
     ("/edit", "Compose the next message in your editor"),
@@ -1559,7 +1559,7 @@ def handle_slash_command(
             "  \033[1m/connect <app>\033[0m       Connect a service\n"
             "  \033[1m/apps\033[0m                List connectable services\n"
             + product_help +
-            "  \033[1m/rounds <n>\033[0m          Set max tool call rounds (default 25)\n"
+            "  \033[1m/rounds <n>\033[0m          Set tool round limit (0 = unlimited, default)\n"
             "  \033[1m/queue on|off\033[0m        Enable/disable busy submissions; Ctrl+Q edits pending messages\n"
             "  \033[1m/paste\033[0m               Paste lines literally; end with a lone '.' or Ctrl+D\n"
             "  \033[1m/edit\033[0m                Compose the next message in your editor (also /paste --editor)\n"
@@ -2611,16 +2611,17 @@ def handle_slash_command(
 
     if command == "/rounds":
         if not arg:
-            print("\n  \033[2mMax tool rounds: currently set via /rounds <n>\033[0m\n")
+            print("\n  \033[2mUse /rounds <n>; 0 = unlimited (default).\033[0m\n")
             return None
         try:
             n = int(arg)
-            if n < 1:
+            if n < 0:
                 raise ValueError
         except ValueError:
             print(f"\n  \033[31mInvalid number: {arg}\033[0m\n")
             return None
-        print(f"\n  \033[1;32m✓ Max tool rounds set to {n}\033[0m\n")
+        limit = str(n) if n else "unlimited"
+        print(f"\n  \033[1;32m✓ Max tool rounds set to {limit}\033[0m\n")
         return n
 
     if command == "/queue":

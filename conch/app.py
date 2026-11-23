@@ -64,7 +64,7 @@ from .prompts import get_chat_prompt
 
 CHAT_SYSTEM_PROMPT = None  # resolved per-provider at startup
 
-MAX_TOOL_ROUNDS = 25  # default, adjustable via /rounds
+MAX_TOOL_ROUNDS = 0  # unlimited foreground work; /rounds opts into a limit
 
 AGENT_MODE_CONFIG_NOTICE = (
     "Agent mode is on: shell commands run without asking. /agent off changes it."
@@ -614,7 +614,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     # the conch-edge daemon) owns scheduled tasks instead; without it this
     # is the classic in-process scheduler and conch.kernel is never imported.
     sched, sched_kind = start_task_backend(
-        config, lambda: system_prompt, max_tool_rounds=MAX_TOOL_ROUNDS,
+        config, lambda: system_prompt,
         pause_controller=session._pause_controller,
     )
 
@@ -1542,11 +1542,10 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                                 "session)\033[0m"
                             )
                     if isinstance(_prompt_meta, dict) and _prompt_meta.get("rounds"):
-                        # A skill's rounds: line is its declared budget
-                        # (delegate_task honours it); the main-session
-                        # default of 25 cut a scaffold+verify arc short.
+                        # A skill can raise a finite limit, but must not
+                        # cap an unlimited foreground session.
                         _wanted = int(_prompt_meta["rounds"])
-                        if _wanted > session.budgets.max_tool_rounds:
+                        if 0 < session.budgets.max_tool_rounds < _wanted:
                             session.budgets.max_tool_rounds = _wanted
                             print(
                                 f"  \033[2m(skill {_prompt_meta.get('skill')}: "
@@ -1690,6 +1689,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                         _ui.set_queue_enabled(False)
                 elif isinstance(result, int):
                     session.budgets.max_tool_rounds = result
+                    chat_state.requested_tool_rounds = 0
                 elif result is not None:
                     # /model (including a picker choice) and /provider have
                     # validated and committed the route to session.config.
@@ -1961,6 +1961,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                         print(f"  \033[1;32m\u2713 Now using {provider}/{model_name}\033[0m")
                 elif _action[0] == "set_rounds":
                     session.budgets.max_tool_rounds = _action[1]
+                    chat_state.requested_tool_rounds = 0
                 elif _action[0] == "clear_history":
                     old_count = len([m for m in messages if m.get("role") == "user"])
                     messages.clear()

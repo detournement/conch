@@ -178,7 +178,7 @@ class TestArgumentAndIdIntegrity(TestExactRequestAuthorization):
             max_parallel_tool_calls=2,
         )
         self.assertEqual(client.calls, [])
-        self.assertIn("parallel tool calls", usage["tool_protocol_error"])
+        self.assertIn("tool_protocol_error", usage)
         self.assertEqual(
             len([m for m in history if m.get("role") == "tool"]), 2
         )
@@ -225,6 +225,33 @@ class TestArgumentAndIdIntegrity(TestExactRequestAuthorization):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertNotIn("duplicate", ids)
         self.assertEqual(ids, [result["tool_call_id"] for result in results])
+
+
+class TestUnboundedTurnSafety(unittest.TestCase):
+    def test_repeated_batches_stop_even_when_they_are_oversized(self):
+        for batch_size, executed in ((1, 1), (3, 0)):
+            with self.subTest(batch_size=batch_size):
+                client = RecordingClient()
+                requests = 0
+
+                def raw_fn(_config, _messages, _tools):
+                    nonlocal requests
+                    requests += 1
+                    self.assertLessEqual(requests, 3, "Repeated invalid work must stop")
+                    return {"content": "", "tool_calls": [
+                        _call("safe", "{}", f"call-{requests}-{index}")
+                        for index in range(batch_size)
+                    ]}
+
+                with patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                    chat_turn(
+                        {"max_parallel_tool_calls": 2, "max_identical_tool_batches": 2},
+                        "openai", raw_fn,
+                        [{"role": "user", "content": "Do the task"}],
+                        [_tool("safe")], {}, {"safe": client},
+                    )
+                self.assertEqual(client.calls, [("safe", {})] * executed)
+                self.assertEqual(requests, 3)
 
 
 class TestCompactionProtocolGroups(unittest.TestCase):

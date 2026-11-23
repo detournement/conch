@@ -8,6 +8,7 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
+[Next release: v0.9.9 (unreleased)](CHANGELOG.md) ·
 [Current release: v0.9.8][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
@@ -765,6 +766,9 @@ The installer:
 For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
+
+The v0.9.9 changes on this branch are unreleased; v0.9.8 remains the latest
+published GitHub release.
 
 `conch-shell` is not published on PyPI at v0.9.8. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows

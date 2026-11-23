@@ -7,7 +7,7 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
-## [Unreleased]
+## [0.9.9] - 2026-11-23 (unreleased)
 
 ### Changed
 
@@ -639,7 +639,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
-[Unreleased]: https://github.com/detournement/conch/compare/v0.9.8...HEAD
+[0.9.9]: https://github.com/detournement/conch/pull/15
 [0.9.8]: https://github.com/detournement/conch/releases/tag/v0.9.8
 [0.9.7]: https://github.com/detournement/conch/releases/tag/v0.9.7
 [0.9.6]: https://github.com/detournement/conch/releases/tag/v0.9.6

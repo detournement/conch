@@ -7,6 +7,25 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [0.9.9] - 2026-11-23
+
+### Changed
+
+- Foreground chat and one-shot `conch "..."` tool workflows no longer stop
+  after 25 rounds by default. Existing automatic context summarization and
+  fallback compression keep long turns within the context budget.
+- `/rounds 0` and `conch_config set_rounds=0` restore unlimited rounds;
+  positive limits remain available. Skills can raise finite limits without
+  capping unlimited sessions. Background and evaluation budgets, token
+  caps, cancellation, and repeated-call protection remain in place.
+
+### Fixed
+
+- Apply fallback compression when tool results shrink without changing the
+  number of messages.
+- Stop repeated oversized tool-call batches instead of letting their
+  parallel-call rejection bypass repeated-call protection.
+
 ## [0.9.8] - 2026-11-22
 
 ### Added
@@ -620,6 +639,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[0.9.9]: https://github.com/detournement/conch/releases/tag/v0.9.9
 [0.9.8]: https://github.com/detournement/conch/releases/tag/v0.9.8
 [0.9.7]: https://github.com/detournement/conch/releases/tag/v0.9.7
 [0.9.6]: https://github.com/detournement/conch/releases/tag/v0.9.6

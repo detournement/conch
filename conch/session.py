@@ -31,12 +31,15 @@ _UNSET = object()
 class SessionBudgets:
     """Execution budgets owned by one session.
 
+    ``max_tool_rounds=0`` leaves the round count unlimited; positive values
+    bound explicitly budgeted work such as background tasks and subagents.
+
     ``turn_token_budget`` of ``None`` defers to the session config's
     ``turn_token_budget`` key (current behavior); a number overrides it for
     this session only.
     """
 
-    max_tool_rounds: int = 25
+    max_tool_rounds: int = 0
     turn_token_budget: Optional[int] = None
 
 
@@ -148,7 +151,7 @@ class AgentSession:
         steering_fn=None,
         evaluation=None,
     ) -> tuple:
-        """Run one bounded agent turn through ``runtime.chat_turn``.
+        """Run one agent turn through ``runtime.chat_turn``.
 
         The session installs its pause context for the whole turn, including
         synchronous nested skill calls, retries, compaction and summaries.
@@ -194,13 +197,12 @@ class AgentSession:
                     evaluation=evaluation,
                 )
         finally:
-            # A skill loaded mid-turn (skill_manage use) that declares a
-            # larger rounds: budget keeps it for the rest of the session,
-            # exactly as /skill does (/rounds changes it again).
+            # A skill can raise a finite session budget, never cap an
+            # unlimited session. /rounds explicitly replaces that budget.
             wanted = int(
                 getattr(self.chat_state, "requested_tool_rounds", 0) or 0
             )
-            if evaluation is None and wanted > self.budgets.max_tool_rounds:
+            if evaluation is None and 0 < self.budgets.max_tool_rounds < wanted:
                 self.budgets.max_tool_rounds = wanted
 
     # -- lifecycle -----------------------------------------------------------

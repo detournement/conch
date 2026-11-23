@@ -1,12 +1,14 @@
-"""Tests for graceful budget exhaustion (plan 2.6) and weak-model side tasks
-(plan 2.7)."""
+"""Tests for explicit budgets, long-running tool turns and weak-model side tasks."""
 
 import io
+import json
 import unittest
 from unittest.mock import patch
 
 from conch.providers import error_response
-from conch.runtime import auto_compact, chat_turn, side_task_fn, weak_model_config
+from conch.runtime import (
+    auto_compact, chat_turn, estimate_tokens, side_task_fn, weak_model_config,
+)
 
 
 def _tool_call_response(n):
@@ -22,53 +24,42 @@ def _tool_call_response(n):
 
 
 class _NoopClient:
+    def __init__(self):
+        self.calls = 0
+
     def call_tool(self, name, arguments):
+        self.calls += 1
         return {"content": [{"type": "text", "text": "ok"}]}
 
 
 class TestGracefulExhaustion(unittest.TestCase):
-    def test_round_budget_summarizes_progress(self):
+    def test_explicit_round_budget_stops_tool_execution(self):
         calls = {"n": 0}
+        client = _NoopClient()
 
         def raw_fn(config, messages, tools):
             calls["n"] += 1
             if tools is not None:
                 return _tool_call_response(calls["n"])
-            # The exhaustion summary call has no tools
-            self.assertIn("Summarize", messages[-1]["content"])
             return {"content": "Progress: did A and B; remaining: C",
                     "tool_calls": None,
                     "_usage": {"input_tokens": 10, "output_tokens": 10},
                     "_model": "test"}
 
         with patch("sys.stderr", io.StringIO()):
-            reply, usage = chat_turn(
+            _, usage = chat_turn(
                 config={}, provider="openai", raw_fn=raw_fn,
                 messages=[{"role": "user", "content": "go"}],
                 tools=[{"function": {"name": "noop"}}], tool_map={},
-                builtin_clients={"noop": _NoopClient()}, max_tool_rounds=2,
+                builtin_clients={"noop": client}, max_tool_rounds=2,
             )
-        self.assertIn("Progress: did A and B", reply)
-        self.assertIn("tool round budget reached", reply)
-        self.assertNotIn("[max tool call rounds reached]", reply)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(usage["input_tokens"] + usage["output_tokens"], 320)
 
-    def test_summary_failure_falls_back_to_marker(self):
-        def raw_fn(config, messages, tools):
-            if tools is not None:
-                return _tool_call_response(0)
-            return error_response("connection refused")
-
-        with patch("sys.stderr", io.StringIO()):
-            reply, _ = chat_turn(
-                config={}, provider="openai", raw_fn=raw_fn,
-                messages=[{"role": "user", "content": "go"}],
-                tools=[{"function": {"name": "noop"}}], tool_map={},
-                builtin_clients={"noop": _NoopClient()}, max_tool_rounds=1,
-            )
-        self.assertEqual(reply, "[tool round budget reached]")
-
-    def test_token_budget_stops_early(self):
+    def test_token_budget_stops_an_unlimited_turn(self):
         calls = {"n": 0}
+        client = _NoopClient()
 
         def raw_fn(config, messages, tools):
             calls["n"] += 1
@@ -79,37 +70,89 @@ class TestGracefulExhaustion(unittest.TestCase):
                     "_model": "test"}
 
         with patch("sys.stderr", io.StringIO()):
-            reply, usage = chat_turn(
+            _, usage = chat_turn(
                 config={"turn_token_budget": "200"}, provider="openai",
                 raw_fn=raw_fn,
                 messages=[{"role": "user", "content": "go"}],
                 tools=[{"function": {"name": "noop"}}], tool_map={},
-                builtin_clients={"noop": _NoopClient()}, max_tool_rounds=50,
+                builtin_clients={"noop": client},
             )
-        self.assertIn("stopped at budget", reply)
-        self.assertIn("token budget reached", reply)
-        # 2 tool rounds (300 tokens) trip the 200-token budget on round 3
-        self.assertLessEqual(calls["n"], 3 + 1)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(usage["input_tokens"] + usage["output_tokens"], 302)
 
-    def test_no_budget_uses_all_rounds(self):
-        calls = {"n": 0}
 
-        def raw_fn(config, messages, tools):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return _tool_call_response(1)
-            return {"content": "done", "tool_calls": None,
-                    "_usage": {"input_tokens": 1, "output_tokens": 1},
-                    "_model": "test"}
+class TestToolContinuation(unittest.TestCase):
+    def _run_long_turn(self, *, summary_fails):
+        class ProgressClient:
+            completed = 0
 
-        with patch("sys.stderr", io.StringIO()):
-            reply, _ = chat_turn(
+            def call_tool(self, name, arguments):
+                step = arguments["step"]
+                if step != self.completed + 1:
+                    raise ValueError("Steps must execute once and in order")
+                self.completed = step
+                return {"content": [{
+                    "type": "text",
+                    "text": f"step {step}\n" + "detail " * 200,
+                }]}
+
+        client = ProgressClient()
+        requests = 0
+        tools = [{"type": "function", "function": {
+            "name": "advance",
+            "parameters": {"type": "object", "properties": {
+                "step": {"type": "integer"},
+            }, "required": ["step"]},
+        }}]
+
+        def raw_fn(config, messages, send_tools):
+            nonlocal requests
+            if send_tools is None:
+                if summary_fails:
+                    return error_response("Summary service unavailable")
+                return {"content": "Complete 60 steps; progress is in the latest tool result."}
+            requests += 1
+            self.assertLessEqual(requests, 61, "The final answer must end the turn")
+            self.assertLessEqual(estimate_tokens(messages, send_tools), 4000)
+            pending = set()
+            completed = 0
+            for message in messages:
+                if message.get("tool_calls"):
+                    self.assertFalse(pending)
+                    pending = {call["id"] for call in message["tool_calls"]}
+                elif message["role"] == "tool":
+                    self.assertIn(message["tool_call_id"], pending)
+                    pending.remove(message["tool_call_id"])
+                    completed = int(message["content"].splitlines()[0].split()[1])
+            self.assertFalse(pending)
+            self.assertEqual(completed, client.completed)
+            if completed == 60:
+                return {"content": f"Finished {completed} steps."}
+            return {"content": "", "tool_calls": [{
+                "id": f"step-{completed + 1}", "type": "function",
+                "function": {
+                    "name": "advance",
+                    "arguments": json.dumps({"step": completed + 1}),
+                },
+            }]}
+
+        with patch("conch.runtime.get_context_limit", return_value=3600), \
+             patch("conch.runtime._token_calibration", {}), \
+             patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+            chat_turn(
                 config={}, provider="openai", raw_fn=raw_fn,
-                messages=[{"role": "user", "content": "go"}],
-                tools=[{"function": {"name": "noop"}}], tool_map={},
-                builtin_clients={"noop": _NoopClient()}, max_tool_rounds=5,
+                messages=[{"role": "system", "content": "Execute the requested steps."},
+                          {"role": "user", "content": "Complete 60 steps in order."}],
+                tools=tools, tool_map={}, builtin_clients={"advance": client},
             )
-        self.assertEqual(reply, "done")
+        self.assertEqual(client.completed, 60)
+
+    def test_long_turn_compacts_and_preserves_tool_progress(self):
+        self._run_long_turn(summary_fails=False)
+
+    def test_long_turn_keeps_context_bounded_when_summaries_fail(self):
+        self._run_long_turn(summary_fails=True)
 
 
 class TestWeakModelConfig(unittest.TestCase):

@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.8][release] ·
+[Current release: v0.9.9][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.8
+[release]: https://github.com/detournement/conch/releases/tag/v0.9.9
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -766,9 +766,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v0.9.8. GitHub releases include a
+`conch-shell` is not published on PyPI at v0.9.9. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v0.9.8` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v0.9.9` to install the release sdist.
 
 ### Updating
 
@@ -1396,6 +1396,14 @@ Only native tool calls are executable; repeated identical call batches stop.
   model and tool output are replaced with `[credential redacted]` before
   a transcript is written or indexed — the running session keeps the
   original; what the user typed is stored as typed.
+- Foreground chat and `conch "..."` tool turns have no default round limit.
+  Conch automatically summarizes older history as it reaches roughly 70% of
+  the context budget, keeping recent tool exchanges; if summarization fails,
+  fallback compression caps older results and drops old complete exchanges.
+  `/rounds N` sets an explicit limit, and `/rounds 0` restores unlimited rounds.
+  Cancellation, repeated-call protection, and optional token budgets still
+  apply. Scheduled, remote, delegated, and evaluation work keeps its own
+  finite budgets. Compression bounds context, not total API spend.
 - `/new` also saves up to five recent file-tool references for the next
   conversation's first turn, synchronously and independently of summaries.
   This keeps generated files discoverable without retaining the old transcript
@@ -1462,10 +1470,10 @@ the same name. Skills can scope tools, model, and round budget:
 /skill <name> [task]
 ```
 
-A skill's `rounds:` budget applies whether you load it with `/skill` or the
-model loads it itself mid-turn (`skill_manage use`): the running turn's tool
-round budget rises to it, the session keeps the raised value, and it is never
-lowered (`/rounds` changes it again).
+A skill's `rounds:` budget can raise a finite round limit whether you load it
+with `/skill` or the model loads it mid-turn (`skill_manage use`). The session
+keeps that raised limit; an unlimited session stays unlimited. An explicit
+`/rounds` change replaces the limit and clears the previous skill's request.
 
 The model can delegate a bounded subtask into a fresh context with
 `delegate_task`; recursive delegation and self-management tools are excluded.
@@ -1956,7 +1964,7 @@ plain sessions. This table groups the shipped commands.
 | `/profile`, `/profiles` | Tool profiles |
 | `/connect`, `/apps` | Composio applications |
 | `/reload`, `/resettools` | Reload integrations or reset textual tool-call drift |
-| `/rounds <n>` | Set the turn's maximum tool rounds |
+| `/rounds <n>` | Set the turn's maximum tool rounds; `0` = unlimited (default) |
 | `/queue on\|off`, `/paste`, `/edit` | Steering/follow-up submission and multiline composition |
 | `/status`, `/cost` | Session and provider status |
 | `/capitol ...` | Capitol runtime, artifacts, packs, and gated administration |

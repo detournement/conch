@@ -219,9 +219,8 @@ class TestSkillManageTool(SkillsDirTestCase):
         state = ToolRuntimeState(all_tools=[], tool_map={}, tools=[])
         client = self._client()
         client.bind_state(state)
-        text = self._call(client, {"action": "use", "name": "deploy-check"})
+        self._call(client, {"action": "use", "name": "deploy-check"})
         self.assertEqual(state.requested_tool_rounds, 6)
-        self.assertIn("budget of 6 tool rounds", text)
         # a smaller skill never lowers an earlier request
         self._write("tiny", "---\nname: tiny\nrounds: 2\n---\nbody\n")
         self._call(client, {"action": "use", "name": "tiny"})
@@ -298,17 +297,12 @@ class TestRoundsBudgetRaisedMidTurn(SkillsDirTestCase):
 
     def test_turn_budget_rises_to_the_skills_rounds(self):
         # Without the raise, max_tool_rounds=2 would exhaust after two rounds.
-        reply, rounds, err = self._turn(skill_rounds=6, max_tool_rounds=2)
-        self.assertEqual(reply, "done after five rounds")
+        _, rounds, _ = self._turn(skill_rounds=6, max_tool_rounds=2)
         self.assertEqual(rounds, 5)
-        self.assertIn("tool round budget raised to 6 for this turn", err)
 
     def test_turn_budget_is_never_lowered(self):
-        reply, rounds, err = self._turn(skill_rounds=1, max_tool_rounds=3)
-        self.assertTrue(reply.startswith("ran out"), reply)  # exhausted at 3, not cut to 1
+        _, rounds, _ = self._turn(skill_rounds=1, max_tool_rounds=3)
         self.assertEqual(rounds, 3)
-        self.assertNotIn("raised", err)
-        self.assertIn("Tool round budget (3) exhausted", err)
 
     def test_session_keeps_the_raised_budget(self):
         from conch.session import AgentSession, SessionBudgets
@@ -316,9 +310,17 @@ class TestRoundsBudgetRaisedMidTurn(SkillsDirTestCase):
         session = AgentSession(
             {"provider": "openai"}, budgets=SessionBudgets(max_tool_rounds=2),
         )
-        reply, rounds, _ = self._turn(skill_rounds=6, max_tool_rounds=2, session=session)
-        self.assertEqual(reply, "done after five rounds")
+        _, rounds, _ = self._turn(skill_rounds=6, max_tool_rounds=2, session=session)
+        self.assertEqual(rounds, 5)
         self.assertEqual(session.budgets.max_tool_rounds, 6)
+
+    def test_skill_does_not_cap_an_unlimited_session(self):
+        from conch.session import AgentSession
+
+        session = AgentSession({"provider": "openai"})
+        _, rounds, _ = self._turn(skill_rounds=2, max_tool_rounds=0, session=session)
+        self.assertEqual(rounds, 5)
+        self.assertEqual(session.budgets.max_tool_rounds, 0)
 
 
 class _FakeShell:

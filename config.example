@@ -201,8 +201,9 @@ api_key_env=
 # Define custom tool profiles as comma-separated group lists.
 #profile_research=github, jira
 
-# Per-turn budgets: tool rounds are set with /rounds; an optional token cap
-# makes the model summarize progress instead of stopping abruptly.
+# Foreground turns have unlimited tool rounds by default; context compacts
+# automatically. /rounds N opts into a limit; /rounds 0 removes it.
+# An optional token cap still ends the turn with a progress summary.
 #turn_token_budget=40000
 
 # Reassemble multi-line pastes at the chat prompt into one message (on by

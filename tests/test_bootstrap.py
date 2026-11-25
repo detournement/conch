@@ -169,7 +169,7 @@ class TestBuildAgentSession(BootstrapTestCase):
     def _build(self, config=None):
         with patch.object(bootstrap.mcp_mod, "create_clients", return_value={}), \
                 patch.object(bootstrap.mcp_mod, "collect_tools", return_value=([], {})), \
-                patch.object(bootstrap.mcp_mod, "save_tool_cache", lambda tools: None):
+                patch.object(bootstrap.mcp_mod, "save_server_cache", lambda fingerprints, results: None):
             return build_agent_session(
                 config or {"provider": "openai", "chat_model": "gpt-4o"}
             )

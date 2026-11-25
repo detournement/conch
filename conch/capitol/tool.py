@@ -52,12 +52,18 @@ from typing import Any, Dict, List, Optional
 
 from ..policy import evaluate_required_policy
 from .client import (
+    FINAL_STATUS_EVENT,
     KEEPALIVE_EVENT,
     TERMINAL_EVENT_TYPES,
     TERMINAL_RUN_STATUSES,
     CapitolRuntime,
 )
-from .errors import CapitolAuthError, CapitolCapabilityError, CapitolError
+from .errors import (
+    CapitolAuthError,
+    CapitolCapabilityError,
+    CapitolError,
+    CapitolProtocolError,
+)
 from .packs.templates import clean_text
 
 #: Hard bounds on the watch deadline (seconds): a tool call may poll, but
@@ -66,6 +72,9 @@ WATCH_DEADLINE_DEFAULT = 120.0
 WATCH_DEADLINE_MAX = 600.0
 WATCH_DEADLINE_MIN = 5.0
 WATCH_POLL_SECONDS = 2.0
+#: Polling watch: a poll that returns events skips the status call, but
+#: status is still checked at least every Nth poll.
+WATCH_STATUS_EVERY = 5
 
 #: Payload render budget for JSON-ish op results.
 RESULT_BUDGET = 6000
@@ -364,14 +373,57 @@ def _hitl_lines(event: Dict[str, Any]) -> Optional[str]:
     )
 
 
+class _WatchTally:
+    """What one watch op saw: counts, HITL relays, the recent tail, and
+    the cursor (events at or below it are skipped)."""
+
+    def __init__(self, since: int):
+        self.last_seen = max(0, int(since) - 1)
+        self.counts: Dict[str, int] = {}
+        self.hitl: List[str] = []
+        self.recent: List[str] = []
+        self.total = 0
+        self.terminal_event = False
+
+    def observe(self, event: Any) -> bool:
+        """Tally one event; False when it is skipped."""
+        if not isinstance(event, dict):
+            return False
+        if event.get("event_type") == KEEPALIVE_EVENT:
+            return False
+        sequence = event.get("sequence")
+        if isinstance(sequence, (int, float)):
+            if int(sequence) <= self.last_seen:
+                return False
+            self.last_seen = int(sequence)
+        self.total += 1
+        kind = str(event.get("event_type") or "unknown")
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        if kind in TERMINAL_EVENT_TYPES:
+            self.terminal_event = True
+        needs_input = _hitl_lines(event)
+        if needs_input:
+            self.hitl.append(needs_input)
+        node = clean_text(
+            (event.get("node") or {}).get("display_name")
+            or (event.get("node") or {}).get("node_id"), 50,
+        )
+        self.recent.append(f"seq {sequence} {kind} {node}".rstrip())
+        if len(self.recent) > 8:
+            self.recent.pop(0)
+        return True
+
+
 class CapitolSessionClient:
     """Builtin fronting ``CapitolRuntime`` for chat sessions.
 
     A fresh runtime is built per call (bearer resolved by reference at
     call time, never stored on the client), matching the /capitol CLI's
-    per-command construction. ``remote_origin`` switches the client into
-    channel mode: reads and HITL responses pass through, ``start``
-    proposes an origin-bound approval instead of executing.
+    per-command construction; the AgentCard behind it is shared through
+    the short-TTL process cache (:meth:`CapitolRuntime.cached`).
+    ``remote_origin`` switches the client into channel mode: reads and
+    HITL responses pass through, ``start`` proposes an origin-bound
+    approval instead of executing.
     """
 
     name = "capitol_control"
@@ -389,7 +441,7 @@ class CapitolSessionClient:
         return {"content": [{"type": "text", "text": message}]}
 
     def _runtime(self) -> CapitolRuntime:
-        return CapitolRuntime.from_config(self._config)
+        return CapitolRuntime.cached(self._config)
 
     def _procedure_client(self):
         from .procedures import CapitolProcedureClient
@@ -811,49 +863,61 @@ class CapitolSessionClient:
         since = int(arguments.get("since_sequence") or 0)
         runtime = self._runtime()
         started = _clock()
-        last_seen = max(0, since - 1)
-        counts: Dict[str, int] = {}
-        hitl: List[str] = []
-        recent: List[str] = []
-        total = 0
+        deadline_at = started + deadline
+        watch = _WatchTally(since)
         final_state = ""
-        terminal_event = False
-        while True:
-            payload = runtime.run_events(run_id, since_sequence=last_seen + 1)
-            for event in (payload or {}).get("events") or []:
-                if not isinstance(event, dict):
-                    continue
-                if event.get("event_type") == KEEPALIVE_EVENT:
-                    continue
-                sequence = event.get("sequence")
-                if isinstance(sequence, (int, float)):
-                    if int(sequence) <= last_seen:
-                        continue
-                    last_seen = int(sequence)
-                total += 1
-                kind = str(event.get("event_type") or "unknown")
-                counts[kind] = counts.get(kind, 0) + 1
-                if kind in TERMINAL_EVENT_TYPES:
-                    terminal_event = True
-                needs_input = _hitl_lines(event)
-                if needs_input:
-                    hitl.append(needs_input)
-                node = clean_text(
-                    (event.get("node") or {}).get("display_name")
-                    or (event.get("node") or {}).get("node_id"), 50,
+        status_payload: Optional[Dict[str, Any]] = None
+        polling = True
+        if runtime.can_stream_events():
+            polling = False
+            try:
+                ended = self._watch_stream(
+                    runtime, run_id, watch, deadline_at,
+                    _sleep=_sleep, _clock=_clock,
                 )
-                recent.append(f"seq {sequence} {kind} {node}".rstrip())
-                if len(recent) > 8:
-                    recent.pop(0)
-            status_payload = runtime.run_status(run_id)
-            state = str((status_payload or {}).get("status") or "").lower()
-            if state in TERMINAL_RUN_STATUSES or terminal_event:
+            except (CapitolAuthError, CapitolProtocolError):
+                raise
+            except CapitolError:
+                ended = False
+                polling = True  # stream kept dropping: poll what is left
+            if ended:
+                status_payload = runtime.run_status(run_id)
+                state = str(
+                    (status_payload or {}).get("status") or ""
+                ).lower()
                 final_state = state or "ended"
-                break
-            if _clock() - started >= deadline:
-                break
-            _sleep(min(WATCH_POLL_SECONDS,
-                       max(0.0, deadline - (_clock() - started))))
+        if polling:
+            polls = 0
+            while True:
+                payload = runtime.run_events(
+                    run_id, since_sequence=watch.last_seen + 1
+                )
+                fresh = 0
+                for event in (payload or {}).get("events") or []:
+                    if watch.observe(event):
+                        fresh += 1
+                polls += 1
+                # A poll that delivered events (and no terminal one) is
+                # proof of life; check status when it went quiet, on a
+                # terminal event, and at least every Nth poll.
+                if (watch.terminal_event or not fresh
+                        or polls % WATCH_STATUS_EVERY == 0):
+                    status_payload = runtime.run_status(run_id)
+                    state = str(
+                        (status_payload or {}).get("status") or ""
+                    ).lower()
+                    if state in TERMINAL_RUN_STATUSES or watch.terminal_event:
+                        final_state = state or "ended"
+                        break
+                if _clock() - started >= deadline:
+                    break
+                _sleep(min(WATCH_POLL_SECONDS,
+                           max(0.0, deadline - (_clock() - started))))
+        counts = watch.counts
+        hitl = watch.hitl
+        recent = watch.recent
+        total = watch.total
+        last_seen = watch.last_seen
         lines = [
             f"run {run_id}: "
             + (f"terminal state {final_state}" if final_state else
@@ -876,7 +940,7 @@ class CapitolSessionClient:
             )
         if final_state == "failed":
             error = clean_text(
-                (runtime.run_status(run_id) or {}).get("error_message"), 300
+                (status_payload or {}).get("error_message"), 300
             )
             if error:
                 lines.append(f"error: {error}")
@@ -888,6 +952,25 @@ class CapitolSessionClient:
                 "(or op='status' for a cheap check)"
             )
         return self._text("\n".join(lines))
+
+    @staticmethod
+    def _watch_stream(runtime: CapitolRuntime, run_id: str,
+                      watch: "_WatchTally", deadline_at: float, *,
+                      _sleep, _clock) -> bool:
+        """Stream events until the run ends (True) or the deadline passes
+        (False). Socket reads are bounded by the deadline, so the 630 s
+        stream read timeout never outlives the op."""
+        for event in runtime.watch_run(
+            run_id, since_sequence=watch.last_seen + 1,
+            deadline=deadline_at, reconnect_delay=1.0,
+            _sleep=_sleep, _clock=_clock,
+        ):
+            if event.get("event_type") == FINAL_STATUS_EVENT:
+                return True
+            watch.observe(event)
+            if _clock() >= deadline_at:
+                return watch.terminal_event
+        return watch.terminal_event
 
     # -- HITL ------------------------------------------------------------------
 

@@ -7,6 +7,71 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [1.0.2] - 2026-11-25
+
+### Performance
+
+- Conch reaches its prompt without waiting on the network. MCP tool schemas
+  are cached per server (keyed on a hash of its `mcp.json` entry, never on
+  secret values) and servers connect in the background; a tool called
+  before its server is ready waits for it. With a slow MCP server and a
+  slow provider, launch-to-prompt went from 8.2s to 0.1s (1.9s on a first
+  run with no cache). One-shot runs, scheduled tasks and missions use the
+  cache and start no server until one of its tools is called.
+- A passing model check is remembered for 24 hours per provider, model,
+  endpoint and key fingerprint (the key itself is never stored). Otherwise
+  the check runs in the background and settles before your first message.
+  An offline provider no longer stops Conch from starting.
+- Provider calls reuse HTTP keep-alive connections per host, including
+  streaming responses, which removes a TCP and TLS handshake from every
+  model call and tool round (about 100-185 ms per call measured against
+  api.openai.com). A stale idle connection is retried once, and only if
+  no response byte had arrived; proxied hosts use plain urllib. Set
+  `http_keepalive=false` to opt out.
+- Conversation saves are incremental: unchanged messages are not scrubbed
+  again and the search index updates only new or changed messages,
+  including across compaction. A save on a 1.6 MB conversation dropped
+  from about 340 ms to about 8 ms.
+- The fleet controller keeps one SSH ControlMaster per worker host
+  (started on first use, 5-minute idle timeout, restarted on failure)
+  instead of a new SSH connection per call: a steady tick with 10 tasks
+  went from 30 handshakes to none. A worker that fails a connection is
+  skipped for the rest of the tick and backed off, and the duplicate
+  `worker.status` call is gone. Artifacts stream through one
+  `conch-hostctl` session into a digest-checked `.part` file on a
+  background thread. Tested against a simulated transport.
+- The kernel daemon verifies the event journal incrementally from a
+  verified-through checkpoint: at 300k events, startup verification went
+  from 1.7s to about 2 ms. `conch mission verify` still checks every hash.
+- Capitol pack flows flush run cursors every 100 events or 10 seconds and
+  when a run parks, finishes or fails, instead of rewriting the state file
+  on every event (0.3 ms per event instead of 138 ms at 2,000 sessions).
+  `capitol_control watch` streams events within its deadline and checks
+  run status less often, and the agent card is cached for 120 seconds;
+  the bearer is still resolved on every call.
+
+### Added
+
+- `kernel_retention_days` (default 90, `0` turns it off) prunes processed
+  or unaddressed inbox rows and delivered outbox rows older than that
+  through journaled events, so replay stays exact. The event journal is
+  never pruned. Once rows are pruned, versions before 1.0.2 cannot replay
+  the journal.
+- `capitol_pack_retention_days` (default 30) and `capitol_pack_history_cap`
+  (default 50) prune finished pack sessions and cap their history.
+
+### Fixed
+
+- A mission session that crashed after writing more than 50 events now
+  releases its token budget reservation. Before, it was abandoned with an
+  unknown session id and kept up to 2,000,000 tokens reserved.
+- Two shells saving conversations at the same time no longer overwrite
+  each other's entries in `index.json`.
+- Resuming a Capitol event stream from an older cursor no longer delivers
+  events that were already processed.
+- The kernel `status` command and folder-watch polling no longer load whole
+  tables.
+
 ## [1.0.1] - 2026-11-25
 
 ### Fixed
@@ -716,6 +781,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[1.0.2]: https://github.com/detournement/conch/releases/tag/v1.0.2
 [1.0.1]: https://github.com/detournement/conch/releases/tag/v1.0.1
 [1.0.0]: https://github.com/detournement/conch/releases/tag/v1.0.0
 [0.9.9]: https://github.com/detournement/conch/releases/tag/v0.9.9

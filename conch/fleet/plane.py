@@ -34,9 +34,13 @@ Invariants enforced here:
 
 from __future__ import annotations
 
+import hashlib
+import os
 import random
+import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..kernel.model import DispatchState, KernelError, WorkerState
 from ..kernel.store import MissionStore
@@ -61,7 +65,23 @@ DEFAULTS = {
     "max_fan_out": 8,
     "child_token_budget": 100000,
     "default_required_trust": 0,
+    # Per-worker backoff after a transport (connection) failure: the rest
+    # of that worker's calls are skipped until it expires, so a dead host
+    # costs one bounded attempt per window instead of one per call.
+    "transport_backoff_base_seconds": 1.0,
+    "transport_backoff_cap_seconds": 30.0,
 }
+
+#: Bound on one pulled artifact (matches the worker's per-task publish
+#: bound, conch.fleet.taskexec.ARTIFACT_MAX_BYTES).
+ARTIFACT_PULL_MAX_BYTES = 64 * 1024 * 1024
+
+#: Raw bytes per chunk on the legacy ``artifact.get``/``artifact.put`` RPC
+#: path (workers whose hostctl cannot stream).
+ARTIFACT_RPC_CHUNK_BYTES = 256 * 1024
+
+#: Worker task states that end polling (task.status carries the receipt).
+_WORKER_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 
 
 class PlaneError(KernelError):
@@ -69,6 +89,35 @@ class PlaneError(KernelError):
 
 
 TransportFactory = Callable[[Dict[str, Any]], Any]
+
+
+class WorkerBackoff(PlaneError):
+    """A call was skipped: the worker failed a transport call recently."""
+
+
+class _GuardedTransport:
+    """Wraps one worker's transport with the plane's per-worker backoff.
+
+    Any exception from ``call`` is a transport failure (RPC-level errors
+    come back as ``ok=False`` responses, not exceptions): it starts or
+    extends the worker's backoff, and every further call to that worker is
+    skipped without spawning anything until the backoff expires.
+    """
+
+    def __init__(self, plane: "TaskPlane", worker_id: str, inner: Any):
+        self._plane = plane
+        self._worker_id = worker_id
+        self.inner = inner
+
+    def call(self, op: str, args: Optional[Dict[str, Any]] = None):
+        self._plane._check_available(self._worker_id)
+        try:
+            response = self.inner.call(op, args)
+        except Exception:
+            self._plane._note_transport_failure(self._worker_id)
+            raise
+        self._plane._note_transport_success(self._worker_id)
+        return response
 
 
 class TaskPlane:
@@ -89,10 +138,70 @@ class TaskPlane:
         )
         #: Per-task required-trust overrides (default from config).
         self._required_trust: Dict[str, int] = {}
+        #: worker_id -> (monotonic retry-at, consecutive failures).
+        self._worker_backoff: Dict[str, Tuple[float, int]] = {}
+        #: worker_id -> when it failed a transport call this round. Every
+        #: further call to it is skipped until the next round starts (or,
+        #: for callers that never start rounds, until the cap elapses).
+        self._round_failed: Dict[str, float] = {}
+        self._backoff_lock = threading.Lock()
+        #: worker_id -> the last heartbeat sweep's ``worker.status`` result
+        #: (reused for skill inventories instead of a second call).
+        self.last_sweep_statuses: Dict[str, Dict[str, Any]] = {}
+        #: Called with each dispatch row the plane finalizes as SUCCEEDED
+        #: (the controller uses it to queue artifact pulls).
+        self.on_success: Optional[Callable[[Dict[str, Any]], None]] = None
 
     @property
     def epoch(self) -> int:
         return self.store.current_epoch()
+
+    # -- per-worker transport health ------------------------------------------
+
+    def transport(self, worker: Dict[str, Any]) -> _GuardedTransport:
+        """The worker's transport, guarded by its transport backoff."""
+        return _GuardedTransport(
+            self, worker["worker_id"], self._factory(worker)
+        )
+
+    def begin_round(self) -> None:
+        """Start a new pass (each schedule_once): workers that failed in
+        the previous pass are retried once their time backoff expires."""
+        with self._backoff_lock:
+            self._round_failed.clear()
+
+    def worker_available(self, worker_id: str) -> bool:
+        now = time.monotonic()
+        cap = float(self.config["transport_backoff_cap_seconds"])
+        with self._backoff_lock:
+            failed_at = self._round_failed.get(worker_id)
+            if failed_at is not None and now - failed_at < cap:
+                return False
+            entry = self._worker_backoff.get(worker_id)
+        return entry is None or now >= entry[0]
+
+    def _check_available(self, worker_id: str) -> None:
+        if not self.worker_available(worker_id):
+            raise WorkerBackoff(
+                f"worker {worker_id} is backing off after a transport"
+                " failure"
+            )
+
+    def _note_transport_failure(self, worker_id: str) -> None:
+        base = float(self.config["transport_backoff_base_seconds"])
+        cap = float(self.config["transport_backoff_cap_seconds"])
+        with self._backoff_lock:
+            self._round_failed[worker_id] = time.monotonic()
+            entry = self._worker_backoff.get(worker_id)
+            failures = (entry[1] if entry else 0) + 1
+            delay = min(base * (2 ** (failures - 1)), cap)
+            self._worker_backoff[worker_id] = (
+                time.monotonic() + delay, failures,
+            )
+
+    def _note_transport_success(self, worker_id: str) -> None:
+        with self._backoff_lock:
+            self._worker_backoff.pop(worker_id, None)
 
     # -- submission -----------------------------------------------------------
 
@@ -153,6 +262,8 @@ class TaskPlane:
                     required_trust: int) -> List[Dict[str, Any]]:
         out = []
         for worker in self.registry.list(state=WorkerState.ACTIVE):
+            if not self.worker_available(worker["worker_id"]):
+                continue
             if not self.registry.eligible(
                 worker, envelope, required_trust=required_trust
             ):
@@ -186,6 +297,7 @@ class TaskPlane:
         return best[0]
 
     def schedule_once(self, limit: int = 16) -> List[Dict[str, Any]]:
+        self.begin_round()
         now = float(self.clock())
         results = []
         queued = self.store.list_dispatches(state=DispatchState.QUEUED)
@@ -217,7 +329,7 @@ class TaskPlane:
             worker_id=worker_id, fence=fence,
             reason=f"offer to {worker_id}",
         )
-        transport = self._factory(worker)
+        transport = self.transport(worker)
         try:
             offer = transport.call("task.offer", {
                 "envelope": envelope, "attempt": attempt, "fence": fence,
@@ -304,7 +416,7 @@ class TaskPlane:
 
     def poll_once(self) -> Dict[str, int]:
         stats = {"events": 0, "completed": 0, "failed": 0, "requeued": 0,
-                 "delegated": 0, "resumed": 0}
+                 "delegated": 0, "resumed": 0, "skipped": 0}
         for dispatch in self.store.list_dispatches(
             states=DispatchState.IN_FLIGHT
         ):
@@ -323,7 +435,13 @@ class TaskPlane:
         worker = self.registry.get(dispatch["worker_id"])
         if worker is None:
             return
-        transport = self._factory(worker)
+        if not self.worker_available(worker["worker_id"]):
+            # A transport failure earlier this pass (or a live backoff):
+            # skip without spawning ssh; the heartbeat sweep decides
+            # reachability on evidence.
+            stats["skipped"] = stats.get("skipped", 0) + 1
+            return
+        transport = self.transport(worker)
         attempt = int(dispatch["attempt"])
         # Ingest events (idempotent) and advance the ack watermark.
         existing = self.store.list_dispatch_events(task_id, attempt)
@@ -358,6 +476,13 @@ class TaskPlane:
         if dispatch["state"] not in (
             DispatchState.OFFERING, DispatchState.RUNNING
         ):
+            return
+        reported = (
+            events_resp.result.get("state") if events_resp.ok else None
+        )
+        if reported and reported not in _WORKER_TERMINAL:
+            # task.events already reported a live worker-side state: the
+            # receipt (task.status) is only needed once it is terminal.
             return
         try:
             status = transport.call("task.status", {"task_id": task_id})
@@ -584,6 +709,11 @@ class TaskPlane:
             )
             self._record_side_effect(dispatch)
             stats["completed"] += 1
+            if self.on_success is not None:
+                try:
+                    self.on_success(self.store.get_dispatch(task_id))
+                except Exception as exc:
+                    self._log(f"on_success hook for {task_id}: {exc}")
         elif outcome == "cancelled":
             self.store.transition_dispatch(
                 task_id, DispatchState.CANCELLED, reason="worker cancelled",
@@ -666,21 +796,24 @@ class TaskPlane:
         stats = {"heartbeats": 0, "unreachable": 0}
         now = float(self.clock())
         deadline = float(self.config["heartbeat_deadline_seconds"])
+        statuses: Dict[str, Dict[str, Any]] = {}
         for worker in self.registry.list():
             if worker["state"] not in (
                 WorkerState.ACTIVE, WorkerState.DRAINING,
                 WorkerState.UPDATING,
             ):
                 continue
-            transport = self._factory(worker)
-            try:
-                status = transport.call("worker.status", {})
-            except Exception:
-                status = None
+            status = None
+            if self.worker_available(worker["worker_id"]):
+                try:
+                    status = self.transport(worker).call("worker.status", {})
+                except Exception:
+                    status = None
             if status is not None and status.ok:
                 self.registry.heartbeat(
                     worker["worker_id"], status.result.get("heartbeat_seq", 0)
                 )
+                statuses[worker["worker_id"]] = dict(status.result or {})
                 stats["heartbeats"] += 1
                 continue
             last = worker.get("last_heartbeat_at")
@@ -690,6 +823,7 @@ class TaskPlane:
             if now - reference >= deadline:
                 self._mark_unreachable(worker)
                 stats["unreachable"] += 1
+        self.last_sweep_statuses = statuses
         return stats
 
     def _mark_unreachable(self, worker: Dict[str, Any]) -> None:
@@ -737,20 +871,35 @@ class TaskPlane:
         return True
 
     # -- artifact transfer (content-addressed, digest-verified both ways) -----
+    #
+    # Preferred path: ONE ``conch-hostctl artifact-get/put --worker`` session
+    # per artifact, streamed (over the worker's shared SSH master in
+    # production). Workers whose hostctl predates streaming fall back to
+    # the chunked ``artifact.get``/``artifact.put`` RPCs. Pulls write
+    # incrementally to a ``.part`` file and only bytes whose digest
+    # verifies are renamed into place; nothing is buffered whole in memory.
 
     def push_artifact(self, worker: Dict[str, Any], digest: str,
                       data: bytes) -> Dict[str, Any]:
         import base64
-        import hashlib
+
+        from .transport import ArtifactStreamUnsupported
 
         if hashlib.sha256(data).hexdigest() != digest:
             raise PlaneError("refusing to push data that mismatches digest")
-        transport = self._factory(worker)
-        chunk = 256 * 1024
+        inner = self._factory(worker)
+        if hasattr(inner, "stream_artifact_put"):
+            try:
+                return inner.stream_artifact_put(digest, data)
+            except ArtifactStreamUnsupported:
+                pass
+            except Exception as exc:
+                raise PlaneError(f"artifact push failed: {exc}")
+        transport = self.transport(worker)
         offset = 0
-        result = {}
+        result: Dict[str, Any] = {}
         while offset < len(data) or not data:
-            piece = data[offset:offset + chunk]
+            piece = data[offset:offset + ARTIFACT_RPC_CHUNK_BYTES]
             resp = transport.call("artifact.put", {
                 "digest": digest, "offset": offset,
                 "total_size": len(data),
@@ -766,33 +915,98 @@ class TaskPlane:
                 break
         return result
 
-    def pull_artifact(self, worker: Dict[str, Any],
-                      digest: str) -> bytes:
-        import base64
-        import hashlib
+    def pull_artifact_to(self, worker: Dict[str, Any], digest: str,
+                         dest, *, max_bytes: int = ARTIFACT_PULL_MAX_BYTES,
+                         cancel: Optional[threading.Event] = None) -> int:
+        """Pull one artifact into the file *dest* (atomic, digest-verified,
+        idempotent) and return its size. Raises PlaneError on a refusal and
+        the transport's own error on a connection failure."""
+        from .transport import ArtifactStreamUnsupported, TransportError
 
-        transport = self._factory(worker)
-        chunk = 256 * 1024
+        digest = str(digest or "").strip().lower()
+        if len(digest) != 64 or any(
+            c not in "0123456789abcdef" for c in digest
+        ):
+            raise PlaneError(f"invalid artifact digest {digest!r}")
+        dest = Path(dest)
+        if dest.is_file():
+            return dest.stat().st_size
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(
+            f"{dest.name}.part-{os.getpid()}-{threading.get_ident()}"
+        )
+        try:
+            with open(part, "wb") as sink:
+                hasher = _HashingSink(sink)
+                inner = self._factory(worker)
+                streamed = False
+                if hasattr(inner, "stream_artifact_get"):
+                    try:
+                        inner.stream_artifact_get(
+                            digest, hasher, max_bytes=max_bytes,
+                            cancel=cancel,
+                        )
+                        streamed = True
+                    except ArtifactStreamUnsupported:
+                        sink.seek(0)
+                        sink.truncate()
+                        hasher = _HashingSink(sink)
+                    except TransportError:
+                        self._note_transport_failure(worker["worker_id"])
+                        raise
+                    except Exception as exc:
+                        raise PlaneError(f"artifact pull failed: {exc}")
+                if not streamed:
+                    self._pull_chunked(
+                        worker, digest, hasher, max_bytes, cancel
+                    )
+            if hasher.hexdigest() != digest:
+                raise PlaneError(
+                    "pulled artifact digest mismatch — refusing the bytes"
+                )
+            os.replace(part, dest)
+            return hasher.size
+        finally:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+
+    def _pull_chunked(self, worker: Dict[str, Any], digest: str, sink,
+                      max_bytes: int,
+                      cancel: Optional[threading.Event]) -> None:
+        import base64
+
+        transport = self.transport(worker)
         offset = 0
-        buffer = bytearray()
         while True:
+            if cancel is not None and cancel.is_set():
+                raise PlaneError("artifact pull cancelled")
             resp = transport.call("artifact.get", {
-                "digest": digest, "offset": offset, "length": chunk,
+                "digest": digest, "offset": offset,
+                "length": ARTIFACT_RPC_CHUNK_BYTES,
             })
             if not resp.ok:
                 raise PlaneError(f"artifact pull failed: {resp.error}")
             piece = base64.b64decode(resp.result["data_b64"])
-            buffer.extend(piece)
             offset += len(piece)
-            if resp.result.get("eof"):
+            if offset > max_bytes:
+                raise PlaneError(
+                    f"artifact exceeds the {max_bytes}-byte bound"
+                )
+            sink.write(piece)
+            if resp.result.get("eof") or not piece:
                 break
-            if not piece:
-                break
-        if hashlib.sha256(bytes(buffer)).hexdigest() != digest:
-            raise PlaneError(
-                "pulled artifact digest mismatch — refusing the bytes"
-            )
-        return bytes(buffer)
+
+    def pull_artifact(self, worker: Dict[str, Any],
+                      digest: str) -> bytes:
+        """Compatibility wrapper: pull via a temp file, return the bytes."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "artifact"
+            self.pull_artifact_to(worker, digest, target)
+            return target.read_bytes()
 
     # -- one full pass --------------------------------------------------------
 
@@ -800,3 +1014,20 @@ class TaskPlane:
         scheduled = self.schedule_once()
         polled = self.poll_once()
         return {"scheduled": len(scheduled), **polled}
+
+
+class _HashingSink:
+    """File-like writer that hashes and counts what passes through."""
+
+    def __init__(self, sink):
+        self._sink = sink
+        self._hash = hashlib.sha256()
+        self.size = 0
+
+    def write(self, data: bytes) -> int:
+        self._hash.update(data)
+        self.size += len(data)
+        return self._sink.write(data)
+
+    def hexdigest(self) -> str:
+        return self._hash.hexdigest()

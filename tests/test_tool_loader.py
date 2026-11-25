@@ -88,7 +88,7 @@ class LoaderCase(unittest.TestCase):
             self.memory, self.config, interactive=False, permissions=default_permissions()
         )
         # Nothing here reads the user's mcp.json or spawns a server.
-        p = patch.object(bootstrap.mcp_mod, "save_tool_cache", lambda tools: None)
+        p = patch.object(bootstrap.mcp_mod, "save_server_cache", lambda fingerprints, results: None)
         p.start()
         self.addCleanup(p.stop)
 
@@ -121,8 +121,12 @@ class TestBuiltinsFirst(LoaderCase):
         self.assertEqual(loader.builtin_state.server_status["slow"].state, "loading")
         self.assertEqual(loader.pending(), ["slow"])
 
-    def test_wait_default_is_thirty_seconds(self):
-        self.assertEqual(TOOL_LOAD_WAIT_SECONDS, 30.0)
+    def test_startup_wait_is_short_without_a_cache(self):
+        # No cached tools: the prompt waits at most ~1.5s, then the loader
+        # keeps going in the background (it used to wait up to 30s).
+        self.assertEqual(TOOL_LOAD_WAIT_SECONDS, 1.5)
+        loader = self._loader({"slow": FakeServer("slow", release=threading.Event())})
+        self.assertEqual(loader.startup_wait(), TOOL_LOAD_WAIT_SECONDS)
 
 
 class TestLateAttach(LoaderCase):

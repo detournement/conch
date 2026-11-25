@@ -15,7 +15,7 @@ import urllib.request
 from typing import List, Optional
 
 from .bootstrap import (
-    TOOL_LOAD_WAIT_SECONDS,
+    TOOL_RELOAD_WAIT_SECONDS,
     StartupError,
     ToolLoader,
     apply_agent_mode_from_config,
@@ -550,9 +550,13 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     # Startup model check: verify the configured model before anything
     # calls it. A failure puts alternatives in front of the user (TTY) or
     # walks the pre-approved fallback_models list (non-interactive); it
-    # never swaps a model silently. Fails closed when nothing works.
+    # never swaps a model silently. Fails closed when nothing works. A
+    # success is remembered for a day; without one the interactive shell
+    # checks in the background and settles it before the first message.
     try:
-        model_check = startup_check or ensure_working_model(config, interactive=interactive)
+        model_check = startup_check or ensure_working_model(
+            config, interactive=interactive, use_cache=True, background=interactive,
+        )
     except StartupError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(exc.code)
@@ -783,7 +787,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         swap_tool_state(chat_state, _tool_loader.builtin_state)
         if not _tool_loader.ready.is_set():
             with Spinner("Loading tools"):
-                _tool_loader.wait(timeout=TOOL_LOAD_WAIT_SECONDS)
+                _tool_loader.wait(timeout=TOOL_RELOAD_WAIT_SECONDS)
         if _attach_loaded_tools(announce=False):
             _print_tool_notices()
             print(f"  \033[1;32m{len(chat_state.tools)}/{len(chat_state.all_tools)} tools active\033[0m\n")
@@ -796,6 +800,8 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         _print_conch_shell_art()
         if not model_check.checked:
             check_note = ", model check off"
+        elif model_check.pending:
+            check_note = " · verifying model in the background"
         elif model_check.switched:
             check_note = " ✓ verified, switched with approval"
         else:
@@ -868,11 +874,14 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
         )
 
     # Wait a bounded time for MCP discovery (with a brief spinner if
-    # needed). When it expires the session starts on the builtin tools and
-    # the loader's result is attached between turns once it arrives.
-    if not _tool_loader.ready.is_set():
+    # needed): not at all when every server's tools came from the cache,
+    # at most TOOL_LOAD_WAIT_SECONDS otherwise. When it expires the session
+    # starts on the builtin (and cached) tools and the loader's result is
+    # attached between turns once it arrives.
+    _startup_tool_wait = _tool_loader.startup_wait()
+    if _startup_tool_wait > 0 and not _tool_loader.ready.is_set():
         with Spinner("Loading tools"):
-            _tool_loader.wait(timeout=TOOL_LOAD_WAIT_SECONDS)
+            _tool_loader.wait(timeout=_startup_tool_wait)
     session.attach_clients(
         builtin_clients, chat_state=chat_state, mcp_clients=mcp_clients
     )
@@ -1709,6 +1718,39 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 with (contextlib.nullcontext() if _route_check.done()
                       else Spinner(f"Verifying {provider}/{model_name}")):
                     _route_probe = _route_check.wait()
+                if not _route_probe.ok and _route_check.startup:
+                    # The launch check of the configured route failed after
+                    # the prompt appeared: offer the startup alternatives
+                    # (the recovery prints its own diagnosis).
+                    print()
+                    from .modelcheck import recover_startup_failure
+                    try:
+                        _recovered = recover_startup_failure(
+                            config, _route_probe,
+                            input_fn=_ui.ask if _ui else None,
+                        )
+                    except StartupError as exc:
+                        print(f"  \033[2m{exc}\033[0m")
+                        print(
+                            "  \033[2mUse /model or /provider to choose a working "
+                            "model; your message was not sent.\033[0m\n"
+                        )
+                    else:
+                        if _recovered.switched:
+                            _refresh_model(normalize_history=True)
+                            from .runtime import append_model_switch_note
+                            append_model_switch_note(
+                                messages, provider=provider, model=model_name,
+                                config=config,
+                            )
+                            _save_current()
+                        print(
+                            f"  \033[2mNow using {provider}/{model_name}; your "
+                            "message was not sent.\033[0m\n"
+                        )
+                    if _ui:
+                        _ui.prefill(user_input)
+                    continue
                 if not _route_probe.ok:
                     _route_check.restore(config)
                     _refresh_model(normalize_history=True)
@@ -2205,7 +2247,9 @@ def main():
         # may ask the user to pick an alternative; a piped/--non-interactive
         # one-shot walks fallback_models or fails closed. No silent swap.
         try:
-            model_check = initial_check or ensure_working_model(config, interactive=interactive)
+            model_check = initial_check or ensure_working_model(
+                config, interactive=interactive, use_cache=True,
+            )
         except StartupError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(exc.code)

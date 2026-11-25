@@ -657,6 +657,13 @@ class _PackFlowBase:
             if self.history_collection else []
         )
 
+    def _init_state(self):
+        """Retention knobs from config; the pack's history collection is
+        capped like ``runs``/``revisions``."""
+        self.state.configure_retention(self.config)
+        if self.history_collection:
+            self.state.history_lists.add(self.history_collection)
+
     # -- shared helpers -------------------------------------------------------
 
     def _intake_spec(self, kind: str) -> Dict[str, Any]:
@@ -765,6 +772,7 @@ class PackChannelFlow(_PackFlowBase):
         self.notify = notify
         self._init_pack(pack, "channel")
         self.state = state or PackState(filename=pack.state_file)
+        self._init_state()
         self._input_keys: Dict[str, str] = {}
         self.intake = self._intake_spec("channel_message")
         if not self.intake:
@@ -802,8 +810,9 @@ class PackChannelFlow(_PackFlowBase):
                  ) -> CapitolRuntime:
         """A fresh runtime per step: the bearer is resolved at call time
         (never stored) and the session's A2A context is re-threaded so
-        audit attribution stays continuous across restarts."""
-        runtime = CapitolRuntime.from_config(self.config)
+        audit attribution stays continuous across restarts. The AgentCard
+        comes from the short-TTL process cache, not a GET per step."""
+        runtime = CapitolRuntime.cached(self.config)
         runtime.discover()
         context = str((session or {}).get("context_id") or "")
         if context:
@@ -1211,22 +1220,28 @@ class PackChannelFlow(_PackFlowBase):
         """
         final_state = ""
         last_sequence = max(0, int(since) - 1)
-        for event in runtime.watch_run(run_id, since_sequence=since):
-            event_type = str(event.get("event_type") or "")
-            sequence = event.get("sequence")
-            if isinstance(sequence, (int, float)):
-                last_sequence = int(sequence)
-                self.state.update_run(
-                    session_id, run_id, last_sequence=last_sequence
-                )
-            if event_type == "node.input_required":
-                return "parked", self._park_hitl(
-                    session_id, kind, run_id, event, last_sequence
-                )
-            if event_type == FINAL_STATUS_EVENT:
-                final_state = str(
-                    (event.get("data") or {}).get("state") or ""
-                )
+        try:
+            for event in runtime.watch_run(run_id, since_sequence=since):
+                event_type = str(event.get("event_type") or "")
+                sequence = event.get("sequence")
+                if isinstance(sequence, (int, float)):
+                    if int(sequence) <= last_sequence:
+                        continue  # replayed below the cursor
+                    last_sequence = int(sequence)
+                    # In memory; flushed on cadence, park, finish, error.
+                    self.state.advance_cursor(
+                        session_id, run_id, last_sequence
+                    )
+                if event_type == "node.input_required":
+                    return "parked", self._park_hitl(
+                        session_id, kind, run_id, event, last_sequence
+                    )
+                if event_type == FINAL_STATUS_EVENT:
+                    final_state = str(
+                        (event.get("data") or {}).get("state") or ""
+                    )
+        finally:
+            self.state.flush_cursors()
         status = runtime.run_status(run_id)
         run_state = str((status or {}).get("status") or final_state or "")
         self.state.update_run(session_id, run_id, status=run_state)
@@ -1516,6 +1531,7 @@ class PackShellFlow(_PackFlowBase):
         self.config = config or {}
         self._init_pack(pack, "shell")
         self.state = state or PackState(filename=pack.state_file)
+        self._init_state()
         self.say = say
         self.ask = ask or (lambda prompt: input(prompt))
         self.confirm = confirm or self._default_confirm
@@ -1612,29 +1628,40 @@ class PackShellFlow(_PackFlowBase):
 
         Mid-run ``node.input_required`` events are relayed to the user and
         answered through the HITL skills; every event advances the
-        persisted ``last_sequence`` cursor so a resumed watch never
-        replays or drops events.
+        ``last_sequence`` cursor (persisted on a cadence and at
+        HITL/terminal/error) and replays below it are skipped.
         """
         self.state.record_run(session_id, kind, run_id, idempotency_key)
         self.say(f"  {kind} run {run_id} started")
         final_state = ""
-        for event in self.runtime.watch_run(run_id):
-            event_type = str(event.get("event_type") or "")
-            sequence = event.get("sequence")
-            if isinstance(sequence, (int, float)):
-                self.state.update_run(
-                    session_id, run_id, last_sequence=int(sequence)
-                )
-            if event_type == "node.node_started":
-                node = (event.get("node") or {}).get("display_name") or ""
-                if node:
-                    self.say(f"    · {clean_text(node, 80)}")
-            elif event_type == "node.input_required":
-                self._answer_input_required(run_id, event)
-            elif event_type == FINAL_STATUS_EVENT:
-                final_state = str(
-                    (event.get("data") or {}).get("state") or ""
-                )
+        last_sequence = 0
+        try:
+            for event in self.runtime.watch_run(run_id):
+                event_type = str(event.get("event_type") or "")
+                sequence = event.get("sequence")
+                if isinstance(sequence, (int, float)):
+                    if int(sequence) <= last_sequence:
+                        continue  # replayed below the cursor
+                    last_sequence = int(sequence)
+                    self.state.advance_cursor(
+                        session_id, run_id, last_sequence,
+                        # the user may sit at a HITL prompt for a while
+                        flush=event_type == "node.input_required",
+                    )
+                if event_type == "node.node_started":
+                    node = (
+                        (event.get("node") or {}).get("display_name") or ""
+                    )
+                    if node:
+                        self.say(f"    · {clean_text(node, 80)}")
+                elif event_type == "node.input_required":
+                    self._answer_input_required(run_id, event)
+                elif event_type == FINAL_STATUS_EVENT:
+                    final_state = str(
+                        (event.get("data") or {}).get("state") or ""
+                    )
+        finally:
+            self.state.flush_cursors()
         status = self.runtime.run_status(run_id)
         run_state = str((status or {}).get("status") or final_state or "")
         self.state.update_run(session_id, run_id, status=run_state)

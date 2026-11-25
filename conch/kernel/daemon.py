@@ -58,6 +58,13 @@ from .store import MissionStore, default_kernel_dir, default_state_dir
 
 DAEMON_LOG_MAX_BYTES = 1024 * 1024
 
+#: Inbox/outbox projection retention (config ``kernel_retention_days``;
+#: 0 disables). Journal events are never pruned. See
+#: MissionStore.apply_retention for the safety argument.
+DEFAULT_RETENTION_DAYS = 90
+#: Retention runs on the first tick and then once per this many ticks.
+RETENTION_EVERY_TICKS = 3600
+
 
 class DaemonAlreadyRunning(KernelError):
     """Another daemon holds the kernel lock."""
@@ -266,12 +273,18 @@ class EdgeDaemon:
             raise
 
     def _verify_journal_or_refuse(self) -> None:
-        """Startup gate: recompute every mission's event hash chain before
-        adopting the epoch or executing anything. A tampered or damaged
-        journal must not be built upon — refusing to start is the only
-        safe answer, and the operator gets the exact failing position."""
+        """Startup gate: verify the event hash chains before adopting the
+        epoch or executing anything. A tampered or damaged journal must not
+        be built upon — refusing to start is the only safe answer, and the
+        operator gets the exact failing position.
+
+        Incremental: events after the verified-through checkpoint are
+        recomputed and the checkpoint itself is re-anchored (see
+        MissionStore.verify_chain_incremental), so start-up cost tracks
+        new events, not journal size. ``conch mission verify`` (the
+        ``mission.verify`` op) still recomputes every hash on demand."""
         try:
-            report = self.store.verify_journal()
+            report = self.store.verify_journal(incremental=True)
         except KernelError as exc:
             self.log(f"journal verification FAILED: {exc}")
             raise JournalVerificationFailed(
@@ -281,6 +294,10 @@ class EdgeDaemon:
         self.log(
             f"journal verified: {report['events_verified']} event(s) across"
             f" {report['missions']} mission(s) in {report['seconds']:.3f}s"
+            + (
+                f" (incremental from seq {report['from_seq']})"
+                if report.get("from_seq") else ""
+            )
         )
 
     def startup_model_check(self) -> str:
@@ -517,7 +534,40 @@ class EdgeDaemon:
         if self._tick_count % 60 == 0:
             self.store.reconcile(self.holder)
             self.store.expire_approvals()
+        if self._tick_count % RETENTION_EVERY_TICKS == 1:
+            self._apply_retention()
         return stats
+
+    def retention_days(self) -> int:
+        """Inbox/outbox retention horizon in days; 0 disables pruning.
+        Never shorter than the compile-suggestion window, which mines
+        browser events from the inbox."""
+        from ..config import get_int
+        from .patterns import parse_window_days
+
+        days = get_int(
+            self.config, "kernel_retention_days", DEFAULT_RETENTION_DAYS
+        )
+        if days <= 0:
+            return 0
+        return max(days, parse_window_days(self.config))
+
+    def _apply_retention(self) -> Dict[str, int]:
+        days = self.retention_days()
+        if not days or self.store is None:
+            return {"inbox_pruned": 0, "outbox_pruned": 0}
+        try:
+            result = self.store.apply_retention(days * 86400.0)
+        except Exception as exc:
+            self.log(f"retention pass failed: {type(exc).__name__}: {exc}")
+            return {"inbox_pruned": 0, "outbox_pruned": 0}
+        if result["inbox_pruned"] or result["outbox_pruned"]:
+            self.log(
+                f"retention: pruned {result['inbox_pruned']} inbox and"
+                f" {result['outbox_pruned']} outbox row(s) older than"
+                f" {days} day(s) (journal events kept)"
+            )
+        return result
 
     # -- product daemon services (plugin seam) ----------------------------------
 
@@ -783,7 +833,7 @@ class EdgeDaemon:
                 ),
                 "missions": by_status,
                 "pending_approvals": len(self.store.pending_approvals()),
-                "pending_outbox": len(self.store.list_outbox(status="pending")),
+                "pending_outbox": self.store.count_outbox(status="pending"),
                 "kernel": str(self.kernel_dir / "kernel.db"),
                 "events": self.store.event_count(),
                 "journal_verification": self.journal_verification,

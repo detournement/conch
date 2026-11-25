@@ -23,11 +23,21 @@ needs a TTY. What happens when it fails depends on the surface:
 Nothing here switches a model without one of those two forms of
 approval, and nothing here prints or logs a credential — keys are only
 ever referred to by the name of their environment variable.
+
+The interactive shell and one-shots remember a successful check for
+:data:`VERIFIED_CACHE_TTL` (``model_check_cache.json`` in the state dir,
+keyed on a hash of provider, model, endpoint and a short fingerprint of
+the key — never the key), so a launch normally sends no probe at all.
+When the shell has no fresh result it checks in the background
+(:class:`RouteCheck` with ``startup=True``) and shows its prompt at once;
+the first message waits only while the check is still running, and a
+failure then offers the usual alternatives with the message unsent.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import shutil
@@ -40,6 +50,7 @@ import urllib.error
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import display_path, get_config_path, local_only_enabled, set_config_values
@@ -177,10 +188,107 @@ class ModelCheckOutcome:
     switched: bool = False
     saved: bool = False
     via_fallback: bool = False
+    # A fresh successful check was remembered (no probe was sent).
+    cached: bool = False
+    # Still being checked in the background (interactive shell startup).
+    pending: bool = False
 
     @property
     def label(self) -> str:
         return f"{self.provider}/{self.model}"
+
+
+# ---------------------------------------------------------------------------
+# Remembered successful checks
+# ---------------------------------------------------------------------------
+
+# How long a successful check is trusted before the next launch probes again.
+VERIFIED_CACHE_TTL = 24 * 3600.0
+_VERIFIED_CACHE_VERSION = 1
+
+
+def verified_cache_path() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return state / "conch" / "model_check_cache.json"
+
+
+def _route_endpoint(provider: str, config: dict) -> str:
+    from .providers import get_custom_base_url, get_ollama_base_url
+
+    if provider in CLOUD_PROVIDERS:
+        return cloud_base_url(provider, config)
+    if provider == "custom":
+        return get_custom_base_url(config)
+    if provider == "ollama":
+        return get_ollama_base_url(config)
+    return ""
+
+
+def route_fingerprint(provider: str, model: str, config: dict) -> str:
+    """Hash of what a successful check vouches for: provider, model,
+    endpoint, the key's variable name and a short hash of its value (so a
+    rotated key is re-checked). The key itself is never stored."""
+    from .providers import api_key_env_for
+
+    provider = (provider or "").lower()
+    key_env = api_key_env_for(provider, config) if provider else ""
+    key = os.environ.get(key_env, "").strip() if key_env else ""
+    key_print = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] if key else ""
+    blob = json.dumps([
+        _VERIFIED_CACHE_VERSION, provider, (model or "").strip(),
+        _route_endpoint(provider, config), key_env, key_print,
+    ]).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:32]
+
+
+def _read_verified() -> Dict[str, float]:
+    try:
+        data = json.loads(verified_cache_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    routes = data.get("routes") if isinstance(data, dict) else None
+    if not isinstance(routes, dict) or data.get("version") != _VERIFIED_CACHE_VERSION:
+        return {}
+    return {
+        key: float(value) for key, value in routes.items()
+        if isinstance(value, (int, float))
+    }
+
+
+def cached_check(provider: str, model: str, config: dict,
+                 ttl: float = VERIFIED_CACHE_TTL) -> Optional[ProbeResult]:
+    """An OK result when this exact route passed a check within *ttl*
+    seconds, else None. Never touches the network."""
+    try:
+        when = _read_verified().get(route_fingerprint(provider, model, config))
+    except Exception:
+        return None
+    if when is None or not 0 <= time.time() - when < ttl:
+        return None
+    return ProbeResult(
+        (provider or "").lower(), model, OK, "verified earlier (cached)"
+    )
+
+
+def remember_check(result: ProbeResult, config: dict) -> None:
+    """Record a successful check of *result*'s route. Never raises."""
+    if not result.ok:
+        return
+    try:
+        routes = _read_verified()
+        now = time.time()
+        routes = {
+            key: when for key, when in routes.items()
+            if 0 <= now - when < VERIFIED_CACHE_TTL
+        }
+        routes[route_fingerprint(result.provider, result.model, config)] = now
+        path = verified_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps({"version": _VERIFIED_CACHE_VERSION, "routes": routes}))
+        os.replace(tmp, path)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -875,9 +983,13 @@ class RouteCheck:
     when it fails."""
 
     def __init__(self, provider: str, model: str, config: dict, previous: dict,
-                 timeout: Optional[float] = None):
+                 timeout: Optional[float] = None, *, startup: bool = False):
         self.provider, self.model = provider, model
         self.previous = dict(previous)
+        # The shell's launch check of its configured route: there is no
+        # earlier route to go back to, so a failure offers alternatives
+        # instead; a success is remembered (VERIFIED_CACHE_TTL).
+        self.startup = startup
         self._result: Optional[ProbeResult] = None
         # Bind the probe now: the thread runs what was in effect at the switch.
         self._thread = threading.Thread(
@@ -900,14 +1012,31 @@ class RouteCheck:
         config[ROUTE_CHECK_KEY] = check
         return check
 
+    @classmethod
+    def begin_startup(cls, config: dict, provider: str, model: str, *,
+                      timeout: Optional[float] = None) -> "RouteCheck":
+        """Check the configured route in the background at shell launch and
+        record the check in *config* for the first message to settle."""
+        previous = {key: config.get(key) for key in ROUTE_KEYS}
+        check = cls(provider, model, dict(config), previous, timeout, startup=True)
+        config[ROUTE_CHECK_KEY] = check
+        return check
+
     def _run(self, probe, config: dict, timeout: Optional[float]) -> None:
         self._result = probe(self.provider, self.model, config, timeout=timeout)
+        if self.startup and self._result is not None and self._result.ok:
+            remember_check(self._result, config)
 
     def done(self) -> bool:
         return not self._thread.is_alive()
 
-    def wait(self) -> ProbeResult:
-        self._thread.join()
+    def wait(self, timeout: Optional[float] = None) -> ProbeResult:
+        """The probe's result; with *timeout*, an ERROR result when it has
+        not finished by then (check :meth:`done`)."""
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            return ProbeResult(
+                self.provider, self.model, ERROR, "verification still running")
         return self._result or ProbeResult(
             self.provider, self.model, ERROR, "verification did not finish")
 
@@ -1269,13 +1398,34 @@ def _startup_error(message: str):
     return StartupError(message, code=MODEL_CHECK_EXIT_CODE)
 
 
+# How long a background startup check is given to settle on its own: a
+# failure needing no network (no key, a catalog miss) or a refused
+# connection lands well within it and gets the usual recovery prompt.
+STARTUP_SETTLE_SECONDS = 0.25
+
+
+def recover_startup_failure(config: dict, failure: ProbeResult, *,
+                            input_fn: Optional[Callable[[str], str]] = None,
+                            out=None) -> ModelCheckOutcome:
+    """The interactive recovery for a background startup check that failed
+    after the prompt appeared: the same diagnosis and approved alternatives
+    as at launch. Raises :class:`conch.bootstrap.StartupError` when nothing
+    is chosen (the shell reports it and keeps running)."""
+    return _interactive_recovery(
+        config, failure, timeout=model_check_timeout(config),
+        input_fn=input_fn, out=out, persist_mode="ask", restart_hint=False,
+    )
+
+
 def ensure_working_model(config: dict, *, interactive: bool,
                          input_fn: Optional[Callable[[str], str]] = None,
                          out=None,
                          announce: Optional[Callable[[str], None]] = None,
                          persist_mode: str = "ask",
                          discover: bool = True,
-                         restart_hint: bool = True) -> ModelCheckOutcome:
+                         restart_hint: bool = True,
+                         use_cache: bool = False,
+                         background: bool = False) -> ModelCheckOutcome:
     """Validate the configured model; recover with approval or fail closed.
 
     Mutates *config* in place when a switch is approved (interactive) or a
@@ -1291,14 +1441,35 @@ def ensure_working_model(config: dict, *, interactive: bool,
     ``always`` (the wizard: the pick becomes the default), or ``never``.
     ``restart_hint=False`` omits the "edit the config and restart" advice
     for a caller that offers its own next step (first-run setup).
+
+    ``use_cache`` trusts a success remembered within
+    :data:`VERIFIED_CACHE_TTL` (no probe is sent) and remembers a new one.
+    ``background`` (interactive only) never waits on the network: the probe
+    runs as a startup :class:`RouteCheck` recorded in *config*, and the
+    outcome comes back ``pending`` for the shell to settle before the first
+    message. A failure that is known within :data:`STARTUP_SETTLE_SECONDS`
+    (no key, a catalog miss, a refused connection) is handled here as usual.
     """
     provider = (config.get("provider") or "").lower()
     model = (config.get("chat_model") or config.get("model") or "").strip()
     if not model_check_enabled(config):
         return ModelCheckOutcome(provider, model, None, checked=False)
+    if use_cache:
+        remembered = cached_check(provider, model, config)
+        if remembered is not None:
+            return ModelCheckOutcome(provider, model, remembered, cached=True)
     timeout = model_check_timeout(config)
-    with Spinner("Verifying configured model") if interactive else nullcontext():
-        result = probe_model(provider, model, config, timeout=timeout)
+    if background and interactive:
+        check = RouteCheck.begin_startup(config, provider, model, timeout=timeout)
+        result = check.wait(STARTUP_SETTLE_SECONDS)
+        if not check.done():
+            return ModelCheckOutcome(provider, model, None, pending=True)
+        config.pop(ROUTE_CHECK_KEY, None)
+    else:
+        with Spinner("Verifying configured model") if interactive else nullcontext():
+            result = probe_model(provider, model, config, timeout=timeout)
+        if result.ok and use_cache:
+            remember_check(result, config)
     if result.ok:
         return ModelCheckOutcome(provider, model, result)
     if interactive:

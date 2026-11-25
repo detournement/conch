@@ -171,7 +171,7 @@ class DirectKernelClient:
             "uptime_seconds": 0.0,
             "missions": by_status,
             "pending_approvals": len(self.store.pending_approvals()),
-            "pending_outbox": len(self.store.list_outbox(status="pending")),
+            "pending_outbox": self.store.count_outbox(status="pending"),
             "kernel": str(self.kernel_dir / "kernel.db"),
             "events": self.store.event_count(),
         }

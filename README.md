@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v1.0.1][release] ·
+[Current release: v1.0.2][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v1.0.1
+[release]: https://github.com/detournement/conch/releases/tag/v1.0.2
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -766,9 +766,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v1.0.1. GitHub releases include a
+`conch-shell` is not published on PyPI at v1.0.2. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v1.0.1` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v1.0.2` to install the release sdist.
 
 ### Updating
 
@@ -1235,6 +1235,17 @@ catalog and the models-list endpoint (a 1-token completion only when needed);
 Ollama uses `/api/tags` plus advertised `tools`; custom endpoints use
 `/v1/models` plus a forced tool-call probe with a 512-token output budget so
 reasoning models can finish the native call. A pass shows `✓ verified`.
+
+A pass is remembered for 24 hours per provider, model, endpoint and key
+(stored as a short hash in `~/.local/state/conch/model_check_cache.json`;
+the key itself is never written), so the shell and one-shots normally send
+no probe at launch; a rotated key or a changed endpoint is checked again.
+When the interactive shell has nothing remembered it does not wait: the
+prompt appears at once (`· verifying model in the background`), the first
+message waits only while the check is still running, and a failure then
+shows the alternatives below with your message left unsent (failures known
+instantly, such as a missing key, are still handled before the prompt).
+
 A failure is classified — `no API
 key`, `unreachable`, `authentication failed`, `model not found`, `timed out`,
 `failed tool-call conformance`, `rate limited`, `quota/billing exhausted`,
@@ -1361,10 +1372,19 @@ fan-out workers included, appear on the [conversations page](#conversations-page
   server: an HTTP server gets `connect_timeout` (default 5s) to answer
   `initialize` and `timeout` (default 30s) per request; a stdio server
   gets `timeout` (default 60s) per reply — all optional keys on the
-  server block. Builtin tools are available from the first turn; servers
-  still loading when the shell starts are named and attach when ready,
-  and an unreachable server is reported once with the reason (`/tools`
-  shows per-server status, `/reload` retries).
+  server block. The shell never waits for MCP servers before its prompt:
+  each server's tool schemas are cached
+  (`~/.local/state/conch/tool_cache.json`, keyed on a hash of the server's
+  mcp.json block; `env`/`headers` values are never part of the key), so its
+  tools are offered at once while it connects in the background, and a call
+  made before it has connected waits for it (up to 30s). A tool the server
+  no longer offers returns a clear tool error and leaves the list at the
+  next refresh. A server with no cached tools yet (first run, or a changed
+  entry) gets about 1.5s before the prompt, then is named as still loading
+  and attaches when ready. One-shots, scheduled tasks and missions use the
+  cache without starting or listing any server until one of its tools is
+  called. An unreachable server is reported once with the reason (`/tools`
+  shows per-server status, `/reload` retries and waits for fresh lists).
 - **Executable tools:** an executable in `~/.config/conch/tools/` becomes a
   tool when `<name> --schema` returns its JSON schema; calls receive JSON on
   stdin.
@@ -1731,6 +1751,15 @@ receive only the requested model, tools, action classes, data ceiling, token
 budget, and wall-clock budget. Mission truth, credentials, approvals, and the
 external-action ledger stay on the controller.
 
+The controller keeps one OpenSSH ControlMaster per worker host. It starts the
+master on first use, keeps it for 5 minutes idle, restarts it if it dies, and
+stops it on shutdown, so a worker RPC does not pay a fresh SSH handshake. A
+worker whose connection fails is skipped for the rest of that tick and backed
+off. Completed tasks' artifacts are pulled on a separate thread. Each pull
+streams through one `conch-hostctl artifact-get` session into a `.part` file
+and is moved into place only after its digest checks out. Older worker
+hostctl installs fall back to chunked RPCs.
+
 Workers default to narrow `{read, compute, write_local}` authority. Raise a
 specific worker's ceiling explicitly:
 
@@ -1839,7 +1868,7 @@ network sandbox for tools you explicitly enable or approve.
 | `agent_mode` | `false` | Auto-execute ordinary shell commands for the session |
 | `permission_mode` | `prompt_all` | `prompt_all`, `safe_auto`, or `yolo` |
 | `local_only` | `auto` | Prevent cloud fallback for local-provider sessions |
-| `model_check` | `on` | Probe the configured model at every start; `off` skips it |
+| `model_check` | `on` | Verify the configured model at start (a pass is remembered for 24h; the shell checks in the background); `off` skips it |
 | `model_check_timeout` | `60` seats; `4` otherwise | Seconds per startup probe (0.5–60) |
 | `fallback_models` | unset | Ordered `provider/model` list a non-interactive run may switch to |
 | `tool_profile` | automatic | Built-in or custom tool profile |

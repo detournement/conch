@@ -42,10 +42,11 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import urllib.error
 import urllib.request
@@ -63,6 +64,9 @@ A2A_VERSION = "1.0"
 SUPPORTED_WIRE_PREFIX = "1.0"
 DEFAULT_TIMEOUT = 120.0
 STREAM_READ_TIMEOUT = 630.0
+#: How long :meth:`CapitolRuntime.cached` runtimes reuse a fetched
+#: AgentCard (process-wide, keyed by base_url/org/agent/bearer source).
+CARD_CACHE_TTL = 120.0
 UPLOAD_MAX_BYTES = 500 * 1024 * 1024
 INLINE_MAX_BYTES = 50 * 1024 * 1024
 
@@ -82,6 +86,16 @@ TERMINAL_EVENT_TYPES = frozenset({
 
 KEEPALIVE_EVENT = "a2a.stream_keepalive"
 FINAL_STATUS_EVENT = "_final_status"
+
+# (base_url, org, agent, bearer_source) -> (fetched_at_monotonic, card)
+_CARD_CACHE: Dict[Tuple[str, str, str, str], Tuple[float, Dict[str, Any]]] = {}
+_CARD_CACHE_LOCK = threading.Lock()
+
+
+def clear_card_cache() -> None:
+    """Forget every process-wide cached AgentCard."""
+    with _CARD_CACHE_LOCK:
+        _CARD_CACHE.clear()
 
 
 def build_file_part(
@@ -230,6 +244,11 @@ class CapitolRuntime:
         self.timeout = float(timeout)
         self.context_id: Optional[str] = None
         self._card: Optional[Dict[str, Any]] = None
+        self._card_at = 0.0
+        #: Set by :meth:`cached`: the card is shared process-wide and
+        #: re-fetched once older than ``_card_ttl`` seconds.
+        self._card_key: Optional[Tuple[str, str, str, str]] = None
+        self._card_ttl: Optional[float] = None
         if not (self.base_url and self.org_id and self.agent_id):
             raise CapitolError(
                 "CapitolRuntime needs base_url, org_id, and agent_id "
@@ -274,6 +293,24 @@ class CapitolRuntime:
         bearer, source = resolve_bearer(config, org_id, agent_id, base_url)
         runtime = cls(base_url, org_id, agent_id, bearer, **kwargs)
         runtime.bearer_source = source
+        return runtime
+
+    @classmethod
+    def cached(cls, config: dict, *, card_ttl: float = CARD_CACHE_TTL,
+               **kwargs) -> "CapitolRuntime":
+        """:meth:`from_config` for hot paths (per tool call, per flow
+        step): the bearer is still resolved now — so a rotated token takes
+        effect on the next call — but the AgentCard comes from a
+        process-wide cache keyed by (base_url, org, agent, bearer source)
+        for *card_ttl* seconds instead of a fresh GET per runtime. Each
+        call returns a new runtime object, so per-session state
+        (``context_id``) is never shared."""
+        runtime = cls.from_config(config, **kwargs)
+        runtime._card_key = (
+            runtime.base_url, runtime.org_id, runtime.agent_id,
+            runtime.bearer_source,
+        )
+        runtime._card_ttl = float(card_ttl)
         return runtime
 
     # -- endpoints ----------------------------------------------------------
@@ -461,8 +498,17 @@ class CapitolRuntime:
 
     def discover(self, refresh: bool = False) -> Dict[str, Any]:
         """Fetch (and cache) the AgentCard; refuse unsupported wire majors."""
-        if self._card is not None and not refresh:
+        ttl = self._card_ttl
+        if self._card is not None and not refresh and (
+            ttl is None or time.monotonic() - self._card_at < ttl
+        ):
             return self._card
+        if self._card_key is not None and not refresh:
+            with _CARD_CACHE_LOCK:
+                hit = _CARD_CACHE.get(self._card_key)
+            if hit is not None and time.monotonic() - hit[0] < (ttl or 0):
+                self._card_at, self._card = hit
+                return self._card
         raw = self._request(self.card_url)
         try:
             card = json.loads(raw.decode("utf-8"))
@@ -487,7 +533,20 @@ class CapitolRuntime:
                 CapitolProtocolError,
             )
         self._card = card
+        self._card_at = time.monotonic()
+        if self._card_key is not None:
+            with _CARD_CACHE_LOCK:
+                _CARD_CACHE[self._card_key] = (self._card_at, card)
         return card
+
+    def can_stream_events(self) -> bool:
+        """True when :meth:`watch_run` would stream (the card advertises
+        ``subscribe_workflow_events`` and does not switch streaming off)."""
+        try:
+            self.ensure_skill("subscribe_workflow_events", "watch_run")
+        except CapitolCapabilityError:
+            return False
+        return self.streaming_advertised() is not False
 
     # -- capability gating ----------------------------------------------------
     #
@@ -849,9 +908,14 @@ class CapitolRuntime:
     # -- streaming ------------------------------------------------------------
 
     def _stream_frames(
-        self, skill_id: str, data: Dict[str, Any]
+        self, skill_id: str, data: Dict[str, Any],
+        read_timeout: Optional[float] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """One SSE connection; yields parsed JSON-RPC frames until EOF."""
+        """One SSE connection; yields parsed JSON-RPC frames until EOF.
+
+        *read_timeout* (default :data:`STREAM_READ_TIMEOUT`) bounds the
+        connect and each socket read; a read that times out or fails ends
+        the stream as a retryable transport :class:`CapitolError`."""
         envelope = self._envelope(
             "SendStreamingMessage", skill_id, data, self.context_id
         )
@@ -866,7 +930,8 @@ class CapitolRuntime:
         )
         try:
             response = urllib.request.urlopen(
-                request, timeout=STREAM_READ_TIMEOUT
+                request,
+                timeout=read_timeout if read_timeout else STREAM_READ_TIMEOUT,
             )
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
@@ -884,11 +949,20 @@ class CapitolRuntime:
                 retryable=True, category="transport",
             ) from None
         try:
-            lines = (
-                raw.decode("utf-8", "replace")
-                for raw in iter(response.readline, b"")
-            )
-            for payload in sse_events(lines):
+            def _lines():
+                while True:
+                    try:
+                        raw = response.readline()
+                    except OSError as exc:  # incl. socket.timeout
+                        raise self._fail(
+                            f"Capitol stream read failed: {exc}",
+                            retryable=True, category="transport",
+                        ) from None
+                    if not raw:
+                        return
+                    yield raw.decode("utf-8", "replace")
+
+            for payload in sse_events(_lines()):
                 try:
                     frame = json.loads(payload)
                 except ValueError:
@@ -910,7 +984,9 @@ class CapitolRuntime:
         types: Optional[List[str]] = None,
         max_reconnects: int = 5,
         reconnect_delay: float = 1.0,
+        deadline: Optional[float] = None,
         _sleep=time.sleep,
+        _clock=time.monotonic,
     ) -> Iterator[Dict[str, Any]]:
         """Stream a run's WorkflowEvents, resuming across disconnects.
 
@@ -927,16 +1003,15 @@ class CapitolRuntime:
         ``subscribe_workflow_events`` (and ``capabilities.streaming`` is
         not explicitly false); otherwise it degrades to the resumable
         ``get_workflow_events`` polling loop — same yielded shapes, same
-        cursor semantics.
+        cursor semantics. Events re-sent at or below the cursor are
+        dropped, so a resume from a slightly stale cursor never replays.
+
+        *deadline* (a ``_clock`` / :func:`time.monotonic` instant) bounds
+        a streaming watch for callers with their own time budget: each
+        socket read times out by then, and the generator simply stops —
+        without a ``_final_status`` frame — once it passes.
         """
-        stream_capable = True
-        try:
-            self.ensure_skill("subscribe_workflow_events", "watch_run")
-            if self.streaming_advertised() is False:
-                stream_capable = False
-        except CapitolCapabilityError:
-            stream_capable = False
-        if not stream_capable:
+        if not self.can_stream_events():
             self.ensure_skill("get_workflow_events", "watch_run (polling)")
             for event in self.poll_run(
                 run_id, since_sequence=since_sequence, types=types,
@@ -946,7 +1021,20 @@ class CapitolRuntime:
             return
         last_seen = max(0, int(since_sequence) - 1)
         failures = 0
+
+        def remaining() -> Optional[float]:
+            if deadline is None:
+                return None
+            return deadline - _clock()
+
         while True:
+            budget = remaining()
+            if budget is not None and budget <= 0:
+                return
+            read_timeout = (
+                None if budget is None
+                else max(0.05, min(STREAM_READ_TIMEOUT, budget))
+            )
             data: Dict[str, Any] = {
                 "run_id": run_id,
                 "since_sequence": last_seen + 1,
@@ -958,8 +1046,11 @@ class CapitolRuntime:
             terminal_event = False
             try:
                 for frame in self._stream_frames(
-                    "subscribe_workflow_events", data
+                    "subscribe_workflow_events", data, read_timeout
                 ):
+                    budget = remaining()
+                    if budget is not None and budget <= 0:
+                        return  # keepalives/status frames past the budget
                     result = frame.get("result") or {}
                     artifact = result.get("artifact")
                     if artifact:
@@ -974,7 +1065,9 @@ class CapitolRuntime:
                                 continue
                             sequence = event.get("sequence")
                             if isinstance(sequence, (int, float)):
-                                last_seen = max(last_seen, int(sequence))
+                                if int(sequence) <= last_seen:
+                                    continue  # re-sent below the cursor
+                                last_seen = int(sequence)
                                 progressed = True
                                 failures = 0
                             if event.get("event_type") in TERMINAL_EVENT_TYPES:
@@ -999,6 +1092,9 @@ class CapitolRuntime:
                 raise
             except CapitolError:
                 pass  # transport drop — reconcile and maybe resume below
+            budget = remaining()
+            if budget is not None and budget <= 0:
+                return  # the caller's budget is spent; it reconciles
             # Stream ended without a terminal status frame: reconcile.
             try:
                 status_payload = self.run_status(run_id)
@@ -1025,7 +1121,11 @@ class CapitolRuntime:
                     retryable=True,
                     category="transport",
                 )
-            _sleep(reconnect_delay * failures)
+            delay = reconnect_delay * failures
+            budget = remaining()
+            if budget is not None:
+                delay = min(delay, max(0.0, budget))
+            _sleep(delay)
 
     def poll_run(
         self,

@@ -365,6 +365,65 @@ class TestStart(ToolCase):
 
 
 class TestWatch(ToolCase):
+    """The polling watch (the card does not advertise streaming)."""
+
+    def setUp(self):
+        super().setUp()
+        FakeGateway.card = dict(
+            FakeGateway.card, capabilities={"streaming": False}
+        )
+
+    def status_calls(self):
+        return [
+            skill for skill, _data, _env in FakeGateway.calls
+            if skill == "get_workflow_status"
+        ]
+
+    def test_status_checked_only_when_a_poll_goes_quiet(self):
+        FakeGateway.runs["run-1"] = {"status": "running", "output": {}}
+        FakeGateway.run_events["run-1"] = [_event(1), _event(2)]
+        clock = {"now": 0.0}
+        result = self.client._op_watch(
+            {"run_id": "run-1", "deadline_seconds": 30},
+            _sleep=lambda s: clock.__setitem__("now", clock["now"] + 2.0),
+            _clock=lambda: clock["now"],
+        )
+        text = result["content"][0]["text"]
+        self.assertIn("still running", text)
+        polls = sum(
+            1 for skill, _data, _env in FakeGateway.calls
+            if skill == "get_workflow_events"
+        )
+        # The first poll delivered events: no status call for it.
+        self.assertEqual(len(self.status_calls()), polls - 1)
+
+    def test_status_checked_every_nth_busy_poll(self):
+        from conch.capitol.tool import WATCH_STATUS_EVERY
+
+        FakeGateway.runs["run-1"] = {"status": "running", "output": {}}
+        FakeGateway.run_events["run-1"] = [_event(n) for n in range(1, 50)]
+        original = FakeGateway._dispatch
+        served = {"next": 1}
+
+        def one_event_per_poll(handler, skill, data, message):
+            if skill == "get_workflow_events":
+                # Busy run: every poll returns exactly one new event.
+                seq = served["next"]
+                served["next"] += 1
+                return {"events": [_event(seq)]}
+            return original(handler, skill, data, message)
+
+        clock = {"now": 0.0}
+        with patch.object(FakeGateway, "_dispatch", one_event_per_poll):
+            self.client._op_watch(
+                {"run_id": "run-1", "deadline_seconds": 20},
+                _sleep=lambda s: clock.__setitem__("now", clock["now"] + 2.0),
+                _clock=lambda: clock["now"],
+            )
+        polls = served["next"] - 1
+        self.assertEqual(len(self.status_calls()),
+                         polls // WATCH_STATUS_EVERY)
+
     def test_summarizes_to_terminal(self):
         FakeGateway.runs["run-1"] = {"status": "success", "output": {}}
         FakeGateway.run_events["run-1"] = [
@@ -432,6 +491,59 @@ class TestWatch(ToolCase):
             "op": "watch", "run_id": "run-1", "since_sequence": 3,
         })
         self.assertIn("1 event(s) observed, last sequence 3", text)
+
+
+class TestWatchStreaming(ToolCase):
+    """The card advertises subscribe_workflow_events: watch streams."""
+
+    def test_streams_to_terminal_without_polling(self):
+        FakeGateway.runs["run-1"] = {"status": "running", "output": {}}
+        FakeGateway.stream_plans["run-1"] = [
+            {"events": [_event(1), _event(2, "node.tool_call"),
+                        _event(3, "workflow.run_completed")],
+             "end": "terminal"},
+        ]
+        text = self.call({"op": "watch", "run_id": "run-1"})
+        self.assertIn("terminal state success", text)
+        self.assertIn("3 event(s) observed, last sequence 3", text)
+        skills = [skill for skill, _d, _e in FakeGateway.calls]
+        self.assertNotIn("get_workflow_events", skills)
+        self.assertEqual(skills.count("get_workflow_status"), 1)
+
+    def test_resume_cursor_and_hitl(self):
+        FakeGateway.runs["run-1"] = {"status": "running", "output": {}}
+        FakeGateway.stream_plans["run-1"] = [
+            {"events": [_event(1), _event(2), _event(
+                3, "node.input_required", data={
+                    "request_id": "req-5", "input_kind": "clarification",
+                    "prompt": "Which size?",
+                })], "end": "terminal"},
+        ]
+        text = self.call({
+            "op": "watch", "run_id": "run-1", "since_sequence": 3,
+        })
+        self.assertEqual(FakeGateway.stream_requests[0]["since"], 3)
+        self.assertIn("1 event(s) observed, last sequence 3", text)
+        self.assertIn("NEEDS INPUT [clarification] request_id=req-5", text)
+
+    def test_deadline_bounds_a_silent_stream(self):
+        import time as _time
+
+        FakeGateway.runs["run-1"] = {"status": "running", "output": {}}
+        FakeGateway.stream_plans["run-1"] = [
+            {"events": [_event(1)], "end": "hang", "seconds": 7.0},
+        ]
+        started = _time.monotonic()
+        result = self.client._op_watch(
+            {"run_id": "run-1", "deadline_seconds": 5},
+            _sleep=lambda _s: None,
+        )
+        text = result["content"][0]["text"]
+        # Bounded by the 5 s op deadline, not by the silent stream (or
+        # the 630 s STREAM_READ_TIMEOUT).
+        self.assertLess(_time.monotonic() - started, 6.5)
+        self.assertIn("still running at the 5s watch deadline", text)
+        self.assertIn("since_sequence=2", text)
 
 
 class TestRespond(ToolCase):

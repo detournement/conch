@@ -78,6 +78,14 @@ class FakeMasters:
     def kill_all(self):
         """The masters die without removing their sockets (kill -9)."""
         for server in self._sockets:
+            # close() alone does not stop a listener while another thread
+            # is blocked in accept() on Linux: the in-flight syscall keeps
+            # it listening, so a probe could still connect. shutdown()
+            # stops it at once, like a process that died.
+            try:
+                server.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             server.close()
         self._sockets = []
 

@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v1.0.2][release] ·
+[Current release: v1.0.3][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v1.0.2
+[release]: https://github.com/detournement/conch/releases/tag/v1.0.3
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -766,9 +766,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v1.0.2. GitHub releases include a
+`conch-shell` is not published on PyPI at v1.0.3. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v1.0.2` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v1.0.3` to install the release sdist.
 
 ### Updating
 
@@ -1361,6 +1361,37 @@ fan-out workers included, appear on the [conversations page](#conversations-page
   directories. A filesystem MCP server's `list_allowed_directories` describes
   that server only; it is not a global Conch workspace restriction. OS access
   failures and Conch's guarded-path approvals still apply.
+- **Read before edit:** `edit_file`, and `write_file` replacing an existing
+  file, refuse a file the session has not read with `read_file` (partial reads
+  count) or one that changed on disk since it was last read or written by the
+  tool; the model is told to read it (again) first. Creating files is free.
+  Subagents keep their own record. Turn off with
+  `require_read_before_edit=false`.
+- **Search:** `grep` (regex over file contents; `files_with_matches`,
+  `content` with context lines, or `count`; `glob` filter, case-insensitive
+  flag, `head_limit`) and `glob` (file name patterns such as `**/*.py`, newest
+  first) are read-only and never ask in any permission mode. `grep` uses
+  ripgrep when it is installed and otherwise a built-in search; both skip
+  `.gitignore`d files inside a Git repository and binary files, cap long lines
+  and result counts (saying when they cut), redact credential-shaped values
+  like `read_file`, and withhold matches inside credential files.
+- **Edit checks:** `post_edit_check` runs your linter or type checker after
+  each successful `edit_file`/`write_file` and appends its exit status and
+  output (first 4000 chars) to the result the model sees:
+
+  ```ini
+  post_edit_check.py=ruff check --quiet {path}
+  post_edit_check.ts=npx --no-install eslint {path}
+  post_edit_check_timeout=30
+  ```
+
+  A plain `post_edit_check=...` is the default for every other extension
+  (unset: no check).
+
+  `{path}` is the shell-quoted changed file, relative to the working
+  directory when inside it; the command runs there without an approval prompt
+  because you configured it. A `post_edit_check.<ext>` entry beats the default,
+  and an empty one turns the check off for that extension.
 - **Web:** `web_fetch` reads an http(s) page as text (HTML stripped to
   headings, paragraphs, and links; JSON pretty-printed; binary types refused),
   capped at 2 MB downloaded. `prompt_all` asks per URL (`a` allows the host
@@ -1394,13 +1425,13 @@ fan-out workers included, appear on the [conversations page](#conversations-page
   `profile_<name>` entries can select tool groups.
 
 Built-in tools are `local_shell`, `interactive_terminal`, `ssh_remote`,
-`read_file`, `edit_file`, `write_file`, `web_fetch`, `manage_tools`,
+`read_file`, `edit_file`, `write_file`, `grep`, `glob`, `web_fetch`, `manage_tools`,
 `save_memory`, `search_conversations`, `todo_list`, `personal_items`,
 `delegate_task`, `fan_out`, `skill_manage`, `conch_config`,
 `conch_introspect`, and `public_api`; configured components add `api_layer`,
 `llamaidx_registry`, `fleet_delegate`, and `capitol_control`. Ollama and custom
-endpoints are offered at most 17 tools per request: 13 pinned ones (shell, SSH,
-file tools, `web_fetch`, `delegate_task`, `conch_config`, ...) plus four picked
+endpoints are offered at most 19 tools per request: 15 pinned ones (shell, SSH,
+file and search tools, `web_fetch`, `delegate_task`, `conch_config`, ...) plus four picked
 by relevance. On every provider, tool schemas are also held to about 35% of
 the context budget: when the enabled tools would take more, a request carries
 the pinned tools plus the most relevant others that fit, so a large MCP
@@ -1461,9 +1492,20 @@ Only native tool calls are executable; repeated identical call batches stop.
   Secret-bearing entries are rejected whole; legacy matches are withheld from
   recall. Standing facts (`/fact`) are not credential-scanned.
 - Starting in a Git repository injects a bounded repository map unless
-  `repo_map=false`. The nearest `CONCH.md` or `AGENTS.md` supplies project
-  instructions (`CONCH.md` wins in the same directory); the nearest project
-  `.conchrc` supplies configuration overrides.
+  `repo_map=false`, plus short coding guidance (search before changing, read
+  before editing, minimal diffs, run the project's own tests and linters,
+  report what was not verified, commit/push/PR only when asked).
+- Project instructions are collected from every directory between the git
+  root (or the current directory outside a repository) and the current
+  directory, root first. In each directory the order is `CONCH.md`,
+  `AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md`,
+  `.github/copilot-instructions.md`, `.cursorrules`, then
+  `.cursor/rules/*.mdc` rules marked `alwaysApply: true` (or without
+  frontmatter). Symlinks and identical copies load once. The total is capped
+  at 6,000 characters for small context windows, rising to 24,000 for
+  200k-token models, with a note where text was cut. Files are read once per
+  session so the prompt prefix stays cacheable; `/status` lists the loaded
+  files. The nearest project `.conchrc` supplies configuration overrides.
 - Inside a git checkout the status bar shows where you are: `🐙 owner/repo ⎇ branch`
   for a GitHub repository (with the branch's open PR number and `✓`/`✗`/`●` for its
   checks), `name ⎇ branch` otherwise; the startup banner repeats it. For GitHub,
@@ -1591,7 +1633,9 @@ their configuration files are not interchangeable.
 
 `hook_pre_tool_use`, `hook_post_tool_use`, and `hook_on_turn_end` name scripts
 that receive JSON on stdin. A nonzero pre-hook blocks the call; JSON output
-from a pre-hook can rewrite arguments, which are schema-validated again. A hook
+from a pre-hook can rewrite arguments, which are schema-validated again. A
+post-hook's output (first 4000 chars) is appended to the tool result the model
+sees, labelled `[post_tool_use hook output]`, so a hook can report diagnostics. A hook
 that crashes or times out is reported and the call proceeds, so treat hooks as
 a convenience gate, not a security boundary.
 
@@ -1827,6 +1871,16 @@ Configuration files are applied in this order, with later values winning:
 1. `~/.config/conch/config`
 2. `~/.conchrc`
 3. the nearest `.conchrc` between the current directory and Git root
+
+A project `.conchrc` arrives with the repository, so Conch applies only
+model choice, limits and display settings from it (provider and model
+names, effort and context sizes, token budgets, `tool_profile`,
+`git_checkpoints`, `show_token_stats` and the like). Keys that would run
+commands, widen permissions or redirect traffic and credentials (hooks,
+`post_edit_check`, `permission_mode`, `allow_prefixes`, any `*_base_url`,
+`api_key_env`, sandbox and fallback settings) are ignored there, and
+Conch names them once. Put them in your own config if you trust the
+project.
 
 Supported `CONCH_*` environment variables override files. Provider keys and
 other secrets belong in `~/.config/conch/env` or another named environment

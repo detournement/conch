@@ -181,6 +181,44 @@ def format_turn_stats_line(turn_usage: dict, cost_str: str, gauge: str,
     )
 
 
+def _project_context_budget(provider: str, model: str, config: dict = None) -> int:
+    """Char budget for project instructions, scaled to the model's window.
+
+    Local providers use only explicitly configured windows: building the
+    system prompt must never wait on a server probe.
+    """
+    from .config import project_context_budget
+
+    config = config or {}
+    provider = (provider or "").lower()
+    window = 0
+    if provider in ("ollama", "custom"):
+        keys = (
+            ("ollama_num_ctx", "ollama_context_window") if provider == "ollama"
+            else ("custom_context_window",)
+        )
+        for key in keys:
+            try:
+                window = int(config.get(key) or 0)
+            except (TypeError, ValueError):
+                window = 0
+            if window:
+                break
+    elif provider:
+        from .providers import get_context_window
+        try:
+            window = get_context_window(provider, model, config)
+        except Exception:
+            window = 0
+    return project_context_budget(window)
+
+
+def _builtin_tool_names() -> set:
+    """Names of conch's built-in file tools (stable for the session)."""
+    from .filetools import FILE_TOOL_DEFS
+    return {tool_def["function"]["name"] for tool_def in FILE_TOOL_DEFS}
+
+
 def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "", model: str = "", config: dict = None) -> str:
     """Build the session system prompt.
 
@@ -200,10 +238,14 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
         from .prompts import build_self_description
         parts.append(build_self_description(provider, model, config))
     prompt = base_prompt + "\n\n" + " ".join(parts) if parts else base_prompt
-    # Project-level instructions (CONCH.md / AGENTS.md, plan 1.8) are
-    # persistent context that lives outside compactable history.
-    from .config import load_project_context
-    project_ctx = load_project_context()
+    # Project-level instructions (CONCH.md, AGENTS.md, CLAUDE.md, Copilot
+    # and Cursor rules; plan 1.8) are persistent context that lives outside
+    # compactable history. The snapshot is read once per session so the
+    # prefix stays byte-stable for prompt caching.
+    from .config import session_project_context
+    project_ctx = session_project_context(
+        _project_context_budget(provider, model, config)
+    )
     if project_ctx:
         prompt += "\n\n" + project_ctx
     # Always-loaded facts tier (plan 2.8): bounded, user-editable.
@@ -218,18 +260,15 @@ def _build_system_prompt(base_prompt: str, location: str = "", provider: str = "
         repo_map = get_repo_map()
         if repo_map:
             prompt += "\n\n" + repo_map
-            # Repo detected → git-aware coding discipline. The nudge is
-            # prompt-level; the deterministic backstop is the turn-level
-            # checkpoint layer (gitcheckpoint.py), which snapshots every
-            # mutating turn regardless of what the model does.
-            prompt += (
-                "\n\nThis is a git repository: use git deliberately when "
-                "writing code. Check git status/diff before and after "
-                "edits, prefer a feature branch for multi-file changes, "
-                "and commit logical units with descriptive messages when "
-                "the user asks for commits. Conch snapshots the worktree "
-                "after every turn that changes files (/undo restores)."
-            )
+    # Inside a git repository → coding guidance (find before changing,
+    # minimal diffs, run the project's checks, git only when asked). The
+    # nudge is prompt-level; the deterministic backstop is the turn-level
+    # checkpoint layer (gitcheckpoint.py), which snapshots every mutating
+    # turn regardless of what the model does.
+    from .repomap import find_git_root
+    if find_git_root() is not None:
+        from .prompts import build_coding_guidance
+        prompt += "\n\n" + build_coding_guidance(_builtin_tool_names())
     # GitHub snapshot (repository, branch PR and checks, open PRs and
     # issues) once github_context.start() has fetched it.
     from .github_context import get as repo_context

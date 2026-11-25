@@ -7,6 +7,54 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [1.0.3] - 2026-11-25
+
+### Added
+
+- `grep` and `glob` tools for searching file contents and names. They are
+  read-only, never ask for approval, respect `.gitignore`, use ripgrep
+  when it is installed (with a Python fallback), cap their results, and
+  redact credentials. Matches inside credential files are listed by name
+  only.
+- `post_edit_check` runs your linter or type checker after each
+  successful `edit_file`/`write_file` and shows the model its exit status
+  and output, so it can fix what it just broke. Per-extension entries
+  (`post_edit_check.py=ruff check --quiet {path}`) override the default,
+  and an empty value turns the check off for that extension.
+- Project instructions now load from CONCH.md, AGENTS.md, CLAUDE.md,
+  .claude/CLAUDE.md, .github/copilot-instructions.md, .cursorrules and
+  always-applied .cursor/rules/*.mdc, at every level from the git root
+  down to the current directory. Symlinked or duplicate files load once,
+  each block is labelled with its path, and the size limit grows with the
+  model's context window (6,000 to 24,000 characters). `/status` lists the
+  files that were loaded.
+- Inside a git repository the system prompt carries short coding
+  guidance: search before changing, read before editing, keep diffs
+  minimal, run the project's own tests and linters before calling work
+  done, report what was not verified, and commit, push or open pull
+  requests only when asked.
+
+### Changed
+
+- `edit_file` and `write_file` refuse to change an existing file that was
+  not read this session or that changed on disk since it was read, and
+  ask the model to read it (again) first. Set
+  `require_read_before_edit=false` to turn this off.
+- Output from `post_tool_use` hooks now reaches the model, appended to the
+  tool result.
+- The tool cap for local models rises from 17 to 19 so that `grep` and
+  `glob` can be pinned without crowding out relevant tools.
+
+### Security
+
+- A per-project `.conchrc` can no longer run commands, widen permissions
+  or redirect traffic and credentials. Before, a cloned repository's
+  `.conchrc` could set `permission_mode=yolo`, hook commands, `base_url` or
+  `api_key_env` and take effect as soon as Conch ran inside it. Project
+  files now apply only model choice, limits and display settings. Conch
+  names any key it ignored; put such keys in `~/.config/conch/config` if
+  you trust the project.
+
 ## [1.0.2] - 2026-11-25
 
 ### Performance
@@ -781,6 +829,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[1.0.3]: https://github.com/detournement/conch/releases/tag/v1.0.3
 [1.0.2]: https://github.com/detournement/conch/releases/tag/v1.0.2
 [1.0.1]: https://github.com/detournement/conch/releases/tag/v1.0.1
 [1.0.0]: https://github.com/detournement/conch/releases/tag/v1.0.0

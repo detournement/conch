@@ -34,6 +34,9 @@ PINNED_TOOL_NAMES = {
     "read_file",
     "edit_file",
     "write_file",
+    # Read-only search: cheaper and safer than grep/find through the shell.
+    "grep",
+    "glob",
     "web_fetch",
 }
 
@@ -2765,6 +2768,15 @@ class DelegateTaskClient:
                 k: v for k, v in self._builtin_clients.items()
                 if k not in excluded
             }
+        # The subagent gets its own file-tools copy (one per shared client):
+        # it must read what it edits, and the parent then sees what the
+        # subagent changed as changed-since-read.
+        forks: Dict[int, Any] = {}
+        for key, client in list(sub_clients.items()):
+            if hasattr(client, "fork"):
+                if id(client) not in forks:
+                    forks[id(client)] = client.fork()
+                sub_clients[key] = forks[id(client)]
         system_prompt = self.SUBAGENT_PROMPT
         if skill is not None:
             from . import skills as skills_mod

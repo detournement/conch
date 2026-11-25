@@ -7,6 +7,42 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [1.0.1] - 2026-11-25
+
+### Fixed
+
+- Evaluations and tool-less requests on `gpt-6.1-terra`, `gpt-6-sol`,
+  `gpt-6-luna` and `gpt-5.6-sol`/`-terra`/`-luna` no longer fail with
+  "transport failed (unsupported)". These models accept a custom
+  temperature only with `reasoning_effort: "none"`, which Conch sends only
+  on tool calls; other requests now use the model's default temperature.
+  Verified live for all six models.
+- Output from `local_shell` keeps multibyte characters (CJK, emoji, box
+  drawing) intact when they straddle a read boundary, instead of turning
+  them into replacement characters.
+
+### Performance
+
+- Anthropic requests use prompt caching (automatic `cache_control`), so
+  each tool round reads the tool schemas, system prompt and earlier history
+  from cache instead of reprocessing them. This lowers time to first token
+  and input cost on long agent turns. Turn it off with
+  `anthropic_prompt_cache=false`. Token counts, the context gauge and
+  calibration still use the full prompt size, and the session cost line
+  prices cached input at its discounted rate.
+- Commands that print a lot of output run up to about 15x faster in
+  `local_shell` (3M lines: 5.4s to 1.7s, the speed of the terminal itself).
+  The terminal-control filter skips its per-character pass for plain text,
+  and output is read in 64 KiB chunks.
+- The fleet controller asks SQLite for in-flight dispatches only, instead
+  of decoding the whole dispatch history on every one-second tick.
+- Kernel databases get indexes for the folder-watch inbox poll and the
+  outbox delivery claim, which ran as full table scans every tick. They
+  are added automatically the next time the kernel opens.
+- Unattended SSH commands (fleet RPCs and captured `ssh_remote` exec) set
+  `ConnectTimeout=10` and server-alive checks, so a host that is down no
+  longer holds up the controller for the whole RPC timeout.
+
 ## [1.0.0] - 2026-11-25
 
 ### Added
@@ -680,6 +716,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[1.0.1]: https://github.com/detournement/conch/releases/tag/v1.0.1
 [1.0.0]: https://github.com/detournement/conch/releases/tag/v1.0.0
 [0.9.9]: https://github.com/detournement/conch/releases/tag/v0.9.9
 [0.9.8]: https://github.com/detournement/conch/releases/tag/v0.9.8

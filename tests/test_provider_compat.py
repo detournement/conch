@@ -138,6 +138,28 @@ class TestBuildOpenAIRequestBody(unittest.TestCase):
             )
             self.assertEqual(body.get("reasoning_effort"), "none", model)
 
+    def test_effort_none_family_sends_temperature_only_with_effort_none(self):
+        """These models reject a custom temperature unless reasoning_effort
+        is "none" (HTTP 400 "Only the default (1) value is supported";
+        verified live 2026-11-25). A tool-less request, such as the first
+        eval turn or a summary, must therefore omit it."""
+        msgs = [{"role": "user", "content": "hi"}]
+        for model in (
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra",
+        ):
+            no_tools = build_openai_chat_request_body(
+                model, msgs, temperature=0.7, max_completion_tokens=1024)
+            self.assertNotIn("temperature", no_tools, model)
+            with_tools = build_openai_chat_request_body(
+                model, msgs, temperature=0.7, max_completion_tokens=1024,
+                tools=[_make_tool("t")])
+            self.assertEqual(with_tools.get("temperature"), 0.7, model)
+            picked_effort = build_openai_chat_request_body(
+                model, msgs, temperature=0.7, max_completion_tokens=1024,
+                reasoning_effort="high")
+            self.assertNotIn("temperature", picked_effort, model)
+
     def test_gpt56_without_tools_keeps_reasoning(self):
         body = build_openai_chat_request_body(
             "gpt-5.6-sol", [{"role": "user", "content": "hi"}],

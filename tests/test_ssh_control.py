@@ -123,6 +123,9 @@ class TestSSHCommandConstruction(unittest.TestCase):
         argv = self.manager.exec_argv(self.target, command)
         self.assertIn("BatchMode=yes", argv)
         self.assertIn("-T", argv)
+        # Unattended execs never wait out a dead host's TCP timeout.
+        self.assertIn("ConnectTimeout=10", argv)
+        self.assertIn("ServerAliveInterval=15", argv)
         self.assertEqual(argv[-1], command)
         host_index = argv.index("--") + 1
         self.assertEqual(argv[host_index], self.target.host)

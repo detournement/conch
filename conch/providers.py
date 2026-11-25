@@ -1234,16 +1234,24 @@ def build_openai_chat_request_body(
         "messages": messages,
         "max_completion_tokens": max_completion_tokens,
     }
-    if not _openai_is_strict_reasoning_model(model):
-        body["temperature"] = temperature
     if tools:
         body["tools"] = _sanitize_tools_for_openai(tools)
-    if tools and _openai_tools_require_effort_none(model):
+    effort_none_family = _openai_tools_require_effort_none(model)
+    if tools and effort_none_family:
         body["reasoning_effort"] = "none"
     elif reasoning_effort:
         # Chosen in the model picker; model_tuning only allows it on
         # reasoning models that tool-call with an effort set.
         body["reasoning_effort"] = reasoning_effort
+    # The effort-"none" family (gpt-5.6-*, gpt-6-{sol,luna}, gpt-6.1-terra)
+    # accepts a custom temperature only with reasoning_effort "none"; any
+    # other request (e.g. a tool-less summary or the first eval turn) gets
+    # HTTP 400 "'temperature' does not support 0.7 ... Only the default (1)".
+    # Verified live 2026-11-25 for all six models.
+    if not _openai_is_strict_reasoning_model(model) and (
+        not effort_none_family or body.get("reasoning_effort") == "none"
+    ):
+        body["temperature"] = temperature
     return body
 
 
@@ -1294,10 +1302,31 @@ def anthropic_forced_tool_choice_supported(model: str) -> bool:
     return not name.startswith(("claude-opus-5-5", "claude-fable-5-1"))
 
 
-def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Return estimated cost in USD for a given token count."""
+# Prompt-cache pricing relative to the base input rate. Reads are 0.1x on
+# most models (lower on some newer ones, so this errs high); 5-minute
+# writes are 1.25x.
+CACHE_READ_MULTIPLIER = 0.1
+CACHE_WRITE_MULTIPLIER = 1.25
+
+
+def estimate_cost(
+    model: str, input_tokens: int, output_tokens: int,
+    *, cache_read_tokens: int = 0, cache_write_tokens: int = 0,
+) -> float:
+    """Return estimated cost in USD for a given token count.
+
+    *input_tokens* is the full prompt size; the cached portions of it
+    (*cache_read_tokens*, *cache_write_tokens*) are priced at their rates.
+    """
     rate = MODEL_PRICING.get(model, (0.0, 0.0))
-    return (input_tokens * rate[0] + output_tokens * rate[1]) / 1_000_000
+    cached = max(0, cache_read_tokens) + max(0, cache_write_tokens)
+    uncached = max(0, input_tokens - cached)
+    prompt = (
+        uncached
+        + max(0, cache_read_tokens) * CACHE_READ_MULTIPLIER
+        + max(0, cache_write_tokens) * CACHE_WRITE_MULTIPLIER
+    )
+    return (prompt * rate[0] + output_tokens * rate[1]) / 1_000_000
 
 
 _BILLING_LABELS = {
@@ -1320,6 +1349,7 @@ def _billing_kind(provider: str, model: str, config: Optional[dict] = None) -> s
 def record_session_usage(
     usage: dict, provider: str, model: str, input_tokens: int, output_tokens: int,
     config: Optional[dict] = None, *, count_turn: bool = True,
+    cache_read_tokens: int = 0, cache_write_tokens: int = 0,
 ) -> str:
     """Accumulate a completed turn, returning its honestly labelled cost.
 
@@ -1328,7 +1358,11 @@ def record_session_usage(
     not a conversation turn.
     """
     kind = _billing_kind(provider, model, config)
-    cost = estimate_cost(model, input_tokens, output_tokens) if kind == "api" else 0.0
+    cost = estimate_cost(
+        model, input_tokens, output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    ) if kind == "api" else 0.0
     usage["input_tokens"] = usage.get("input_tokens", 0) + input_tokens
     usage["output_tokens"] = usage.get("output_tokens", 0) + output_tokens
     usage["cost"] = usage.get("cost", 0.0) + cost
@@ -1399,6 +1433,47 @@ def _attach_server_timings(target: dict, data: dict) -> None:
         target["gen_seconds"] = seconds
 
 
+def _anthropic_input_usage(usage: dict) -> dict:
+    """Prompt-side usage from an Anthropic ``usage`` object.
+
+    With prompt caching the API splits the prompt into ``input_tokens``
+    (uncached), ``cache_read_input_tokens`` and ``cache_creation_input_tokens``.
+    ``input_tokens`` here is their sum, the full prompt size, because the
+    context gauge and the chars-per-token calibration need the real prompt
+    length; the cache counters ride along so cost can price them.
+    """
+    usage = usage if isinstance(usage, dict) else {}
+
+    def _count(key: str) -> int:
+        value = usage.get(key)
+        return value if type(value) is int and value > 0 else 0
+
+    read = _count("cache_read_input_tokens")
+    write = _count("cache_creation_input_tokens")
+    result = {"input_tokens": _count("input_tokens") + read + write}
+    if read:
+        result["cache_read_input_tokens"] = read
+    if write:
+        result["cache_creation_input_tokens"] = write
+    return result
+
+
+def _apply_anthropic_prompt_cache(body: Dict[str, Any], config: dict) -> None:
+    """Enable automatic prompt caching (on by default).
+
+    A top-level ``cache_control`` makes the API place a breakpoint on the
+    last cacheable block and move it forward as the conversation grows, so
+    every tool round re-reads the tools, system prompt and history from
+    cache instead of reprocessing them. Opt out with
+    ``anthropic_prompt_cache=false``.
+    """
+    if str(config.get("anthropic_prompt_cache", "true")).strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        return
+    body["cache_control"] = {"type": "ephemeral"}
+
+
 def _normalize_usage(data: dict, provider: str) -> dict:
     """Extract a uniform usage dict from any provider's raw API response.
 
@@ -1417,11 +1492,9 @@ def _normalize_usage(data: dict, provider: str) -> dict:
         _attach_server_timings(result, data)
         return result
     if provider == "anthropic":
-        usage = data.get("usage", {})
-        return {
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-        }
+        result = _anthropic_input_usage(data.get("usage", {}))
+        result["output_tokens"] = (data.get("usage") or {}).get("output_tokens", 0)
+        return result
     if provider == "ollama":
         result = {
             "input_tokens": data.get("prompt_eval_count", 0),
@@ -1693,6 +1766,7 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         "messages": _wire_images("anthropic", user_messages),
     }
     _apply_anthropic_effort(body, config, model)
+    _apply_anthropic_prompt_cache(body, config)
     if tools:
         import copy
         body["tools"] = [
@@ -2943,6 +3017,7 @@ def stream_anthropic(
         "stream": True,
     }
     _apply_anthropic_effort(body, config, model)
+    _apply_anthropic_prompt_cache(body, config)
     if tools:
         import copy
         body["tools"] = [
@@ -3001,7 +3076,7 @@ def stream_anthropic(
 
                 if etype == "message_start":
                     mu = data.get("message", {}).get("usage", {})
-                    usage["input_tokens"] = mu.get("input_tokens", 0)
+                    usage.update(_anthropic_input_usage(mu))
 
                 elif etype == "content_block_start":
                     block = data.get("content_block", {})

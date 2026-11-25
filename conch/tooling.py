@@ -653,6 +653,15 @@ def ensure_tools_active(chat_state, names) -> List[str]:
     return added
 
 
+# Anything feed()'s state machine treats specially or drops: C0 controls
+# other than \t \n \r (so ESC, BEL, CAN, SUB, \b ...), DEL and C1 controls.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+# PTY read size: big enough that output-heavy commands (builds, logs) don't
+# pay a select/read/decode round per 4 KiB.
+_PTY_READ_SIZE = 65536
+
+
 class _CapturedTerminalText:
     """Strip terminal controls incrementally, without buffering control payloads.
 
@@ -671,6 +680,18 @@ class _CapturedTerminalText:
         return held
 
     def feed(self, text: str) -> str:
+        if self._state == "text" and text and not _CONTROL_CHAR_RE.search(text):
+            # Fast path (the common case: plain output). With no escapes,
+            # backspaces or stray controls, the state machine below reduces
+            # to "emit everything, holding back the last printable char".
+            # Doing that with slices instead of a per-char Python loop is
+            # what keeps large command output from dominating tool time.
+            last = text[-1]
+            if last in "\n\r\t":
+                out, self._held = self._held + text, ""
+            else:
+                out, self._held = self._held + text[:-1], last
+            return out
         output = []
         for char in text:
             state = self._state
@@ -964,6 +985,10 @@ class LocalShellClient:
         captured_tail = ""
         captured_total = 0
         sanitizer = _CapturedTerminalText()
+        # Incremental decode: a multibyte UTF-8 char split across two reads
+        # must not turn into two replacement characters.
+        import codecs
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         def capture(chunk: str) -> None:
             nonlocal captured_head, captured_tail, captured_total
@@ -1001,14 +1026,14 @@ class LocalShellClient:
                         break
                     if master_fd in rlist:
                         try:
-                            data = os.read(master_fd, 4096)
+                            data = os.read(master_fd, _PTY_READ_SIZE)
                         except OSError as e:
                             if e.errno in (errno.EIO, errno.EBADF):
                                 break
                             raise
                         if not data:
                             break
-                        chunk = sanitizer.feed(data.decode("utf-8", errors="replace"))
+                        chunk = sanitizer.feed(decoder.decode(data))
                         capture(chunk)
                         if stream_output:
                             sys.stderr.write(f"    \033[2m{chunk.rstrip()}\033[0m\n")
@@ -1019,14 +1044,15 @@ class LocalShellClient:
                                 r2, _, _ = select.select([master_fd], [], [], 0.1)
                                 if not r2:
                                     break
-                                data = os.read(master_fd, 4096)
+                                data = os.read(master_fd, _PTY_READ_SIZE)
                                 if not data:
                                     break
-                                chunk = sanitizer.feed(data.decode("utf-8", errors="replace"))
+                                chunk = sanitizer.feed(decoder.decode(data))
                                 capture(chunk)
                         except OSError:
                             pass
                         break
+                capture(sanitizer.feed(decoder.decode(b"", final=True)))
                 capture(sanitizer.finish())
             except KeyboardInterrupt:
                 proc.kill()

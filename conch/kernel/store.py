@@ -307,6 +307,11 @@ CREATE TABLE IF NOT EXISTS outbox (
     transport TEXT NOT NULL DEFAULT '',
     delivered_at REAL
 );
+-- Hot per-tick reads: folder-watch polls the inbox by source, and the
+-- outbox claim looks for due pending rows. Without these both scan tables
+-- that are never pruned (browser capture writes an inbox row per event).
+CREATE INDEX IF NOT EXISTS idx_inbox_source ON inbox(source, inbox_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, next_attempt_at);
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id TEXT PRIMARY KEY,
     mission_id TEXT NOT NULL,
@@ -3090,12 +3095,20 @@ class MissionStore:
 
     def list_dispatches(self, state: str = "", mission_id: str = "",
                         worker_id: str = "",
-                        parent_task_id: str = "") -> List[Dict[str, Any]]:
+                        parent_task_id: str = "",
+                        states=()) -> List[Dict[str, Any]]:
+        """Dispatch rows, oldest first. *states* filters to any of several
+        states in SQL (uses idx_dispatches_state) so per-tick callers don't
+        decode the whole, never-pruned history to find in-flight rows."""
         query = "SELECT * FROM dispatches"
         clauses, params = [], []
         if state:
             clauses.append("state=?")
             params.append(state)
+        states = [str(item) for item in (states or ())]
+        if states:
+            clauses.append("state IN (" + ",".join("?" * len(states)) + ")")
+            params.extend(states)
         if mission_id:
             clauses.append("mission_id=?")
             params.append(mission_id)

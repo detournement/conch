@@ -465,6 +465,8 @@ class RemoteLoop:
                 conv.usage, provider,
                 usage.get("model") or self.config.get("chat_model", self.config.get("model", "")),
                 in_tok, out_tok, self.config,
+                cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+                cache_write_tokens=usage.get("cache_creation_input_tokens", 0),
             )
         if reply:
             messages.append({"role": "assistant", "content": reply})

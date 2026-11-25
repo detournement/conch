@@ -258,11 +258,11 @@ PROVIDER_TOOL_LIMITS = {
     "openrouter": 128,
     # Local models drown in large tool lists: cap hard and select the most
     # relevant tools per turn (see tooling.select_relevant_tools). The cap
-    # is the pinned core (tooling.PINNED_TOOL_NAMES, 13 tools) plus 4 slots
+    # is the pinned core (tooling.PINNED_TOOL_NAMES, 15 tools) plus 4 slots
     # for tools picked by relevance (MCP servers, memory, search, ...).
-    "ollama": 17,
+    "ollama": 19,
     # Custom endpoints usually front local models too — stay conservative.
-    "custom": 17,
+    "custom": 19,
 }
 
 # Used for `/provider` and tool `set_provider` — stable defaults, not KNOWN_MODELS[0].

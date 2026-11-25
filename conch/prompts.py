@@ -69,8 +69,12 @@ _CHAT_BASE = (
     "- read_file / edit_file / write_file: use these for file contents and "
     "changes instead of shell cat/head, heredocs, echo redirection, or "
     "sed -i. read_file returns numbered lines (offset/limit for long files); "
-    "edit_file replaces an exact, unique old_string (read the file first); "
-    "write_file creates or fully replaces a file. The user reviews a diff "
+    "edit_file replaces an exact, unique old_string; write_file creates or "
+    "fully replaces a file. Read a file with read_file before editing or "
+    "replacing it: edits to unread files, or files changed on disk since "
+    "your last read, are refused (read again, then retry). An edit result "
+    "may include post_edit_check or hook diagnostics: fix what they report "
+    "before moving on. The user reviews a diff "
     "before edits apply, unless auto-execution is enabled. These builtins use "
     "the host user's filesystem permissions, not an MCP server's directory "
     "allowlist. Use the requested path (absolute, ~, or relative); missing "
@@ -78,6 +82,10 @@ _CHAT_BASE = (
     "or claim read-only access without an actual refusal from the appropriate "
     "tool. Respect real denials, and report saved only after a successful "
     "write or edit result.\n"
+    "- grep / glob: search file contents (regex; files, matching lines with "
+    "context, or counts) and find files by name pattern (newest first). Both "
+    "are read-only, never ask, and skip .gitignored files: prefer them over "
+    "grep, rg, find, or ls -R through local_shell.\n"
     "- web_fetch: fetch an http(s) URL as readable text (HTML, JSON, text). "
     "Never put secrets in a URL.\n"
     "- MCP tools: call external tools when available (Jira, web search, Gmail, etc.).\n"
@@ -162,7 +170,10 @@ _CHAT_LOCAL = (
     "- read_file/edit_file/write_file: host-user files, including absolute and ~ "
     "paths outside the working directory; not restricted to MCP directory lists. "
     "Use the requested path, not cat/heredocs/sed -i. Respect actual tool denials; "
-    "claim saved only after successful write/edit results.\n"
+    "claim saved only after successful write/edit results. Read a file before "
+    "editing it.\n"
+    "- grep/glob: search file contents and names (respects .gitignore, no "
+    "approval); prefer them to shell grep/find.\n"
     "- web_fetch: read an http(s) URL as text.\n"
     "- save_memory: remember durable preferences and facts.\n"
     "- search_conversations: recall past work; read known files first.\n"
@@ -286,6 +297,58 @@ def capitol_docs_guidance(config: dict = None) -> str:
         "Connecting Slack/Gmail/GitHub on Capitol is a platform question, not "
         "conch's /connect."
     )
+
+
+# ---------------------------------------------------------------------------
+# Coding guidance -- added to the chat system prompt inside a git repository
+# ---------------------------------------------------------------------------
+
+# Stable text (no per-turn values) so the system prompt prefix stays
+# cacheable. {search} is filled once per session by build_coding_guidance.
+CODING_GUIDANCE = (
+    "Working in a code repository:\n"
+    "- Find before you change. {search} Locate the definition, its callers "
+    "and the existing tests before editing, and follow the patterns already "
+    "in use.\n"
+    "- Read a file before editing it, and re-read the region after a failed "
+    "edit instead of guessing.\n"
+    "- Keep diffs minimal and focused on the request. Match the surrounding "
+    "style, naming and formatting; do not reformat, rename or refactor "
+    "unrelated code.\n"
+    "- Verify with the project's own checks. Discover them from the project "
+    "instructions, package.json scripts, pyproject.toml, tox.ini, "
+    "noxfile.py, Makefile or CI config (.github/workflows), and run the "
+    "relevant tests and linters before saying the work is done.\n"
+    "- Never claim tests pass without running them. Report what you ran, "
+    "the result, and anything you could not verify.\n"
+    "- Check git status and diff before and after changes. Commit, push or "
+    "open a pull request (gh pr create) only when the user asks; never "
+    "force-push or rewrite shared history. Conch snapshots the worktree "
+    "after every turn that changes files (/undo restores)."
+)
+
+_CODING_SEARCH_WITH_TOOLS = (
+    "Search with the grep tool (contents) and the glob tool (file names) "
+    "rather than guessing paths."
+)
+_CODING_SEARCH_WITH_SHELL = (
+    "Search with rg (ripgrep) through local_shell, e.g. rg -n 'name' or "
+    "rg --files -g '*.py', rather than guessing paths."
+)
+
+
+def build_coding_guidance(tool_names=None) -> str:
+    """The coding-guidance section for a session whose tools are *tool_names*.
+
+    Mentions the grep/glob tools only when both are available; otherwise
+    points at rg through local_shell.
+    """
+    names = set(tool_names or ())
+    search = (
+        _CODING_SEARCH_WITH_TOOLS if {"grep", "glob"} <= names
+        else _CODING_SEARCH_WITH_SHELL
+    )
+    return CODING_GUIDANCE.format(search=search)
 
 
 # ---------------------------------------------------------------------------

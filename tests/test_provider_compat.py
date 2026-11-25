@@ -322,6 +322,8 @@ class TestToolCapping(unittest.TestCase):
                 "read_file",
                 "edit_file",
                 "write_file",
+                "grep",
+                "glob",
                 "web_fetch",
             },
         )

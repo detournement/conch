@@ -356,14 +356,18 @@ class RemoteLoop:
             thread_id,
             sender,
         )
-        for key in ("read_file", "web_fetch"):
+        variants: Dict[int, Any] = {}
+        for key in ("read_file", "grep", "glob", "web_fetch"):
             # The pool's clients carry the hosting session's interactive
             # policy and permission mode; remote turns get non-interactive
             # prompt_all copies, so guarded reads and unlisted fetches
             # refuse instead of prompting the local terminal (or riding
-            # the host's /agent mode).
-            if hasattr(clients.get(key), "remote_variant"):
-                clients[key] = clients[key].remote_variant()
+            # the host's /agent mode). One copy per shared client.
+            client = clients.get(key)
+            if hasattr(client, "remote_variant"):
+                if id(client) not in variants:
+                    variants[id(client)] = client.remote_variant()
+                clients[key] = variants[id(client)]
         if "capitol_control" in clients:
             # Origin-bound variant: reads and HITL responses pass
             # through; an effectful start pins its exact payload into an

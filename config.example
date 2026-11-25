@@ -686,6 +686,27 @@ api_key_env=
 #hook_pre_tool_use=~/.config/conch/hooks/gate.sh
 #hook_post_tool_use=~/.config/conch/hooks/audit.sh
 #hook_on_turn_end=~/.config/conch/hooks/notify.sh
+# post_tool_use stdout (first 4000 chars) is appended to the tool result the
+# model sees, labelled "[post_tool_use hook output]", so a hook can feed it
+# diagnostics. Each hook has a 10s timeout.
+
+# --- Coding: edit checks and read-before-edit ----------------------------------
+# post_edit_check runs after every successful edit_file/write_file, in the
+# session's working directory, without an approval prompt (you configured
+# it). {path} becomes the shell-quoted changed path (relative to the working
+# directory when inside it). The exit status and the first 4000 chars of
+# stdout+stderr are appended to the edit's tool result, so the model sees
+# lint and type errors at once. A post_edit_check.<ext> entry overrides the
+# default for that file extension; an empty (or "off") one disables it.
+# Treat it like a hook: a project .conchrc can set it too.
+#post_edit_check=
+#post_edit_check.py=ruff check --quiet {path}
+#post_edit_check.ts=npx --no-install eslint {path}
+#post_edit_check.md=
+#post_edit_check_timeout=30
+# edit_file, and write_file replacing an existing file, refuse files not read
+# with read_file this session or changed on disk since the last read/write.
+#require_read_before_edit=true
 
 # --- Prompt overrides ---------------------------------------------------------
 # Map provider/model globs to your own system-prompt template files.

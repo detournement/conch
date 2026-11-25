@@ -2692,6 +2692,12 @@ def handle_slash_command(
         config_path = get_config_path()
         exists = "" if os.path.isfile(config_path) else "  \033[2m(not created yet — using defaults)\033[0m"
         print(f"    Config file:    {display_path(config_path)}{exists}")
+        from .config import loaded_project_instruction_files
+        project_files = loaded_project_instruction_files()
+        print(
+            "    Project docs:   "
+            + (", ".join(project_files) if project_files else "\033[2mnone\033[0m")
+        )
         if provider == "ollama":
             print(f"    Ollama server:  {get_ollama_base_url(config)}")
         elif provider == "custom":

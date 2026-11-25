@@ -2111,6 +2111,35 @@ def _add_cache_usage(total_usage: dict, usage: dict) -> None:
             total_usage[key] = total_usage.get(key, 0) + value
 
 
+def _after_tool_use(name: str, arguments: dict, result_text: str,
+                    config: Optional[dict], changed_path: Optional[str] = None,
+                    cwd: Optional[str] = None) -> str:
+    """The tool result the model sees, after the edit -> diagnostics loop.
+
+    A successful edit/write (*changed_path*) runs the configured
+    ``post_edit_check`` and appends its exit status and capped output.
+    Then the ``post_tool_use`` hook runs (with that result) and its
+    output, capped, is appended too, labelled, so a hook can feed the
+    model diagnostics. Both are user-configured; neither asks."""
+    from .filetools import cap_check_output, run_post_edit_check
+    from .tooling import run_hook
+
+    if changed_path:
+        check = run_post_edit_check(config, changed_path, cwd)
+        if check:
+            result_text += "\n\n" + check
+    ok, hook_out = run_hook(
+        "post_tool_use",
+        {"tool": name, "arguments": arguments, "result": result_text},
+        config,
+    )
+    hook_out = cap_check_output(str(hook_out or ""))
+    if hook_out:
+        status = "" if ok else " (hook exited non-zero)"
+        result_text += f"\n\n[post_tool_use hook output{status}]\n{hook_out}"
+    return result_text
+
+
 @contextlib.contextmanager
 def serialized_agent_execution():
     """Serialize inference/agent state that is still process-global."""
@@ -2874,11 +2903,15 @@ def chat_turn(
                     print("  \033[2m(arguments rewritten by pre_tool_use hook)\033[0m",
                           file=sys.stderr)
                 tool_failed = False
+                changed_path = None
                 checkpoint()
                 try:
                     if name in builtin_clients:
                         raw_result = builtin_clients[name].call_tool(name, arguments)
                         tool_failed = bool(raw_result.get("isError"))
+                        # Set by edit_file/write_file on success: the file
+                        # post_edit_check runs on.
+                        changed_path = raw_result.get("changed_path")
                         content_blocks = raw_result.get("content", [])
                         if isinstance(content_blocks, list):
                             result_text = "\n".join(
@@ -2925,10 +2958,10 @@ def chat_turn(
                         )
                 result_text = str(result_text or "(no output)")
                 if evaluation is None:
-                    run_hook(
-                        "post_tool_use",
-                        {"tool": name, "arguments": arguments, "result": result_text},
-                        config,
+                    result_text = _after_tool_use(
+                        name, arguments, result_text, config,
+                        changed_path=None if tool_failed else changed_path,
+                        cwd=getattr(builtin_clients.get(name), "cwd", None),
                     )
                 is_error = result_text.startswith("Error") or "error" in result_text[:50].lower()
                 if activity is None:

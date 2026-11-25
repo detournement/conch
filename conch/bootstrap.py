@@ -207,12 +207,12 @@ def make_builtin_clients(
         prefixes = [p.strip() for p in allow.split(",") if p.strip()]
         local_shell.allow_prefixes(prefixes)
         ssh_remote.allow_prefixes(prefixes)
-    # File tools (one client behind read_file/edit_file/write_file) and
+    # File tools (one client behind read_file/edit_file/write_file/grep/glob) and
     # web_fetch share local_shell's policy defaults and result budget.
     from .filetools import FILE_TOOL_NAMES, FileToolsClient
     from .webfetch import WebFetchClient
 
-    files = FileToolsClient(permissions=perms)
+    files = FileToolsClient(permissions=perms, config=config)
     files.set_policy(LocalShellPolicy(interactive=interactive, allow_auto_execute=perms.get_agent_mode()))
     files.set_result_budget(result_budget)
     web = WebFetchClient(permissions=perms, config=config)

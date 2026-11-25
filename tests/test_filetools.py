@@ -55,9 +55,17 @@ class FileToolsCase(unittest.TestCase):
         self.addCleanup(env.stop)
         self.addCleanup(self._tmp.cleanup)
 
+    #: Edit-semantics and approval tests change seeded files without a
+    #: read_file first, so they opt out of read-before-edit on purpose;
+    #: TestReadBeforeEdit (test_coding_tools.py) covers the guard itself.
+    CONFIG = {"require_read_before_edit": "false"}
+
     def client(self, mode="prompt_all", interactive=True, input_fn=None,
-               auto=False):
-        client = FileToolsClient(permissions=PermissionState(permission_mode=mode))
+               auto=False, config=None):
+        client = FileToolsClient(
+            permissions=PermissionState(permission_mode=mode),
+            config=dict(self.CONFIG) if config is None else config,
+        )
         client.set_policy(LocalShellPolicy(
             interactive=interactive, allow_auto_execute=auto,
             input_fn=input_fn or _never_called,

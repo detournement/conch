@@ -148,9 +148,10 @@ Registry models (`llamaidx/...`) and `auto` work only for `fanout_model`. When
 `fanout_model` is blank, fan-out workers use `subagent_model`, then the session
 model.
 
-Local providers (`ollama`, `custom`) send at most 17 tool schemas per request:
-13 always-pinned tools (shell, file read/edit/write, `web_fetch`,
-`delegate_task`, `conch_config`, ...) plus 4 slots chosen by relevance.
+Local providers (`ollama`, `custom`) send at most 19 tool schemas per request:
+15 always-pinned tools (shell, file read/edit/write, `grep`, `glob`,
+`web_fetch`, `delegate_task`, `conch_config`, ...) plus 4 slots chosen by
+relevance.
 
 ## Optional: make both endpoints named OMP subagents
 

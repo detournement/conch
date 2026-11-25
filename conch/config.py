@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 
 DEFAULT_CONFIG: Dict[str, str] = {
@@ -563,9 +565,30 @@ def resolve_editor(config: Optional[Dict[str, str]] = None) -> str:
 # Project-level context and config (plan 1.8)
 # ---------------------------------------------------------------------------
 
-PROJECT_CONTEXT_FILES = ("CONCH.md", "AGENTS.md")
-# Budget so project instructions can't swamp a small local model (~1.5k tokens)
+# Instruction files collected at every directory from the git root down to
+# cwd, in this precedence order within a directory. Conch's own file comes
+# first; other agents' conventions follow, so a repo that only carries
+# CLAUDE.md, Copilot or Cursor rules still gets its guidance read.
+PROJECT_CONTEXT_FILES = (
+    "CONCH.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".claude/CLAUDE.md",
+    ".github/copilot-instructions.md",
+    ".cursorrules",
+)
+# Cursor rule directory, read after the files above at each level. Only
+# rules with ``alwaysApply: true`` (or no frontmatter at all) load.
+PROJECT_CURSOR_RULES_DIR = ".cursor/rules"
+# Budget floor so project instructions can't swamp a small local model
+# (~1.5k tokens); large-window models get up to the ceiling.
 PROJECT_CONTEXT_MAX_CHARS = 6000
+PROJECT_CONTEXT_CEILING_CHARS = 24000
+# Share of the context window (~4 chars/token) the budget scales with:
+# 3% of a 200k-token window is the 24k-char ceiling.
+PROJECT_CONTEXT_WINDOW_SHARE = 0.03
+# A file cut to fewer chars than this is dropped instead of kept as a stub.
+_PROJECT_CONTEXT_MIN_PARTIAL = 200
 
 
 def _find_upwards(filenames, start_dir: str = "") -> Optional[Path]:
@@ -587,24 +610,272 @@ def find_project_rc(start_dir: str = "") -> Optional[Path]:
     return _find_upwards((".conchrc",), start_dir)
 
 
-def load_project_context(start_dir: str = "") -> str:
-    """Contents of the nearest CONCH.md/AGENTS.md, capped for small models.
+def project_context_budget(context_window: int = 0) -> int:
+    """Char budget for project instructions given a context window (tokens).
+
+    PROJECT_CONTEXT_MAX_CHARS is the floor (small local windows); the
+    budget grows with the window up to PROJECT_CONTEXT_CEILING_CHARS.
+    """
+    try:
+        window = int(context_window or 0)
+    except (TypeError, ValueError):
+        window = 0
+    scaled = int(window * 4 * PROJECT_CONTEXT_WINDOW_SHARE)
+    return max(PROJECT_CONTEXT_MAX_CHARS, min(PROJECT_CONTEXT_CEILING_CHARS, scaled))
+
+
+def _project_dirs(start_dir: str = "") -> List[Path]:
+    """Directories from the git root down to *start_dir*, root first.
+
+    Outside a git repository only *start_dir* itself is searched, so a
+    stray CLAUDE.md in $HOME never leaks into unrelated sessions.
+    """
+    start = Path(start_dir or os.getcwd()).resolve()
+    chain = [start]
+    current = start
+    while True:
+        if (current / ".git").exists():
+            return list(reversed(chain))
+        if current.parent == current:
+            return [start]
+        current = current.parent
+        chain.append(current)
+
+
+def _split_mdc_frontmatter(text: str):
+    """(frontmatter dict or None, body) for a Cursor ``.mdc`` rule."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, text
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            meta = {}
+            for line in lines[1:index]:
+                key, sep, value = line.partition(":")
+                if sep:
+                    meta[key.strip().lower()] = value.strip().strip("\"'")
+            return meta, "\n".join(lines[index + 1:])
+    return None, text
+
+
+def _read_text(path: Path) -> Optional[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
+def _cursor_rules(directory: Path) -> List[tuple]:
+    """(path, body) for the always-applied Cursor rules in *directory*."""
+    rules_dir = directory / PROJECT_CURSOR_RULES_DIR
+    try:
+        if not rules_dir.is_dir():
+            return []
+        candidates = sorted(rules_dir.glob("*.mdc"))
+    except OSError:
+        return []
+    found = []
+    for path in candidates:
+        text = _read_text(path)
+        if text is None:
+            continue
+        meta, body = _split_mdc_frontmatter(text)
+        if meta is not None and meta.get("alwaysapply", "").lower() != "true":
+            continue
+        found.append((path, body))
+    return found
+
+
+def discover_project_instructions(start_dir: str = "") -> List[tuple]:
+    """Ordered ``(label, path, text)`` for every project instruction file.
+
+    Walks from the git root (or *start_dir* outside a repo) down to
+    *start_dir*. Within a directory PROJECT_CONTEXT_FILES order applies,
+    then always-applied ``.cursor/rules/*.mdc`` in name order. Files are
+    deduplicated by real path (AGENTS.md is often a symlink to CLAUDE.md)
+    and by content hash. Labels are paths relative to the walk's root.
+    """
+    dirs = _project_dirs(start_dir)
+    base = dirs[0]
+    seen_paths = set()
+    seen_hashes = set()
+    entries = []
+
+    def _add(path: Path, text: str) -> None:
+        real = os.path.realpath(path)
+        if real in seen_paths:
+            return
+        seen_paths.add(real)
+        text = text.strip()
+        if not text:
+            return
+        digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+        if digest in seen_hashes:
+            return
+        seen_hashes.add(digest)
+        # A symlinked file (AGENTS.md -> CLAUDE.md) is labelled with the
+        # file it points at when that lives inside the project.
+        label = None
+        for candidate in (Path(real), path):
+            try:
+                label = candidate.relative_to(base).as_posix()
+                break
+            except ValueError:
+                continue
+        if label is None:
+            label = str(path)
+        entries.append((label, path, text))
+
+    for directory in dirs:
+        for filename in PROJECT_CONTEXT_FILES:
+            path = directory / filename
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
+                continue
+            text = _read_text(path)
+            if text is not None:
+                _add(path, text)
+        for path, body in _cursor_rules(directory):
+            _add(path, body)
+    return entries
+
+
+def render_project_instructions(entries, budget: int = PROJECT_CONTEXT_MAX_CHARS) -> tuple:
+    """``(prompt text, loaded labels)`` for *entries* within *budget* chars.
+
+    Root-first order is kept so deeper, more specific files come later.
+    Once the budget runs out the rest is cut, with a visible note saying
+    how much was left out; labels list only files that made it in.
+    """
+    blocks = []
+    loaded = []
+    remaining = max(0, int(budget))
+    omitted = 0
+    for label, _path, text in entries:
+        block = f"--- {label} ---\n{text}"
+        if len(block) <= remaining:
+            blocks.append(block)
+            loaded.append(label)
+            remaining -= len(block) + 2
+            continue
+        if remaining >= _PROJECT_CONTEXT_MIN_PARTIAL:
+            blocks.append(block[:remaining].rstrip())
+            loaded.append(f"{label} (truncated)")
+            omitted += len(block) - remaining
+        else:
+            omitted += len(block)
+        remaining = 0
+    if not blocks:
+        return "", []
+    body = (
+        "Project instructions (from the repository's instruction files, "
+        "root first; deeper files are more specific):\n" + "\n\n".join(blocks)
+    )
+    if omitted:
+        body += (
+            f"\n... [project instructions truncated: {omitted:,} more chars "
+            "not loaded; read the files directly if needed]"
+        )
+    return body, loaded
+
+
+def load_project_context(start_dir: str = "", budget: int = PROJECT_CONTEXT_MAX_CHARS) -> str:
+    """Merged project instruction files, capped at *budget* chars.
 
     These are persistent project instructions that live outside compactable
     history (the CLAUDE.md pattern); injected into the system prompt.
     """
-    path = _find_upwards(PROJECT_CONTEXT_FILES, start_dir)
-    if path is None:
-        return ""
-    try:
-        text = path.read_text().strip()
-    except OSError:
-        return ""
-    if not text:
-        return ""
-    if len(text) > PROJECT_CONTEXT_MAX_CHARS:
-        text = text[:PROJECT_CONTEXT_MAX_CHARS] + "\n... [project context truncated]"
-    return f"Project instructions (from {path}):\n{text}"
+    text, _loaded = render_project_instructions(
+        discover_project_instructions(start_dir), budget
+    )
+    return text
+
+
+# Session snapshot: the system prompt must stay byte-stable across turns
+# (provider prompt caching keys on the prefix), so the files are read once
+# per directory per process. Rendering is keyed by budget too, so a model
+# switch that changes the budget re-renders from the same snapshot.
+_PROJECT_CONTEXT_ENTRIES: Dict[str, list] = {}
+_PROJECT_CONTEXT_RENDERED: Dict[tuple, tuple] = {}
+_PROJECT_CONTEXT_LOADED: List[str] = []
+
+
+def session_project_context(budget: int = PROJECT_CONTEXT_MAX_CHARS, start_dir: str = "") -> str:
+    """Session-stable project instructions for the system prompt."""
+    directory = str(Path(start_dir or os.getcwd()).resolve())
+    entries = _PROJECT_CONTEXT_ENTRIES.get(directory)
+    if entries is None:
+        entries = discover_project_instructions(directory)
+        _PROJECT_CONTEXT_ENTRIES[directory] = entries
+    key = (directory, int(budget))
+    rendered = _PROJECT_CONTEXT_RENDERED.get(key)
+    if rendered is None:
+        rendered = render_project_instructions(entries, budget)
+        _PROJECT_CONTEXT_RENDERED[key] = rendered
+    _PROJECT_CONTEXT_LOADED[:] = rendered[1]
+    return rendered[0]
+
+
+def loaded_project_instruction_files() -> List[str]:
+    """Labels of the instruction files in the current system prompt."""
+    return list(_PROJECT_CONTEXT_LOADED)
+
+
+def reset_project_context_cache() -> None:
+    """Forget the session snapshot (tests; a fresh process re-reads)."""
+    _PROJECT_CONTEXT_ENTRIES.clear()
+    _PROJECT_CONTEXT_RENDERED.clear()
+    del _PROJECT_CONTEXT_LOADED[:]
+
+
+# A per-project .conchrc arrives with the repository, so it is untrusted:
+# cloning a repo and running conch in it must not let the repo run
+# commands (hooks, post_edit_check, editor), widen permissions
+# (permission_mode, allow_prefixes), or redirect traffic and credentials
+# (*_base_url, api_key_env, *_token_env, fallback routes, sandboxes).
+# Only these keys, which change model choice, limits and display, apply
+# from a project file; everything else must live in the user's own config.
+PROJECT_RC_ALLOWED_KEYS = frozenset({
+    "provider", "model", "chat_model", "subagent_model", "weak_model",
+    "weak_provider", "fanout_model", "model_effort", "model_context",
+    "tool_profile", "show_token_stats", "infobar", "colorscheme",
+    "multiline_paste", "git_checkpoints", "repo_map",
+    "session_summary_min_turns", "max_output_tokens",
+    "max_parallel_tool_calls", "max_identical_tool_batches",
+    "turn_token_budget", "child_token_budget", "max_delegation_depth",
+    "max_fan_out", "fanout_concurrency",
+    "ollama_context_window", "ollama_num_ctx", "ollama_num_predict",
+    "ollama_think", "ollama_keep_alive",
+    "custom_context_window", "custom_max_tokens",
+    "anthropic_prompt_cache", "http_keepalive",
+})
+
+_warned_project_rc: set = set()
+
+
+def _filter_project_rc(values: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    """Split a project .conchrc into (applied, ignored-key names)."""
+    allowed = {k: v for k, v in values.items() if k in PROJECT_RC_ALLOWED_KEYS}
+    ignored = sorted(k for k in values if k not in PROJECT_RC_ALLOWED_KEYS)
+    return allowed, ignored
+
+
+def _warn_ignored_project_keys(path: Path, ignored: List[str]) -> None:
+    if not ignored:
+        return
+    marker = (str(path), tuple(ignored))
+    if marker in _warned_project_rc:
+        return
+    _warned_project_rc.add(marker)
+    print(
+        f"conch: ignored {len(ignored)} setting(s) from project {path}: "
+        f"{', '.join(ignored)}. A project .conchrc may only choose models, "
+        "limits and display; put these in ~/.config/conch/config if you "
+        "trust them.",
+        file=sys.stderr,
+    )
 
 
 def load_config() -> Dict[str, str]:
@@ -622,11 +893,13 @@ def load_config() -> Dict[str, str]:
     explicit: Dict[str, str] = {}
     config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch"
     paths = [config_dir / "config", Path.home() / ".conchrc"]
-    project_rc = find_project_rc()
-    if project_rc is not None and project_rc != (Path.home() / ".conchrc"):
-        paths.append(project_rc)
     for path in paths:
         explicit.update(_parse_config_file(path))
+    project_rc = find_project_rc()
+    if project_rc is not None and project_rc != (Path.home() / ".conchrc"):
+        allowed, ignored = _filter_project_rc(_parse_config_file(project_rc))
+        explicit.update(allowed)
+        _warn_ignored_project_keys(project_rc, ignored)
     for env_name, key in ENV_CONFIG_KEYS.items():
         if env_name in os.environ:
             explicit[key] = os.environ[env_name].strip()

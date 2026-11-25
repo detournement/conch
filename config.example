@@ -110,10 +110,19 @@ api_key_env=
 
 # --- OpenRouter ---------------------------------------------------------------
 # Frontier models not on the other providers, via openrouter.ai:
-#   moonshotai/kimi-k3           (2.8T MoE, 1M context, $3/$15 per MTok)
-#   z-ai/glm-5.2                 (~750B MoE, 1M context, $0.98/$3.08 per MTok)
-#   deepseek/deepseek-v4-pro     (1.6T MoE, 1M context, $0.435/$0.87 per MTok)
-#   deepseek/deepseek-v4-flash   (284B MoE, 1M context, $0.14/$0.28 per MTok)
+#   moonshotai/kimi-k3.1-pro     (1M context, $0.24/$8.40 per MTok)
+#   moonshotai/kimi-k3           (2.8T MoE, 1M context, $0.19/$16 per MTok)
+#   z-ai/glm-5.3                 (1M context, $0.07/$1.40 per MTok)
+#   z-ai/glm-5.2                 (~750B MoE, 1M context, $0.62/$2.42 per MTok)
+#   deepseek/deepseek-v4-pro     (1.6T MoE, 1M context, $0.72/$1.52 per MTok)
+#   deepseek/deepseek-v4-flash   (284B MoE, 1M context, $0.09/$0.18 per MTok)
+#   google/gemini-4-neon         (1M context, $3/$15 per MTok)
+#   google/gemini-3.8-flash      (1M context, $0.825/$4.125 per MTok)
+#   qwen/qwen3.8-2.4t-a95b       (2.4T MoE, 1M context, $2/$6 per MTok)
+#   x-ai/grok-4.7                (500K context, $2/$6 per MTok)
+#   minimax/minimax-m3           (1M context, $0.30/$1.20 per MTok)
+#   meta/muse-wonder             (1M context, $4/$20 per MTok)
+#   mistralai/mistral-large-4-0  (1M context, $0.70/$2.10 per MTok)
 # Switch between them in chat with /model.
 #provider=openrouter
 #model=moonshotai/kimi-k3

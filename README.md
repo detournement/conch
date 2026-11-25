@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v0.9.9][release] ·
+[Current release: v1.0.0][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v0.9.9
+[release]: https://github.com/detournement/conch/releases/tag/v1.0.0
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -766,9 +766,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v0.9.9. GitHub releases include a
+`conch-shell` is not published on PyPI at v1.0.0. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v0.9.9` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v1.0.0` to install the release sdist.
 
 ### Updating
 
@@ -891,7 +891,8 @@ CLI's default alias (`model = default`). Both the picker and textual `/models`
 list also discover the signed-in Codex account's named models, including the
 available Sol, Astra, Terra, and Luna versions. Discovery uses native `model/list`,
 not the API-key catalog or Conch reading a credential/cache file. Selecting a
-named model still runs the live tool-call probe before switching.
+named model still runs the live tool-call probe, in the background after the
+switch like every `/model` switch.
 
 Chat, one-shots, and `conch-ask` use schema-constrained responses from the
 unmodified native client. Conch dispatches requested tools through its existing
@@ -1194,16 +1195,17 @@ was displayed on screen.
 Conch requires native structured tool calling. It rejects unsupported models
 instead of attempting to execute JSON or XML written as prose.
 
-The cloud catalog was live-audited on 2026-09-23:
+The OpenAI, OpenRouter, and Bedrock catalogs were live-audited on 2026-11-25
+(Anthropic on 2026-10-09):
 
 <!-- markdownlint-disable MD013 -->
 
 | Provider | Current catalog notes |
 | --- | --- |
 | Anthropic | Includes `claude-opus-5-5`, Opus 5, Sonnet 5, and verified 4.x models. Opus 5.5 uses automatic tool choice plus strict result verification because it rejects forced tool choice. |
-| OpenAI | Includes verified `gpt-6-sol`, `gpt-6-luna`, GPT-5.6 Sol/Terra/Luna, GPT-5.5/5.4, GPT-4.1/4o, and supported o-series models. Conch sends the required `reasoning_effort="none"` for GPT-6 and GPT-5.6 Chat Completions tool calls. |
-| Bedrock | `moonshotai.kimi-k2.5`, `moonshot.kimi-k2-thinking`, and `zai.glm-5` over Bedrock's OpenAI-compatible endpoint. |
-| OpenRouter | Kimi K3, GLM-5.2, and DeepSeek V4 Pro/Flash. |
+| OpenAI | Includes verified `gpt-6.1-terra`, `gpt-6-sol`, `gpt-6-luna`, GPT-5.6 Sol/Terra/Luna, GPT-5.5/5.4, GPT-4.1/4o, and `o3`. Conch sends the required `reasoning_effort="none"` for GPT-6.x and GPT-5.6 Chat Completions tool calls. `gpt-6-astra`, `gpt-6.1-sol`, and `gpt-6.2-sol`/`-astra` need v1/responses for tools and are not listed. |
+| Bedrock | `us.moonshotai.kimi-k3` (US inference profile), `moonshotai.kimi-k2.5`, `moonshot.kimi-k2-thinking`, `zai.glm-5`, `minimax.minimax-m2.5`, `deepseek.v3.2`, and `mistral.mistral-large-3-675b-instruct` over Bedrock's OpenAI-compatible endpoint. |
+| OpenRouter | Kimi K3.1 Pro/K3, GLM-5.3/5.2, DeepSeek V4 Pro/Flash, Gemini 4 Neon, Gemini 3.8 Flash, Qwen3.8 2.4T, Grok 4.7, MiniMax M3, Meta Muse Wonder, and Mistral Large 4. |
 | Cerebras | The adapter and catalog are present, but the 2026-09-23 audit had no key; treat the carried-forward entries as unverified until re-audited. |
 | Ollama | Models are discovered from `/api/tags` and shown only when the server advertises native tool support. |
 | Custom | OpenAI-compatible llama.cpp, vLLM, and LM Studio endpoints are discovered and must pass a native tool-call probe. |
@@ -1215,8 +1217,12 @@ Completions for OpenAI-compatible tools. In the interactive editor, `/models`
 and bare `/model` open the [model picker](#model-picker) across every provider,
 seat, local server, the llama-idx registry, and `extra_models`; `/provider`
 selects another provider. `/model <name> [--provider <name>]` accepts an
-explicit model ID and validates it before switching. Plain sessions retain the
-textual catalog.
+explicit model ID and validates it against the catalog before switching. The
+switch takes effect at once: for cloud and seat models the live model check
+runs in the background, and your next message waits for it only while it is
+still running. If the check fails, Conch switches back to the last working
+model and returns your message to the composer unsent. Plain sessions retain
+the textual catalog.
 
 ### Startup model check
 
@@ -1375,7 +1381,10 @@ Built-in tools are `local_shell`, `interactive_terminal`, `ssh_remote`,
 `llamaidx_registry`, `fleet_delegate`, and `capitol_control`. Ollama and custom
 endpoints are offered at most 17 tools per request: 13 pinned ones (shell, SSH,
 file tools, `web_fetch`, `delegate_task`, `conch_config`, ...) plus four picked
-by relevance.
+by relevance. On every provider, tool schemas are also held to about 35% of
+the context budget: when the enabled tools would take more, a request carries
+the pinned tools plus the most relevant others that fit, so a large MCP
+catalog cannot crowd the conversation out of the context window.
 
 Tool calls are canonicalized and schema-validated before hooks or execution.
 Only native tool calls are executable; repeated identical call batches stop.
@@ -1397,9 +1406,12 @@ Only native tool calls are executable; repeated identical call batches stop.
   a transcript is written or indexed — the running session keeps the
   original; what the user typed is stored as typed.
 - Foreground chat and `conch "..."` tool turns have no default round limit.
-  Conch automatically summarizes older history as it reaches roughly 70% of
-  the context budget, keeping recent tool exchanges; if summarization fails,
-  fallback compression caps older results and drops old complete exchanges.
+  Conch automatically summarizes history from before your current request as
+  it reaches roughly 70% of the context budget; the request and its tool
+  exchanges stay verbatim. When a request still exceeds the budget, fallback
+  compression caps and then drops the oldest material first (earlier turns,
+  then the current turn's earliest tool exchanges) and never drops your
+  latest message.
   `/rounds N` sets an explicit limit, and `/rounds 0` restores unlimited rounds.
   Cancellation, repeated-call protection, and optional token budgets still
   apply. Scheduled, remote, delegated, and evaluation work keeps its own

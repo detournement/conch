@@ -182,10 +182,10 @@ class ResolveTests(unittest.TestCase):
         self.assertTrue(warning)
 
     def test_auto_matches_effort(self):
-        self.assertEqual(self.resolve("light", fanout_model="auto")[0].label,
-                         "openai/gpt-6-luna")
-        self.assertEqual(self.resolve("standard", fanout_model="auto")[0].label,
-                         "openai/gpt-6-sol")
+        for effort in ("light", "standard"):
+            choice = self.resolve(effort, fanout_model="auto")[0]
+            self.assertEqual(choice.provider, "openai")  # the session's provider
+            self.assertEqual(fanout.model_tier(choice.provider, choice.model), effort)
 
 
 class _Parent:

@@ -305,18 +305,29 @@ def char_count(messages: List[dict], tools: Optional[List[dict]] = None) -> int:
     return total + int(image_count * IMAGE_TOKENS * CHARS_PER_TOKEN)
 
 
+def _token_cost(
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+    *,
+    key: str = "default",
+) -> float:
+    """Unrounded estimate_tokens: costs of disjoint message lists add up
+    exactly, so a budget can be tracked group by group."""
+    # Images are a fixed per-image cost; only text goes through the ratio.
+    messages, image_count = without_payloads(messages)
+    return (
+        char_count(messages, tools) / get_chars_per_token(key)
+        + image_count * IMAGE_TOKENS
+    )
+
+
 def estimate_tokens(
     messages: List[dict],
     tools: Optional[List[dict]] = None,
     *,
     key: str = "default",
 ) -> int:
-    # Images are a fixed per-image cost; only text goes through the ratio.
-    messages, image_count = without_payloads(messages)
-    return (
-        int(char_count(messages, tools) / get_chars_per_token(key))
-        + image_count * IMAGE_TOKENS
-    )
+    return int(_token_cost(messages, tools, key=key))
 
 
 def format_context_gauge(used_tokens: int, window: int) -> str:
@@ -437,6 +448,10 @@ def truncate_tool_result(text: str, provider: str, config: Optional[dict] = None
 
 AUTO_COMPACT_THRESHOLD = 0.7  # of the context budget
 AUTO_COMPACT_KEEP_RECENT = 6  # messages kept verbatim
+# Tool schemas are re-sent with every request. Holding them to half the
+# auto-compaction threshold leaves the conversation at least as much room
+# as the tools before summarization starts.
+TOOL_SCHEMA_BUDGET_FRACTION = AUTO_COMPACT_THRESHOLD / 2
 
 _COMPACT_SYSTEM_PROMPT = (
     "You compress conversation history. Summarize the transcript into a "
@@ -519,6 +534,28 @@ def _recent_group_start(
     return recent_start
 
 
+def _is_user_request(message: dict) -> bool:
+    """Something the user said (a request or mid-turn guidance), not the
+    tool results Anthropic carries in a user-role message."""
+    return message.get("role") == "user" and not is_anthropic_tool_result(message)
+
+
+def _current_turn_start(messages: List[dict], start: int = 0) -> int:
+    """Index of the user message that opened the turn in progress: the
+    earliest user message after the last assistant reply that called no
+    tools. ``len(messages)`` when the history ends with such a reply."""
+    turn = len(messages)
+    for index in range(len(messages) - 1, start - 1, -1):
+        message = messages[index]
+        if message.get("role") == "assistant" and not (
+            message.get("tool_calls") or has_anthropic_tool_use(message)
+        ):
+            break
+        if _is_user_request(message):
+            turn = index
+    return turn
+
+
 def _prepend_history_note(recent: List[dict], text: str) -> List[dict]:
     """Insert a compaction note without creating a second system message."""
     note = f"[Earlier conversation context]\n{text}"
@@ -534,9 +571,14 @@ def _prepend_history_note(recent: List[dict], text: str) -> List[dict]:
 def _compaction_span(messages: List[dict]) -> tuple:
     """(start, cut): ``messages[start:cut]`` is the older history a
     compaction summarizes — after the system prompt, before the last few
-    whole tool-call groups."""
+    whole tool-call groups and before the turn in progress. The current
+    request and its tool rounds stay verbatim; compress_context bounds a
+    turn that outgrows the budget by itself."""
     start = 1 if messages and messages[0].get("role") == "system" else 0
-    return start, _recent_group_start(messages, start, AUTO_COMPACT_KEEP_RECENT)
+    return start, min(
+        _recent_group_start(messages, start, AUTO_COMPACT_KEEP_RECENT),
+        _current_turn_start(messages, start),
+    )
 
 
 def can_compact(messages: List[dict]) -> bool:
@@ -556,9 +598,10 @@ def auto_compact(
     focus: str = "",
 ) -> bool:
     """LLM-generated compaction: at ~70% of the context budget, replace older
-    history with a single model-written summary, keeping the system prompt
-    and the last few messages verbatim. *force* (/compact) skips the
-    threshold; *focus* is appended to the summarizer's instruction.
+    history with a single model-written summary, keeping the system prompt,
+    the turn in progress, and at least the last few messages verbatim.
+    *force* (/compact) skips the threshold; *focus* is appended to the
+    summarizer's instruction.
 
     Returns True when history was compacted. On any failure (summary call
     errors, empty summary) leaves messages untouched — the cheap char-capping
@@ -652,56 +695,138 @@ def summarize_message(message: dict, keep_images: bool = False) -> dict:
     return message
 
 
+_DROPPED_NOTE = re.compile(
+    r"\[Earlier conversation context\]\n(\d+) older messages were dropped to "
+    r"fit the active model context window\.(?: (\d+) of them were from "
+    r"earlier tool calls on the current request\.)?(?:\n\n|\Z)"
+)
+
+
+def _dropped_note(dropped: int, from_turn: int) -> str:
+    text = (
+        f"{dropped} older messages were dropped to fit the active model "
+        "context window."
+    )
+    if from_turn:
+        text += (
+            f" {from_turn} of them were from earlier tool calls on the "
+            "current request."
+        )
+    return text
+
+
+def _take_dropped_note(message: dict) -> tuple:
+    """(rest, dropped, from_turn): *message* without a leading drop note and
+    the counts that note carried; *rest* is None when the note was the whole
+    message. Folding the counts into the next note keeps repeated passes from
+    stacking notes on the current request."""
+    content = message.get("content")
+    match = (
+        _DROPPED_NOTE.match(content)
+        if message.get("role") == "user" and isinstance(content, str)
+        else None
+    )
+    if match is None:
+        return message, 0, 0
+    rest = content[match.end():]
+    return (
+        {**message, "content": rest} if rest else None,
+        int(match.group(1)),
+        int(match.group(2) or 0),
+    )
+
+
 def compress_context(
     messages: List[dict],
     tools: Optional[List[dict]],
     provider: str,
     config: Optional[dict] = None,
 ) -> List[dict]:
+    """Fit an over-budget request by giving up the oldest material first.
+
+    Older history is char-capped, then dropped one whole group at a time (a
+    tool call never loses its results); then the turn in progress gives up
+    its earlier tool rounds the same way, and its latest round is capped.
+    The user's own messages in the turn in progress go last, and the latest
+    one is never dropped: the model must always see the request it is
+    working on.
+    """
     limit = get_context_limit(provider, config)
     key = calibration_key(provider, config)
     if estimate_tokens(messages, tools, key=key) <= limit:
         return messages
     has_system = bool(messages) and messages[0].get("role") == "system"
-    start = 1 if has_system else 0
     system = [messages[0]] if has_system else []
-    spans = _history_group_spans(messages, start)
-    # The latest real user turn keeps its images: it is what the model is
-    # being asked about. Older images collapse to placeholders.
-    current = len(messages)
-    for index in range(len(messages) - 1, start - 1, -1):
-        if messages[index].get("role") == "user" and not is_anthropic_tool_result(
-            messages[index]
-        ):
-            current = index
+    history = messages[len(system):]
+    dropped = from_turn = 0
+    if history:
+        first, dropped, from_turn = _take_dropped_note(history[0])
+        history = ([first] if first is not None else []) + history[1:]
+    spans = _history_group_spans(history)
+    turn = _current_turn_start(history)
+    # The latest user message keeps its images when capped (base64 is never
+    # sliced); older images collapse to placeholders.
+    latest = max(
+        (index for index, message in enumerate(history) if _is_user_request(message)),
+        default=len(history),
+    )
+    older, rounds, asks = [], [], []
+    for group, (begin, _end) in enumerate(spans):
+        if begin < turn:
+            older.append(group)
+        elif _is_user_request(history[begin]):
+            asks.append(group)
+        else:
+            rounds.append(group)
+    last = len(spans) - 1
+    steps = (
+        [("cap", group) for group in older]
+        + [("drop", group) for group in older if group != last]
+        + [("cap", group) for group in rounds if group != last]
+        + [("drop", group) for group in rounds if group != last]
+        + [("cap", group) for group in rounds if group == last]
+        + [("cap", group) for group in asks]
+        + [("drop", group) for group in asks[:-1]]
+    )
+    groups = [history[begin:end] for begin, end in spans]
+    costs = [_token_cost(members, key=key) for members in groups]
+    total = _token_cost(system, tools, key=key) + sum(costs)
+    in_turn = set(rounds)
+    removed = set()
+
+    def note_cost() -> float:
+        if not dropped:
+            return 0.0
+        note = _prepend_history_note([], _dropped_note(dropped, from_turn))
+        return _token_cost(note, key=key)
+
+    for action, group in steps:
+        if total + note_cost() <= limit:
             break
-    groups = [
-        [
-            summarize_message(messages[index], keep_images=index >= current)
+        if action == "drop":
+            removed.add(group)
+            total -= costs[group]
+            dropped += len(groups[group])
+            if group in in_turn:
+                from_turn += len(groups[group])
+            continue
+        begin, end = spans[group]
+        capped = [
+            summarize_message(history[index], keep_images=index >= latest)
             for index in range(begin, end)
         ]
-        for begin, end in spans
+        cost = _token_cost(capped, key=key)
+        total += cost - costs[group]
+        groups[group], costs[group] = capped, cost
+    body = [
+        message
+        for group, members in enumerate(groups)
+        if group not in removed
+        for message in members
     ]
-    dropped_messages = 0
-
-    def candidate() -> List[dict]:
-        body = [message for group in groups for message in group]
-        if dropped_messages:
-            body = _prepend_history_note(
-                body,
-                f"{dropped_messages} older messages were dropped to fit "
-                "the active model context window.",
-            )
-        return system + body
-
-    compressed = candidate()
-    while (
-        len(groups) > 1
-        and estimate_tokens(compressed, tools, key=key) > limit
-    ):
-        dropped_messages += len(groups.pop(0))
-        compressed = candidate()
-    return compressed
+    if dropped:
+        body = _prepend_history_note(body, _dropped_note(dropped, from_turn))
+    return system + body
 
 
 def canonical_tool_call(raw: dict, index: int) -> dict:
@@ -1656,6 +1781,7 @@ def select_request_tools(
     provider_tool_limits: Dict[str, int],
     pinned_names=None,
     query: Optional[str] = None,
+    config: Optional[dict] = None,
 ) -> Optional[List[dict]]:
     """Select the exact tools offered to the model for this request.
 
@@ -1663,17 +1789,37 @@ def select_request_tools(
     survive the per-provider relevance cap alongside the built-in pins.
     *query* is the text relevance is judged against; it defaults to the
     latest user message.
+
+    Every request re-sends the schemas, so beyond the provider's count cap
+    they are held to TOOL_SCHEMA_BUDGET_FRACTION of the context budget
+    (*config* sizes it): the pinned tools plus the most relevant others
+    that fit. A large catalog must not crowd the conversation itself out.
     """
+    from .tooling import PINNED_TOOL_NAMES, select_relevant_tools
+
     send_tools = list(tools or [])
+    if query is None:
+        query = _latest_user_text(messages)
     tool_limit = provider_tool_limits.get(provider)
     if tool_limit and len(send_tools) > tool_limit:
-        from .tooling import select_relevant_tools
-
         send_tools = select_relevant_tools(
-            send_tools,
-            _latest_user_text(messages) if query is None else query,
-            tool_limit, pinned_names,
+            send_tools, query, tool_limit, pinned_names,
         )
+    key = calibration_key(provider, config)
+    budget = get_context_limit(provider, config) * TOOL_SCHEMA_BUDGET_FRACTION
+    if estimate_tokens([], send_tools, key=key) > budget:
+        always = PINNED_TOOL_NAMES | set(pinned_names or ())
+        # The most tools that fit; pinned ones (and at least one) always go.
+        low = max(1, sum(_tool_name(tool) in always for tool in send_tools))
+        high = len(send_tools) - 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            picked = select_relevant_tools(send_tools, query, mid, pinned_names)
+            if estimate_tokens([], picked, key=key) <= budget:
+                low = mid
+            else:
+                high = mid - 1
+        send_tools = select_relevant_tools(send_tools, query, low, pinned_names)
     return send_tools or None
 
 
@@ -2105,6 +2251,7 @@ def chat_turn(
             tools, provider, messages, PROVIDER_TOOL_LIMITS,
             getattr(chat_state, "pinned_tools", None),
             query="\n".join(relevance),
+            config=config,
         )
         # Model-generated compaction first (plan 1.4); char-capping
         # compress_context stays as the cheap backstop below.
@@ -2342,6 +2489,7 @@ def chat_turn(
                         tools, fb_provider, messages, PROVIDER_TOOL_LIMITS,
                         getattr(chat_state, "pinned_tools", None),
                         query="\n".join(relevance),
+                        config=fb_config,
                     )
                     fb_tool_names = {
                         _tool_name(tool)

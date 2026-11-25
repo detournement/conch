@@ -9,6 +9,7 @@
 1.5: token-aware tool-result truncation.
 """
 
+import json
 import re
 import unittest
 from unittest.mock import patch
@@ -16,16 +17,18 @@ from unittest.mock import patch
 from conch import app as app_mod
 from conch.app import _augment_user_message, _build_system_prompt
 from conch.prompts import get_chat_prompt
-from conch.providers import error_response
+from conch.providers import PROVIDER_TOOL_LIMITS, error_response
 from conch.runtime import (
     CHARS_PER_TOKEN,
     auto_compact,
     char_count,
+    compress_context,
     estimate_tokens,
     format_context_gauge,
     get_chars_per_token,
     record_token_calibration,
     reset_token_calibration,
+    select_request_tools,
     tool_result_char_budget,
     truncate_middle,
     truncate_tool_result,
@@ -284,6 +287,113 @@ class TestAutoCompact(CalibrationTestCase):
                     msgs[i - 1].get("tool_calls"),
                     "tool result must directly follow its tool call",
                 )
+
+
+REQUEST = "transcribe yo.aup3 into a new folder"
+
+
+def _turn_in_progress(rounds):
+    """Two finished turns, then a request whose tool rounds are under way."""
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(2):
+        msgs += [{"role": "user", "content": f"earlier question {i}"},
+                 {"role": "assistant", "content": f"earlier answer {i} " + "y" * 400}]
+    msgs.append({"role": "user", "content": REQUEST})
+    for i in range(rounds):
+        msgs += [
+            {"role": "assistant", "content": f"step {i}", "tool_calls": [{
+                "id": f"c{i}", "type": "function",
+                "function": {"name": "local_shell", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": f"c{i}", "content": f"output {i} " + "z" * 3000},
+        ]
+    return msgs
+
+
+def _dropped_count(msgs):
+    found = re.findall(r"(\d+) older messages were dropped", json.dumps(msgs))
+    return [int(count) for count in found]
+
+
+class TestTurnInProgressSurvivesCompaction(CalibrationTestCase):
+    def test_fallback_compression_keeps_the_request_being_worked_on(self):
+        msgs = _turn_in_progress(12)
+        with patch("conch.runtime.get_context_limit", return_value=1200):
+            result = compress_context(msgs, None, "openai", {})
+        self.assertLessEqual(estimate_tokens(result), 1200)
+        self.assertTrue(any(
+            m["role"] == "user" and m["content"].endswith(REQUEST) for m in result
+        ))
+        # Older turns go before the request's own work; the latest round is intact.
+        self.assertNotIn("earlier answer", json.dumps(result))
+        self.assertEqual(result[-1], msgs[-1])
+        self.assertIn("earlier tool calls on the current request", json.dumps(result))
+        for index, message in enumerate(result):
+            if message["role"] == "tool":
+                self.assertTrue(result[index - 1].get("tool_calls"))
+
+    def test_repeated_compression_keeps_one_cumulative_note(self):
+        with patch("conch.runtime.get_context_limit", return_value=1200):
+            first = compress_context(_turn_in_progress(12), None, "openai", {})
+            grown = first + _turn_in_progress(14)[-4:]
+            second = compress_context(grown, None, "openai", {})
+        self.assertEqual(len(_dropped_count(first)), 1)
+        self.assertEqual(len(_dropped_count(second)), 1)
+        self.assertGreater(_dropped_count(second)[0], _dropped_count(first)[0])
+        self.assertTrue(second[1]["content"].endswith(REQUEST))
+
+    def test_summary_leaves_the_request_and_its_rounds_verbatim(self):
+        msgs = _turn_in_progress(4)
+        seen = {}
+
+        def raw_fn(config, summary_messages, tools):
+            seen["transcript"] = summary_messages[1]["content"]
+            return {"content": "- earlier answers covered", "tool_calls": None}
+
+        # Over the 70% threshold, yet roomy enough that the side model's
+        # transcript is not middle-truncated.
+        with patch("conch.runtime.get_context_limit", return_value=4000):
+            self.assertTrue(auto_compact(msgs, None, "ollama", {}, raw_fn))
+        self.assertIn("earlier answer 1", seen["transcript"])
+        self.assertNotIn(REQUEST, seen["transcript"])
+        self.assertNotIn("output 0", seen["transcript"])
+        self.assertIn("earlier answers covered", msgs[1]["content"])
+        self.assertTrue(msgs[1]["content"].endswith(REQUEST))
+        self.assertEqual(msgs[2:], _turn_in_progress(4)[-8:])
+
+
+class TestToolSchemaBudget(CalibrationTestCase):
+    def _tools(self):
+        def tool(name, description):
+            return {"type": "function", "function": {
+                "name": name, "description": description,
+                "parameters": {"type": "object", "properties": {}},
+            }}
+        tools = [tool(f"crm_tool_{i}", "crm records " + "d" * 2000) for i in range(50)]
+        return tools + [
+            tool("audio_transcribe", "transcribe audio " + "d" * 2000),
+            tool("local_shell", "run a command " + "d" * 2000),
+        ]
+
+    def test_large_catalog_is_held_to_the_schema_budget(self):
+        messages = [{"role": "user", "content": "transcribe this audio"}]
+        with patch("conch.runtime.get_context_limit", return_value=10000):
+            sent = select_request_tools(
+                self._tools(), "codex", messages, PROVIDER_TOOL_LIMITS, config={},
+            )
+        names = {tool["function"]["name"] for tool in sent}
+        self.assertLessEqual(estimate_tokens([], sent), 3500)
+        self.assertIn("local_shell", names)  # pinned
+        self.assertIn("audio_transcribe", names)  # most relevant
+        self.assertLess(len(sent), 52)
+
+    def test_catalog_within_budget_is_sent_whole(self):
+        messages = [{"role": "user", "content": "transcribe this audio"}]
+        with patch("conch.runtime.get_context_limit", return_value=10**6):
+            sent = select_request_tools(
+                self._tools(), "codex", messages, PROVIDER_TOOL_LIMITS, config={},
+            )
+        self.assertEqual(len(sent), 52)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ stale scrub results, and the search index always matches a full rebuild.
 
 import json
 import os
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path

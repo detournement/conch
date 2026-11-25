@@ -521,7 +521,7 @@ class TestArtifactPullerBackoff(PlaneHarness):
     def test_oversized_declared_artifact_not_queued(self):
         worker_id = self.enroll("w1", "host-1")
         plane = TaskPlane(self.store, self.registry, self.factory)
-        puller = ArtifactPuller(plane, self.root / "store", lambda l: None)
+        puller = ArtifactPuller(plane, self.root / "store", lambda _line: None)
         added = puller.add_dispatch(
             {"task_id": "t1", "result": {"artifacts": [
                 {"name": "x", "digest": "cd" * 32, "size": 1 << 40},

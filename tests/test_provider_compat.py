@@ -124,9 +124,13 @@ class TestBuildOpenAIRequestBody(unittest.TestCase):
         self.assertNotIn("max_tokens", body)
 
     def test_gpt56_tools_force_no_reasoning(self):
-        """gpt-5.6-{sol,terra,luna} reject function tools on chat completions
-        unless reasoning_effort="none" (verified live 2026-09-14)."""
-        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        """gpt-5.6-{sol,terra,luna}, gpt-6-{sol,luna}, and gpt-6.1-terra
+        reject function tools on chat completions unless
+        reasoning_effort="none" (verified live 2026-09-14/09-23/11-25)."""
+        for model in (
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra",
+        ):
             body = build_openai_chat_request_body(
                 model, [{"role": "user", "content": "hi"}],
                 temperature=0.7, max_completion_tokens=1024,
@@ -616,7 +620,7 @@ class TestModelCatalog(unittest.TestCase):
         self.assertIn("gpt-4o", openai_models)
         self.assertIn("gpt-4o-mini", openai_models)
         self.assertIn("o3", openai_models)
-        self.assertIn("o4-mini", openai_models)
+        self.assertIn("gpt-6.1-terra", openai_models)
         self.assertIn("gpt-5.4", openai_models)
         self.assertIn("gpt-5.5", openai_models)
         self.assertIn("gpt-5.6-sol", openai_models)
@@ -626,9 +630,15 @@ class TestModelCatalog(unittest.TestCase):
     def test_openai_pruned_models_stay_out(self):
         """Pruned/quarantined 2026-09-14: bare gpt-5.6 does not exist, and
         the pro/codex models are v1/responses-only — conch's chat-completions
-        path cannot tool-call them."""
+        path cannot tool-call them. 2026-11-25: gpt-6.1-sol and
+        gpt-6.2-{sol,astra} are quarantined for the same reason (no effort
+        "none"); gpt-4.1-nano, o4-mini, o3-mini, o1 were deprecated."""
         openai_models = KNOWN_MODELS["openai"]
-        for model in ("gpt-5.6", "gpt-5.3-codex", "gpt-5.4-pro", "o3-pro", "o1-pro"):
+        for model in (
+            "gpt-5.6", "gpt-5.3-codex", "gpt-5.4-pro", "o3-pro", "o1-pro",
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra",
+            "gpt-4.1-nano", "o4-mini", "o3-mini", "o1",
+        ):
             self.assertNotIn(model, openai_models)
             self.assertNotIn(model, MODEL_PRICING)
 

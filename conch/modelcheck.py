@@ -34,6 +34,7 @@ import shutil
 import socket
 import sys
 import textwrap
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -848,6 +849,84 @@ def probe_candidate(candidate: Candidate, config: dict, timeout: float) -> Probe
     result = probe_model(candidate.provider, candidate.model, merged, timeout=timeout)
     candidate.result = result
     return result
+
+
+# ---------------------------------------------------------------------------
+# Background verification of a /model switch
+# ---------------------------------------------------------------------------
+
+ROUTE_KEYS = ("provider", "api_key_env", "chat_model", "model", "custom_model")
+# Runtime-only config key (like _evaluation_policy): the switch whose probe
+# the shell has not settled yet.
+ROUTE_CHECK_KEY = "_route_check"
+
+
+def _configured_route(config: dict) -> Tuple[str, str]:
+    """(provider, model) the session routes to, as AgentSession reads them."""
+    provider = str(config.get("provider") or "").lower()
+    return provider, config.get("chat_model", config.get("model", "")) or ""
+
+
+class RouteCheck:
+    """The live probe of a route /model just committed, running in the
+    background so the switch takes effect at once (a seat probe is a full
+    native-client generation). The shell settles it before the next message
+    uses the route and restores *previous*, the last route known to work,
+    when it fails."""
+
+    def __init__(self, provider: str, model: str, config: dict, previous: dict,
+                 timeout: Optional[float] = None):
+        self.provider, self.model = provider, model
+        self.previous = dict(previous)
+        self._result: Optional[ProbeResult] = None
+        # Bind the probe now: the thread runs what was in effect at the switch.
+        self._thread = threading.Thread(
+            target=self._run, args=(probe_model, dict(config), timeout),
+            name=f"conch-route-check-{provider}", daemon=True,
+        )
+        self._thread.start()
+
+    @classmethod
+    def begin(cls, config: dict, provider: str, model: str, probe_config: dict, *,
+              timeout: Optional[float] = None) -> "RouteCheck":
+        """Start checking *provider*/*model* just before the caller commits it
+        to *config*, and record the check there for the shell to settle."""
+        pending = config.get(ROUTE_CHECK_KEY)
+        if isinstance(pending, cls) and (pending.provider, pending.model) == _configured_route(config):
+            previous = pending.previous  # the route in use is itself unverified
+        else:
+            previous = {key: config.get(key) for key in ROUTE_KEYS}
+        check = cls(provider, model, probe_config, previous, timeout)
+        config[ROUTE_CHECK_KEY] = check
+        return check
+
+    def _run(self, probe, config: dict, timeout: Optional[float]) -> None:
+        self._result = probe(self.provider, self.model, config, timeout=timeout)
+
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
+    def wait(self) -> ProbeResult:
+        self._thread.join()
+        return self._result or ProbeResult(
+            self.provider, self.model, ERROR, "verification did not finish")
+
+    def restore(self, config: dict) -> None:
+        """Put the last working route back into *config*."""
+        for key, value in self.previous.items():
+            if value is None:
+                config.pop(key, None)
+            else:
+                config[key] = value
+
+
+def take_route_check(config: dict, provider: str, model: str) -> Optional[RouteCheck]:
+    """Remove the pending switch check from *config*; return it when it is
+    for the route now in use (a switch by another path supersedes it)."""
+    check = config.pop(ROUTE_CHECK_KEY, None)
+    if isinstance(check, RouteCheck) and (check.provider, check.model) == (provider, model):
+        return check
+    return None
 
 
 def _routing_key(candidate: Optional[Candidate], config: dict) -> tuple:

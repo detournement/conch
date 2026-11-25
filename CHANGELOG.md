@@ -7,6 +7,47 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [1.0.0] - 2026-11-25
+
+### Added
+
+- Newer cloud models, each verified live for native tool calling on
+  2026-11-25. OpenRouter: Kimi K3.1 Pro, GLM-5.3, Gemini 4 Neon, Gemini 3.8
+  Flash, Qwen3.8 2.4T, Grok 4.7, MiniMax M3, Meta Muse Wonder, and Mistral
+  Large 4. OpenAI: `gpt-6.1-terra`. Bedrock: Kimi K3 (US inference profile),
+  MiniMax M2.5, DeepSeek V3.2, and Mistral Large 3.
+
+### Changed
+
+- Switching models with `/model` or the model picker takes effect at once.
+  The live model check now runs in the background (a ChatGPT or Claude seat
+  check is a full generation that took 3-7 seconds), and your next message
+  waits for it only if it is still running. If the check fails, Conch
+  switches back to the last working model and returns your message to the
+  composer unsent.
+- OpenRouter prices and the OpenAI, OpenRouter, and Bedrock audit dates are
+  refreshed. `gpt-6.1-sol` and `gpt-6.2-sol`/`-astra` stay out of the OpenAI
+  catalog because they need v1/responses for tool calls.
+
+### Removed
+
+- OpenAI `gpt-4.1-nano`, `o4-mini`, `o3-mini`, and `o1`: the API no longer
+  lists them and rejects them as deprecated.
+
+### Fixed
+
+- Conch no longer loses the request it is working on in the middle of a
+  turn. Automatic summarization now covers only history from before the
+  current request, so the request and its tool exchanges stay verbatim.
+  Fallback compression gives up earlier turns first, then the current
+  turn's earliest tool exchanges, and never drops your latest message.
+  Repeated compression keeps one cumulative note instead of stacking notes.
+- Large tool catalogs no longer crowd the conversation out of the context
+  window. Tool schemas are held to about 35% of the context budget per
+  request, keeping the pinned tools plus the most relevant others. With
+  200+ MCP tools on a 128K-window model such as a ChatGPT seat, requests
+  previously kept little more than the latest tool exchange.
+
 ## [0.9.9] - 2026-11-23
 
 ### Changed
@@ -639,6 +680,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[1.0.0]: https://github.com/detournement/conch/releases/tag/v1.0.0
 [0.9.9]: https://github.com/detournement/conch/releases/tag/v0.9.9
 [0.9.8]: https://github.com/detournement/conch/releases/tag/v0.9.8
 [0.9.7]: https://github.com/detournement/conch/releases/tag/v0.9.7

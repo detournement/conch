@@ -407,31 +407,62 @@ class TestModelSwitchProbes(unittest.TestCase):
             )
         return result, config, messages, captured, out.getvalue()
 
-    def test_switch_runs_probe_and_refreshes_state(self):
+    def test_switch_commits_at_once_and_probes_new_model_in_background(self):
         from conch import modelcheck
         ok = modelcheck.ProbeResult("anthropic", "claude-opus-5-5",
                                     modelcheck.OK, "listed by the provider")
-        result, config, messages, captured, _ = self._switch(ok)
-        # The model-check probe ran on the NEW model before committing.
-        self.assertEqual(captured, {"provider": "anthropic", "model": "claude-opus-5-5"})
-        # State refreshed to the new model (max_tokens etc. derive from this).
+        result, config, messages, captured, text = self._switch(ok)
+        # The route is committed before the probe settles.
         self.assertEqual(config["chat_model"], "claude-opus-5-5")
         self.assertEqual(config["model"], "claude-opus-5-5")
-        self.assertEqual(result[0], "anthropic")
-        self.assertEqual(result[1], "claude-opus-5-5")
-        # A switch note was recorded in history.
+        self.assertEqual(result[:2], ("anthropic", "claude-opus-5-5"))
+        self.assertIn("verifying in the background", text)
         self.assertTrue(any("switched" in str(m.get("content", "")).lower()
                             for m in messages))
+        check = modelcheck.take_route_check(config, "anthropic", "claude-opus-5-5")
+        self.assertTrue(check.wait().ok)
+        self.assertEqual(captured, {"provider": "anthropic", "model": "claude-opus-5-5"})
+        self.assertNotIn(modelcheck.ROUTE_CHECK_KEY, config)
 
-    def test_unusable_switch_is_refused_by_probe(self):
+    def test_failed_background_probe_restores_last_working_route(self):
         from conch import modelcheck
         bad = modelcheck.ProbeResult("anthropic", "claude-opus-5-5",
                                      modelcheck.MODEL_NOT_FOUND,
                                      "not in the provider catalog")
-        result, config, messages, captured, text = self._switch(bad)
-        self.assertIsNone(result, "an unusable model must not be switched to")
+        _, config, _, _, _ = self._switch(bad)
+        check = modelcheck.take_route_check(config, "anthropic", "claude-opus-5-5")
+        self.assertFalse(check.wait().ok)
+        check.restore(config)
         self.assertEqual(config["chat_model"], "claude-sonnet-5")
-        self.assertIn("Cannot switch", text)
+        self.assertEqual(config["model"], "claude-sonnet-5")
+        self.assertEqual(config["provider"], "anthropic")
+
+    def test_chained_switches_restore_the_last_verified_route(self):
+        from conch import commands, modelcheck
+        config = {"provider": "anthropic", "chat_model": "claude-sonnet-5",
+                  "model": "claude-sonnet-5", "api_key_env": "ANTHROPIC_API_KEY"}
+        bad = modelcheck.ProbeResult("anthropic", "x", modelcheck.ERROR, "down")
+        with patch.dict(os.environ, DUMMY_KEY), \
+                patch("sys.stdout", io.StringIO()), \
+                patch("conch.modelcheck.probe_model", return_value=bad):
+            for model in ("claude-opus-5-5", "claude-opus-5"):
+                commands.handle_slash_command(
+                    f"/model {model}", config, config["provider"],
+                    config["chat_model"], lambda *a, **k: None,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        check = modelcheck.take_route_check(config, "anthropic", "claude-opus-5")
+        self.assertFalse(check.wait().ok)
+        check.restore(config)
+        # Not claude-opus-5-5: that pick was never verified either.
+        self.assertEqual(config["chat_model"], "claude-sonnet-5")
+
+    def test_check_for_a_superseded_route_is_dropped(self):
+        from conch import modelcheck
+        ok = modelcheck.ProbeResult("anthropic", "claude-opus-5-5", modelcheck.OK, "")
+        _, config, _, _, _ = self._switch(ok)
+        self.assertIsNone(modelcheck.take_route_check(config, "ollama", "llama3.3"))
+        self.assertNotIn(modelcheck.ROUTE_CHECK_KEY, config)
 
     def test_switch_skips_probe_when_model_check_off(self):
         config = {"provider": "anthropic", "chat_model": "claude-sonnet-5",

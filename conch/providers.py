@@ -50,24 +50,43 @@ KNOWN_MODELS = {
         "gemma-4-31b",
         "zai-glm-4.7",
     ],
-    # AWS Bedrock via its OpenAI-compatible endpoint (us-east-2), all three
-    # re-verified with forced tool-call probes 2026-09-14. Kimi K3 is still
-    # not in Bedrock's managed catalog; use OpenRouter for it.
+    # AWS Bedrock via its OpenAI-compatible endpoint (us-east-2), all
+    # re-verified with forced tool-call probes 2026-11-25. The runtime
+    # endpoint has no /models route; existence was cross-checked against
+    # bedrock-mantle's /v1/models list and the probe is authoritative.
+    # Kimi K3 is on-demand only via the US cross-region inference profile
+    # (bare moonshotai.kimi-k3 returns 400 "on-demand throughput isn't
+    # supported").
     "bedrock": [
+        "us.moonshotai.kimi-k3",
         "moonshotai.kimi-k2.5",
         "moonshot.kimi-k2-thinking",
         # Z.AI GLM-5 (744B MoE, ~44B active) — biggest GLM on Bedrock,
         # verified live in us-east-2 (also us-east-1/us-west-2).
         "zai.glm-5",
+        "minimax.minimax-m2.5",
+        "deepseek.v3.2",
+        "mistral.mistral-large-3-675b-instruct",
     ],
     # OpenRouter (openrouter.ai) — OpenAI-compatible gateway to frontier
     # models not available on other providers here. All listed models
-    # re-verified for native tool calling 2026-09-14.
+    # re-verified for native tool calling 2026-11-25. Not listed because
+    # this account's OpenRouter data policy leaves no endpoint (HTTP 404):
+    # z-ai/glm-5.3-prime, qwen/qwen4-max, qwen/qwen3.8-max-*, qwen3.7-max.
     "openrouter": [
+        "moonshotai/kimi-k3.1-pro",
         "moonshotai/kimi-k3",
+        "z-ai/glm-5.3",
         "z-ai/glm-5.2",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-flash",
+        "google/gemini-4-neon",
+        "google/gemini-3.8-flash",
+        "qwen/qwen3.8-2.4t-a95b",
+        "x-ai/grok-4.7",
+        "minimax/minimax-m3",
+        "meta/muse-wonder",
+        "mistralai/mistral-large-4-0",
     ],
     # Conch requires native tool calling over /v1/chat/completions, so only
     # models that pass the forced-tool probe there are listed (e.g. o1-mini
@@ -82,14 +101,20 @@ KNOWN_MODELS = {
     #   gpt-6-astra — tool calling requires v1/responses, and it does not
     #   support reasoning_effort="none", so the chat-completions escape
     #   hatch the other GPT-6 models have is unavailable.
+    # Quarantined 2026-11-25 for the same reason (tools need v1/responses
+    # and effort "none" is rejected: only low/medium/high/xhigh):
+    #   gpt-6.2-sol, gpt-6.2-astra, gpt-6.1-sol
     # Re-add them only if/when conch grows a v1/responses adapter.
+    # Pruned 2026-11-25 (absent from /v1/models AND probe 404 "deprecated"):
+    #   gpt-4.1-nano, o4-mini, o3-mini, o1
     "openai": [
-        # gpt-6-{sol,luna} and gpt-5.6-{sol,terra,luna} tool-call on chat
-        # completions only with reasoning_effort="none" (sent automatically
-        # by build_openai_chat_request_body; see
-        # _openai_tools_require_effort_none). gpt-6 verified live
-        # 2026-09-23: with effort "none" the forced probe passes; without
-        # it the API returns 400 pointing at v1/responses.
+        # gpt-6.1-terra, gpt-6-{sol,luna} and gpt-5.6-{sol,terra,luna}
+        # tool-call on chat completions only with reasoning_effort="none"
+        # (sent automatically by build_openai_chat_request_body; see
+        # _openai_tools_require_effort_none). Verified live 2026-11-25:
+        # with effort "none" the forced probe passes; without it the API
+        # returns 400 pointing at v1/responses.
+        "gpt-6.1-terra",
         "gpt-6-sol",
         "gpt-6-luna",
         "gpt-5.6-sol",
@@ -103,13 +128,9 @@ KNOWN_MODELS = {
         "gpt-5-nano",
         "gpt-4.1",
         "gpt-4.1-mini",
-        "gpt-4.1-nano",
         "gpt-4o",
         "gpt-4o-mini",
-        "o4-mini",
         "o3",
-        "o3-mini",
-        "o1",
     ],
     # Pruned 2026-09-14 (absent from /v1/models AND 404 on a direct probe):
     #   claude-fable-5, claude-sonnet-4-7
@@ -160,33 +181,45 @@ MODEL_VERIFIED = {
     "gpt-oss-120b": _CEREBRAS_UNVERIFIED,
     "gemma-4-31b": _CEREBRAS_UNVERIFIED,
     "zai-glm-4.7": _CEREBRAS_UNVERIFIED,
-    "moonshotai.kimi-k2.5": "2026-09-23",
-    "moonshot.kimi-k2-thinking": "2026-09-23",
-    "zai.glm-5": "2026-09-23",
-    "moonshotai/kimi-k3": "2026-09-23",
-    "z-ai/glm-5.2": "2026-09-23",
-    "deepseek/deepseek-v4-pro": "2026-09-23",
-    "deepseek/deepseek-v4-flash": "2026-09-23",
-    "gpt-6-sol": "2026-09-23",
-    "gpt-6-luna": "2026-09-23",
-    "gpt-5.6-sol": "2026-09-23",
-    "gpt-5.6-terra": "2026-09-23",
-    "gpt-5.6-luna": "2026-09-23",
-    "gpt-5.5": "2026-09-23",
-    "gpt-5.4": "2026-09-23",
-    "gpt-5.4-mini": "2026-09-23",
-    "gpt-5.4-nano": "2026-09-23",
-    "gpt-5-mini": "2026-09-23",
-    "gpt-5-nano": "2026-09-23",
-    "gpt-4.1": "2026-09-23",
-    "gpt-4.1-mini": "2026-09-23",
-    "gpt-4.1-nano": "2026-09-23",
-    "gpt-4o": "2026-09-23",
-    "gpt-4o-mini": "2026-09-23",
-    "o4-mini": "2026-09-23",
-    "o3": "2026-09-23",
-    "o3-mini": "2026-09-23",
-    "o1": "2026-09-23",
+    # Bedrock, OpenRouter, and OpenAI catalogs re-audited live 2026-11-25
+    # (tools/audit_models.py: existence + forced native tool-call probe).
+    "us.moonshotai.kimi-k3": "2026-11-25 (tools)",
+    "moonshotai.kimi-k2.5": "2026-11-25 (tools)",
+    "moonshot.kimi-k2-thinking": "2026-11-25 (tools)",
+    "zai.glm-5": "2026-11-25 (tools)",
+    "minimax.minimax-m2.5": "2026-11-25 (tools)",
+    "deepseek.v3.2": "2026-11-25 (tools)",
+    "mistral.mistral-large-3-675b-instruct": "2026-11-25 (tools)",
+    "moonshotai/kimi-k3.1-pro": "2026-11-25 (tools)",
+    "moonshotai/kimi-k3": "2026-11-25 (tools)",
+    "z-ai/glm-5.3": "2026-11-25 (tools)",
+    "z-ai/glm-5.2": "2026-11-25 (tools)",
+    "deepseek/deepseek-v4-pro": "2026-11-25 (tools)",
+    "deepseek/deepseek-v4-flash": "2026-11-25 (tools)",
+    "google/gemini-4-neon": "2026-11-25 (tools)",
+    "google/gemini-3.8-flash": "2026-11-25 (tools)",
+    "qwen/qwen3.8-2.4t-a95b": "2026-11-25 (tools)",
+    "x-ai/grok-4.7": "2026-11-25 (tools)",
+    "minimax/minimax-m3": "2026-11-25 (tools)",
+    "meta/muse-wonder": "2026-11-25 (tools)",
+    "mistralai/mistral-large-4-0": "2026-11-25 (tools)",
+    "gpt-6.1-terra": "2026-11-25 (tools)",
+    "gpt-6-sol": "2026-11-25 (tools)",
+    "gpt-6-luna": "2026-11-25 (tools)",
+    "gpt-5.6-sol": "2026-11-25 (tools)",
+    "gpt-5.6-terra": "2026-11-25 (tools)",
+    "gpt-5.6-luna": "2026-11-25 (tools)",
+    "gpt-5.5": "2026-11-25 (tools)",
+    "gpt-5.4": "2026-11-25 (tools)",
+    "gpt-5.4-mini": "2026-11-25 (tools)",
+    "gpt-5.4-nano": "2026-11-25 (tools)",
+    "gpt-5-mini": "2026-11-25 (tools)",
+    "gpt-5-nano": "2026-11-25 (tools)",
+    "gpt-4.1": "2026-11-25 (tools)",
+    "gpt-4.1-mini": "2026-11-25 (tools)",
+    "gpt-4o": "2026-11-25 (tools)",
+    "gpt-4o-mini": "2026-11-25 (tools)",
+    "o3": "2026-11-25 (tools)",
     # Anthropic catalog re-audited live 2026-10-09 (existence + native
     # tool-call probe via tools/audit_models.py): all pass. The "(tools…)"
     # suffix records the tool_choice mode the probe used — claude-opus-5-5
@@ -254,16 +287,31 @@ MODEL_CONTEXT_WINDOWS = {
     "gpt-oss-120b": 131072,
     "gemma-4-31b": 131072,
     "zai-glm-4.7": 131072,
-    # bedrock (Moonshot Kimi, Z.AI GLM)
+    # bedrock (no window in Bedrock's list; per OpenRouter's listing of the
+    # same model, 2026-11-25)
+    "us.moonshotai.kimi-k3": 1048576,
     "moonshotai.kimi-k2.5": 262144,
     "moonshot.kimi-k2-thinking": 262144,
     "zai.glm-5": 202752,  # Bedrock's listed window (model card says 200K-class)
-    # openrouter (windows per openrouter.ai/api/v1/models, verified 2026-07)
+    "minimax.minimax-m2.5": 65536,  # conservative: OpenRouter's listed window
+    "deepseek.v3.2": 163840,
+    "mistral.mistral-large-3-675b-instruct": 262144,
+    # openrouter (windows per openrouter.ai/api/v1/models, verified 2026-11-25)
+    "moonshotai/kimi-k3.1-pro": 1048576,
     "moonshotai/kimi-k3": 1048576,
+    "z-ai/glm-5.3": 1048576,
     "z-ai/glm-5.2": 1048576,
     "deepseek/deepseek-v4-pro": 1048576,
     "deepseek/deepseek-v4-flash": 1048576,
+    "google/gemini-4-neon": 1048576,
+    "google/gemini-3.8-flash": 1048576,
+    "qwen/qwen3.8-2.4t-a95b": 1048576,
+    "x-ai/grok-4.7": 500000,
+    "minimax/minimax-m3": 1048576,
+    "meta/muse-wonder": 1048576,
+    "mistralai/mistral-large-4-0": 1048576,
     # openai
+    "gpt-6.1-terra": 1050000,
     "gpt-6-sol": 1050000,
     "gpt-6-luna": 1050000,
     "gpt-5.6-sol": 1050000,
@@ -277,13 +325,9 @@ MODEL_CONTEXT_WINDOWS = {
     "gpt-5-nano": 400000,
     "gpt-4.1": 1047576,
     "gpt-4.1-mini": 1047576,
-    "gpt-4.1-nano": 1047576,
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
-    "o4-mini": 200000,
     "o3": 200000,
-    "o3-mini": 200000,
-    "o1": 200000,
     # anthropic (1M is the default window from Sonnet 4.6 / Opus 4.6 onward)
     "claude-opus-5-5": 1000000,
     "claude-opus-5": 1000000,
@@ -1068,14 +1112,30 @@ MODEL_PRICING = {
     "zai-glm-4.7":                 (0.00, 0.00),
     "moonshotai.kimi-k2.5":        (0.60, 3.00),
     "moonshot.kimi-k2-thinking":   (0.60, 2.50),
-    # Bedrock on-demand US-region rates (aws.amazon.com/bedrock/pricing).
+    # Bedrock on-demand standard US-region rates (AWS price list API,
+    # AmazonBedrock us-east-2, 2026-11-25).
     "zai.glm-5":                   (1.00, 3.20),
-    # OpenRouter rates (openrouter.ai/api/v1/models, verified 2026-08).
-    "moonshotai/kimi-k3":          (3.00, 15.00),
-    "z-ai/glm-5.2":                (0.98, 3.08),
-    "deepseek/deepseek-v4-pro":    (0.435, 0.87),
-    "deepseek/deepseek-v4-flash":  (0.14, 0.28),
-    # GPT-6 rates per developers.openai.com/api/docs/pricing (2026-09-23).
+    "us.moonshotai.kimi-k3":       (3.30, 16.50),
+    "minimax.minimax-m2.5":        (0.30, 1.20),
+    "deepseek.v3.2":               (0.62, 1.85),
+    "mistral.mistral-large-3-675b-instruct": (0.50, 1.50),
+    # OpenRouter rates (openrouter.ai/api/v1/models, verified 2026-11-25).
+    "moonshotai/kimi-k3.1-pro":    (0.2403, 8.4023),
+    "moonshotai/kimi-k3":          (0.192, 16.00),
+    "z-ai/glm-5.3":                (0.0699, 1.40),
+    "z-ai/glm-5.2":                (0.62, 2.42),
+    "deepseek/deepseek-v4-pro":    (0.72341, 1.5228),
+    "deepseek/deepseek-v4-flash":  (0.09, 0.18),
+    "google/gemini-4-neon":        (3.00, 15.00),
+    "google/gemini-3.8-flash":     (0.825, 4.125),
+    "qwen/qwen3.8-2.4t-a95b":      (2.00, 6.00),
+    "x-ai/grok-4.7":               (2.00, 6.00),
+    "minimax/minimax-m3":          (0.30, 1.20),
+    "meta/muse-wonder":            (4.00, 20.00),
+    "mistralai/mistral-large-4-0": (0.70, 2.10),
+    # GPT-6 rates per developers.openai.com/api/docs/pricing (2026-09-23);
+    # gpt-6.1-terra per OpenRouter's openai/gpt-6.1-terra (2026-11-25).
+    "gpt-6.1-terra":               (1.00, 5.00),
     "gpt-6-sol":                   (2.00, 10.00),
     "gpt-6-luna":                  (0.10, 0.50),
     "gpt-5.6-sol":                 (5.00, 30.00),
@@ -1089,13 +1149,9 @@ MODEL_PRICING = {
     "gpt-5-nano":                  (0.20, 1.25),
     "gpt-4.1":                     (2.00, 8.00),
     "gpt-4.1-mini":                (0.40, 1.60),
-    "gpt-4.1-nano":                (0.10, 0.40),
     "gpt-4o":                      (2.50, 10.00),
     "gpt-4o-mini":                 (0.15, 0.60),
-    "o4-mini":                     (1.10, 4.40),
     "o3":                          (2.00, 8.00),
-    "o3-mini":                     (1.10, 4.40),
-    "o1":                          (15.00, 60.00),
     # Opus 5.5 per platform.claude.com pricing (2026-09-23).
     "claude-opus-5-5":             (4.00, 20.00),
     "claude-opus-5":               (5.00, 25.00),
@@ -1211,14 +1267,17 @@ def _openai_tools_require_effort_none(model: str) -> bool:
     otherwise).
 
     gpt-5.6-{sol,terra,luna} verified live 2026-09-14; gpt-6-{sol,luna}
-    verified live 2026-09-23 (with "none" the forced probe passes; without
-    it: "Function tools with reasoning_effort are not supported ... use
-    /v1/responses or set reasoning_effort to 'none'"). gpt-6-astra is NOT
-    handled here: it does not support effort "none" at all, so it stays
-    out of the catalog until a v1/responses adapter exists.
+    verified live 2026-09-23; gpt-6.1-terra verified live 2026-11-25 (with
+    "none" the forced probe passes; without it: "Function tools with
+    reasoning_effort are not supported ... use /v1/responses or set
+    reasoning_effort to 'none'"). gpt-6-astra, gpt-6.1-sol, and
+    gpt-6.2-{sol,astra} are NOT handled here: they reject effort "none",
+    so they stay out of the catalog until a v1/responses adapter exists.
     """
     name = model.lower().strip()
-    return name.startswith("gpt-5.6") or name.startswith(("gpt-6-sol", "gpt-6-luna"))
+    return name.startswith("gpt-5.6") or name.startswith(
+        ("gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra")
+    )
 
 
 def anthropic_forced_tool_choice_supported(model: str) -> bool:

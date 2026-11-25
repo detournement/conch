@@ -1700,6 +1700,32 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                     continue
                 user_input = _custom_prompt
 
+            # A model chosen moments ago is verified in the background
+            # (/model): settle that before this message uses it, and go back
+            # to the last working route if it failed.
+            from .modelcheck import take_route_check
+            _route_check = take_route_check(config, provider, model_name)
+            if _route_check is not None:
+                with (contextlib.nullcontext() if _route_check.done()
+                      else Spinner(f"Verifying {provider}/{model_name}")):
+                    _route_probe = _route_check.wait()
+                if not _route_probe.ok:
+                    _route_check.restore(config)
+                    _refresh_model(normalize_history=True)
+                    from .runtime import append_model_switch_note
+                    append_model_switch_note(
+                        messages, provider=provider, model=model_name, config=config
+                    )
+                    _save_current()
+                    print(
+                        f"\n  \033[31m✗ {_route_probe.label} {_route_probe.describe()}\033[0m\n"
+                        f"  \033[2mSwitched back to {provider}/{model_name}; "
+                        "your message was not sent.\033[0m\n"
+                    )
+                    if _ui:
+                        _ui.prefill(user_input)
+                    continue
+
             # Preflight after a failed turn (plan 3.3): don't burn the message
             # against a dead server — check first and offer a clean retry.
             if _backend_failed and provider == "ollama":

@@ -305,9 +305,9 @@ class TaskPlane:
     def poll_once(self) -> Dict[str, int]:
         stats = {"events": 0, "completed": 0, "failed": 0, "requeued": 0,
                  "delegated": 0, "resumed": 0}
-        for dispatch in self.store.list_dispatches():
-            if dispatch["state"] not in DispatchState.IN_FLIGHT:
-                continue
+        for dispatch in self.store.list_dispatches(
+            states=DispatchState.IN_FLIGHT
+        ):
             try:
                 self._poll_dispatch(dispatch, stats)
             except Exception as exc:  # a single bad worker can't stall others

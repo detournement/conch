@@ -284,7 +284,16 @@ class SSHControlManager:
         if tty:
             argv.append("-tt")
         else:
-            argv.extend(["-T", "-o", "BatchMode=yes"])
+            # Unattended execs (fleet RPCs, captured ssh_remote exec) must
+            # not hang on a host that is down without refusing: bound the
+            # connect and detect a dead peer, instead of waiting out the
+            # caller's whole RPC timeout on every call.
+            argv.extend([
+                "-T", "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=3",
+            ])
         argv.extend(self._target_options(target))
         argv.extend(["--", target.host])
         if command:

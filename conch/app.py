@@ -1911,7 +1911,9 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                     get_context_limit,
                 )
                 cost_str = record_session_usage(
-                    session_usage, provider, used_model, in_tok, out_tok, config
+                    session_usage, provider, used_model, in_tok, out_tok, config,
+                    cache_read_tokens=turn_usage.get("cache_read_input_tokens", 0),
+                    cache_write_tokens=turn_usage.get("cache_creation_input_tokens", 0),
                 )
                 ctx_used = estimate_tokens(
                     messages, key=calibration_key(provider, config)

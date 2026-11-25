@@ -1749,6 +1749,7 @@ def _graceful_exhaustion(
     if is_error_response(response):
         return fallback
     usage = response.get("_usage", {})
+    _add_cache_usage(total_usage, usage)
     total_usage["input_tokens"] += usage.get("input_tokens", 0)
     total_usage["output_tokens"] += usage.get("output_tokens", 0)
     content = (response.get("content") or "").strip()
@@ -2100,6 +2101,16 @@ def diagnose_undispatchable_response(
     return line, shape
 
 
+def _add_cache_usage(total_usage: dict, usage: dict) -> None:
+    """Carry prompt-cache counters (Anthropic) into the turn totals so cost
+    can price cached input at its discounted rate. ``input_tokens`` already
+    includes them: it stays the full prompt size for gauges/calibration."""
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if value:
+            total_usage[key] = total_usage.get(key, 0) + value
+
+
 @contextlib.contextmanager
 def serialized_agent_execution():
     """Serialize inference/agent state that is still process-global."""
@@ -2333,6 +2344,7 @@ def chat_turn(
             if is_error_response(response):
                 evaluation.provider_error(error_detail(response))
         usage = response.get("_usage", {})
+        _add_cache_usage(total_usage, usage)
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)
         total_usage["model"] = response.get("_model", total_usage["model"])
@@ -2374,6 +2386,7 @@ def chat_turn(
                     with Spinner("Retrying"):
                         response = raw_fn(config, send_messages, send_tools)
                 usage = response.get("_usage", {})
+                _add_cache_usage(total_usage, usage)
                 total_usage["input_tokens"] += usage.get("input_tokens", 0)
                 total_usage["output_tokens"] += usage.get("output_tokens", 0)
                 total_usage["model"] = response.get(
@@ -2406,6 +2419,7 @@ def chat_turn(
                     with Spinner("Retrying with the new key"):
                         response = raw_fn(config, send_messages, send_tools)
                 usage = response.get("_usage", {})
+                _add_cache_usage(total_usage, usage)
                 total_usage["input_tokens"] += usage.get("input_tokens", 0)
                 total_usage["output_tokens"] += usage.get("output_tokens", 0)
                 total_usage["model"] = response.get("_model", total_usage["model"])
@@ -2547,6 +2561,7 @@ def chat_turn(
                         send_messages = fb_messages
                         send_tools = fb_tools
                         usage = response.get("_usage", {})
+                        _add_cache_usage(total_usage, usage)
                         total_usage["input_tokens"] += usage.get(
                             "input_tokens", 0
                         )

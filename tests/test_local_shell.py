@@ -449,6 +449,29 @@ class TestCapturedTerminalText(unittest.TestCase):
         self.assertEqual(
             "".join(sanitizer.feed(char) for char in raw) + sanitizer.finish(), expected)
 
+    def test_fast_path_matches_per_character_state_machine(self):
+        # feed() short-circuits control-free chunks; the result must be
+        # identical to the per-character state machine whatever the chunking.
+        import random
+        import re
+        from unittest import mock
+
+        alphabet = ["a", "b", "\u00e9", "\u6f22", " ", "\n", "\r", "\t", "\b",
+                    "\x1b[1m", "\x1b]0;t\x07", "\x07", "\x9b2J", "\x00"]
+        rng = random.Random(1234)
+        for trial in range(500):
+            raw = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
+            # Reference: a pattern matching every char disables the fast path.
+            with mock.patch("conch.tooling._CONTROL_CHAR_RE", re.compile(r"[\s\S]")):
+                reference = _CapturedTerminalText()
+                expected = reference.feed(raw) + reference.finish()
+            cuts = sorted(rng.sample(range(len(raw) + 1), min(4, len(raw) + 1)))
+            pieces = [raw[i:j] for i, j in zip([0] + cuts, cuts + [len(raw)])]
+            fast = _CapturedTerminalText()
+            got = "".join(fast.feed(p) for p in pieces) + fast.finish()
+            with self.subTest(trial=trial, raw=raw):
+                self.assertEqual(got, expected)
+
     def test_unterminated_control_payload_is_not_returned(self):
         sanitizer = _CapturedTerminalText()
         self.assertEqual(sanitizer.feed("text\x1b]52;c;") + sanitizer.finish(), "text")
@@ -484,6 +507,37 @@ class TestLocalShellExecution(_QuietStdout, unittest.TestCase):
         client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))
         result = client.call_tool("local_shell", {"command": ""})
         self.assertIn("empty", result["content"][0]["text"].lower())
+
+    def test_multibyte_utf8_split_across_reads_is_preserved(self):
+        # The capture reads in fixed-size chunks; a multibyte character
+        # straddling a read boundary must decode intact, not as U+FFFD.
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))
+        script = (
+            "import sys; w = sys.stdout.buffer; "
+            "[(w.write(b'\\xe6'), w.flush(), __import__('time').sleep(0.05), "
+            "w.write(b'\\xbc\\xa2'), w.flush()) for _ in range(3)]"
+        )
+        with _CaptureStderr():
+            result = client.call_tool(
+                "local_shell",
+                {"command": f"{sys.executable} -c \"{script}\""},
+            )
+        text = result["content"][0]["text"]
+        self.assertEqual(text, "漢" * 3)
+        self.assertNotIn("�", text)
+
+    def test_large_output_is_truncated_to_budget(self):
+        client = LocalShellClient()
+        client.set_policy(LocalShellPolicy(interactive=False, allow_auto_execute=True))
+        client.set_result_budget(4000)
+        with _CaptureStderr():
+            result = client.call_tool("local_shell", {"command": "seq 1 200000"})
+        text = result["content"][0]["text"]
+        self.assertTrue(text.startswith("1\n2\n3\n"))
+        self.assertTrue(text.endswith("200000"))
+        self.assertIn("truncated", text)
+        self.assertLessEqual(len(text), 4200)
 
     def test_nonzero_exit_appended(self):
         client = LocalShellClient()

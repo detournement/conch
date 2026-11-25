@@ -24,6 +24,10 @@ api_key_env=
 #model=claude-sonnet-5
 #chat_model=claude-sonnet-5
 #api_key_env=ANTHROPIC_API_KEY
+# Prompt caching is on by default for Anthropic: each tool round re-reads
+# the tool schemas, system prompt and history from cache (billed at ~0.1x)
+# instead of reprocessing them. Set to false to opt out.
+#anthropic_prompt_cache=true
 
 # --- AWS Bedrock (Moonshot Kimi) example -------------------------------------
 # Uses Bedrock's OpenAI-compatible endpoint with a long-term Bedrock API key

@@ -8,6 +8,7 @@ import ipaddress
 import os
 import re
 import secrets
+import socket
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -234,9 +235,17 @@ class SSHControlManager:
             options.extend(["-l", target.user])
         return options
 
-    def connect_argv(self, target: SSHTarget) -> list[str]:
+    def connect_argv(
+        self, target: SSHTarget, *, batch: bool = False
+    ) -> list[str]:
+        """Argv that starts a backgrounded ControlMaster for *target*.
+
+        ``batch=True`` is for unattended masters (the fleet controller):
+        never prompt, and bound the connect so a dead host fails fast. The
+        default (interactive ``ssh_remote`` connect) is unchanged.
+        """
         control_path = self._reserve_control_path(target)
-        return [
+        argv = [
             "ssh",
             "-M",
             "-S",
@@ -249,12 +258,20 @@ class SSHControlManager:
             "ServerAliveInterval=30",
             "-o",
             "ServerAliveCountMax=3",
+        ]
+        if batch:
+            argv.extend([
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+            ])
+        argv.extend([
             "-N",
             "-f",
             *self._target_options(target),
             "--",
             target.host,
-        ]
+        ])
+        return argv
 
     def check_argv(self, target: SSHTarget) -> list[str]:
         return [
@@ -450,6 +467,36 @@ class SSHControlManager:
         else:
             self._purge_stale(target)
         return connected
+
+    def master_ready(self, target: SSHTarget) -> bool:
+        """Cheap, spawn-free liveness check of a master this process owns.
+
+        Connects to the control socket directly (no ``ssh -O check``
+        process). A missing or refusing socket means the master is gone:
+        it is purged so the next :meth:`connect_argv` can reserve the path
+        again. Used by unattended callers that check before every exec.
+        """
+
+        if target.identity not in self._owned_targets:
+            return False
+        path = self.control_path(target)
+        if not self._socket_is_owned(path):
+            self._purge_stale(target)
+            return False
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        try:
+            probe.connect(str(path))
+        except (ConnectionRefusedError, FileNotFoundError):
+            self._purge_stale(target)
+            return False
+        except OSError:
+            # Transient local trouble (e.g. a busy accept queue): do not
+            # destroy a master that may be alive.
+            return True
+        finally:
+            probe.close()
+        return True
 
     def connected_targets(self) -> list[SSHTarget]:
         connected = []

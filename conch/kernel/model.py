@@ -607,6 +607,12 @@ EVENT_KINDS = frozenset({
     "outbox_enqueued",
     "inbox_received",
     "inbox_processed",
+    # Retention (MissionStore.apply_retention): journaled deletions of old
+    # inbox/outbox projection rows so replay removes exactly what the live
+    # database removed. Chained under mission_id "". The events they prune
+    # (inbox_received / outbox_enqueued) stay in the journal.
+    "inbox_pruned",
+    "outbox_pruned",
     "session_started",
     "session_checkpointed",
     "session_abandoned",

@@ -23,8 +23,15 @@ without double execution):
   fenced receipts, retry by failure class with backoff,
 - heartbeat-sweep the fleet on its own cadence (silent worker →
   UNREACHABLE + requeue),
-- pull completed tasks' content-addressed artifacts into the local store,
-- record worker-reported skill inventories (capability, never authority).
+- queue completed tasks' content-addressed artifacts for the artifact
+  thread, which streams them into the local store off the tick,
+- record worker-reported skill inventories (capability, never authority)
+  from the heartbeat sweep's own ``worker.status`` results.
+
+Per-tick cost is bounded: every worker RPC rides one shared SSH
+ControlMaster per host (no handshake per call), a worker that fails a
+transport call is skipped for the rest of the tick and backed off, and
+artifact bytes never move on the tick thread.
 
 The daemon reuses the edge daemon's machinery exactly as Phase 1
 promised: the same ``_KernelLock`` flock + adopted-epoch ownership, the
@@ -55,7 +62,7 @@ from ..kernel.model import DispatchState, KernelError, WorkerState
 from ..kernel.store import MissionStore, default_state_dir
 from ..swarm.protocol import TaskEnvelope
 from . import authority
-from .plane import TaskPlane
+from .plane import ARTIFACT_PULL_MAX_BYTES, TaskPlane
 from .registry import FleetRegistry
 
 CONTROLLER_LOG_MAX_BYTES = 1024 * 1024
@@ -93,23 +100,34 @@ def ensure_adhoc_mission(store: MissionStore) -> str:
     })
 
 
-def default_transport_factory(config: Optional[dict] = None):
+class PooledTransportFactory:
     """WorkerTransport factory over each worker's recorded SSH identity.
+
+    All transports share one :class:`SSHConnectionPool`, so each worker
+    host gets one ControlMaster (started lazily, re-established on
+    failure) instead of a fresh SSH connection per RPC. ``close()`` stops
+    the masters; the controller calls it on shutdown.
 
     The remote relay command is per-worker: enrollment records where
     hostctl was bootstrapped (``labels.hostctl``); hosts with a full conch
     install fall back to the ``conch-hostctl`` console script.
     """
-    from ..ssh_control import SSHControlManager, SSHTarget
-    from .transport import WorkerTransport
 
-    manager = SSHControlManager()
-    try:
-        rpc_timeout = float((config or {}).get("fleet_rpc_timeout", 60.0))
-    except (TypeError, ValueError):
-        rpc_timeout = 60.0
+    def __init__(self, config: Optional[dict] = None, *, pool=None):
+        from .transport import SSHConnectionPool
 
-    def factory(worker: Dict[str, Any]) -> WorkerTransport:
+        self.pool = pool or SSHConnectionPool()
+        try:
+            self.rpc_timeout = float(
+                (config or {}).get("fleet_rpc_timeout", 60.0)
+            )
+        except (TypeError, ValueError):
+            self.rpc_timeout = 60.0
+
+    def __call__(self, worker: Dict[str, Any]):
+        from ..ssh_control import SSHTarget
+        from .transport import WorkerTransport
+
         target = SSHTarget(
             host=str(worker["host"]),
             user=str(worker.get("ssh_user") or ""),
@@ -118,10 +136,202 @@ def default_transport_factory(config: Optional[dict] = None):
         labels = worker.get("labels") or {}
         hostctl = str(labels.get("hostctl") or "conch-hostctl")
         return WorkerTransport(
-            target, worker["name"], manager=manager, hostctl=hostctl,
-            rpc_timeout=rpc_timeout,
+            target, worker["name"], pool=self.pool, hostctl=hostctl,
+            rpc_timeout=self.rpc_timeout,
         )
-    return factory
+
+    def close(self) -> None:
+        self.pool.close()
+
+
+def default_transport_factory(config: Optional[dict] = None):
+    """The production factory: pooled SSH transports (see above)."""
+    return PooledTransportFactory(config)
+
+
+def close_transport_factory(factory) -> None:
+    close = getattr(factory, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+class ArtifactPuller:
+    """Pulls completed tasks' artifacts on its own thread.
+
+    The tick thread only *queues* digests (from the plane's success hook
+    and one startup scan), so it never moves artifact bytes and never
+    re-lists already-pulled dispatches. Each pull is one streamed hostctl
+    session into a ``.part`` file, digest-verified, then renamed. A failed
+    pull backs off per digest instead of retrying every tick. The puller
+    touches no SQLite state: each job carries the worker row it needs.
+    """
+
+    def __init__(self, plane: TaskPlane, store_dir: Path,
+                 log: Callable[[str], None], *,
+                 backoff_base: float = 5.0, backoff_cap: float = 600.0,
+                 max_attempts: int = 10,
+                 clock: Callable[[], float] = time.monotonic):
+        self.plane = plane
+        self.store_dir = Path(store_dir)
+        self._log = log
+        self.backoff_base = float(backoff_base)
+        self.backoff_cap = float(backoff_cap)
+        self.max_attempts = int(max_attempts)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._jobs: Dict[str, Dict[str, Any]] = {}
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._pulled_unreported = 0
+        self.pulled_total = 0
+
+    # -- queueing (tick thread) ------------------------------------------------
+
+    def add_dispatch(self, dispatch: Dict[str, Any],
+                     worker: Optional[Dict[str, Any]]) -> int:
+        """Queue a SUCCEEDED dispatch's artifacts not yet stored locally."""
+        if worker is None:
+            return 0
+        references = (dispatch.get("result") or {}).get("artifacts") or []
+        added = 0
+        for ref in references:
+            if not isinstance(ref, dict):
+                continue
+            digest = str(ref.get("digest") or "").strip().lower()
+            if len(digest) != 64 or any(
+                c not in "0123456789abcdef" for c in digest
+            ):
+                continue
+            if (self.store_dir / digest).is_file():
+                continue
+            try:
+                size = int(ref.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size > ARTIFACT_PULL_MAX_BYTES:
+                self._log(
+                    f"artifact {digest[:12]} for {dispatch['task_id']}"
+                    f" declares {size} bytes — over the pull bound,"
+                    " not pulled"
+                )
+                continue
+            with self._lock:
+                if digest in self._jobs:
+                    continue
+                self._jobs[digest] = {
+                    "digest": digest, "worker": dict(worker),
+                    "task_id": dispatch["task_id"],
+                    "name": ref.get("name"),
+                    "max_bytes": size or ARTIFACT_PULL_MAX_BYTES,
+                    "attempts": 0, "next_at": 0.0,
+                }
+            added += 1
+        if added:
+            self._wake.set()
+        return added
+
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._jobs)
+
+    def take_pulled(self) -> int:
+        with self._lock:
+            count, self._pulled_unreported = self._pulled_unreported, 0
+            return count
+
+    # -- pulling (artifact thread) ---------------------------------------------
+
+    def _next_job(self) -> Optional[Dict[str, Any]]:
+        now = float(self._clock())
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            if job["next_at"] > now:
+                continue
+            if not self.plane.worker_available(job["worker"]["worker_id"]):
+                continue
+            return job
+        return None
+
+    def process_one(self) -> bool:
+        """Pull one ready artifact; False when nothing is ready."""
+        job = self._next_job()
+        if job is None:
+            return False
+        digest = job["digest"]
+        target = self.store_dir / digest
+        try:
+            size = self.plane.pull_artifact_to(
+                job["worker"], digest, target,
+                max_bytes=job["max_bytes"], cancel=self._stop,
+            )
+        except Exception as exc:
+            with self._lock:
+                job["attempts"] += 1
+                gave_up = job["attempts"] >= self.max_attempts
+                if gave_up:
+                    self._jobs.pop(digest, None)
+                else:
+                    delay = min(
+                        self.backoff_base * (2 ** (job["attempts"] - 1)),
+                        self.backoff_cap,
+                    )
+                    job["next_at"] = float(self._clock()) + delay
+            self._log(
+                f"artifact pull {digest[:12]} for {job['task_id']} failed"
+                f" (attempt {job['attempts']}): {exc}"
+                + (" — giving up; pull on demand with /fleet" if gave_up
+                   else "")
+            )
+            return True
+        with self._lock:
+            self._jobs.pop(digest, None)
+            self._pulled_unreported += 1
+            self.pulled_total += 1
+        self._log(
+            f"artifact {digest[:12]} ({job.get('name')}, {size} bytes)"
+            f" pulled for {job['task_id']}"
+        )
+        return True
+
+    def drain(self) -> int:
+        """Synchronously pull every artifact ready now (single-tick mode).
+        Each job is tried at most once; failures back off as usual."""
+        count = 0
+        while not self._stop.is_set() and self.process_one():
+            count += 1
+        return count
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                worked = self.process_one()
+            except Exception as exc:  # never let the thread die silently
+                self._log(f"artifact thread error: {exc}")
+                worked = False
+            if not worked:
+                self._wake.wait(1.0)
+                self._wake.clear()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="conch-controller-artifacts",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
 
 
 def _plane_config(config: dict) -> Dict[str, Any]:
@@ -168,7 +378,8 @@ class ControllerDaemon:
                  socket_path: Optional[Path] = None,
                  clock: Callable[[], float] = time.time,
                  tick_seconds: float = 1.0,
-                 transport_factory: Optional[Callable] = None):
+                 transport_factory: Optional[Callable] = None,
+                 artifact_thread: bool = True):
         self.config = config or {}
         self.kernel_dir = Path(kernel_dir) if kernel_dir else (
             fleet_kernel_dir()
@@ -180,6 +391,8 @@ class ControllerDaemon:
         self._factory = transport_factory or default_transport_factory(
             self.config
         )
+        self._artifact_thread = bool(artifact_thread)
+        self.artifacts: Optional[ArtifactPuller] = None
         self._lock = _KernelLock(self.kernel_dir)
         self.store: Optional[MissionStore] = None
         self.registry: Optional[FleetRegistry] = None
@@ -244,6 +457,13 @@ class ControllerDaemon:
                 config=_plane_config(self.config), clock=self.clock,
                 log=self.log,
             )
+            self.artifacts = ArtifactPuller(
+                self.plane, local_artifact_dir(self.kernel_dir), self.log,
+            )
+            self.plane.on_success = self._queue_artifacts
+            self._seed_artifact_queue()
+            if self._artifact_thread:
+                self.artifacts.start()
             recovered = self._recover()
             if recovered:
                 self.log(
@@ -277,6 +497,8 @@ class ControllerDaemon:
 
     def shutdown(self) -> None:
         self._stop.set()
+        if self.artifacts is not None:
+            self.artifacts.stop()
         if self._server is not None:
             try:
                 self._server.close()
@@ -292,6 +514,8 @@ class ControllerDaemon:
                 socket_path.unlink()
         except OSError:
             pass
+        # Stop the per-worker SSH ControlMasters this controller started.
+        close_transport_factory(self._factory)
         if self.store is not None:
             self.store.close()
             self.store = None
@@ -336,21 +560,24 @@ class ControllerDaemon:
             sweep = self.plane.heartbeat_sweep()
             stats.update(sweep)
             self._record_skill_inventories()
-        stats["artifacts_pulled"] = self._pull_completed_artifacts()
+        stats["artifacts_pulled"] = (
+            self.artifacts.take_pulled() if self.artifacts else 0
+        )
+        stats["artifacts_pending"] = (
+            self.artifacts.pending() if self.artifacts else 0
+        )
         self._tick_count += 1
         return stats
 
     def _record_skill_inventories(self) -> None:
-        """Fold worker-reported skills (worker.status) into capabilities."""
+        """Fold worker-reported skills into capabilities, from the
+        heartbeat sweep's own ``worker.status`` results (no second call)."""
+        statuses = self.plane.last_sweep_statuses
         for worker in self.registry.list(state=WorkerState.ACTIVE):
-            transport = self._factory(worker)
-            try:
-                status = transport.call("worker.status", {})
-            except Exception:
+            status = statuses.get(worker["worker_id"])
+            if not status:
                 continue
-            if not status.ok:
-                continue
-            skills = status.result.get("skills")
+            skills = status.get("skills")
             if isinstance(skills, list):
                 try:
                     self.registry.record_skills(
@@ -359,47 +586,29 @@ class ControllerDaemon:
                 except KernelError:
                     continue
 
-    def _pull_completed_artifacts(self, limit: int = 4) -> int:
-        """Pull declared artifacts of SUCCEEDED dispatches into the local
-        content-addressed store (bounded per tick, idempotent by digest)."""
-        pulled = 0
-        store_dir = local_artifact_dir(self.kernel_dir)
+    def _queue_artifacts(self, dispatch: Optional[Dict[str, Any]]) -> None:
+        """Plane success hook: queue the dispatch's artifacts for pulling."""
+        if not dispatch or self.artifacts is None:
+            return
+        if not (dispatch.get("result") or {}).get("artifacts"):
+            return
+        worker = self.registry.get(dispatch.get("worker_id") or "")
+        self.artifacts.add_dispatch(dispatch, worker)
+
+    def _seed_artifact_queue(self) -> int:
+        """One startup scan for SUCCEEDED dispatches whose artifacts are
+        not stored locally yet (later completions arrive via the hook)."""
+        queued = 0
         for dispatch in self.store.list_dispatches(
             state=DispatchState.SUCCEEDED
         ):
-            references = (dispatch.get("result") or {}).get("artifacts")
-            if not references:
+            if not (dispatch.get("result") or {}).get("artifacts"):
                 continue
             worker = self.registry.get(dispatch.get("worker_id") or "")
-            if worker is None:
-                continue
-            for ref in references:
-                digest = str(ref.get("digest") or "")
-                if not digest:
-                    continue
-                target = store_dir / digest
-                if target.is_file():
-                    continue
-                if pulled >= limit:
-                    return pulled
-                try:
-                    data = self.plane.pull_artifact(worker, digest)
-                except Exception as exc:
-                    self.log(
-                        f"artifact pull {digest[:12]} for"
-                        f" {dispatch['task_id']} failed: {exc}"
-                    )
-                    continue
-                store_dir.mkdir(parents=True, exist_ok=True)
-                tmp = target.with_name(target.name + ".part")
-                tmp.write_bytes(data)
-                os.replace(tmp, target)
-                pulled += 1
-                self.log(
-                    f"artifact {digest[:12]} ({ref.get('name')}) pulled"
-                    f" for {dispatch['task_id']}"
-                )
-        return pulled
+            queued += self.artifacts.add_dispatch(dispatch, worker)
+        if queued:
+            self.log(f"queued {queued} artifact(s) left unpulled")
+        return queued
 
     # -- control socket ------------------------------------------------------------
 
@@ -660,16 +869,10 @@ class ControllerDaemon:
             worker = self.registry.get(dispatch.get("worker_id") or "")
             if worker is None:
                 raise KernelError("task has no assigned worker to pull from")
-            digest = str(args.get("digest") or "")
-            data = self.plane.pull_artifact(worker, digest)
-            store_dir = local_artifact_dir(self.kernel_dir)
-            store_dir.mkdir(parents=True, exist_ok=True)
-            target = store_dir / digest
-            if not target.is_file():
-                tmp = target.with_name(target.name + ".part")
-                tmp.write_bytes(data)
-                os.replace(tmp, target)
-            return {"path": str(target), "size": len(data)}
+            digest = str(args.get("digest") or "").strip().lower()
+            target = local_artifact_dir(self.kernel_dir) / digest
+            size = self.plane.pull_artifact_to(worker, digest, target)
+            return {"path": str(target), "size": size}
         if op == "shutdown":
             self._stop.set()
             return {"ok": True}
@@ -775,7 +978,7 @@ def check_skill_availability(registry: FleetRegistry,
 
 def run_controller_daemon(config: dict, *, once: bool = False) -> int:
     """Entry for ``conch-controller run``: start, supervise, exit cleanly."""
-    daemon = ControllerDaemon(config)
+    daemon = ControllerDaemon(config, artifact_thread=not once)
     try:
         daemon.start()
     except DaemonAlreadyRunning as exc:
@@ -789,6 +992,8 @@ def run_controller_daemon(config: dict, *, once: bool = False) -> int:
     if once:
         try:
             stats = daemon.tick()
+            if daemon.artifacts is not None:
+                stats["artifacts_pulled"] += daemon.artifacts.drain()
             print(
                 f"conch-controller: single tick complete: {stats}",
                 flush=True,

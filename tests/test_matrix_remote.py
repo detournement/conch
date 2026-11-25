@@ -290,7 +290,7 @@ class DaemonMatrixCase(unittest.TestCase):
         for target, replacement in (
             ("create_clients", lambda: {}),
             ("collect_tools", lambda clients: ([], {})),
-            ("save_tool_cache", lambda tools: None),
+            ("save_server_cache", lambda fingerprints, results: None),
         ):
             mcp_patcher = patch(f"conch.mcp.{target}", replacement)
             mcp_patcher.start()

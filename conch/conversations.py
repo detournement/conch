@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import sys
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 
 SCHEMA_VERSION = 2
@@ -102,10 +106,10 @@ def scrub_messages_for_storage(messages: List[Dict[str, Any]]) -> List[Dict[str,
             copy = dict(message)
             copy["content"] = _scrub_content(copy.get("content"))
             tool_calls = copy.get("tool_calls")
-            if isinstance(tool_calls, list):
+            if isinstance(tool_calls, (list, tuple)):
                 copy["tool_calls"] = [_scrub_tool_call(call) for call in tool_calls]
             scrubbed.append(copy)
-        elif role == "user" and isinstance(message.get("content"), list):
+        elif role == "user" and isinstance(message.get("content"), (list, tuple)):
             # Anthropic wire shape: tool results ride in a user turn as
             # tool_result blocks. Those are tool output; the user's own
             # text blocks are left alone.
@@ -125,7 +129,9 @@ def scrub_messages_for_storage(messages: List[Dict[str, Any]]) -> List[Dict[str,
 def _scrub_content(content: Any) -> Any:
     if isinstance(content, str):
         return _scrub_text(content)
-    if isinstance(content, list):
+    if isinstance(content, (list, tuple)):
+        # Tuples are scrubbed like lists: both serialize as a JSON array,
+        # and the per-message storage cache keys on that serialization.
         blocks = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "image":
@@ -138,7 +144,7 @@ def _scrub_content(content: Any) -> Any:
                 for key in ("text", "content"):
                     if isinstance(block.get(key), str):
                         block[key] = _scrub_text(block[key])
-                    elif isinstance(block.get(key), list):
+                    elif isinstance(block.get(key), (list, tuple)):
                         block[key] = _scrub_content(block[key])
                 if "input" in block:
                     block["input"] = _scrub_json_value(block["input"])
@@ -156,7 +162,7 @@ def _scrub_json_value(value: Any) -> Any:
         return _scrub_text(value)
     if isinstance(value, dict):
         return {key: _scrub_json_value(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_scrub_json_value(item) for item in value]
     return value
 
@@ -170,10 +176,116 @@ def _scrub_tool_call(call: Any) -> Any:
         function = dict(function)
         if isinstance(function.get("arguments"), str):
             function["arguments"] = _scrub_text(function["arguments"])
-        elif isinstance(function.get("arguments"), (dict, list)):
+        elif isinstance(function.get("arguments"), (dict, list, tuple)):
             function["arguments"] = _scrub_json_value(function["arguments"])
         call["function"] = function
     return call
+
+
+
+class _StoredMessage(NamedTuple):
+    """One message as it is persisted: its scrubbed JSON (already indented
+    for its place in the conversation file) and its search-index row
+    (``text`` is None when the message is not indexed)."""
+    fragment: str
+    role: str
+    text: Optional[str]
+
+
+# Scrubbing a long conversation dominated every save (each turn re-ran the
+# credential scanner over every message, twice). Results are cached per
+# message keyed on a digest of the message's own JSON serialization, so
+# the key changes whenever the content does -- an in-place edit, a
+# compaction that rebuilds the list, a reorder -- and the cached value is
+# exactly what scrubbing that content produces: the scrubber is a pure
+# function of the JSON-visible content (tuples are scrubbed like lists, so
+# two values that serialize alike are scrubbed alike). Values are immutable
+# strings, so nothing a caller does can poison an entry.
+_STORE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_store_cache: "OrderedDict[bytes, _StoredMessage]" = OrderedDict()
+_store_cache_bytes = 0
+_store_cache_lock = threading.Lock()
+
+
+def _message_digest(message: Any) -> bytes:
+    raw = json.dumps(message).encode("ascii")  # ensure_ascii: pure ASCII
+    return hashlib.blake2b(raw, digest_size=20).digest()
+
+
+def _search_entry(message: Any) -> Tuple[str, Optional[str]]:
+    """``(role, text)`` for the search index; text is None when the
+    message is not indexed (system prompts, empty or unreadable ones)."""
+    if not isinstance(message, dict):
+        return "", None
+    role = message.get("role", "")
+    if role == "system":
+        return role, None
+    try:
+        text = _extract_searchable_text(message)
+    except Exception:
+        return role, None
+    return role, (text if text.strip() else None)
+
+
+def _build_stored_message(message: Any) -> _StoredMessage:
+    scrubbed = scrub_messages_for_storage([message])[0]
+    # Nested two levels deep (document -> "messages" array) at indent=2.
+    # JSON strings never hold a raw newline, so every newline in the
+    # encoding is structural and re-indenting it is exact.
+    fragment = json.dumps(scrubbed, indent=2).replace("\n", "\n    ")
+    role, text = _search_entry(scrubbed)
+    return _StoredMessage(fragment, role, text)
+
+
+def _stored_message(message: Any) -> _StoredMessage:
+    global _store_cache_bytes
+    key = _message_digest(message)
+    with _store_cache_lock:
+        hit = _store_cache.get(key)
+        if hit is not None:
+            _store_cache.move_to_end(key)
+            return hit
+    stored = _build_stored_message(message)
+    size = len(stored.fragment) + len(stored.text or "")
+    if size > _STORE_CACHE_MAX_BYTES // 4:
+        return stored
+    with _store_cache_lock:
+        if key not in _store_cache:
+            _store_cache[key] = stored
+            _store_cache_bytes += size
+        while _store_cache_bytes > _STORE_CACHE_MAX_BYTES and _store_cache:
+            _old_key, old = _store_cache.popitem(last=False)
+            _store_cache_bytes -= len(old.fragment) + len(old.text or "")
+    return stored
+
+
+def _clear_store_cache() -> None:
+    global _store_cache_bytes
+    with _store_cache_lock:
+        _store_cache.clear()
+        _store_cache_bytes = 0
+
+
+def _storage_document(conv: "Conversation") -> Tuple[str, List[_StoredMessage]]:
+    """The conversation file text -- byte-identical to
+    ``json.dumps(conv.storage_copy().to_dict(), indent=2)`` -- and the
+    per-message stored entries it was built from (reused for indexing)."""
+    stored = [_stored_message(message) for message in conv.messages]
+    token = f"conch-messages-{uuid.uuid4().hex}"
+    doc = conv.to_dict()
+    doc["messages"] = token
+    doc["usage"] = dict(conv.usage)
+    doc["previous_context"] = _scrub_text(conv.previous_context)
+    head = json.dumps(doc, indent=2)
+    placeholder = json.dumps(token)
+    if head.count(placeholder) != 1:  # never in practice; stay correct
+        return json.dumps(conv.storage_copy().to_dict(), indent=2), stored
+    if stored:
+        array = "[\n    " + ",\n    ".join(item.fragment for item in stored) + "\n  ]"
+    else:
+        array = "[]"
+    before, after = head.split(placeholder)
+    return before + array + after, stored
 
 
 def _slugify_title(text: str) -> str:
@@ -243,11 +355,17 @@ class Conversation:
         )
 
     def save(self):
+        self._persist()
+
+    def _persist(self) -> List[_StoredMessage]:
+        """Write the scrubbed conversation atomically; returns the stored
+        per-message entries so the caller can index exactly what was
+        written without scrubbing again."""
         self.updated_at = datetime.now().isoformat()
         self.title = self.title or _extract_title(self.messages)
-        _atomic_write_text(
-            self.path, json.dumps(self.storage_copy().to_dict(), indent=2)
-        )
+        text, stored = _storage_document(self)
+        _atomic_write_text(self.path, text)
+        return stored
 
     @classmethod
     def load(cls, path: Path) -> "Conversation":
@@ -321,6 +439,11 @@ def _fts_match_expression(query: str) -> str:
     return " OR ".join(parts)
 
 
+def _row_digest(role: Any, text: str) -> str:
+    raw = f"{role}\x00{text}".encode("utf-8", "surrogatepass")
+    return hashlib.blake2b(raw, digest_size=16).hexdigest()
+
+
 class SearchIndex:
     """SQLite FTS5 index over conversation messages (plan 2.8).
 
@@ -333,6 +456,8 @@ class SearchIndex:
     def __init__(self):
         self._conn: Optional[sqlite3.Connection] = None
         self._ok: Optional[bool] = None
+        # One explicit transaction at a time on the shared connection.
+        self._write_lock = threading.Lock()
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -351,6 +476,22 @@ class SearchIndex:
                 "CREATE TABLE IF NOT EXISTS indexed_convs "
                 "(conv_id TEXT PRIMARY KEY, updated_at TEXT)"
             )
+            # Incremental indexing bookkeeping: which FTS row holds each
+            # (conversation, message index) and a digest of its content,
+            # plus the updated_at this bookkeeping was last written for.
+            # A writer that predates it (an older conch on the same state
+            # dir) rewrites indexed_convs without touching fts_state, which
+            # is how a stale map is detected.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS fts_rows (conv_id TEXT NOT NULL, "
+                "message_index INTEGER NOT NULL, digest TEXT NOT NULL, "
+                "fts_rowid INTEGER NOT NULL, PRIMARY KEY (conv_id, message_index))"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS fts_state "
+                "(conv_id TEXT PRIMARY KEY, updated_at TEXT)"
+            )
+            conn.commit()
             self._conn = conn
         return self._conn
 
@@ -367,34 +508,107 @@ class SearchIndex:
         conn = self._connect()
         return dict(conn.execute("SELECT conv_id, updated_at FROM indexed_convs"))
 
-    def index_conversation(self, conv: "Conversation"):
+    def index_conversation(
+        self,
+        conv: "Conversation",
+        entries: Optional[List[Tuple[str, Optional[str]]]] = None,
+    ):
+        """Bring *conv*'s FTS rows up to date, touching only the rows
+        whose content changed: a normal turn inserts the new messages, a
+        compaction or in-place edit replaces the rows it changed and drops
+        rows past the new end. *entries* are the per-message ``(role,
+        text)`` pairs when the caller already has them (the save path);
+        otherwise they are derived from *conv*'s messages, which must
+        already be the scrubbed storage form."""
+        if entries is None:
+            entries = [_search_entry(msg) for msg in conv.messages]
+        desired: Dict[int, Tuple[str, str, str]] = {}
+        if conv.title and conv.title != "New conversation":
+            desired[-1] = ("title", conv.title, _row_digest("title", conv.title))
+        for index, (role, text) in enumerate(entries):
+            if text is not None:
+                desired[index] = (role, text, _row_digest(role, text))
+        with self._write_lock:
+            self._apply_rows(conv, desired)
+
+    def _apply_rows(self, conv: "Conversation",
+                    desired: Dict[int, Tuple[str, str, str]]) -> None:
         conn = self._connect()
-        with conn:
-            conn.execute("DELETE FROM messages_fts WHERE conv_id = ?", (conv.id,))
-            if conv.title and conv.title != "New conversation":
-                conn.execute(
-                    "INSERT INTO messages_fts VALUES (?, ?, ?, ?)",
-                    (conv.id, -1, "title", conv.title),
-                )
-            for i, msg in enumerate(conv.messages):
-                if msg.get("role") == "system":
-                    continue
-                text = _extract_searchable_text(msg)
-                if text.strip():
-                    conn.execute(
-                        "INSERT INTO messages_fts VALUES (?, ?, ?, ?)",
-                        (conv.id, i, msg.get("role", ""), text),
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            indexed_at = conn.execute(
+                "SELECT updated_at FROM indexed_convs WHERE conv_id = ?", (conv.id,)
+            ).fetchone()
+            state_at = conn.execute(
+                "SELECT updated_at FROM fts_state WHERE conv_id = ?", (conv.id,)
+            ).fetchone()
+            existing: Optional[Dict[int, Tuple[str, int]]] = {}
+            if indexed_at is None and state_at is None:
+                pass  # never indexed: there are no rows to reconcile
+            elif indexed_at is not None and state_at is not None and indexed_at == state_at:
+                existing = {
+                    index: (digest, rowid)
+                    for index, digest, rowid in conn.execute(
+                        "SELECT message_index, digest, fts_rowid FROM fts_rows "
+                        "WHERE conv_id = ?", (conv.id,)
                     )
+                }
+            else:
+                existing = None  # rows out of step with the map: rebuild
+            stale = [] if existing is None else [
+                (index, rowid) for index, (digest, rowid) in existing.items()
+                if desired.get(index, (None, None, None))[2] != digest
+            ]
+            if existing is not None and not all(
+                conn.execute(
+                    "SELECT conv_id, message_index FROM messages_fts WHERE rowid = ?",
+                    (rowid,),
+                ).fetchone() == (conv.id, index)
+                for index, rowid in stale
+            ):
+                existing = None  # the map no longer matches the rows
+            if existing is None:
+                conn.execute("DELETE FROM messages_fts WHERE conv_id = ?", (conv.id,))
+                conn.execute("DELETE FROM fts_rows WHERE conv_id = ?", (conv.id,))
+                existing, stale = {}, []
+            for index, rowid in stale:
+                conn.execute("DELETE FROM messages_fts WHERE rowid = ?", (rowid,))
+                conn.execute(
+                    "DELETE FROM fts_rows WHERE conv_id = ? AND message_index = ?",
+                    (conv.id, index),
+                )
+            for index, (role, text, digest) in desired.items():
+                have = existing.get(index)
+                if have is not None and have[0] == digest:
+                    continue
+                cursor = conn.execute(
+                    "INSERT INTO messages_fts VALUES (?, ?, ?, ?)",
+                    (conv.id, index, role, text),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO fts_rows VALUES (?, ?, ?, ?)",
+                    (conv.id, index, digest, cursor.lastrowid),
+                )
             conn.execute(
                 "INSERT OR REPLACE INTO indexed_convs VALUES (?, ?)",
                 (conv.id, conv.updated_at),
             )
+            conn.execute(
+                "INSERT OR REPLACE INTO fts_state VALUES (?, ?)",
+                (conv.id, conv.updated_at),
+            )
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
 
     def remove_conversation(self, conv_id: str):
         conn = self._connect()
         with conn:
             conn.execute("DELETE FROM messages_fts WHERE conv_id = ?", (conv_id,))
             conn.execute("DELETE FROM indexed_convs WHERE conv_id = ?", (conv_id,))
+            conn.execute("DELETE FROM fts_rows WHERE conv_id = ?", (conv_id,))
+            conn.execute("DELETE FROM fts_state WHERE conv_id = ?", (conv_id,))
 
     def search_rows(self, query: str, limit: int = 400) -> List[tuple]:
         """Matching (conv_id, message_index, role, text) rows, best first."""
@@ -434,6 +648,50 @@ class SearchIndex:
             pass
 
 
+def _read_index_file() -> Optional[Dict[str, Any]]:
+    """The index on disk, normalized; None when missing or unreadable."""
+    try:
+        data = json.loads(_index_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if isinstance(data, list):
+        return {"schema_version": 1, "conversations": data}
+    if isinstance(data, dict):
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        if not isinstance(data.get("conversations"), list):
+            data["conversations"] = []
+        data["conversations"] = [
+            item for item in data["conversations"] if isinstance(item, dict)
+        ]
+        return data
+    return None
+
+
+@contextlib.contextmanager
+def _index_lock(path: Path) -> Iterator[None]:
+    """Exclusive advisory lock serializing index.json read-modify-write
+    across processes (POSIX flock on a sidecar file; a no-op where fcntl
+    is unavailable or the lock file cannot be opened)."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    try:
+        fd = os.open(
+            str(path.with_name(path.name + ".lock")),
+            os.O_RDWR | os.O_CREAT, PRIVATE_FILE_MODE,
+        )
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
+
+
 class ConversationManager:
     def __init__(self):
         self._index = self._load_index()
@@ -449,20 +707,26 @@ class ConversationManager:
             pass
 
     def _load_index(self) -> Dict[str, Any]:
-        try:
-            data = json.loads(_index_path().read_text())
-            if isinstance(data, list):
-                return {"schema_version": 1, "conversations": data}
-            if isinstance(data, dict):
-                data.setdefault("schema_version", SCHEMA_VERSION)
-                data.setdefault("conversations", [])
-                return data
-            return {"schema_version": SCHEMA_VERSION, "conversations": []}
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return {"schema_version": SCHEMA_VERSION, "conversations": []}
+        return _read_index_file() or {
+            "schema_version": SCHEMA_VERSION, "conversations": [],
+        }
 
-    def _save_index(self):
-        _atomic_write_text(_index_path(), json.dumps(self._index, indent=2))
+    def _update_index(self, change: Callable[[Dict[str, Any]], bool]) -> None:
+        """Apply *change* to the index under an exclusive lock, starting
+        from the copy on disk rather than this process's memory: two
+        shells each rewriting their own in-memory index used to clobber
+        each other's entries. *change* mutates the index and returns
+        whether anything changed (nothing is written otherwise). When the
+        file is missing or unreadable, this process's copy is the base."""
+        path = _index_path()
+        _ensure_private_dir(path.parent)
+        with _index_lock(path):
+            index = _read_index_file()
+            if index is None:
+                index = copy.deepcopy(self._index)
+            if change(index):
+                _atomic_write_text(path, json.dumps(index, indent=2))
+            self._index = index
 
     def _upsert_index_entry(self, conv: Conversation):
         entry = {
@@ -474,11 +738,17 @@ class ConversationManager:
             "message_count": len(conv.messages),
             "usage": dict(conv.usage),
         }
-        conversations = [item for item in self._index["conversations"] if item["id"] != conv.id]
-        conversations.append(entry)
-        conversations.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
-        self._index["conversations"] = conversations
-        self._save_index()
+
+        def change(index: Dict[str, Any]) -> bool:
+            conversations = [
+                item for item in index["conversations"] if item.get("id") != conv.id
+            ]
+            conversations.append(entry)
+            conversations.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+            index["conversations"] = conversations
+            return True
+
+        self._update_index(change)
 
     def create(self, model: str, provider: str,
                previous: Optional[Conversation] = None) -> Conversation:
@@ -495,12 +765,15 @@ class ConversationManager:
     def save(self, conversation: Conversation):
         if conversation.messages and conversation.title == "New conversation":
             conversation.title = _extract_title(conversation.messages)
-        conversation.save()
+        stored = conversation._persist()
         self._upsert_index_entry(conversation)
         if self._search_index.available():
             try:
-                # Index what was written, never the unscrubbed original.
-                self._search_index.index_conversation(conversation.storage_copy())
+                # Index what was written (the scrubbed entries the file was
+                # built from), never the unscrubbed original.
+                self._search_index.index_conversation(
+                    conversation, [(item.role, item.text) for item in stored]
+                )
             except sqlite3.Error:
                 pass
 
@@ -553,14 +826,20 @@ class ConversationManager:
         )
         return None
 
+    def _remove_index_entry(self, conv_id: str) -> None:
+        def change(index: Dict[str, Any]) -> bool:
+            entries = [
+                item for item in index["conversations"] if item.get("id") != conv_id
+            ]
+            if len(entries) == len(index["conversations"]):
+                return False
+            index["conversations"] = entries
+            return True
+
+        self._update_index(change)
+
     def _drop_index_entry(self, conv_id: str):
-        entries = [
-            item for item in self._index["conversations"]
-            if item.get("id") != conv_id
-        ]
-        if len(entries) != len(self._index["conversations"]):
-            self._index["conversations"] = entries
-            self._save_index()
+        self._remove_index_entry(conv_id)
         if self._search_index.available():
             try:
                 self._search_index.remove_conversation(conv_id)
@@ -572,10 +851,7 @@ class ConversationManager:
         if not path.exists():
             return False
         path.unlink()
-        self._index["conversations"] = [
-            item for item in self._index["conversations"] if item["id"] != conv_id
-        ]
-        self._save_index()
+        self._remove_index_entry(conv_id)
         if self._search_index.available():
             try:
                 self._search_index.remove_conversation(conv_id)

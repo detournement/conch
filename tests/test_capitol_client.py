@@ -20,6 +20,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,7 @@ from unittest.mock import patch
 
 from conch.capitol.client import (
     CapitolRuntime,
+    clear_card_cache,
     extract_payload,
     sse_events,
 )
@@ -89,6 +91,7 @@ class FakeGateway(BaseHTTPRequestHandler):
 
     @classmethod
     def reset(cls, port):
+        clear_card_cache()  # runtimes from .cached() share cards per port
         cls.card = {
             "name": "Fake eBay Sales Operator",
             "wireSchemaVersion": "1.0.11",
@@ -393,7 +396,20 @@ class FakeGateway(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         plan = cls.stream_plans.get(run_id) or []
-        segment = plan.pop(0) if plan else {"events": [], "end": "terminal"}
+        if plan:
+            segment = plan.pop(0)
+        elif run_id in getattr(cls, "run_events", {}):
+            # No scripted stream: serve the persisted events the polling
+            # skill would return, ending the way the run's status says.
+            status = str((cls.runs.get(run_id) or {}).get("status") or "")
+            segment = {
+                "events": list(cls.run_events[run_id]),
+                "end": "terminal" if status in (
+                    "success", "failed", "stopped", "cancelled"
+                ) else "drop",
+            }
+        else:
+            segment = {"events": [], "end": "terminal"}
         for event in segment.get("events", []):
             # Persisted events honor the since_sequence cursor; transport
             # frames without a sequence (keepalives) always pass through.
@@ -402,7 +418,9 @@ class FakeGateway(BaseHTTPRequestHandler):
             frame({"artifact": {"parts": [{"data": event}]}})
         end = segment.get("end", "terminal")
         if end == "terminal":
-            cls.runs.setdefault(run_id, {}).update(status="success")
+            run = cls.runs.setdefault(run_id, {})
+            if run.get("status") not in ("failed", "stopped", "cancelled"):
+                run.update(status="success")
             frame({"status": {"state": "TASK_STATE_COMPLETED"}})
         elif end == "stream_local":
             frame({"status": {
@@ -411,6 +429,10 @@ class FakeGateway(BaseHTTPRequestHandler):
                     "stream_close_reason": "inactivity_timeout",
                 }}]},
             }})
+        elif end == "hang":
+            # Hold the stream open silently (no keepalives): only a client
+            # read timeout ends it.
+            time.sleep(float(segment.get("seconds", 2.0)))
         # end == "drop": close without a terminal frame
 
 
@@ -622,6 +644,91 @@ class CapitolClientTests(unittest.TestCase):
         events = list(self.runtime.watch_run(run_id))
         kinds = [event.get("event_type") for event in events]
         self.assertNotIn("a2a.stream_keepalive", kinds)
+
+    def test_watch_run_skips_events_resent_below_cursor(self):
+        # A gateway that replays from an older sequence after a reconnect
+        # (or a resume from a slightly stale cursor) never surfaces
+        # duplicates: the client skips sequence <= last_seen itself.
+        FakeGateway.runs["run-replay"] = {"status": "running", "output": {}}
+        connections = []
+
+        def frames(_skill, data, _read_timeout=None):
+            connections.append(data["since_sequence"])
+            replay = [1, 2, 3] if len(connections) == 1 else [1, 2, 3, 4]
+            for sequence in replay:
+                yield {"result": {"artifact": {"parts": [
+                    {"data": _event(sequence)}
+                ]}}}
+            if len(connections) > 1:
+                yield {"result": {"status": {
+                    "state": "TASK_STATE_COMPLETED"
+                }}}
+
+        with patch.object(self.runtime, "_stream_frames", frames):
+            events = list(self.runtime.watch_run(
+                "run-replay", since_sequence=2, reconnect_delay=0,
+                _sleep=lambda _s: None,
+            ))
+        sequences = [
+            event["sequence"] for event in events
+            if event.get("event_type") == "node.node_started"
+        ]
+        self.assertEqual(sequences, [2, 3, 4])
+        self.assertEqual(connections, [2, 4])
+        self.assertEqual(events[-1]["event_type"], "_final_status")
+
+    def test_watch_run_deadline_bounds_a_silent_stream(self):
+        run_id = "run-silent"
+        FakeGateway.runs[run_id] = {"status": "running", "output": {}}
+        FakeGateway.stream_plans[run_id] = [
+            {"events": [_event(1)], "end": "hang", "seconds": 3.0},
+        ]
+        started = time.monotonic()
+        events = list(self.runtime.watch_run(
+            run_id, deadline=started + 0.6, _sleep=lambda _s: None,
+        ))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.5)  # bounded, not STREAM_READ_TIMEOUT
+        self.assertEqual([e.get("sequence") for e in events], [1])
+        self.assertNotIn(
+            "_final_status", [e.get("event_type") for e in events]
+        )
+
+    def test_cached_runtime_shares_card_and_resolves_bearer_per_call(self):
+        config = {
+            "capitol_base_url": f"http://127.0.0.1:{self.port}",
+            "capitol_org": ORG,
+            "capitol_agent": AGENT,
+        }
+        card_gets = []
+        original = CapitolRuntime._request
+
+        def counting(runtime, url, **kwargs):
+            if url.endswith("/.well-known/agent-card.json"):
+                card_gets.append(url)
+            return original(runtime, url, **kwargs)
+
+        with patch.object(CapitolRuntime, "_request", counting), \
+                patch.dict(os.environ, {"CAPITOL_A2A_BEARER": BEARER}):
+            first = CapitolRuntime.cached(config)
+            first.discover()
+            second = CapitolRuntime.cached(config)
+            second.ensure_skill("call_workflow")
+            self.assertIsNot(first, second)  # context_id is never shared
+            self.assertIs(first.discover(), second.discover())
+            self.assertEqual(len(card_gets), 1)
+            # The bearer is resolved per runtime: a rotation takes effect.
+            with patch.dict(os.environ, {"CAPITOL_A2A_BEARER": "rotated"}):
+                rotated = CapitolRuntime.cached(config)
+            self.assertEqual(rotated._bearer, "rotated")
+            # Past the TTL the card is fetched again; refresh always is.
+            CapitolRuntime.cached(config, card_ttl=0).discover()
+            self.assertEqual(len(card_gets), 2)
+            second.discover(refresh=True)
+            self.assertEqual(len(card_gets), 3)
+            # Plain from_config runtimes keep a per-object card.
+            CapitolRuntime.from_config(config).discover()
+            self.assertEqual(len(card_gets), 4)
 
     def test_sse_parser_multiline_and_comments(self):
         lines = [
@@ -891,6 +998,34 @@ class CredentialTests(unittest.TestCase):
                 )
                 self.assertEqual(bearer, "cap_a2a_LOCAL")
                 self.assertEqual(source, "registry:local-ebay")
+
+    def test_registry_parse_is_cached_until_the_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "agents.yaml"
+            registry.write_text(self.SAMPLE)
+            with patch(
+                "conch.capitol.credentials.REGISTRY_PATH", registry
+            ), patch(
+                "conch.capitol.credentials.parse_agents_yaml",
+                wraps=parse_agents_yaml,
+            ) as parse, patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CAPITOL_A2A_BEARER", None)
+                for _ in range(3):
+                    bearer, _ = resolve_bearer(
+                        {}, "org-local", "agent-local",
+                        "http://localhost:8300",
+                    )
+                self.assertEqual(bearer, "cap_a2a_LOCAL")
+                self.assertEqual(parse.call_count, 1)
+                registry.write_text(
+                    self.SAMPLE.replace("cap_a2a_LOCAL", "cap_a2a_ROTATEDBEARER002")
+                )
+                os.utime(registry, ns=(1, time.time_ns() + 10**9))
+                bearer, _ = resolve_bearer(
+                    {}, "org-local", "agent-local", "http://localhost:8300",
+                )
+                self.assertEqual(bearer, "cap_a2a_ROTATEDBEARER002")
+                self.assertEqual(parse.call_count, 2)
 
     def test_resolve_bearer_missing_names_sources_only(self):
         with tempfile.TemporaryDirectory() as tmp:

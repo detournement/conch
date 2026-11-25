@@ -16,6 +16,13 @@ Design (Swarm Phase 1):
   reproduces them exactly (proven by tests via :meth:`MissionStore.verify_integrity`).
   Operational coordination state — timer claims, leases, outbox delivery
   status, meta — is deliberately not mission truth and not replayed.
+- Startup verification is incremental from a verified-through checkpoint
+  in ``meta`` (:meth:`MissionStore.verify_chain_incremental`); the full
+  chain check stays available on demand.
+- Retention prunes old inbox/outbox projection rows only through
+  journaled ``inbox_pruned`` / ``outbox_pruned`` events, so replay stays
+  exact; journal events themselves are never pruned
+  (:meth:`MissionStore.apply_retention`).
 - Unknown event kinds or schema versions fail closed, matching
   ``conch.swarm.protocol`` conventions.
 - Secret bytes never belong in kernel rows or events (non-negotiable
@@ -87,6 +94,21 @@ ARTIFACT_INLINE_MAX_BYTES = 65536
 #: Outbox redelivery backoff (seconds), doubled per attempt up to the cap.
 OUTBOX_BASE_BACKOFF = 30.0
 OUTBOX_MAX_BACKOFF = 3600.0
+
+#: meta key holding the journal verified-through checkpoint (see
+#: :meth:`MissionStore.verify_chain_incremental`).
+JOURNAL_CHECKPOINT_KEY = "journal_verified_through"
+
+#: Retention (see :meth:`MissionStore.apply_retention`). Inbox rows that
+#: are consumed (processed/failed) or were never addressed to a mission
+#: (capture streams: browser, folder-watch verbs) are prunable once older
+#: than the horizon; pending rows addressed to a mission never are. The
+#: predicate reads replayed columns only so replay deletes identically.
+_INBOX_PRUNE_PREDICATE = (
+    "received_at<? AND (status!='pending' OR mission_id='')"
+)
+#: Rows per retention event; one event is one short writer transaction.
+RETENTION_BATCH = 500
 
 
 def default_state_dir() -> Path:
@@ -926,6 +948,26 @@ def _apply_event(conn: sqlite3.Connection, mission_id: str, kind: str,
             (data["status"], data.get("detail", ""), created_at,
              data["idempotency_key"]),
         )
+    elif kind == "inbox_pruned":
+        # Deterministic predicate over replayed columns only, so replay
+        # deletes exactly the rows the live database deleted at this
+        # position in the journal.
+        conn.execute(
+            "DELETE FROM inbox WHERE " + _INBOX_PRUNE_PREDICATE
+            + " AND inbox_id<=?",
+            (float(data["before"]), int(data["through_inbox_id"])),
+        )
+    elif kind == "outbox_pruned":
+        # Outbox delivery status is operational (not replayed), so the
+        # event names the exact rows instead of a predicate.
+        ids = [int(value) for value in data["outbox_ids"]]
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            conn.execute(
+                "DELETE FROM outbox WHERE outbox_id IN (%s)"
+                % ",".join("?" for _ in chunk),
+                chunk,
+            )
     elif kind == "worker_enrolled":
         conn.execute(
             "INSERT INTO workers(worker_id, name, host, ssh_user, ssh_port,"
@@ -2519,10 +2561,16 @@ class MissionStore:
         return self._mutate(fn)
 
     def list_inbox(self, source: str = "", limit: int = 500,
-                   since: float = 0.0) -> List[Dict[str, Any]]:
+                   since: float = 0.0,
+                   after_id: int = 0) -> List[Dict[str, Any]]:
         """Inbox rows in chronological order, payload parsed — the read
         surface capture sources (browser events especially) mine from.
-        Filters: exact *source*, ``received_at >= since``."""
+        Filters: exact *source*, ``received_at >= since``.
+
+        Without *after_id* the newest *limit* rows are returned. With
+        *after_id* (a cursor: the last inbox_id the caller consumed) the
+        OLDEST *limit* rows after it are returned, so a poller pages
+        forward without skipping and its steady state reads zero rows."""
         sql = ("SELECT inbox_id, source, idempotency_key, mission_id,"
                " payload, status, received_at FROM inbox")
         clauses = []
@@ -2533,13 +2581,20 @@ class MissionStore:
         if since:
             clauses.append("received_at>=?")
             params.append(float(since))
+        if after_id:
+            clauses.append("inbox_id>?")
+            params.append(int(after_id))
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY inbox_id DESC LIMIT ?"
+        sql += " ORDER BY inbox_id %s LIMIT ?" % (
+            "ASC" if after_id else "DESC"
+        )
         params.append(max(1, int(limit)))
         rows = self._read_conn().execute(sql, params).fetchall()
+        if not after_id:
+            rows = list(reversed(rows))
         entries = []
-        for row in reversed(rows):
+        for row in rows:
             entry = dict(row)
             try:
                 entry["payload"] = _json.loads(entry["payload"])
@@ -2641,6 +2696,110 @@ class MissionStore:
                     (str(error)[:500], int(outbox_id)),
                 )
         self._mutate(fn)
+
+    def count_outbox(self, status: str = "") -> int:
+        """Outbox row count, optionally by status (no row materialization)."""
+        if status:
+            row = self._read_conn().execute(
+                "SELECT COUNT(*) FROM outbox WHERE status=?", (status,)
+            ).fetchone()
+        else:
+            row = self._read_conn().execute(
+                "SELECT COUNT(*) FROM outbox"
+            ).fetchone()
+        return int(row[0])
+
+    def apply_retention(self, older_than_seconds: float,
+                        now: Optional[float] = None,
+                        max_batches: int = 20) -> Dict[str, int]:
+        """Prune old inbox and outbox projection rows; returns counts.
+
+        Retention semantics
+        -------------------
+        - ``mission_events`` is never pruned: the hash chain and every
+          payload (inbox_received / outbox_enqueued carry the full
+          payload) stay in the journal. Only the duplicate projection
+          rows go.
+        - Inbox: rows received before ``now - older_than_seconds`` that
+          are consumed (processed/failed) or were never addressed to a
+          mission (capture streams — browser events, folder-watch
+          verbs). A pending row addressed to a mission is unread mission
+          input and is never pruned.
+        - Outbox: rows *delivered* before the horizon. Pending and
+          failed rows stay (still due, or evidence for the operator).
+        - Every deletion rides an ``inbox_pruned`` / ``outbox_pruned``
+          event (chain ``""``) applied by :func:`_apply_event`, so replay
+          deletes exactly the same rows at the same journal position and
+          ``verify_integrity`` still compares every replayed column.
+          inbox_pruned is a predicate over replayed columns plus an
+          inbox_id bound; outbox_pruned lists ids, because delivery
+          status is operational and not replayed.
+        - Dedupe horizon: inbox idempotency keys and outbox dedupe keys
+          of pruned rows are forgotten, so a re-post of the same key
+          after the horizon is accepted again. Callers keep the horizon
+          far beyond any retry/spool window (the daemon default is 90
+          days and never less than the compile-suggestion window).
+        - Bounded work: at most ``RETENTION_BATCH`` rows per event and
+          ``max_batches`` events per call; each batch is its own short
+          writer transaction.
+        """
+        if older_than_seconds <= 0:
+            return {"inbox_pruned": 0, "outbox_pruned": 0}
+        current = float(now if now is not None else self.clock())
+        horizon = current - float(older_than_seconds)
+
+        def prune_inbox(conn):
+            bound = conn.execute(
+                "SELECT inbox_id FROM inbox WHERE " + _INBOX_PRUNE_PREDICATE
+                + " ORDER BY inbox_id LIMIT 1 OFFSET ?",
+                (horizon, RETENTION_BATCH - 1),
+            ).fetchone()
+            if bound is None:
+                bound = conn.execute(
+                    "SELECT MAX(inbox_id) FROM inbox WHERE "
+                    + _INBOX_PRUNE_PREDICATE,
+                    (horizon,),
+                ).fetchone()
+            if bound is None or bound[0] is None:
+                return 0
+            count = int(conn.execute(
+                "SELECT COUNT(*) FROM inbox WHERE " + _INBOX_PRUNE_PREDICATE
+                + " AND inbox_id<=?",
+                (horizon, int(bound[0])),
+            ).fetchone()[0])
+            if not count:
+                return 0
+            self._append(conn, "", "inbox_pruned", {
+                "before": horizon, "through_inbox_id": int(bound[0]),
+                "count": count,
+            })
+            return count
+
+        def prune_outbox(conn):
+            ids = [
+                int(row[0]) for row in conn.execute(
+                    "SELECT outbox_id FROM outbox WHERE status='delivered'"
+                    " AND delivered_at IS NOT NULL AND delivered_at<?"
+                    " ORDER BY outbox_id LIMIT ?",
+                    (horizon, RETENTION_BATCH),
+                )
+            ]
+            if not ids:
+                return 0
+            self._append(conn, "", "outbox_pruned", {
+                "before": horizon, "outbox_ids": ids, "count": len(ids),
+            })
+            return len(ids)
+
+        totals = {"inbox_pruned": 0, "outbox_pruned": 0}
+        for key, fn in (("inbox_pruned", prune_inbox),
+                        ("outbox_pruned", prune_outbox)):
+            for _ in range(max(1, int(max_batches))):
+                pruned = self._mutate(fn)
+                totals[key] += pruned
+                if pruned < RETENTION_BATCH:
+                    break
+        return totals
 
     def list_outbox(self, status: str = "",
                     mission_id: str = "") -> List[Dict[str, Any]]:
@@ -4547,25 +4706,246 @@ class MissionStore:
                 verified += 1
         return verified
 
-    def verify_journal(self, full: bool = False) -> Dict[str, Any]:
+    # -- verified-through checkpoint ---------------------------------------
+
+    @staticmethod
+    def _heads_digest(heads: Dict[str, Tuple[int, str]]) -> str:
+        """Digest of every chain head: sorted (mission_id, seq, hash)."""
+        body = _json.dumps(
+            [[mid, int(heads[mid][0]), heads[mid][1]] for mid in sorted(heads)],
+            separators=(",", ":"), ensure_ascii=True,
+        )
+        return hashlib.sha256(body.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _chain_heads(conn: sqlite3.Connection,
+                     through_seq: int) -> Dict[str, Tuple[int, str]]:
+        """Each chain's last event at or before ``through_seq``.
+
+        O(chains * log events): a recursive skip-scan walks the distinct
+        mission ids through idx_events_mission, then one index seek per
+        chain finds its head — no pass over the whole journal."""
+        heads: Dict[str, Tuple[int, str]] = {}
+        for row in conn.execute(
+            "WITH RECURSIVE chains(mid) AS ("
+            " SELECT MIN(mission_id) FROM mission_events"
+            " UNION ALL"
+            " SELECT (SELECT MIN(mission_id) FROM mission_events"
+            "         WHERE mission_id > chains.mid)"
+            " FROM chains WHERE chains.mid IS NOT NULL)"
+            " SELECT mid, (SELECT seq FROM mission_events"
+            "              WHERE mission_id=chains.mid AND seq<=?"
+            "              ORDER BY seq DESC LIMIT 1)"
+            " FROM chains WHERE mid IS NOT NULL",
+            (int(through_seq),),
+        ).fetchall():
+            if row[1] is None:
+                continue  # chain started after through_seq
+            digest = conn.execute(
+                "SELECT hash FROM mission_events WHERE seq=?", (row[1],)
+            ).fetchone()[0]
+            heads[row[0]] = (int(row[1]), digest)
+        return heads
+
+    def journal_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """The stored verified-through checkpoint, or None."""
+        row = self._read_conn().execute(
+            "SELECT value FROM meta WHERE key=?", (JOURNAL_CHECKPOINT_KEY,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            data = _json.loads(row[0])
+            return {
+                "seq": int(data["seq"]), "hash": str(data["hash"]),
+                "heads": str(data["heads"]),
+                "chains": int(data.get("chains", 0)),
+                "verified_at": float(data.get("verified_at", 0.0)),
+            }
+        except (TypeError, ValueError, KeyError):
+            raise KernelError(
+                "journal checkpoint in meta is unreadable — failing closed;"
+                " run a full verification (conch mission verify --full)"
+                " after inspecting the database"
+            )
+
+    def _store_journal_checkpoint(self, seq: int, digest: str,
+                                  heads: str, chains: int) -> None:
+        """Advance (never rewind) the checkpoint. Runs on the writer so a
+        concurrent, older verification cannot move it backwards."""
+        value = _json.dumps({
+            "seq": int(seq), "hash": digest, "heads": heads,
+            "chains": int(chains), "verified_at": float(_time.time()),
+        }, sort_keys=True)
+
+        def fn(conn):
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (JOURNAL_CHECKPOINT_KEY,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    if int(_json.loads(row[0])["seq"]) >= int(seq):
+                        return False
+                except (TypeError, ValueError, KeyError):
+                    pass
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                (JOURNAL_CHECKPOINT_KEY, value),
+            )
+            return True
+        self._mutate(fn)
+
+    def verify_chain_incremental(self) -> Dict[str, Any]:
+        """Verify the journal from the verified-through checkpoint and
+        advance it. Returns ``{"events_verified", "missions",
+        "from_seq", "through_seq"}``; raises KernelError on any mismatch
+        (the checkpoint is then left untouched).
+
+        Integrity semantics
+        -------------------
+        The checkpoint (meta ``journal_verified_through``) records
+        ``seq`` — the highest event seq covered by a successful
+        verification — together with that event's ``hash`` and
+        ``heads``, a SHA-256 over every chain's head (mission_id, seq,
+        hash) as of ``seq``. ``mission_events`` is append-only and seq
+        is AUTOINCREMENT, so rows at or below ``seq`` never legitimately
+        change. On each run:
+
+        1. the event at ``seq`` must still exist with the recorded hash
+           — a truncated, rolled-back, or rewritten tail fails closed;
+        2. the chain heads as of ``seq`` must reproduce ``heads`` — any
+           chain whose last pre-checkpoint event was deleted, rewritten,
+           or had a row slipped in after it fails closed;
+        3. every event after ``seq`` is fully re-verified (schema
+           version, prev_hash linkage to its chain's head, recomputed
+           hash), exactly like :meth:`verify_chain`;
+        4. only then the checkpoint advances to the newest event.
+
+        What it does NOT re-check: the content of pre-checkpoint events
+        that are not chain heads. Damage there (bit rot, a hand edit of
+        an old row) is found by the full check — :meth:`verify_chain`,
+        ``verify_journal(incremental=False)``, ``mission.verify`` and
+        ``verify_journal(full=True)`` all recompute every hash. Deleting
+        the checkpoint only costs time: the next run verifies from
+        genesis. The chain is an unkeyed SHA-256 chain: it is evidence
+        against corruption and naive edits, not against a writer who
+        recomputes every hash (and the checkpoint) — that was equally
+        true of the full check.
+        """
+        conn = self._read_conn()
+        top = conn.execute(
+            "SELECT seq, hash FROM mission_events ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        through = int(top[0]) if top else 0
+        checkpoint = self.journal_checkpoint()
+        if checkpoint is not None and checkpoint["seq"] > 0:
+            start = checkpoint["seq"]
+            anchor = conn.execute(
+                "SELECT hash FROM mission_events WHERE seq=?", (start,)
+            ).fetchone()
+            if anchor is None or anchor[0] != checkpoint["hash"]:
+                raise KernelError(
+                    f"event chain broken at seq={start}: the verified-through"
+                    " checkpoint event is missing or its hash changed"
+                    " (journal truncated, rolled back, or rewritten)"
+                )
+            heads = self._chain_heads(conn, start)
+            if self._heads_digest(heads) != checkpoint["heads"]:
+                raise KernelError(
+                    f"event chain broken at or before seq={start}: chain"
+                    " heads no longer match the verified-through checkpoint"
+                    " (events deleted, rewritten, or inserted)"
+                )
+        else:
+            start, heads = 0, {}
+        verified = 0
+        for row in conn.execute(
+            "SELECT seq, mission_id, kind, data, schema_version, created_at,"
+            " prev_hash, hash FROM mission_events WHERE seq>? AND seq<=?"
+            " ORDER BY seq",
+            (start, through),
+        ):
+            seq, mid = int(row["seq"]), row["mission_id"]
+            if int(row["schema_version"]) != EVENT_SCHEMA_VERSION:
+                raise KernelError(
+                    f"event seq={seq} has unsupported schema"
+                    f" version {row['schema_version']} — failing closed"
+                )
+            prev_hash = heads[mid][1] if mid in heads else GENESIS_HASH
+            if row["prev_hash"] != prev_hash:
+                raise KernelError(
+                    f"event chain broken at seq={seq} for"
+                    f" mission {mid}: prev_hash mismatch"
+                )
+            expected = event_hash(
+                mid, row["kind"], _json.loads(row["data"]),
+                row["created_at"], prev_hash,
+            )
+            if expected != row["hash"]:
+                raise KernelError(
+                    f"event chain broken at seq={seq} for"
+                    f" mission {mid}: hash mismatch"
+                )
+            heads[mid] = (seq, row["hash"])
+            verified += 1
+        if through > start:
+            self._store_journal_checkpoint(
+                through, top[1], self._heads_digest(heads), len(heads),
+            )
+        return {
+            "events_verified": verified, "missions": len(heads),
+            "from_seq": start, "through_seq": through,
+        }
+
+    def verify_journal(self, full: bool = False,
+                       incremental: bool = False) -> Dict[str, Any]:
         """Verify the event journal and report what was checked and how long
-        it took. The default is the bounded startup check — every mission's
-        hash chain, no replay — which is linear in the number of events.
-        ``full=True`` adds the SQLite integrity check and replay
-        equivalence (``verify_integrity``). Raises KernelError on any
-        mismatch; nothing is modified either way."""
+        it took. Raises KernelError on any mismatch.
+
+        - ``incremental=True`` (the daemon's startup gate): verify from
+          the verified-through checkpoint — O(new events), see
+          :meth:`verify_chain_incremental` for exactly what is and is not
+          re-checked.
+        - default: every mission's hash chain from genesis, no replay —
+          linear in the number of events; detects a change anywhere.
+        - ``full=True``: adds the SQLite integrity check and replay
+          equivalence (``verify_integrity``); wins over ``incremental``.
+
+        Mission truth is never modified; a successful chain check
+        advances the operational checkpoint in ``meta``."""
         started = _time.monotonic()
         conn = self._read_conn()
-        missions = int(conn.execute(
-            "SELECT COUNT(DISTINCT mission_id) FROM mission_events"
-        ).fetchone()[0])
-        if full:
-            result = self.verify_integrity()
-            events = int(result["events_verified"])
-            replay = result["replay"]
+        from_seq = 0
+        if full or not incremental:
+            # Pin the range first so the checkpoint never claims events
+            # appended while the full check ran.
+            top = conn.execute(
+                "SELECT seq, hash FROM mission_events ORDER BY seq DESC"
+                " LIMIT 1"
+            ).fetchone()
+            if full:
+                result = self.verify_integrity()
+                events = int(result["events_verified"])
+                replay = result["replay"]
+            else:
+                events = self.verify_chain()
+                replay = "skipped"
+            heads = self._chain_heads(conn, int(top[0]) if top else 0)
+            missions = len(heads)
+            if top is not None:
+                self._store_journal_checkpoint(
+                    int(top[0]), top[1],
+                    self._heads_digest(heads), missions,
+                )
+            mode = "full" if full else "chain"
         else:
-            events = self.verify_chain()
+            result = self.verify_chain_incremental()
+            events = int(result["events_verified"])
+            missions = int(result["missions"])
+            from_seq = int(result["from_seq"])
             replay = "skipped"
+            mode = "incremental"
         return {
             "events_verified": events,
             "missions": missions,
@@ -4573,6 +4953,8 @@ class MissionStore:
             "seconds": round(_time.monotonic() - started, 3),
             "checked_at": float(_time.time()),
             "full": bool(full),
+            "mode": mode,
+            "from_seq": from_seq,
         }
 
     def replay_projections(self) -> sqlite3.Connection:
@@ -4691,13 +5073,16 @@ class MissionStore:
         for mission in self.list_missions(status=MissionState.ACTIVE):
             lease = self.get_lease("mission_session", mission["mission_id"])
             if lease is None or float(lease["expires_at"]) <= current:
-                session_id = ""
-                for event in reversed(
-                    self.event_tail(mission["mission_id"], limit=50)
-                ):
-                    if event["kind"] == "session_started":
-                        session_id = event["data"].get("session_id", "")
-                        break
+                # The latest session_started, however many events the
+                # session wrote after it (a bounded tail scan used to miss
+                # long sessions and leak their budget reservation).
+                started = self.last_event(
+                    mission["mission_id"], ("session_started",)
+                )
+                session_id = (
+                    str(started["data"].get("session_id") or "")
+                    if started else ""
+                )
                 if self.abandon_session(
                     mission["mission_id"], session_id or "unknown",
                     reason="reconcile: lease missing or expired",

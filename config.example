@@ -28,6 +28,12 @@ api_key_env=
 # the tool schemas, system prompt and history from cache (billed at ~0.1x)
 # instead of reprocessing them. Set to false to opt out.
 #anthropic_prompt_cache=true
+# API/local provider calls (anthropic, openai, cerebras, bedrock, openrouter,
+# ollama, custom) reuse HTTP keep-alive connections per host, saving a
+# TCP+TLS handshake (~60-150 ms) on every model call and tool round. Hosts
+# covered by HTTP(S)_PROXY/NO_PROXY use plain urllib. Set to false to open a
+# fresh connection per request.
+#http_keepalive=true
 
 # --- AWS Bedrock (Moonshot Kimi) example -------------------------------------
 # Uses Bedrock's OpenAI-compatible endpoint with a long-term Bedrock API key
@@ -142,6 +148,9 @@ api_key_env=
 # Non-interactive runs (--non-interactive, pipes, cron, conch-ask, the edge
 # daemon) never prompt: they try fallback_models in order and otherwise fail
 # closed with exit status 69. Nothing is ever switched silently.
+# A pass is remembered for 24h (provider, model, endpoint and a hash of the
+# key); the interactive shell checks in the background and never waits on
+# the network before its prompt.
 #model_check=on
 # Default: 60 seconds for native seats, 4 for API/local providers.
 #model_check_timeout=4
@@ -277,6 +286,15 @@ api_key_env=
 # Missions with success criteria or run_once default to true; set the
 # spec field explicitly to override.
 #edge_daemon=false
+#
+# The daemon verifies the event journal incrementally at start (only events
+# after the last verified checkpoint); `conch mission verify` still checks
+# every hash. Processed or unaddressed inbox rows and delivered outbox rows
+# older than kernel_retention_days are pruned through journaled events, so
+# replay stays exact; the event journal itself is never pruned. Never
+# shorter than compile_suggest_window_days. 0 turns pruning off. Once rows
+# are pruned, conch versions before 1.0.2 cannot replay the journal.
+#kernel_retention_days=90
 
 # --- Mission judgment and shared memory ----------------------------------------
 # Critic/self-review sessions: every standard mission gets a scheduled,
@@ -496,6 +514,12 @@ api_key_env=
 # degrades the binding with exponential backoff (mission parks, never fails).
 #capitol_poll_seconds=10
 #capitol_hitl_ttl_seconds=86400
+#
+# Pack flow state (pack_state.json): finished sessions with no pending
+# approval, and their thread bindings, are pruned after this many days;
+# per-session history lists keep the newest entries up to the cap.
+#capitol_pack_retention_days=30
+#capitol_pack_history_cap=50
 
 # Bounded builder/provisioning profile (CapitolAdmin) — OFF BY DEFAULT.
 # Enables creating/managing platform assets (orchestrator agents, workflow

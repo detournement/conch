@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from . import http_transport
 from .render import emit_generation_detail
 from .images import IMAGE_TOKENS, to_provider as _wire_images, without_payloads
 from .seats import PROVIDERS as SEAT_PROVIDERS, complete as seat_complete
@@ -436,7 +437,7 @@ def _ollama_show(model: str, base_url: str, timeout: float) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with http_transport.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode())
 
 
@@ -462,8 +463,8 @@ def _ollama_model_records(
             if now - fetched_at < ttl:
                 return records
     try:
-        with urllib.request.urlopen(
-            f"{base_url}/api/tags", timeout=timeout
+        with http_transport.urlopen(
+            f"{base_url}/api/tags", timeout=timeout, config=config
         ) as response:
             data = json.loads(response.read().decode())
         records = []
@@ -689,8 +690,8 @@ def get_ollama_running_context(
             cached = None
     if cached is None:
         try:
-            with urllib.request.urlopen(
-                f"{base_url}/api/ps", timeout=timeout
+            with http_transport.urlopen(
+                f"{base_url}/api/ps", timeout=timeout, config=config
             ) as response:
                 data = json.loads(response.read().decode())
         except Exception:
@@ -1684,7 +1685,7 @@ def raw_cerebras(config: dict, messages: List[dict], tools: Optional[List[dict]]
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with http_transport.urlopen(req, timeout=60, config=config) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         return http_error_response("cerebras", config, exc)
@@ -1725,7 +1726,7 @@ def raw_openai(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with http_transport.urlopen(req, timeout=60, config=config) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         return http_error_response("openai", config, exc)
@@ -1790,7 +1791,7 @@ def raw_anthropic(config: dict, messages: List[dict], tools: Optional[List[dict]
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with http_transport.urlopen(req, timeout=60, config=config) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         return http_error_response("anthropic", config, exc)
@@ -1926,8 +1927,8 @@ def raw_ollama(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         method="POST",
     )
     try:
-        with urllib.request.urlopen(
-            req, timeout=_config_float(config, "ollama_timeout", 120.0)
+        with http_transport.urlopen(
+            req, timeout=_config_float(config, "ollama_timeout", 120.0), config=config
         ) as response:
             data = json.loads(response.read().decode())
     except Exception as exc:
@@ -2001,7 +2002,7 @@ def raw_bedrock(config: dict, messages: List[dict], tools: Optional[List[dict]] 
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with http_transport.urlopen(req, timeout=120, config=config) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         return http_error_response("bedrock", config, exc)
@@ -2137,7 +2138,7 @@ def raw_openrouter(config: dict, messages: List[dict], tools: Optional[List[dict
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with http_transport.urlopen(req, timeout=120, config=config) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         return http_error_response("openrouter", config, exc)
@@ -2274,7 +2275,7 @@ def _custom_model_records(
         from .runtime import serialized_agent_execution
 
         with serialized_agent_execution():
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with http_transport.urlopen(req, timeout=timeout, config=config) as response:
                 payload = json.loads(response.read().decode())
         data = (
             payload.get("data", payload.get("models", []))
@@ -2397,7 +2398,7 @@ def probe_custom_model(
         from .runtime import serialized_agent_execution
 
         with serialized_agent_execution():
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with http_transport.urlopen(req, timeout=timeout, config=config) as response:
                 payload = json.loads(response.read().decode())
         message = (payload.get("choices") or [{}])[0].get("message", {})
         verified = False
@@ -2503,7 +2504,7 @@ def get_custom_server_props(
             url, headers=_custom_headers(config), method="GET"
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with http_transport.urlopen(req, timeout=timeout, config=config) as response:
                 candidate = json.loads(response.read().decode())
             if isinstance(candidate, dict):
                 props = candidate
@@ -2641,8 +2642,8 @@ def raw_custom(config: dict, messages: List[dict], tools: Optional[List[dict]] =
         method="POST",
     )
     try:
-        with urllib.request.urlopen(
-            req, timeout=_config_float(config, "custom_timeout", 120.0)
+        with http_transport.urlopen(
+            req, timeout=_config_float(config, "custom_timeout", 120.0), config=config
         ) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
@@ -2814,7 +2815,7 @@ def _stream_openai_compat(
     usage = {"input_tokens": 0, "output_tokens": 0}
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with http_transport.urlopen(req, timeout=timeout, config=config) as response:
             for chunk in _iter_sse(response):
                 if chunk.get("error"):
                     err = chunk["error"]
@@ -3056,7 +3057,7 @@ def stream_anthropic(
     usage = {"input_tokens": 0, "output_tokens": 0}
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with http_transport.urlopen(req, timeout=120, config=config) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or line.startswith(":"):
@@ -3306,8 +3307,8 @@ def stream_ollama(
     )
 
     try:
-        with urllib.request.urlopen(
-            req, timeout=_config_float(config, "ollama_timeout", 120.0)
+        with http_transport.urlopen(
+            req, timeout=_config_float(config, "ollama_timeout", 120.0), config=config
         ) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8", errors="replace").strip()

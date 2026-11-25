@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -20,9 +21,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conch" / "mcp.json"
 
-_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "conch"
-_TOOL_CACHE_PATH = _STATE_DIR / "tool_cache.json"
-_CACHE_TTL = 1800  # 30 minutes
+# Tool-schema cache (``tool_cache.json`` in the state dir): one entry per
+# server, keyed on a fingerprint of that server's configuration, so a
+# session can offer a server's tools before the server has answered. A
+# changed entry in mcp.json invalidates only that server's tools; the
+# background connection refreshes every entry on each interactive launch.
+TOOL_CACHE_VERSION = 2
+TOOL_CACHE_MAX_AGE = 7 * 86400.0
+# How long a call to a tool whose server is still connecting waits for it.
+PENDING_SERVER_WAIT = 30.0
 
 # Discovery bounds. ``initialize`` is the first packet a server ever sees,
 # so it is where an unreachable host shows up: a LAN address that is not on
@@ -49,7 +56,9 @@ class ServerStatus:
     ``state`` is ``loading`` until the server's ``tools/list`` finished,
     then ``ready``, ``unreachable`` (it never answered: connect refused or
     timed out, process gone, no reply in time) or ``error`` (it answered
-    with a failure; ``detail`` carries the reason).
+    with a failure; ``detail`` carries the reason). A headless session
+    that took a server's tools from the cache reports ``cached``: the
+    server is started only when one of its tools is called.
     """
 
     name: str
@@ -64,6 +73,9 @@ class ServerStatus:
             return f"ready ({self.tool_count} tool{plural}, {self.elapsed:.1f}s)"
         if self.state == "loading":
             return "loading"
+        if self.state == "cached":
+            plural = "" if self.tool_count == 1 else "s"
+            return f"cached ({self.tool_count} tool{plural}; connects on first use)"
         return f"{self.state}: {self.detail}" if self.detail else self.state
 
 
@@ -774,32 +786,7 @@ def create_clients() -> Dict[str, Any]:
     default 5s), ``timeout`` (HTTP request bound, default 30s; for stdio
     servers the per-reply read bound, default 60s).
     """
-    clients: Dict[str, Any] = {}
-    for name, cfg in _server_entries():
-        credential_names = referenced_env_names({
-            key: cfg.get(key) for key in ("headers", "env", "url", "args")
-        })
-        try:
-            if cfg.get("type") == "http" and cfg.get("url"):
-                client = HttpMcpClient(
-                    name,
-                    expand_references(str(cfg["url"]), server=name, field="url"),
-                    _expand_env(cfg.get("headers"), server=name, field="headers"),
-                    connect_timeout=_timeout_option(name, cfg, "connect_timeout"),
-                    timeout=_timeout_option(name, cfg, "timeout"),
-                )
-            elif cfg.get("command"):
-                client = StdioMcpClient(
-                    name, cfg["command"], cfg.get("args", []), cfg.get("env"),
-                    read_timeout=_timeout_option(name, cfg, "timeout"),
-                )
-            else:
-                continue
-        except McpConfigError as exc:
-            client = MisconfiguredMcpClient(name, str(exc), credential_names)
-        client.credential_names = credential_names
-        clients[name] = client
-    return clients
+    return {name: create_client(name, cfg) for name, cfg in _server_entries()}
 
 
 def mount_config_servers(clients: Dict[str, Any], config: Optional[dict]) -> Dict[str, Any]:
@@ -837,8 +824,12 @@ class ToolDiscovery:
     wait expires, and ``/tools`` to show ready / loading / unreachable.
     """
 
-    def __init__(self, clients: Dict[str, Any]):
+    def __init__(self, clients: Dict[str, Any], on_server_done=None):
         self.clients: Dict[str, Any] = dict(clients)
+        # Called as ``on_server_done(name, client, tools, error)`` from the
+        # discovery thread as each server finishes (the startup loader
+        # releases tool calls waiting on that server).
+        self.on_server_done = on_server_done
         self._lock = threading.Lock()
         self._statuses = {name: ServerStatus(name) for name in self.clients}
         self._results: Dict[str, List[dict]] = {}
@@ -863,6 +854,11 @@ class ToolDiscovery:
         with self._lock:
             self._results[name] = list(tools)
             self._statuses[name] = status
+        if self.on_server_done is not None:
+            try:
+                self.on_server_done(name, client, list(tools), error)
+            except Exception:
+                pass
 
     def run(self) -> Tuple[List[dict], Dict[str, Any]]:
         """Discover every server (blocking until each has finished or hit
@@ -884,18 +880,19 @@ class ToolDiscovery:
         parallel. Duplicate names are skipped after the first server so an
         offered schema can never route to a different, nondeterministically
         selected client."""
-        tools: List[dict] = []
-        tool_map: Dict[str, Any] = {}
         with self._lock:
             results = {name: list(found) for name, found in self._results.items()}
-        for name, client in self.clients.items():
-            for tool in results.get(name, []):
-                tool_name = tool.get("function", {}).get("name", "")
-                if not tool_name or tool_name in tool_map:
-                    continue
-                tools.append(tool)
-                tool_map[tool_name] = client
-        return tools, tool_map
+        return ordered_tools(list(self.clients), results, self.clients)
+
+    def results(self) -> Dict[str, List[dict]]:
+        """``{server: tools}`` for the servers that answered successfully
+        (what the tool cache records)."""
+        with self._lock:
+            return {
+                name: list(self._results.get(name, []))
+                for name, status in self._statuses.items()
+                if status.state == "ready"
+            }
 
 
 def collect_tools(clients: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
@@ -923,25 +920,272 @@ def server_statuses(clients: Dict[str, Any],
     return statuses
 
 
-def load_cached_tools() -> Optional[List[dict]]:
-    """Load tool definitions from disk cache if still fresh."""
-    try:
-        data = json.loads(_TOOL_CACHE_PATH.read_text())
-        if time.time() - data.get("ts", 0) < _CACHE_TTL:
-            return data.get("tools", [])
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    return None
+def tool_cache_path() -> Path:
+    """``tool_cache.json`` in conch's state dir (resolved per call, so a
+    changed ``XDG_STATE_HOME`` is honoured)."""
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return state / "conch" / "tool_cache.json"
 
 
-def save_tool_cache(tools: List[dict]):
-    """Save tool definitions to disk cache."""
+def server_fingerprint(cfg: dict) -> str:
+    """A short hash of one server's configuration, the tool cache's key.
+
+    ``env`` and ``headers`` contribute their *names* only: their values
+    are credentials and never feed the hash. Everything else (command,
+    args, url, type, timeouts) is hashed as written in mcp.json, with
+    ``${VAR}`` references unexpanded.
+    """
+    safe: Dict[str, Any] = {}
+    for key, value in (cfg or {}).items():
+        if key in ("env", "headers") and isinstance(value, dict):
+            safe[key] = sorted(str(name) for name in value)
+        else:
+            safe[key] = value
+    blob = json.dumps(
+        [TOOL_CACHE_VERSION, safe], sort_keys=True, default=str
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:24]
+
+
+def server_configs(config: Optional[dict] = None) -> Dict[str, dict]:
+    """``{name: mcp.json block}`` for every server a session would use, in
+    config order, including the config-keyed Capitol docs server. No
+    client is created and nothing is spawned."""
+    configs = {name: cfg for name, cfg in _server_entries()}
+    docs_url = capitol_docs_url(config)
+    if docs_url and CAPITOL_DOCS_SERVER_NAME not in configs:
+        configs[CAPITOL_DOCS_SERVER_NAME] = {"type": "http", "url": docs_url}
+    return configs
+
+
+def server_fingerprints(config: Optional[dict] = None) -> Dict[str, str]:
+    """``{server name: fingerprint}`` for every configured server, in
+    config order."""
+    return {
+        name: server_fingerprint(cfg)
+        for name, cfg in server_configs(config).items()
+    }
+
+
+def _read_tool_cache() -> Dict[str, Any]:
     try:
-        _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        defs = [{"type": t.get("type", "function"), "function": t["function"]} for t in tools]
-        _TOOL_CACHE_PATH.write_text(json.dumps({"ts": time.time(), "tools": defs}))
-    except (OSError, TypeError):
+        data = json.loads(tool_cache_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != TOOL_CACHE_VERSION:
+        return {}
+    servers = data.get("servers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def load_server_cache(fingerprints: Dict[str, str],
+                      max_age: float = TOOL_CACHE_MAX_AGE) -> Dict[str, List[dict]]:
+    """Cached tool schemas for each server in *fingerprints* whose entry
+    was saved under the same fingerprint within *max_age* seconds. A
+    server missing from the result has no usable cache."""
+    entries = _read_tool_cache()
+    now = time.time()
+    found: Dict[str, List[dict]] = {}
+    for name, fingerprint in fingerprints.items():
+        entry = entries.get(name)
+        if not isinstance(entry, dict) or entry.get("fingerprint") != fingerprint:
+            continue
+        try:
+            age = now - float(entry.get("ts", 0))
+        except (TypeError, ValueError):
+            continue
+        tools = entry.get("tools")
+        if not 0 <= age < max_age or not isinstance(tools, list):
+            continue
+        found[name] = [
+            tool for tool in tools
+            if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name")
+        ]
+    return found
+
+
+def save_server_cache(fingerprints: Dict[str, str],
+                      results: Dict[str, List[dict]]) -> None:
+    """Record *results* (``{server: tools}``, servers that answered) under
+    their current fingerprints. Entries for other configured servers are
+    kept; entries for servers no longer configured are dropped. Never
+    raises: the cache is an optimisation."""
+    try:
+        entries = {
+            name: entry for name, entry in _read_tool_cache().items()
+            if name in fingerprints
+        }
+        now = time.time()
+        for name, tools in results.items():
+            if name not in fingerprints:
+                continue
+            entries[name] = {
+                "fingerprint": fingerprints[name],
+                "ts": now,
+                "tools": [
+                    {"type": tool.get("type", "function"), "function": tool["function"]}
+                    for tool in tools
+                ],
+            }
+        path = tool_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps({"version": TOOL_CACHE_VERSION, "servers": entries}))
+        os.replace(tmp, path)
+    except (OSError, TypeError, KeyError, ValueError):
         pass
+
+
+def ordered_tools(server_order: List[str], results: Dict[str, List[dict]],
+                  clients: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
+    """``(tools, tool_map)`` from per-server results in *server_order*
+    (config order, so the list is identical run to run and prompt caching
+    holds). Duplicate names keep the first server's tool, so an offered
+    schema never routes to a nondeterministically selected client."""
+    tools: List[dict] = []
+    tool_map: Dict[str, Any] = {}
+    for name in server_order:
+        client = clients.get(name)
+        if client is None:
+            continue
+        for tool in results.get(name, []):
+            tool_name = tool.get("function", {}).get("name", "")
+            if not tool_name or tool_name in tool_map:
+                continue
+            tools.append(tool)
+            tool_map[tool_name] = client
+    return tools, tool_map
+
+
+def _tool_error(text: str) -> dict:
+    return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
+class PendingMcpClient:
+    """Routes calls to a server whose tools were offered from the cache
+    before the server itself was connected.
+
+    A call waits (bounded by ``wait_timeout``) for the connection, then
+    runs on the real client if the server still offers the tool; if the
+    server never connected, or no longer offers the tool, the call returns
+    a clear tool error instead. Two ways to get connected:
+
+    * :meth:`resolve`, called by background discovery (the interactive
+      shell's loader, which owns and closes the real client);
+    * a *connect* factory (headless sessions), run on the first call so a
+      session that never uses the server never starts it; this client
+      then owns the connection and closes it.
+    """
+
+    def __init__(self, name: str, connect=None,
+                 wait_timeout: float = PENDING_SERVER_WAIT):
+        self.name = name
+        self.wait_timeout = float(wait_timeout)
+        self.credential_names: List[str] = []
+        self._connect = connect
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._client: Any = None
+        self._offered: set = set()
+        self._error = ""
+        self._closed = False
+
+    @property
+    def last_error(self) -> str:
+        return self._error
+
+    @property
+    def unreachable(self) -> bool:
+        return bool(getattr(self._client, "unreachable", False))
+
+    @property
+    def connected(self) -> bool:
+        return self._done.is_set()
+
+    def resolve(self, client: Any, tools: List[dict], error: str = "") -> None:
+        """The server finished connecting (or failed with *error*)."""
+        with self._lock:
+            self._client = client
+            self._offered = {
+                tool.get("function", {}).get("name", "") for tool in tools or []
+            }
+            self._error = str(error or "")
+        self._done.set()
+
+    def _connect_now(self) -> None:
+        with self._lock:
+            if self._done.is_set() or self._closed:
+                return
+            client = None
+            try:
+                client = self._connect()
+                tools = client.list_tools()
+                error = str(getattr(client, "last_error", "") or "")
+            except Exception as exc:  # a failed connect is a tool error, not a crash
+                tools, error = [], f"{exc.__class__.__name__}: {exc}"
+            self._client = client
+            self._offered = {
+                tool.get("function", {}).get("name", "") for tool in tools or []
+            }
+            self._error = error
+            self._done.set()
+
+    def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        if self._connect is not None and not self._done.is_set():
+            self._connect_now()
+        if not self._done.wait(self.wait_timeout):
+            return _tool_error(
+                f"Error: MCP server {self.name} is still connecting (waited "
+                f"{self.wait_timeout:.0f}s); {tool_name} was not run. Try again "
+                "shortly (/tools shows its status)."
+            )
+        with self._lock:
+            client, offered, error = self._client, set(self._offered), self._error
+        if client is None or (error and tool_name not in offered):
+            reason = f": {error}" if error else ""
+            return _tool_error(
+                f"Error: MCP server {self.name} is unavailable{reason}; "
+                f"{tool_name} was not run (/tools for status, /reload to retry)."
+            )
+        if tool_name not in offered:
+            return _tool_error(
+                f"Error: MCP server {self.name} no longer offers {tool_name} "
+                "(the cached tool list was out of date); it was not run."
+            )
+        return client.call_tool(tool_name, arguments)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            client = self._client if self._connect is not None else None
+        if client is not None:
+            client.close()
+
+
+def create_client(name: str, cfg: dict) -> Any:
+    """One MCP client for the mcp.json block *cfg* (see :func:`create_clients`)."""
+    credential_names = referenced_env_names({
+        key: cfg.get(key) for key in ("headers", "env", "url", "args")
+    })
+    try:
+        if cfg.get("type") == "http" and cfg.get("url"):
+            client = HttpMcpClient(
+                name,
+                expand_references(str(cfg["url"]), server=name, field="url"),
+                _expand_env(cfg.get("headers"), server=name, field="headers"),
+                connect_timeout=_timeout_option(name, cfg, "connect_timeout"),
+                timeout=_timeout_option(name, cfg, "timeout"),
+            )
+        else:
+            client = StdioMcpClient(
+                name, cfg["command"], cfg.get("args", []), cfg.get("env"),
+                read_timeout=_timeout_option(name, cfg, "timeout"),
+            )
+    except McpConfigError as exc:
+        client = MisconfiguredMcpClient(name, str(exc), credential_names)
+    client.credential_names = credential_names
+    return client
 
 
 def execute_tool_result(tool_map: Dict[str, Any], name: str, arguments: dict) -> ToolExecutionResult:

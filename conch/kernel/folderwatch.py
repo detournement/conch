@@ -293,7 +293,9 @@ class FolderWatchService:
     def _consume_verbs(self, watches: Dict[str, Dict[str, Any]]) -> None:
         state = _load_state(self._state_path)
         last_seen = int(state.get("inbox_seen", 0))
-        entries = self.store.list_inbox(source=INBOX_SOURCE, limit=100)
+        entries = self.store.list_inbox(
+            source=INBOX_SOURCE, limit=100, after_id=last_seen,
+        )
         advanced = last_seen
         for entry in entries:
             inbox_id = int(entry.get("inbox_id") or 0)

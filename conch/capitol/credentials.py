@@ -134,17 +134,34 @@ def parse_agents_yaml(text: str) -> List[Dict[str, str]]:
     return agents
 
 
+#: (path, mtime_ns, size, inode) -> parsed entries of the last read. A
+#: rewritten registry (rotated bearer) changes the signature, so the
+#: next resolution re-parses; an unchanged file costs one stat().
+_REGISTRY_CACHE: Dict[str, object] = {}
+
+
 def _load_registry_entries() -> List[Dict[str, str]]:
+    path = REGISTRY_PATH
     try:
-        text = REGISTRY_PATH.read_text()
+        st = path.stat()
+        signature = (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return []
+    if _REGISTRY_CACHE.get("signature") == signature:
+        return list(_REGISTRY_CACHE.get("entries") or [])
+    try:
+        text = path.read_text()
     except OSError:
         return []
     try:
-        return parse_agents_yaml(text)
+        entries = parse_agents_yaml(text)
     except Exception:
         # A malformed registry must not crash resolution — it simply
         # contributes no candidates (the env var path still works).
-        return []
+        entries = []
+    _REGISTRY_CACHE["signature"] = signature
+    _REGISTRY_CACHE["entries"] = entries
+    return list(entries)
 
 
 def resolve_bearer(

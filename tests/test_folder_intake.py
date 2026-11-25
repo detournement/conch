@@ -35,9 +35,10 @@ class FakeStore:
         self.outbox.append((kind, payload, dedupe_key))
         return True
 
-    def list_inbox(self, source="", limit=500, since=0.0):
+    def list_inbox(self, source="", limit=500, since=0.0, after_id=0):
         return [row for row in self.inbox_rows
-                if not source or row["source"] == source][:limit]
+                if (not source or row["source"] == source)
+                and int(row.get("inbox_id") or 0) > int(after_id)][:limit]
 
 
 class FakeEngine:

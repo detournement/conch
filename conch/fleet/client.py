@@ -28,6 +28,7 @@ from ..swarm.protocol import TaskEnvelope, new_id
 from . import authority
 from .controller import (
     check_skill_availability,
+    close_transport_factory,
     controller_alive,
     default_transport_factory,
     ensure_adhoc_mission,
@@ -394,17 +395,10 @@ class DirectFleetClient:
         worker = self.registry.get(dispatch.get("worker_id") or "")
         if worker is None:
             raise KernelError("task has no assigned worker to pull from")
-        data = self.plane.pull_artifact(worker, digest)
-        store_dir = local_artifact_dir(self.kernel_dir)
-        store_dir.mkdir(parents=True, exist_ok=True)
-        target = store_dir / digest
-        if not target.is_file():
-            tmp = target.with_name(target.name + ".part")
-            tmp.write_bytes(data)
-            import os as _os
-
-            _os.replace(tmp, target)
-        return {"path": str(target), "size": len(data)}
+        digest = str(digest or "").strip().lower()
+        target = local_artifact_dir(self.kernel_dir) / digest
+        size = self.plane.pull_artifact_to(worker, digest, target)
+        return {"path": str(target), "size": size}
 
     def wait(self, task_id: str, timeout: float = 330.0,
              poll_seconds: float = 0.3) -> Dict[str, Any]:
@@ -421,6 +415,8 @@ class DirectFleetClient:
         return self.get_task(task_id)
 
     def close(self) -> None:
+        # Stop the SSH ControlMasters this direct drive started.
+        close_transport_factory(self._factory)
         self.store.close()
 
 

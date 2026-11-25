@@ -594,9 +594,28 @@ def _supported_profiles() -> list:
     return profiles
 
 
+def _worker_artifact_path(host: Host, worker: str, digest: str) -> Path:
+    """A worker's own content-addressed artifact store (what its
+    ``artifact.get``/``artifact.put`` RPCs serve): ``<worker home>/
+    artifacts/sha256``, where the docker profile's home is the bind-mounted
+    ``state`` directory."""
+    worker = _check_name(worker, "worker name")
+    base = host.worker_dir(worker)
+    if (host.load_worker(worker).get("profile") or "") == "docker":
+        base = base / "state"
+    return base / "artifacts" / "sha256" / _check_digest(digest)
+
+
+def _artifact_target(host: Host, args) -> Path:
+    worker = getattr(args, "worker", "") or ""
+    if worker:
+        return _worker_artifact_path(host, worker, args.digest)
+    return host.store_path(args.digest)
+
+
 def cmd_artifact_put(host: Host, args) -> dict:
     expected = _check_digest(args.digest)
-    dest = host.store_path(expected)
+    dest = _artifact_target(host, args)
     if dest.is_file() and sha256_file(dest) == expected:
         # Drain stdin so the SSH pipe closes cleanly, but change nothing.
         while sys.stdin.buffer.read(1024 * 1024):
@@ -633,8 +652,10 @@ def cmd_artifact_put(host: Host, args) -> dict:
 
 
 def cmd_artifact_get(host: Host, args) -> None:
-    path = host.store_path(args.digest)
-    if not path.is_file():
+    """Stream one stored blob to stdout (one SSH session per artifact; the
+    controller verifies the digest as it writes)."""
+    path = _artifact_target(host, args)
+    if path.is_symlink() or not path.is_file():
         raise HostctlError(f"artifact {args.digest} is not in the store")
     with open(path, "rb") as handle:
         shutil.copyfileobj(handle, sys.stdout.buffer)
@@ -1654,10 +1675,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("artifact-put",
                        help="Store stdin bytes content-addressed by digest.")
     p.add_argument("--digest", required=True)
+    p.add_argument("--worker", default="",
+                   help="Store into this worker's artifact store instead"
+                        " of the host store.")
 
     p = sub.add_parser("artifact-get",
                        help="Write a stored blob to stdout.")
     p.add_argument("--digest", required=True)
+    p.add_argument("--worker", default="",
+                   help="Read from this worker's artifact store instead"
+                        " of the host store.")
 
     p = sub.add_parser("artifact-has", help="Check whether a blob is stored.")
     p.add_argument("--digest", required=True)

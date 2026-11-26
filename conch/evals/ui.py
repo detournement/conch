@@ -10,9 +10,9 @@ import sys
 from ..config import local_only_enabled
 from ..model_catalog import REGISTRY
 from ..model_picker import pick_model
-from .cases import CASES
 from .results import list_reports, load_report, one_line, save_report, summary
 from .runner import run_suite, select_target
+from .suites import DEFAULT_SUITE, get_suite
 
 
 def _confirm(prompt, input_fn) -> bool:
@@ -32,6 +32,10 @@ def _confirm(prompt, input_fn) -> bool:
 def _share(report, config, input_fn):
     if local_only_enabled(config, str(config.get("provider", ""))):
         print("Sharing blocked by local_only. Results remain private; set local_only=false in Conch's config to permit sharing.")
+        return
+    if report.get("suite", {}).get("id") != DEFAULT_SUITE:
+        print("Public sharing currently covers only the " + DEFAULT_SUITE + " suite; this "
+              + one_line(report.get("suite", {}).get("id", "unknown")) + " report stays local.")
         return
     from .public import default_public_label, public_report
     from .sharing import github_identity, refresh_submission, submit_report
@@ -104,8 +108,9 @@ def _browse(run_id, config, input_fn):
                 provider = target.get("provider", "")
                 passed = sum(case["status"] == "passed" for case in item.get("cases", []))
                 total = len(item.get("cases", []))
+                suite = item.get("suite", {}).get("id", "")
                 print(f"  {index:>3}. {item['run_id']}  {item['status']:<11} {passed}/{total}  "
-                      + one_line(f"{provider}/{model}"))
+                      + one_line(f"{suite} {provider}/{model}"))
             choice = input_fn("Number or full run ID; n/p page; Enter returns: ").strip()
             if not choice:
                 return
@@ -132,17 +137,24 @@ def _browse(run_id, config, input_fn):
 def _arguments(argument):
     parser = argparse.ArgumentParser(prog="/eval", add_help=False)
     parser.add_argument("target", nargs="?")
-    parser.add_argument("--timeout", type=int, default=300, metavar="SECONDS")
+    parser.add_argument("--timeout", type=int, default=None, metavar="SECONDS")
+    parser.add_argument("--suite", default=DEFAULT_SUITE, metavar="SUITE")
     parser.add_argument("--help", "-h", action="store_true")
     try:
         options = parser.parse_args(shlex.split(argument))
     except SystemExit:
         return None
     if options.help:
-        print("/eval [provider/model] [--timeout SECONDS]\n"
+        print("/eval [provider/model] [--suite lite|code] [--timeout SECONDS]\n"
               "/eval results [run-id]\n/eval share <run-id>\n"
-              "Select a model without changing chat; 12 fixed cases; local results; optional public sharing.")
+              "Select a model without changing chat; local results; optional public sharing (lite only).\n"
+              "  --suite lite  conch-lite: 12 fixed cases (shell, tools, files, grounding, recovery, trust); default 300s\n"
+              "  --suite code  conch-code: 4 coding cases on fixture repos (fix a failing test, multi-file rename,\n"
+              "                search-then-edit, honest reporting when tests cannot run); default 600s")
         return None
+    options.suite = get_suite(options.suite).id
+    if options.timeout is None:
+        options.timeout = get_suite(options.suite).default_deadline
     if not 1 <= options.timeout <= 3600:
         raise ValueError("Timeout must be between 1 and 3600 seconds.")
     return options
@@ -181,9 +193,14 @@ def run_eval_command(argument: str, config: dict, provider: str, model: str, *, 
             from ..seat_common import reject_native_evaluation
             reject_native_evaluation(target["provider"])
         print(f"\nEvaluate {one_line(target['provider'])}/{one_line(target['requested_model'])}")
-        print(f"{len(CASES)} synthetic cases · at most 4 inference calls/case · {options.timeout}s total deadline")
-        print("Checks practical Conch skills: shell commands, tools, file edits/saves, evidence, recovery and trust.")
-        print("Up to 1024 output tokens/call where supported; exact provider identity/usage may be unavailable.")
+        suite = get_suite(options.suite)
+        cases = suite.cases
+        limits = suite.limits
+        print(f"{suite.title} v{suite.version}: {len(cases)} synthetic cases · at most "
+              f"{limits['model_calls_per_case']} inference calls/case · {options.timeout}s total deadline")
+        print(suite.blurb)
+        print(f"Up to {limits['max_output_tokens']} output tokens/call where supported; "
+              "exact provider identity/usage may be unavailable.")
         billing = target["billing"]
         print("Billing: " + {"api": "API charges apply; total price is not known in advance.",
                              "subscription": "subscription quota applies.",
@@ -193,13 +210,13 @@ def run_eval_command(argument: str, config: dict, provider: str, model: str, *, 
         if not _confirm("Run this evaluation", input_fn):
             print("Evaluation not started.")
             return
-        number = {case.id: index for index, case in enumerate(CASES, 1)}
-        titles = {case.id: case.title for case in CASES}
+        number = {case.id: index for index, case in enumerate(cases, 1)}
+        titles = {case.id: case.title for case in cases}
 
         def progress(event):
             case_id = event["case_id"]
             if event["type"] == "case_started":
-                print(f"  [{number[case_id]:02}/{len(CASES)}] {case_id} — {titles[case_id]}", flush=True)
+                print(f"  [{number[case_id]:02}/{len(cases)}] {case_id} — {titles[case_id]}", flush=True)
             elif event["type"] == "tick" and sys.stdout.isatty():
                 print(f"\r    Running · {event['elapsed_seconds']:.0f}s", end="", flush=True)
             elif event["type"] == "case_finished":
@@ -207,13 +224,16 @@ def run_eval_command(argument: str, config: dict, provider: str, model: str, *, 
                     print("\r\033[K", end="")
                 print("    " + event["result"]["status"], flush=True)
 
-        report = run_suite(selected, target, deadline_seconds=options.timeout, progress=progress)
+        report = run_suite(selected, target, deadline_seconds=options.timeout, progress=progress,
+                           suite=suite.id)
         print("\n" + summary(report) + "\n")
-        if report["status"] == "complete":
+        if report["status"] == "complete" and suite.id == DEFAULT_SUITE:
             if input_fn("s previews public GitHub sharing; Enter keeps this local: ").strip().lower() == "s":
                 _share(report, config, input_fn)
-        else:
+        elif suite.id == DEFAULT_SUITE:
             print(f"Results remain local. Share later with /eval share {report['run_id']}")
+        else:
+            print("Results remain local; public sharing covers only the " + DEFAULT_SUITE + " suite.")
     except (EOFError, KeyboardInterrupt):
         print("\nEvaluation menu closed; any completed results remain saved.")
     except (OSError, ValueError, RuntimeError) as exc:

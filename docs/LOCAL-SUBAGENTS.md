@@ -98,7 +98,10 @@ the main conversation and does **not** launch a child.
 Delegated work runs serially with a bounded tool budget. Children cannot grant
 themselves more permission than the parent, recursively delegate, or open an
 interactive approval prompt. A denied command is a blocker, not permission to
-retry through a less restricted tool.
+retry through a less restricted tool. A delegated child that starts a
+`local_shell` background process shares it with the parent session (`/ps`
+lists it, and it stops when the parent session ends); fan-out workers cannot
+start background processes.
 
 To use Burt instead, change the custom endpoint to
 `http://192.168.1.226:8080/v1` and change **both** `custom_model` and the skill's

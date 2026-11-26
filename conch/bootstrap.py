@@ -249,6 +249,11 @@ def make_builtin_clients(
         "web_fetch": web,
     }
     clients.update({name: files for name in FILE_TOOL_NAMES})
+    # Background processes (local_shell background=true) are read and
+    # stopped through the shell client that owns their registry.
+    from .bgproc import PROCESS_TOOL_NAMES
+
+    clients.update({name: local_shell for name in PROCESS_TOOL_NAMES})
     clients["skill_manage"].configure(interactive=interactive)
     # Product tools plug in through the session-tool seam: each provider
     # owns its config gate (capitol_control needs capitol_base_url,

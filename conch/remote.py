@@ -191,6 +191,14 @@ class RemoteShellClient(LocalShellClient):
         timeout = int(arguments.get("timeout", 60))
         if not cmd:
             return self._text("Error: empty command")
+        if arguments.get("background") not in (None, False, "", "false", 0):
+            # This client lives for one inbound turn and nobody at the
+            # machine could watch or stop what it left running.
+            return self._text(
+                "Refused: background processes are not available in remote "
+                "channel sessions. Run the command in the foreground (it is "
+                "bounded by its timeout) or ask the user to start it locally."
+            )
         # safe_auto cap: only plain read-only commands (or explicitly
         # allowlisted prefixes) run unattended — never destructive ones.
         if not is_destructive_command(cmd) and (
@@ -244,6 +252,9 @@ REMOTE_EXCLUDED_TOOLS = {
     # No way to review a diff over a channel. read_file and web_fetch stay:
     # their per-turn remote variants never prompt (see _remote_clients).
     "edit_file", "write_file",
+    # Background processes belong to the hosting terminal session; remote
+    # turns can neither start them nor watch or stop the host's.
+    "process_output", "process_kill", "process_list",
 }
 
 

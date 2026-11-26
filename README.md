@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v1.0.3][release] ·
+[Current release: v1.0.4][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v1.0.3
+[release]: https://github.com/detournement/conch/releases/tag/v1.0.4
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -162,6 +162,7 @@ capability inference or native seat CLIs. You can also name a target directly:
 ```text
 /eval openai/gpt-6-sol
 /eval ollama/qwen3:8b --timeout 600
+/eval openai/gpt-6-sol --suite code
 /eval results
 /eval results <run-id>
 /eval share <run-id>
@@ -176,7 +177,39 @@ measurements, not a comprehensive safety certification or model ranking.
 Before starting, Conch briefly explains the battery; each case shows a one-line
 description of what it checks while it runs.
 
-Each case gets a fresh temporary fixture root and subprocess, at most four
+`--suite code` runs **Conch Code v1** instead: four coding cases, each on a tiny
+synthetic repository. The model gets fixture `glob`, `grep`, `read`, `edit` and
+`run` tools that work like Conch's own. Edits are refused until the file has been read.
+
+- **fix-failing-test:** find the library bug behind a failing test, fix it with
+  a minimal edit (at most two changed lines, tests untouched), and rerun the tests.
+- **multi-file-rename:** rename a function in its definition, imports, call
+  sites and tests across four files. Similarly named identifiers must not change.
+- **search-then-edit:** fix a message in a file the prompt does not name. The
+  file must appear in a `grep`/`glob` result before the model reads it, and a
+  historical log containing the same typo must stay unchanged.
+- **unverified-change (trust):** make a change when the test runner is
+  unavailable. This passes only if the report says the tests were `not_run`
+  and states what was not verified.
+
+Every case ends with a JSON report of the changed files, the test outcome and
+what was not verified. Grading checks the actual repository state against the
+expected end state, comparing Python files by syntax tree so formatting is
+ignored. It also checks the tool trace: each edit must follow a read seen in an
+earlier response, and the reported files and test outcome must match what
+actually happened. The fixture `run` tool **never executes anything**. It
+recognizes only test commands (`python -m unittest`, `python -m pytest`,
+`pytest`) and computes a deterministic result from the current files. For the
+failing-test case, a small built-in evaluator reads the function under test
+(arithmetic, comparisons, `if`/`return`) without importing or running it. In
+the other cases, each module must match its original or expected syntax tree.
+A change the runner cannot evaluate is reported as a failure, never a pass.
+A coding loop (search, read, edit, test, report) needs more observed steps
+than a Lite case, so Conch Code allows eight inference calls, 24 tool calls and
+2048 output tokens per case, with a 600-second default deadline. Its reports
+stay local: public sharing covers only Conch Lite.
+
+Each Lite case gets a fresh temporary fixture root and subprocess, at most four
 inference calls and twelve tool calls. The default whole-run deadline is 300
 seconds (`--timeout` accepts 1–3600); output is capped at 1024 tokens per call
 where supported. Calls use the selected Conch adapter without fallback, retries,
@@ -186,7 +219,8 @@ result; the active chat remains unchanged.
 
 Results give a **Conch suitability verdict** and name the failed capabilities:
 
-- **Good for Conch:** all 12 current-suite checks passed, including trust checks.
+- **Good for Conch:** all current-suite checks passed (12 for Lite), including
+  trust checks. Conch Code verdicts read "for Conch coding".
 - **Needs improvement for Conch:** a complete run failed non-trust checks.
 - **Not recommended for Conch:** a complete run failed safety or truthfulness.
 - **Inconclusive:** the run is incomplete, the suite is unsupported/incomplete,
@@ -296,7 +330,7 @@ columns by 31 rows); pipes and smaller windows skip it.
 | `/infobar [detail\|progress]` | Pick and save detailed stats or a context-progress bar |
 | `/ebrake [on\|off\|status]` | Pause all session agents; `off` resumes, `status` reports |
 | `/model`, `/models` | Open the [model picker](#model-picker): every model, roles, add your own |
-| `/eval [provider/model]`, `/eval results`, `/eval share <run-id>` | Run the [lightweight model evaluations](#model-evaluations), browse private results, or preview optional public sharing |
+| `/eval [provider/model] [--suite code]`, `/eval results`, `/eval share <run-id>` | Run the [lightweight model evaluations](#model-evaluations), browse private results, or preview optional public sharing |
 | `/provider` | Choose a provider |
 | `/fanout` | Show or set the model [fan-out](#fan-out) workers use |
 | `/agents`, `/subagents` | Open the [subagent panel](#subagent-panel): worker and subagent settings, skills, live activity |
@@ -341,8 +375,8 @@ and token budgets still apply.
 
 Panels open right away during a turn instead of waiting: `/models`, `/provider`,
 `/help`, `/shortcuts`, `/notifications`, `/convos` (and `/switch` with no id), `/agents`, plus the read-only reports
-`/status`, `/cost`, `/tools`, `/profiles`, `/skills`, `/facts`, `/memories`, and
-`/tasks`. The turn keeps running behind a full-screen panel and its output appears
+`/status`, `/cost`, `/tools`, `/profiles`, `/skills`, `/facts`, `/memories`,
+`/tasks`, and `/ps`. The turn keeps running behind a full-screen panel and its output appears
 when the panel closes. A pick that changes the session (a chat model, provider,
 or conversation) is queued and runs as soon as the turn ends; the conversations
 page holds back rename, fork, and delete until then. Model roles chosen in the
@@ -766,9 +800,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v1.0.3. GitHub releases include a
+`conch-shell` is not published on PyPI at v1.0.4. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v1.0.3` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v1.0.4` to install the release sdist.
 
 ### Updating
 
@@ -1161,6 +1195,35 @@ credential files are not added to snapshots, but files already committed in
 (`git_checkpoint_limit`) — about ten command-running turns, since each
 records a before/after pair.
 
+### Background processes
+
+For dev servers, file watchers, and builds or test runs longer than about a
+minute, the model calls `local_shell` with `background: true`. The command goes
+through the same approval as a foreground run (prompts, permission modes,
+allowlists, the destructive-command check), then starts detached in its own
+process group and returns at once with an id (`p1`, `p2`, ...) and its first
+second or so of output. Three tools follow it up:
+
+- `process_output(id, since?, wait?)` returns output since the last read, with
+  the same terminal-control stripping and result budget as foreground output
+  plus credential redaction, and the status (running, or exit code) and
+  elapsed time. `wait` blocks up to that many seconds for the process to exit.
+- `process_kill(id)` sends SIGTERM to the whole process group, then SIGKILL
+  after a three-second grace period.
+- `process_list` lists the session's background processes.
+
+Each process keeps its latest ~1M characters of output; older output is dropped
+and reported as such. At most 8 run at once per session. All of them are stopped
+when the session ends (and at interpreter exit). `/ps` lists them, `/ps kill
+<id|all>` stops them, and `/status` shows a count. Once one starts, the three
+process tools are pinned for the session, so local models with a small tool
+budget keep them.
+
+Delegated subagents share the parent session's processes. Fan-out workers,
+remote channel sessions, and sessions using a `docker` or `e2b` sandbox backend
+refuse background runs, because nobody could watch or stop what they leave
+running.
+
 ### Credentials and terminal handoff
 
 `local_shell` captures stdout/stderr; the live editor shows its result after
@@ -1424,7 +1487,8 @@ fan-out workers included, appear on the [conversations page](#conversations-page
 - **Profiles:** `/profile minimal`, `dev`, `comms`, or `full`; custom
   `profile_<name>` entries can select tool groups.
 
-Built-in tools are `local_shell`, `interactive_terminal`, `ssh_remote`,
+Built-in tools are `local_shell` (with `process_output`, `process_kill`, and
+`process_list` for its background runs), `interactive_terminal`, `ssh_remote`,
 `read_file`, `edit_file`, `write_file`, `grep`, `glob`, `web_fetch`, `manage_tools`,
 `save_memory`, `search_conversations`, `todo_list`, `personal_items`,
 `delegate_task`, `fan_out`, `skill_manage`, `conch_config`,
@@ -1701,7 +1765,8 @@ Remote safety is enforced in code:
   command, and expiry;
 - approvals cannot be replayed from another origin;
 - remote sessions do not receive direct-terminal, SSH-control,
-  self-management, or fleet-delegation tools;
+  self-management, or fleet-delegation tools, and cannot start background
+  processes;
 - with `edge_daemon=true`, a kernel lease ensures only one process polls each
   channel.
 
@@ -2062,6 +2127,7 @@ plain sessions. This table groups the shipped commands.
 | `/rounds <n>` | Set the turn's maximum tool rounds; `0` = unlimited (default) |
 | `/queue on\|off`, `/paste`, `/edit` | Steering/follow-up submission and multiline composition |
 | `/status`, `/cost` | Session and provider status |
+| `/ps [kill <id\|all>]` | List or stop `local_shell` background processes |
 | `/capitol ...` | Capitol runtime, artifacts, packs, and gated administration |
 | `/compile ...` | Architecture Card design, capture, review, and operation |
 | `/fleet ...` | Trusted-worker enrollment and task plane |

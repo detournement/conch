@@ -71,6 +71,7 @@ class AgentSession:
         self.chat_state = None
         self.mcp_clients: Dict[str, Any] = {}
         self._closed = False
+        self._owns_clients = False
         self._closed_event = threading.Event()
         self._pause_controller = pause_controller or PauseController()
         self._owns_pause_controller = pause_controller is None
@@ -125,6 +126,9 @@ class AgentSession:
         and must keep the parent's bindings (delegated subagents).
         """
         self.builtin_clients = builtin_clients or {}
+        # Only a session that owns its clients stops their background
+        # processes on close (a delegated child shares its parent's shell).
+        self._owns_clients = bool(bind)
         if chat_state is not None:
             self.chat_state = chat_state
         if mcp_clients is not None:
@@ -135,6 +139,8 @@ class AgentSession:
                     client.bind_permissions(self.permissions)
                 if hasattr(client, "set_cwd"):
                     client.set_cwd(self.cwd)
+                if hasattr(client, "bind_owner_session"):
+                    client.bind_owner_session(self)
         return self
 
     # -- turn execution ------------------------------------------------------
@@ -208,7 +214,8 @@ class AgentSession:
     # -- lifecycle -----------------------------------------------------------
 
     def close(self):
-        """Release session-owned resources (SSH control sockets, MCP clients).
+        """Release session-owned resources (SSH control sockets, MCP clients,
+        local_shell background processes).
 
         Idempotent and never raises. Child sessions built on a parent's
         shared clients never include ``ssh_remote`` (it is excluded from
@@ -221,6 +228,12 @@ class AgentSession:
         self._closed_event.set()
         if self._owns_pause_controller:
             self._pause_controller.close()
+        shell = self.builtin_clients.get("local_shell")
+        if self._owns_clients and hasattr(shell, "stop_background_processes"):
+            try:
+                shell.stop_background_processes()
+            except Exception:
+                pass
         fanout = self.builtin_clients.get("fan_out")
         if hasattr(fanout, "stop"):
             try:

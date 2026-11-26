@@ -47,6 +47,8 @@ DEFAULT_TIMEOUT = 600
 # processes at once.
 WORKER_EXTRA_EXCLUDED_TOOLS = frozenset({
     "fan_out", "save_memory", "skill_manage", "conch_introspect",
+    # Workers cannot start background processes (see run_envelope).
+    "process_output", "process_kill", "process_list",
 })
 
 WORKER_PROMPT = (
@@ -788,6 +790,10 @@ def run_envelope(envelope: dict) -> dict:
         shell = clients.get("local_shell")
         if shell is not None:
             shell.allow_prefixes(envelope.get("allow_prefixes") or [])
+            # A worker's process ends with its one bounded turn, and the
+            # parent could never watch or stop what it left running.
+            shell.set_background_allowed(
+                False, "fan-out workers cannot start background processes")
         session.budgets.max_tool_rounds = int(envelope.get("rounds") or DEFAULT_ROUNDS)
         session.attach_clients(clients)
         definitions: List[dict] = []

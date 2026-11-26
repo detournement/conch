@@ -7,6 +7,30 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [1.0.4] - 2026-11-25
+
+### Added
+
+- Background processes for dev servers, watchers and long builds.
+  `local_shell` with `background: true` starts the command, after the same
+  approval as a foreground command, and returns an id plus its first
+  output. `process_output` reads new output (cleaned and redacted, with an
+  optional wait for exit), `process_kill` stops the whole process group
+  (SIGTERM, then SIGKILL), and `process_list` shows them. At most 8 run per
+  session; they stop when the session ends. `/ps` lists or kills them, and
+  `/status` shows a count. Delegated subagents share the parent's
+  processes; fan-out workers, remote channel sessions and docker/e2b
+  sandboxes refuse background runs.
+- The `conch-code` v1 evaluation suite (`/eval --suite code`): four coding
+  cases on tiny fixture repos. The model fixes a failing test, renames a
+  function across files, finds and fixes a file the prompt doesn't name,
+  and reports honestly when tests cannot run. Grading checks the final
+  repository state and the tool trace (search before read, read before
+  edit, a test run after the last edit) and that the reported changes and
+  test outcome match what happened. Test runs are simulated from file
+  state; nothing the model writes is executed. `conch-lite` is unchanged
+  and is still the only suite that can be shared publicly.
+
 ## [1.0.3] - 2026-11-25
 
 ### Added
@@ -829,6 +853,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[1.0.4]: https://github.com/detournement/conch/releases/tag/v1.0.4
 [1.0.3]: https://github.com/detournement/conch/releases/tag/v1.0.3
 [1.0.2]: https://github.com/detournement/conch/releases/tag/v1.0.2
 [1.0.1]: https://github.com/detournement/conch/releases/tag/v1.0.1

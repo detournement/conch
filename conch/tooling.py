@@ -380,6 +380,9 @@ def save_tool_prefs(prefs: dict):
 
 
 def tool_group(name: str, tool_map: dict) -> str:
+    if name in ("process_output", "process_kill", "process_list"):
+        # Background-process tools live and die with local_shell's group.
+        return "local_shell"
     if name in (
         "local_shell",
         "interactive_terminal",
@@ -765,18 +768,82 @@ LOCAL_SHELL_TOOL = {
             "as plain text, not a live terminal display. Animations, fullscreen TUIs, "
             "cursor-updating programs, and credential input cannot be shown through "
             "this tool; use interactive_terminal when it is available. Never claim a "
-            "captured animation was displayed to the user."
+            "captured animation was displayed to the user. background=true starts "
+            "a dev server, watcher or long build detached and returns its id and "
+            "first output at once; follow up with process_output/process_kill."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute"},
-                "timeout": {"type": "integer", "description": "Max seconds to wait (default 60)"},
+                "timeout": {"type": "integer", "description": "Max seconds to wait (default 60; ignored with background)"},
+                "background": {
+                    "type": "boolean",
+                    "description": (
+                        "Run detached (servers, watchers, builds over ~60s) "
+                        "instead of waiting; same approval as a normal run"
+                    ),
+                },
             },
             "required": ["command"],
         },
     },
 }
+
+PROCESS_OUTPUT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "process_output",
+        "description": (
+            "New output from a local_shell background process since the last "
+            "read, plus its status (running / exit code) and elapsed time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Process id, e.g. p1"},
+                "since": {
+                    "type": "integer",
+                    "description": "Char offset to read from (default: where the last read ended)",
+                },
+                "wait": {
+                    "type": "integer",
+                    "description": "Seconds to wait for the process to exit first (default 0, max 300)",
+                },
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+PROCESS_KILL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "process_kill",
+        "description": (
+            "Stop a local_shell background process and its children "
+            "(SIGTERM, then SIGKILL after a grace period)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "Process id, e.g. p1"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+PROCESS_LIST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "process_list",
+        "description": "List this session's local_shell background processes and their status.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+}
+
+PROCESS_TOOLS = (PROCESS_OUTPUT_TOOL, PROCESS_KILL_TOOL, PROCESS_LIST_TOOL)
 
 INTERACTIVE_TERMINAL_TOOL = {
     "type": "function",
@@ -899,6 +966,13 @@ SAVE_MEMORY_TOOL = {
 }
 
 
+def _truthy_flag(value) -> bool:
+    """A boolean tool argument, tolerating "true"/"1" strings from models."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
 class LocalShellClient:
     name = "local_shell"
 
@@ -920,6 +994,116 @@ class LocalShellClient:
         # Called with the command right before an approved command runs
         # (app.py uses it for the pre-turn git checkpoint behind /undo).
         self._before_run = None
+        # Background processes (conch/bgproc.py), created on first use.
+        # Delegated subagents share this client, hence this registry; the
+        # owning session kills everything in it on close.
+        self._processes = None
+        self._background_refusal = ""
+        self._owner_session = None
+
+    # -- background processes ----------------------------------------------
+
+    def processes(self):
+        """This client's ProcessRegistry (created on first use)."""
+        if self._processes is None:
+            from .bgproc import ProcessRegistry
+
+            self._processes = ProcessRegistry()
+        return self._processes
+
+    def set_background_allowed(self, allowed: bool, reason: str = "") -> None:
+        """Allow or refuse ``background: true`` (refusal names *reason*)."""
+        self._background_refusal = "" if allowed else (
+            reason or "background processes are not available in this session"
+        )
+
+    def bind_owner_session(self, session) -> None:
+        """The session whose tool state gets the process tools pinned once a
+        background process starts (weak: the session owns this client)."""
+        import weakref
+
+        self._owner_session = weakref.ref(session) if session is not None else None
+
+    def stop_background_processes(self, grace: Optional[float] = None) -> list:
+        """Kill every running background process; returns those stopped."""
+        if self._processes is None:
+            return []
+        return self._processes.kill_all(grace)
+
+    def _background_blocker(self) -> str:
+        if self._background_refusal:
+            return f"Refused: {self._background_refusal}."
+        if self._exec_backend is not None:
+            return (
+                "Refused: background runs are not supported with the "
+                f"{self._exec_backend.kind} sandbox backend (its commands "
+                "cannot be watched or stopped from here). Run it in the "
+                "foreground with a timeout, or switch to /sandbox local."
+            )
+        if self._processes is not None and self._processes.at_capacity():
+            return self._processes.full_message()
+        return ""
+
+    def _pin_process_tools(self) -> None:
+        owner = self._owner_session() if self._owner_session else None
+        chat_state = getattr(owner, "chat_state", None)
+        if chat_state is None:
+            return
+        from .bgproc import PROCESS_TOOL_NAMES
+
+        try:
+            ensure_tools_active(chat_state, PROCESS_TOOL_NAMES)
+        except Exception:
+            pass
+
+    def _start_background(self, cmd: str) -> dict:
+        from .bgproc import STARTUP_WAIT, RegistryFull, format_output
+
+        blocker = self._background_blocker()
+        if blocker:
+            return self._text(blocker)
+        try:
+            proc = self.processes().start(cmd, shell=True, cwd=self._cwd)
+        except RegistryFull as exc:
+            return self._text(str(exc))
+        except OSError as exc:
+            return self._text(f"Failed to start background process: {exc}")
+        self._pin_process_tools()
+        proc.wait_exit(STARTUP_WAIT)
+        return self._text(format_output(proc, self._result_budget, started=True))
+
+    def _process_tool(self, name: str, arguments: dict) -> dict:
+        from .bgproc import MAX_WAIT, format_list, format_output, status_line
+
+        if name == "process_list":
+            procs = self._processes.list() if self._processes is not None else []
+            return self._text(format_list(procs))
+        proc_id = str(arguments.get("id") or "").strip()
+        proc = self._processes.get(proc_id) if self._processes is not None else None
+        if proc is None:
+            known = ", ".join(p.id for p in self._processes.list()) if self._processes else ""
+            return self._text(
+                f"Error: no background process '{proc_id}'"
+                + (f" (known: {known})" if known else " (none started in this session)")
+            )
+        if name == "process_kill":
+            was_running = proc.group_alive()
+            self._processes.kill(proc.id)
+            if not was_running:
+                return self._text(f"Process {status_line(proc)} (already stopped)")
+            return self._text(f"Stopped process {status_line(proc)}")
+        since = arguments.get("since")
+        try:
+            since = int(since) if since is not None and str(since).strip() != "" else None
+        except (TypeError, ValueError):
+            return self._text("Error: since must be an integer char offset")
+        try:
+            wait = min(MAX_WAIT, max(0, int(arguments.get("wait") or 0)))
+        except (TypeError, ValueError):
+            wait = 0
+        if wait:
+            proc.wait_exit(wait)
+        return self._text(format_output(proc, self._result_budget, since=since))
 
     def set_before_run(self, hook) -> None:
         """Register ``hook(command)`` to run just before an approved
@@ -1110,8 +1294,10 @@ class LocalShellClient:
     def exec_backend(self):
         return self._exec_backend
 
-    def _run_command(self, cmd: str, timeout: int) -> dict:
+    def _run_command(self, cmd: str, timeout: int, background: bool = False) -> dict:
         self._fire_before_run(cmd)
+        if background:
+            return self._start_background(cmd)
         backend = self._exec_backend
         if backend is None:
             return self._run_process(cmd, timeout, shell=True)
@@ -1143,15 +1329,25 @@ class LocalShellClient:
         return self._run_process(list(argv), timeout, shell=False)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
+        if name in ("process_output", "process_kill", "process_list"):
+            return self._process_tool(name, arguments or {})
         cmd = arguments.get("command", "")
         timeout = int(arguments.get("timeout", 60))
         if not cmd:
             return self._text("Error: empty command")
+        background = _truthy_flag(arguments.get("background"))
+        if background:
+            # Refuse before asking: never prompt for a run that cannot start.
+            blocker = self._background_blocker()
+            if blocker:
+                return self._text(blocker)
 
         from .render import clear_active_spinners
         clear_active_spinners()
         if self._exec_backend is not None:
             where = f"Run in {self._exec_backend.kind} sandbox:"
+        elif background:
+            where = "Run locally in the background:"
         else:
             where = "Run locally:"
         print(f"\n  \033[1;33m\u26a0 {where}\033[0m \033[1m{cmd}\033[0m", flush=True)
@@ -1180,7 +1376,7 @@ class LocalShellClient:
                 print(f"  \033[2m(always-allowed: {command_prefix(cmd)})\033[0m")
             else:
                 print("  \033[2m(safe command \u2014 auto-approved)\033[0m")
-            return self._run_command(cmd, timeout)
+            return self._run_command(cmd, timeout, background)
 
         if not self.policy.interactive:
             if destructive:
@@ -1216,7 +1412,7 @@ class LocalShellClient:
             break
 
         if answer.lower() in ("", "y", "yes"):
-            return self._run_command(cmd, timeout)
+            return self._run_command(cmd, timeout, background)
 
         if answer == "A":
             self.permissions().set_agent_mode(True)
@@ -1226,14 +1422,14 @@ class LocalShellClient:
                 input_fn=self.policy.input_fn,
             )
             print("  \033[1;32mAgent mode: ON\033[0m \u2014 all commands will auto-execute")
-            return self._run_command(cmd, timeout)
+            return self._run_command(cmd, timeout, background)
 
         if answer.lower() in ("a", "always"):
             prefix = command_prefix(cmd)
             if prefix and not destructive:
                 self._allowed_prefixes.add(prefix)
                 print(f"  \033[2m(will auto-approve '{prefix} ...' this session)\033[0m")
-            return self._run_command(cmd, timeout)
+            return self._run_command(cmd, timeout, background)
 
         if answer.lower() in ("e", "edit"):
             try:
@@ -1244,7 +1440,7 @@ class LocalShellClient:
                 return self._text(self._no_answer_decline(exc))
             cmd = edited or cmd
             print(f"  \033[2m\u2192 {cmd}\033[0m")
-            return self._run_command(cmd, timeout)
+            return self._run_command(cmd, timeout, background)
 
         # n / anything else = decline; ask for optional feedback
         try:
@@ -2923,6 +3119,8 @@ def discover_user_tools() -> tuple[List[dict], UserToolClient]:
 
 def inject_builtin_tools(all_tools: List[dict], tool_map: Dict[str, Any], clients: Dict[str, Any]):
     builtin = [LOCAL_SHELL_TOOL, MANAGE_TOOLS_TOOL, SAVE_MEMORY_TOOL, PUBLIC_API_TOOL, SEARCH_CONVERSATIONS_TOOL]
+    if "process_output" in clients:
+        builtin.extend(PROCESS_TOOLS)
     if "interactive_terminal" in clients:
         builtin.append(INTERACTIVE_TERMINAL_TOOL)
     if "ssh_remote" in clients:

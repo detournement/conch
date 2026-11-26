@@ -858,8 +858,12 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
                 print("Describe what you want to do. For example:")
                 print('  "Explain this project" or "Help me understand a failing command".')
                 print("Use /model to choose a model; Ctrl+P finds commands.")
-                if session.permissions.get_permission_mode() == "prompt_all":
+                _mode = session.permissions.get_permission_mode()
+                if _mode == "prompt_all":
                     print("Shell commands require your approval before they run.")
+                elif _mode == "accept_edits":
+                    print("accept_edits: file edits inside this repository apply "
+                          "without asking; other shell commands still ask.")
             _print_tool_notices()
             if agent_mode_from_config:
                 print(f"\033[1;33m{AGENT_MODE_CONFIG_NOTICE}\033[0m")

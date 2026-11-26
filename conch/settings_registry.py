@@ -82,8 +82,10 @@ SETTINGS: Tuple[Setting, ...] = (
             group="subagents"),
     Setting("permission_mode", "choice",
             "Shell approval policy: prompt_all asks for everything, safe_auto runs "
-            "read-only commands, yolo runs everything (destructive still asks)",
-            "prompt_all", choices=("prompt_all", "safe_auto", "yolo"), ask_first=True),
+            "read-only commands, accept_edits also applies file edits inside the "
+            "repository, yolo runs everything (destructive still asks)",
+            "prompt_all", choices=("prompt_all", "safe_auto", "accept_edits", "yolo"),
+            ask_first=True),
     Setting("local_only", "choice",
             "Keep a local session from falling back to cloud providers", "auto",
             choices=("auto", "true", "false"), ask_first=True),

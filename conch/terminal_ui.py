@@ -723,7 +723,8 @@ class TerminalUI:
     def _status_text(self):
         fields = self._context_fields
         permission = {
-            "prompt_all": "ask first", "safe_auto": "safe auto", "yolo": "AUTO-EXECUTE",
+            "prompt_all": "ask first", "safe_auto": "safe auto",
+            "accept_edits": "accept edits", "yolo": "AUTO-EXECUTE",
         }.get(fields.get("permission"), fields.get("permission", ""))
         parts = [permission] if permission else []
         with self._condition:

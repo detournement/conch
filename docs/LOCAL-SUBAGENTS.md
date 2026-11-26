@@ -6,7 +6,8 @@ Local inference is optional and does not require an Anthropic or OpenAI API key.
 There are two separate configurations:
 
 - **Conch** delegates through the `delegate_task` tool and Conch skills under
-  `~/.config/conch/skills/`. Delegation inherits the parent's permissions.
+  `~/.config/conch/skills/`. Delegation inherits the parent's permissions,
+  except read-only explore agents (below), which never need any.
 - **OMP**, the coding assistant used to develop Conch, discovers named agents
   under `~/.omp/agent/agents/` and providers in `~/.omp/agent/models.yml`.
   Those files do not configure Conch. OMP is not required to use Conch.
@@ -110,6 +111,32 @@ window. A skill's `provider: custom` selects Conch's configured custom endpoint;
 it cannot supply a second independent base URL. An unusable skill model preference
 can fall back to the parent's model with a warning, so check the delegation output
 rather than assuming it ran locally.
+
+## Read-only explore agents
+
+`delegate_task` with `mode: "explore"`, and `fan_out` tasks with
+`mode: "explore"`, run a read-only explore agent. It is offered only
+`read_file`, `grep`, `glob`, a read-only `local_shell` and `web_fetch` (the
+session's fetch rule, but a fetch that would ask is refused), and gets the
+repository map in its prompt. The shell runs only plain read-only
+commands (`ls`, `cat`, `rg`, `git log`, ...; no pipes, redirects,
+environment dumps, credential paths, or content searches of the home
+directory); `edit_file`/`write_file` are refused and MCP tools are not
+loaded. This is enforced by tool filtering and wrapper clients, not by the
+prompt, so an explore agent cannot change anything even in agent mode and
+never asks for approval, even in `prompt_all`. A fan-out made only of
+explore tasks starts without the ask-first question, so up to eight can
+search in parallel. Each returns a concise findings report, keeping file
+dumps out of the main conversation; that makes explore agents a good fit for
+a small local model:
+
+```text
+Use fan_out with mode explore to find where config keys are validated,
+where permission modes are checked, and which tests cover them.
+```
+
+A skill can narrow an explore agent's tools (`skill` plus `mode: "explore"`)
+but never widen them.
 
 ## Keep a seat parent and fan out to a local model
 

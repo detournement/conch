@@ -16,6 +16,12 @@ A worker's authority never exceeds its parent's. It cannot prompt, so a
 command that would need approval is refused and reported back. A session in
 ``prompt_all`` mode asks once before a fan-out starts, because its workers
 run read-only commands without asking.
+
+A task with ``mode: "explore"`` runs a read-only explore worker (see
+``conch.tooling.explore_toolset``): read_file/grep/glob and plain read-only
+commands only, enforced by the worker's tool set and wrapper clients. A
+fan-out made only of explore tasks changes nothing, so it starts without
+the ``prompt_all`` question.
 """
 
 from __future__ import annotations
@@ -35,6 +41,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import subagent_activity
 from .ebrake import AgentsCancelled, PauseController, checkpoint
+
+# Mirrors conch.tooling (imported lazily there; fanout stays import-light).
+EXPLORE_MODE = "explore"
+SUBAGENT_MODES = ("general", EXPLORE_MODE)
+EXPLORE_TOOLS = ("read_file", "grep", "glob", "local_shell", "web_fetch")
 
 EFFORTS = ("light", "standard", "heavy")
 MAX_TASKS = 8
@@ -72,7 +83,10 @@ FAN_OUT_TOOL = {
             "comparing options. Give every task all the context it needs; workers "
             "share nothing with you or each other. Workers cannot ask the user: "
             "they run read-only shell commands and refuse the rest unless this "
-            "session auto-executes. Set effort so a suitable model is chosen: "
+            "session auto-executes. mode='explore' (per task or for all) makes "
+            "a read-only explore worker that never asks and returns a findings "
+            "report: use it for broad codebase searches so file dumps stay out "
+            "of your context. Set effort so a suitable model is chosen: "
             "light for lookups, extraction and summaries; standard for typical "
             "multi-step work; heavy for hard debugging or design."
         ),
@@ -98,9 +112,19 @@ FAN_OUT_TOOL = {
                                 "enum": list(EFFORTS),
                                 "description": "How demanding the task is",
                             },
+                            "mode": {
+                                "type": "string",
+                                "enum": list(SUBAGENT_MODES),
+                                "description": "explore = read-only worker",
+                            },
                         },
                         "required": ["task"],
                     },
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": list(SUBAGENT_MODES),
+                    "description": "Default mode for tasks that do not set one",
                 },
             },
             "required": ["tasks"],
@@ -418,21 +442,30 @@ class FanOutClient:
             return [], "Error: 'tasks' must be a non-empty list"
         if len(tasks) > MAX_TASKS:
             return [], f"Error: at most {MAX_TASKS} tasks per fan-out"
+        default_mode = str(arguments.get("mode") or "general").strip().lower()
+        if default_mode not in SUBAGENT_MODES:
+            return [], f"Error: unknown mode '{default_mode}' (use general or explore)"
         parsed = []
         for item in tasks:
             if not isinstance(item, dict) or not str(item.get("task") or "").strip():
                 return [], "Error: every task needs a non-empty 'task'"
             task = str(item["task"]).strip()
             effort = str(item.get("effort") or "").strip().lower()
+            mode = str(item.get("mode") or default_mode).strip().lower()
+            if mode not in SUBAGENT_MODES:
+                return [], f"Error: unknown mode '{mode}' (use general or explore)"
             parsed.append({
                 "task": task,
                 "context": str(item.get("context") or "").strip(),
                 "effort": effort if effort in EFFORTS else classify_effort(task),
+                "mode": mode,
             })
         return parsed, ""
 
-    def _worker_tools(self) -> Tuple[List[str], str]:
-        """(tool names workers get, note for the model when one is withheld)."""
+    def _worker_tools(self, explore: bool = False) -> Tuple[List[str], str]:
+        """(tool names workers get, note for the model when one is withheld).
+        *explore* narrows them to the read-only explore set (the worker
+        wraps each one read-only)."""
         from .tooling import DelegateTaskClient
 
         session = self._session
@@ -446,6 +479,7 @@ class FanOutClient:
         names = sorted(
             name for name in session.builtin_clients
             if name in active and name not in excluded
+            and (not explore or name in EXPLORE_TOOLS)
         )
         shell = session.builtin_clients.get("local_shell")
         if "local_shell" in names and getattr(shell, "_exec_backend", None) is not None:
@@ -456,15 +490,18 @@ class FanOutClient:
                            " sandbox, which fan-out workers do not share.")
         return names, ""
 
-    def _permission_mode(self) -> Optional[str]:
-        """The mode workers run in, or None when the user declines."""
+    def _permission_mode(self, explore_only: bool = False) -> Optional[str]:
+        """The mode workers run in, or None when the user declines.
+        *explore_only*: every worker is read-only, so there is nothing to
+        ask about."""
         session = self._session
         mode = session.permissions.get_permission_mode()
         shell = session.builtin_clients.get("local_shell")
         policy = getattr(shell, "policy", None)
         if mode == "yolo" or getattr(policy, "allow_auto_execute", False):
             return "yolo"
-        if mode != "prompt_all" or policy is None or not policy.interactive:
+        if (explore_only or mode != "prompt_all" or policy is None
+                or not policy.interactive):
             return mode
         print("  \033[2mWorkers run read-only commands without asking and refuse"
               " the rest.\033[0m")
@@ -608,18 +645,22 @@ class FanOutClient:
         columns = shutil.get_terminal_size(fallback=(80, 24)).columns
         plan = []
         for index, task in enumerate(tasks, start=1):
-            head = f"{index}. {task['choice'].label} ({task['choice'].reason}) \u2014 "
+            kind = " explore" if task["mode"] == EXPLORE_MODE else ""
+            head = f"{index}.{kind} {task['choice'].label} ({task['choice'].reason}) \u2014 "
             room = max(16, columns - len(head) - 6)
             text = " ".join(task["task"].split())
             plan.append(head + (text if len(text) <= room else text[:room - 1] + "\u2026"))
         tools, tool_note = self._worker_tools()
+        explore_tools, _ = self._worker_tools(explore=True)
+        modes = {task["mode"] for task in tasks}
+        explore_only = modes == {EXPLORE_MODE}
         from .render import clear_active_spinners
 
         clear_active_spinners()
         print(f"\n  \033[1;33m\u26a0 Fan out {len(tasks)} tasks:\033[0m", flush=True)
         for line in plan:
             print(f"    {line}")
-        mode = self._permission_mode()
+        mode = self._permission_mode(explore_only=explore_only)
         if mode is None:
             return self._text("User declined the fan-out.")
         if tool_note:
@@ -645,7 +686,8 @@ class FanOutClient:
             "context": task["context"],
             "config": routed(task["choice"]),
             "cwd": session.cwd,
-            "tools": tools,
+            "tools": explore_tools if task["mode"] == EXPLORE_MODE else tools,
+            "mode": task["mode"],
             "rounds": rounds,
             "permission_mode": mode,
             "allow_prefixes": sorted(getattr(shell, "_allowed_prefixes", ()) or ()),
@@ -764,13 +806,20 @@ def run_envelope(envelope: dict) -> dict:
     from .bootstrap import make_builtin_clients
     from .memory import MemoryStore
     from .session import AgentSession
-    from .tooling import PermissionState, inject_builtin_tools
+    from .tooling import (
+        EXPLORE_PROMPT,
+        PermissionState,
+        _explore_repo_map,
+        explore_toolset,
+        inject_builtin_tools,
+    )
 
     config = dict(envelope.get("config") or {})
     mode = str(envelope.get("permission_mode") or "prompt_all")
+    explore = envelope.get("mode") == EXPLORE_MODE
     permissions = PermissionState(
         agent_mode=mode == "yolo",
-        permission_mode="safe_auto" if mode == "safe_auto" else "prompt_all",
+        permission_mode=mode if mode in ("safe_auto", "accept_edits") else "prompt_all",
     )
     wanted = set(envelope.get("tools") or ())
     session = AgentSession(
@@ -796,17 +845,27 @@ def run_envelope(envelope: dict) -> dict:
                 False, "fan-out workers cannot start background processes")
         session.budgets.max_tool_rounds = int(envelope.get("rounds") or DEFAULT_ROUNDS)
         session.attach_clients(clients)
-        definitions: List[dict] = []
+        prompt = WORKER_PROMPT
         tool_map: Dict[str, Any] = {}
-        inject_builtin_tools(definitions, tool_map, clients)
-        tools = [
-            definition for definition in definitions
-            if definition.get("function", {}).get("name") in clients
-        ]
+        if explore:
+            # Read-only: only the wrapped explore tools exist in this worker.
+            tools, clients = explore_toolset(clients)
+            session.builtin_clients = clients
+            prompt += "\n\n" + EXPLORE_PROMPT
+            repo_map = _explore_repo_map(session.cwd, config)
+            if repo_map:
+                prompt += "\n\n" + repo_map
+        else:
+            definitions: List[dict] = []
+            inject_builtin_tools(definitions, tool_map, clients)
+            tools = [
+                definition for definition in definitions
+                if definition.get("function", {}).get("name") in clients
+            ]
         task = str(envelope.get("task") or "")
         context = str(envelope.get("context") or "")
         messages = [
-            {"role": "system", "content": WORKER_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": task if not context else f"{task}\n\nContext:\n{context}"},
         ]
         reply, usage = session.run_turn(messages, tools=tools or None, tool_map=tool_map)

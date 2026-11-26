@@ -7,6 +7,28 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [1.0.5] - 2026-11-25
+
+### Added
+
+- Read-only explore subagents. `delegate_task` and `fan_out` accept
+  `mode: "explore"` for broad codebase searches: the agent gets only
+  `read_file`, `grep`, `glob`, a strictly read-only shell and a
+  non-prompting `web_fetch`, enforced by tool filtering and wrapper
+  clients rather than the prompt. It cannot write files, run mutating
+  commands, or start or manage background processes. Explore agents never
+  ask for approval, even in `prompt_all`, so an explore-only fan-out runs
+  up to 8 in parallel without asking first. Each returns a short findings
+  report, which keeps file dumps out of the main context.
+- `permission_mode = accept_edits`: file edits inside the repository (the
+  git root, or the working directory outside a repo) apply without asking
+  and still show the diff. Edits outside it, through symlinks that resolve
+  outside it, under `.git/`, and to credential or system paths still ask,
+  and the read-before-edit guard still applies. Shell commands behave as
+  in `safe_auto`. Switch modes for the session with `/permissions <mode>`;
+  the status bar and `/status` show the active mode. A project `.conchrc`
+  cannot set it.
+
 ## [1.0.4] - 2026-11-25
 
 ### Added
@@ -853,6 +875,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[1.0.5]: https://github.com/detournement/conch/releases/tag/v1.0.5
 [1.0.4]: https://github.com/detournement/conch/releases/tag/v1.0.4
 [1.0.3]: https://github.com/detournement/conch/releases/tag/v1.0.3
 [1.0.2]: https://github.com/detournement/conch/releases/tag/v1.0.2

@@ -174,8 +174,12 @@ api_key_env=
 #git_checkpoint_limit=20
 
 # Shell approval policy: prompt_all (default), safe_auto (read-only commands
-# auto-approve), or yolo (everything auto-executes). Destructive commands
-# (rm, dd, git push --force, ...) always prompt, even in agent/yolo mode.
+# auto-approve), accept_edits (safe_auto, plus file edits inside the
+# repository apply without asking; edits outside it, under .git/ and to
+# credential/system paths still ask), or yolo (everything auto-executes).
+# Destructive commands (rm, dd, git push --force, ...) always prompt, even in
+# agent/yolo mode. /permissions <mode> switches it for one session; a
+# project .conchrc cannot set it.
 #permission_mode=safe_auto
 
 # Info bar in the live editor; per-reply detailed stats in plain sessions.

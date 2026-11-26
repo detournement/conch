@@ -48,7 +48,8 @@ BUILTIN_SLASH_COMMANDS = (
     "/find", "/fork", "/forget", "/grep", "/h", "/help", "/image", "/infobar", "/install", "/keys",
     "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
-    "/models", "/new", "/note", "/notes", "/notifications", "/paste", "/profile", "/profiles",
+    "/models", "/new", "/note", "/notes", "/notifications", "/paste", "/permissions",
+    "/profile", "/profiles",
     "/provider", "/ps", "/queue", "/registry", "/reload", "/remember", "/rename", "/reset",
     "/resettools", "/retry", "/rounds", "/s", "/sandbox", "/schedule", "/search",
     "/shortcuts", "/skill", "/skills", "/ssh", "/status", "/subagents", "/switch", "/tasks",
@@ -177,6 +178,8 @@ SLASH_COMMANDS = [
     ("/image [path|clear]", "Attach an image (default: the clipboard) to your next message"),
     ("/agent", "Toggle agent mode (auto-execute shell)"),
     ("/yolo", "Alias for /agent"),
+    ("/permissions [prompt_all|safe_auto|accept_edits|yolo]",
+     "Show or set this session's permission mode"),
     ("/terminal <command>", "Run with direct, non-recorded terminal input/output"),
     ("/ssh <action>", "Connect, execute, open a shell, show status, or disconnect"),
     ("/verbose", "Toggle showing tool args and results"),
@@ -1581,6 +1584,7 @@ def handle_slash_command(
             "  \033[1m/compact [focus]\033[0m     Summarize older history now to free context\n"
             "  \033[1m/image [path|clear]\033[0m  Attach an image (default: clipboard) to your next message\n"
             "  \033[1m/agent\033[0m, \033[1m/yolo\033[0m       Toggle agent mode (auto-execute shell)\n"
+            "  \033[1m/permissions [mode]\033[0m  Show or set the permission mode (accept_edits: auto-apply repo edits)\n"
             "  \033[1m/terminal <command>\033[0m  Direct terminal handoff for sudo/getpass (never captured)\n"
             "  \033[1m/ssh connect <user@host> [port]\033[0m  Authenticate and open a control connection\n"
             "  \033[1m/ssh exec <command>\033[0m  Run a permission-gated remote command\n"
@@ -1645,6 +1649,41 @@ def handle_slash_command(
             print("  \033[2mLocal commands will auto-execute without confirmation.\033[0m")
         print()
         return "agent_mode_changed"
+
+    if command == "/permissions":
+        from .tooling import (
+            PERMISSION_MODE_DESCRIPTIONS,
+            PERMISSION_MODE_LABELS,
+            PERMISSION_MODES,
+            get_permission_mode,
+            normalize_permission_mode,
+            set_permission_mode,
+        )
+
+        if arg:
+            mode = normalize_permission_mode(arg)
+            if not mode:
+                print(f"\n  \033[31mUnknown permission mode '{arg}'.\033[0m"
+                      f" \033[2mChoose one of: {', '.join(PERMISSION_MODES)}\033[0m\n")
+                return None
+            # An explicit mode replaces agent mode (which would otherwise
+            # keep the effective mode at yolo).
+            set_agent_mode(False)
+            set_permission_mode(mode)
+        current = get_permission_mode()
+        print(f"\n  Permission mode: \033[1m{current}\033[0m"
+              f" \033[2m({PERMISSION_MODE_LABELS.get(current, current)})\033[0m")
+        for mode in PERMISSION_MODES:
+            marker = "\u25b8" if mode == current else " "
+            print(f"   {marker} \033[1m{mode:<13}\033[0m"
+                  f"\033[2m{PERMISSION_MODE_DESCRIPTIONS[mode]}\033[0m")
+        if arg:
+            print("  \033[2mThis session only; set permission_mode in"
+                  " your Conch config to keep it.\033[0m")
+            print()
+            return "agent_mode_changed"
+        print("  \033[2mUsage: /permissions <mode>\033[0m\n")
+        return None
 
     if command in ("/terminal", "/tty"):
         if not arg:
@@ -2751,6 +2790,9 @@ def handle_slash_command(
             print(f"    Session:        {turns} turns, {total_in:,} in / {total_out:,} out tokens")
         agent_status = "on" if get_agent_mode() else "off"
         print(f"    Agent mode:     {agent_status}")
+        from .tooling import get_permission_mode
+
+        print(f"    Permissions:    {get_permission_mode()}")
         _bg = _background_summary(tool_map)
         if _bg:
             print(f"    Background:     {_bg}  \033[2m(/ps)\033[0m")

@@ -130,6 +130,7 @@ _CHAT_BASE = (
     "  Tools: /tools, /enable <group>, /disable <group>, /reload\n"
     "  Profiles: /profile [minimal|dev|comms|full]\n"
     "  Agent: /agent [on|off] or /yolo -- toggle auto-execution of shell commands\n"
+    "  Permissions: /permissions [prompt_all|safe_auto|accept_edits|yolo]\n"
     "  Credentials: /terminal <command>; SSH: /ssh help\n"
     "  Verbose: /verbose -- toggle showing tool args and results\n"
     "  Scheduling: /schedule <interval> <prompt>, /tasks, /cancel <id>\n"
@@ -187,7 +188,9 @@ _CHAT_LOCAL = (
     "- skill_manage: load a saved skill's procedure before a task it covers; "
     "when asked to turn a procedure into a skill, draft and save it.\n"
     "- delegate_task: hand a self-contained subtask to a subagent that returns "
-    "a summary.\n"
+    "a summary. For broad codebase searches use mode='explore' (or fan_out "
+    "explore tasks): a read-only agent that never asks and returns findings, "
+    "so file dumps stay out of your context.\n"
     "- conch_introspect: inspect your OWN capabilities, config, and source "
     "code.\n\n"
 
@@ -336,6 +339,11 @@ _CODING_SEARCH_WITH_TOOLS = (
     "Search with the grep tool (contents) and the glob tool (file names) "
     "rather than guessing paths."
 )
+_CODING_EXPLORE = (
+    "\n- For broad searches across many files, use explore agents "
+    "(delegate_task or fan_out with mode='explore'): read-only, they never "
+    "ask and return findings, so file dumps stay out of your context."
+)
 _CODING_SEARCH_WITH_SHELL = (
     "Search with rg (ripgrep) through local_shell, e.g. rg -n 'name' or "
     "rg --files -g '*.py', rather than guessing paths."
@@ -346,14 +354,18 @@ def build_coding_guidance(tool_names=None) -> str:
     """The coding-guidance section for a session whose tools are *tool_names*.
 
     Mentions the grep/glob tools only when both are available; otherwise
-    points at rg through local_shell.
+    points at rg through local_shell. Points at explore agents when
+    delegate_task or fan_out is available.
     """
     names = set(tool_names or ())
     search = (
         _CODING_SEARCH_WITH_TOOLS if {"grep", "glob"} <= names
         else _CODING_SEARCH_WITH_SHELL
     )
-    return CODING_GUIDANCE.format(search=search)
+    text = CODING_GUIDANCE.format(search=search)
+    if names & {"delegate_task", "fan_out"}:
+        text += _CODING_EXPLORE
+    return text
 
 
 # ---------------------------------------------------------------------------

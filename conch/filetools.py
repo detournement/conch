@@ -437,6 +437,52 @@ def _diff_names(shown: str) -> Tuple[str, str]:
     return f"a/{shown}", f"b/{shown}"
 
 
+#: Path components that make a change ask in ``accept_edits`` mode even
+#: inside the repository: git's own metadata (hooks run code, config can
+#: point anywhere).
+ACCEPT_EDITS_GUARDED_PARTS = frozenset({".git"})
+
+
+def edit_root(cwd: str) -> str:
+    """The directory ``accept_edits`` auto-applies inside: the git root
+    enclosing *cwd*, else *cwd* itself (symlink-resolved)."""
+    from .repomap import find_git_root
+
+    try:
+        root = find_git_root(cwd)
+    except OSError:
+        root = None
+    return os.path.realpath(str(root) if root is not None else cwd)
+
+
+def accept_edits_block_reason(path: str, cwd: str) -> Optional[str]:
+    """None when ``accept_edits`` may apply a change to *path* without
+    asking; otherwise a short reason it must ask.
+
+    The literal path and its symlink-resolved target must both lie inside
+    :func:`edit_root`, so a link inside the repository that points outside
+    it counts as outside. Credential and system paths are checked
+    separately (they ask in every mode)."""
+    root = edit_root(cwd)
+    roots = _path_forms(root)
+    literal = os.path.abspath(path)
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return f"outside the repository ({root})"
+    if not any(_within(literal, item) for item in roots) or not _within(real, root):
+        return f"outside the repository ({root})"
+    for form in (literal, real):
+        for item in roots:
+            if not _within(form, item):
+                continue
+            parts = os.path.relpath(form, item).split(os.sep)
+            hit = ACCEPT_EDITS_GUARDED_PARTS.intersection(parts)
+            if hit:
+                return f"a guarded path ({sorted(hit)[0]}/)"
+    return None
+
+
 class FileToolsClient:
     """Serves read_file / edit_file / write_file / grep / glob for one
     session."""
@@ -1104,8 +1150,11 @@ class FileToolsClient:
         Returns None to apply, or the decline/refusal text for the model.
         prompt_all and safe_auto ask (a write is a mutation, never "safe");
         agent/yolo mode or the session 'a' choice apply without asking but
-        still show the diff. Credential files and system locations ask in
-        every mode and are refused when nobody can be asked."""
+        still show the diff. accept_edits applies without asking inside the
+        repository (git root, else the working directory) and asks outside
+        it, for a symlink that resolves outside it, and under ``.git/``.
+        Credential files and system locations ask in every mode and are
+        refused when nobody can be asked."""
         from .render import clear_active_spinners
 
         clear_active_spinners()
@@ -1125,7 +1174,19 @@ class FileToolsClient:
             )
             print(f"  \033[2m({note})\033[0m")
             return None
+        outside = None
+        if guard is None and mode == "accept_edits":
+            outside = accept_edits_block_reason(path, self.cwd)
+            if outside is None:
+                print("  \033[2m(accept edits — inside the repository, auto-applying)\033[0m")
+                return None
         if not self.policy.interactive:
+            if outside:
+                return (
+                    f"Refused: {shown} is {outside}; accept_edits applies "
+                    "changes without asking only inside the repository, and "
+                    "this session cannot prompt. It was not changed."
+                )
             if guard:
                 return (
                     f"Refused: {shown} is a {guard}; changing it requires "
@@ -1140,6 +1201,8 @@ class FileToolsClient:
                 f"  \033[1;31m\u26a0 {guard[0].upper() + guard[1:]} \u2014 "
                 "confirmation required (even in agent mode)\033[0m"
             )
+        elif outside:
+            print(f"  \033[33m(accept edits — {outside}; asking)\033[0m")
 
         _input = self.policy.input_fn or input
         while True:

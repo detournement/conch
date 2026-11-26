@@ -8,10 +8,10 @@ one-off commands to durable missions running across your machines.
 **Capture → compile → operate.**
 
 [Official website](https://conch-site-gamma.vercel.app/) ·
-[Current release: v1.0.4][release] ·
+[Current release: v1.0.5][release] ·
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
-[release]: https://github.com/detournement/conch/releases/tag/v1.0.4
+[release]: https://github.com/detournement/conch/releases/tag/v1.0.5
 
 ```bash
 curl -fsSL https://conch-site-gamma.vercel.app/install | sh
@@ -800,9 +800,9 @@ For a read-only launcher inventory, run the installer with `--check`.
 Existing shells retain aliases and command hashes: use the printed absolute
 launcher immediately, then open a new terminal for the repaired startup files.
 
-`conch-shell` is not published on PyPI at v1.0.4. GitHub releases include a
+`conch-shell` is not published on PyPI at v1.0.5. GitHub releases include a
 source distribution, wheel, and SHA-256 sidecars; the website installer follows
-`edge` by default. Set `CONCH_INSTALL_REF=v1.0.4` to install the release sdist.
+`edge` by default. Set `CONCH_INSTALL_REF=v1.0.5` to install the release sdist.
 
 ### Updating
 
@@ -1087,8 +1087,19 @@ blank header. `conch keys migrate-mcp` converts inline values to this form.
 
 - `prompt_all` — default; every command asks;
 - `safe_auto` — read-only commands auto-run, mutating commands ask;
+- `accept_edits` — `safe_auto`, plus `edit_file`/`write_file` changes inside
+  the repository (the git root, or the working directory outside a repo)
+  apply without asking; the diff is still shown. Edits outside it, through a
+  symlink that resolves outside it, under `.git/`, and to credential or
+  system paths (`.env`, `.conchrc`, keys, `/etc`, ...) still ask, and the
+  read-before-edit rule still applies. Non-read-only shell commands ask;
 - `yolo` — commands auto-run, also toggled for a session with `/agent` or
   `/yolo`.
+
+`/permissions` shows the session's mode; `/permissions <mode>` switches it
+for the session (and turns agent mode off), and the status bar names it.
+`permission_mode` in your user config sets the default; a project `.conchrc`
+cannot set it.
 
 Destructive commands still require confirmation in agent/yolo mode and are
 refused in non-interactive runs: `rm`, `dd`, `mkfs`, `find … -delete`,
@@ -1458,7 +1469,7 @@ fan-out workers included, appear on the [conversations page](#conversations-page
 - **Web:** `web_fetch` reads an http(s) page as text (HTML stripped to
   headings, paragraphs, and links; JSON pretty-printed; binary types refused),
   capped at 2 MB downloaded. `prompt_all` asks per URL (`a` allows the host
-  for the session); `safe_auto` and agent mode fetch without asking;
+  for the session); `safe_auto`, `accept_edits` and agent mode fetch without asking;
   `web_fetch_allow_domains` lists hosts that never ask. URLs carrying
   credentials are refused.
 - **MCP:** stdio and HTTP Model Context Protocol servers from
@@ -1615,6 +1626,16 @@ keeps that raised limit; an unlimited session stays unlimited. An explicit
 
 The model can delegate a bounded subtask into a fresh context with
 `delegate_task`; recursive delegation and self-management tools are excluded.
+`delegate_task` with `mode: "explore"` (and `fan_out` tasks with
+`mode: "explore"`) runs a read-only explore agent for broad codebase
+searches: it is offered only `read_file`, `grep`, `glob`, a read-only
+`local_shell` (plain `ls`/`cat`/`rg`/`git log`-style commands; no pipes,
+redirects, environment dumps, credential paths or home-wide searches) and
+`web_fetch` under the session's own rule (a fetch that would ask is refused
+instead), plus the repository map, and
+returns a findings report. Writes and mutating commands are refused by the
+tool set and wrapper clients whatever the model asks or the session's mode
+is, so an explore agent never asks for approval, even in `prompt_all`.
 Markdown files in `~/.config/conch/commands/` become custom slash commands,
 with `$ARGUMENTS` interpolation.
 
@@ -1665,8 +1686,11 @@ Workers never exceed the session's authority and cannot ask you anything:
   Workers then run read-only commands (`ls`, `cat`, `grep`, ...) and the
   session's allowed command prefixes without asking, and refuse everything
   else, reporting what they could not do.
-- In `safe_auto` and agent mode workers follow the same mode without a prompt.
-  Destructive commands are always refused.
+- In `safe_auto`, `accept_edits` and agent mode workers follow the same mode
+  without a prompt. Destructive commands are always refused.
+- A fan-out made only of explore tasks (`mode: "explore"` on the call or on
+  every task) starts without the ask-first question: explore workers are
+  read-only, so several can search in parallel safely.
 - Workers get the session's active built-in tools, minus self-management,
   memory writes, recursion, the terminal handoff and SSH. MCP tools are not
   loaded in workers. A sandboxed session withholds the shell from workers.
@@ -1985,7 +2009,7 @@ network sandbox for tools you explicitly enable or approve.
 | `api_key_env` | provider-specific | API-key variable name; ignored by seat providers |
 | `seat_timeout` | `120` | Positive finite native-inference deadline in seconds; `CONCH_SEAT_TIMEOUT` overrides it |
 | `agent_mode` | `false` | Auto-execute ordinary shell commands for the session |
-| `permission_mode` | `prompt_all` | `prompt_all`, `safe_auto`, or `yolo` |
+| `permission_mode` | `prompt_all` | `prompt_all`, `safe_auto`, `accept_edits`, or `yolo` |
 | `local_only` | `auto` | Prevent cloud fallback for local-provider sessions |
 | `model_check` | `on` | Verify the configured model at start (a pass is remembered for 24h; the shell checks in the background); `off` skips it |
 | `model_check_timeout` | `60` seats; `4` otherwise | Seconds per startup probe (0.5–60) |
@@ -2106,6 +2130,7 @@ plain sessions. This table groups the shipped commands.
 | `/rename`, `/export`, `/retry`, `/fork`, `/compact` | Retitle, write Markdown, re-run the last message, branch, summarize now |
 | `/image [path\|clear]` | Attach an image to your next message |
 | `/agent`, `/yolo` | Toggle shell auto-execution |
+| `/permissions [mode]` | Show or set the session's permission mode (`prompt_all`, `safe_auto`, `accept_edits`, `yolo`) |
 | `/terminal <command>` | Direct, uncaptured terminal handoff |
 | `/ssh connect\|status\|exec\|shell\|disconnect` | Validated OpenSSH control session |
 | `/verbose` | Toggle tool arguments and results |

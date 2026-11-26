@@ -505,6 +505,21 @@ class RealWorkerTests(unittest.TestCase):
         self.assertIn("cannot prompt", text)
         self.assertFalse((self.work / "written-by-worker").exists())
 
+    def test_explore_workers_run_in_parallel_read_only_even_in_agent_mode(self):
+        (self.work / "notes.txt").write_text("explored by the worker\n")
+        parent = self.parent(fanout_concurrency="3")
+        parent.session.permissions.set_agent_mode(True)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = parent.client.call_tool("fan_out", {"mode": "explore", "tasks": [
+                {"task": "RUN cat notes.txt"}, {"task": "RUN touch made-by-explore"},
+                {"task": "RUN git branch evil"}]})
+        text = result["content"][0]["text"]
+        self.assertIn("3 of 3", text)
+        self.assertIn("explored by the worker", text)
+        self.assertEqual(text.count("explore agents are read-only"), 2)
+        self.assertFalse((self.work / "made-by-explore").exists())
+
     def test_a_slow_worker_is_stopped_at_the_task_timeout(self):
         _Endpoint.delay = 30
         started = time.monotonic()

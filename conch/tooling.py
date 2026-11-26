@@ -53,7 +53,39 @@ TOOL_PREFS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/st
 # delegated, future controller work) own private instances via AgentSession.
 # ---------------------------------------------------------------------------
 
-PERMISSION_MODES = ("prompt_all", "safe_auto", "yolo")
+PERMISSION_MODES = ("prompt_all", "safe_auto", "accept_edits", "yolo")
+
+#: Modes that auto-approve plain read-only shell commands
+#: (:func:`is_safe_command`) and web fetches. ``accept_edits`` is safe_auto
+#: plus auto-applied file edits inside the repository (see
+#: ``FileToolsClient._approve_change``); other shell commands still ask.
+SAFE_AUTO_MODES = frozenset({"safe_auto", "accept_edits"})
+
+#: Short labels for the status bar and /permissions.
+PERMISSION_MODE_LABELS = {
+    "prompt_all": "ask first",
+    "safe_auto": "safe auto",
+    "accept_edits": "accept edits",
+    "yolo": "AUTO-EXECUTE",
+}
+
+PERMISSION_MODE_DESCRIPTIONS = {
+    "prompt_all": "every shell command and file change asks first",
+    "safe_auto": "read-only shell commands run; everything else asks",
+    "accept_edits": (
+        "file edits inside this repository apply without asking (diff "
+        "shown); read-only shell commands run; other commands, edits "
+        "outside the repository and guarded paths ask"
+    ),
+    "yolo": "everything auto-executes (destructive commands still ask)",
+}
+
+
+def normalize_permission_mode(mode: str) -> str:
+    """Canonical spelling of *mode* (``accept-edits`` -> ``accept_edits``),
+    or "" when it is not a permission mode."""
+    normalized = (mode or "").strip().lower().replace("-", "_")
+    return normalized if normalized in PERMISSION_MODES else ""
 
 
 class PermissionState:
@@ -74,8 +106,8 @@ class PermissionState:
         return self._agent_mode
 
     def set_permission_mode(self, mode: str):
-        normalized = (mode or "").strip().lower().replace("-", "_")
-        if normalized in PERMISSION_MODES:
+        normalized = normalize_permission_mode(mode)
+        if normalized:
             self._permission_mode = normalized
 
     def get_permission_mode(self) -> str:
@@ -1364,7 +1396,7 @@ class LocalShellClient:
             auto = True
         elif self._prefix_allowed(cmd):
             auto = True
-        elif mode == "safe_auto" and is_safe_command(cmd):
+        elif mode in SAFE_AUTO_MODES and is_safe_command(cmd):
             auto = True
         else:
             auto = False
@@ -1733,7 +1765,7 @@ class SSHRemoteClient(LocalShellClient):
             return True, "agent mode"
         if self._prefix_allowed(command):
             return True, f"always-allowed: {command_prefix(command)}"
-        if mode == "safe_auto" and is_safe_command(command):
+        if mode in SAFE_AUTO_MODES and is_safe_command(command):
             return True, "safe command"
         return False, ""
 
@@ -2497,8 +2529,12 @@ DELEGATE_TASK_TOOL = {
             "context and its own tool budget. It returns only a concise "
             "summary — use this to keep large exploration or multi-step side "
             "work out of your own context. Subagents run one at a time. "
-            "Pass 'skill' to run a skill-scoped subagent: it gets that "
-            "skill's instructions, allowed tools, and model preference."
+            "mode='explore' gives a read-only subagent (read_file, grep, glob, "
+            "read-only shell; it can change nothing, so it never asks for "
+            "approval) that returns a findings report: use it for broad "
+            "codebase searches. Pass 'skill' to run a skill-scoped subagent: "
+            "it gets that skill's instructions, allowed tools, and model "
+            "preference."
         ),
         "parameters": {
             "type": "object",
@@ -2511,6 +2547,11 @@ DELEGATE_TASK_TOOL = {
                     "type": "string",
                     "description": "Optional extra context the subagent needs",
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["general", "explore"],
+                    "description": "general (default) or explore (read-only search)",
+                },
                 "skill": {
                     "type": "string",
                     "description": "Optional skill name scoping the subagent "
@@ -2521,6 +2562,285 @@ DELEGATE_TASK_TOOL = {
         },
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Explore subagents: a read-only profile for delegate_task and fan_out.
+# Read-only is enforced by tool filtering (only the tools below are offered;
+# the runtime rejects any other tool name) and by wrapper clients that refuse
+# writes and every shell command that is not plainly read-only, whatever the
+# model asks for and whatever the parent's permission mode is.
+# ---------------------------------------------------------------------------
+
+EXPLORE_MODE = "explore"
+SUBAGENT_MODES = ("general", EXPLORE_MODE)
+
+#: Tools an explore agent may be offered (when the parent session has them).
+EXPLORE_TOOLS = ("read_file", "grep", "glob", "local_shell", "web_fetch")
+EXPLORE_FILE_TOOLS = ("read_file", "grep", "glob")
+
+EXPLORE_PROMPT = (
+    "You are an EXPLORE agent: strictly read-only. You can read files, "
+    "search with grep/glob, and run plain read-only shell commands (ls, "
+    "cat, git log/diff/show, ...). You cannot create, edit or delete "
+    "anything, and commands that could change something are refused. "
+    "Search broadly, then reply with a concise findings report: the "
+    "answer, the relevant file paths with line numbers, and short excerpts "
+    "only where they matter. Do not paste whole files."
+)
+
+EXPLORE_SHELL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "local_shell",
+        "description": (
+            "Run one plain read-only shell command (ls, cat, head, wc, grep, "
+            "rg, find, tree, git status/log/diff/show/branch) and return its "
+            "captured output. No pipes, chaining, redirection or "
+            "substitution; anything that could change state is refused. "
+            "Prefer the grep/glob/read_file tools."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The read-only command"},
+                "timeout": {"type": "integer", "description": "Max seconds to wait (default 60)"},
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+# Content searchers an explore agent may not point at the home directory (or
+# above), nor run from there: a recursive search walks ~/.ssh, ~/.aws, ...
+_EXPLORE_RECURSIVE = frozenset({"grep", "rg"})
+# Read-only by prefix but able to change state with some arguments.
+_EXPLORE_GIT_BRANCH_DENY = frozenset({
+    "-d", "-D", "-m", "-M", "-c", "-C", "-f", "-u", "--delete", "--move",
+    "--copy", "--force", "--edit-description", "--unset-upstream", "--track",
+    "--no-track", "--create-reflog",
+})
+_EXPLORE_GIT_BRANCH_LISTING = frozenset({
+    "--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged",
+    "--points-at",
+})
+_GLOB_CHARS = "*?["
+
+
+def _explore_path_refusal(token: str, cwd: str, recursive: bool) -> Optional[str]:
+    from glob import glob as _glob
+
+    from .filetools import sensitive_path_reason
+
+    expanded = os.path.expandvars(os.path.expanduser(token))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(cwd, expanded)
+    candidates = [expanded]
+    if any(ch in expanded for ch in _GLOB_CHARS):
+        candidates.extend(_glob(expanded)[:500])
+    for candidate in candidates:
+        if not os.path.lexists(candidate):
+            continue  # a search pattern or a missing file reads nothing
+        reason = sensitive_path_reason(candidate)
+        if reason:
+            return f"it reads a {reason}"
+        if recursive and _contains_home(candidate):
+            return "it searches the home directory (credential folders live there)"
+    return None
+
+
+def _contains_home(path: str) -> bool:
+    """True when *path* is the home directory or one of its ancestors."""
+    real = os.path.realpath(path).rstrip(os.sep) or os.sep
+    home = os.path.realpath(str(Path.home()))
+    return real == home or home.startswith(real.rstrip(os.sep) + os.sep)
+
+
+def explore_shell_refusal(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
+    """None when *cmd* may run in an explore agent; otherwise the refusal
+    text for the model. Stricter than :func:`is_safe_command`: no
+    environment dumps, no credential paths, no home-wide scans, and none
+    of the state-changing arguments a read-only prefix still accepts."""
+    cwd = cwd or os.getcwd()
+    refused = (
+        "Refused: explore agents are read-only. Only plain read-only "
+        "commands run (ls, cat, head, grep, rg, find, git status/log/diff/"
+        "show); use read_file, grep and glob where you can."
+    )
+    text = (cmd or "").strip()
+    if not is_safe_command(text) or is_destructive_command(text, cwd=cwd):
+        return refused
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return refused
+    if not tokens:
+        return refused
+    exe = tokens[0].lower()
+    args = tokens[1:]
+    lowered = [arg.lower() for arg in args]
+    if exe == "printenv":
+        return "Refused: explore agents may not dump the environment (it holds API keys)."
+    if any(arg.startswith("--output") for arg in lowered):
+        return refused
+    if exe in ("date", "hostname") and args:
+        if exe == "hostname" or any(a in ("-s", "--set") or a.startswith("--set=") for a in lowered):
+            return refused
+    if exe == "tree" and any(a == "-o" or a.startswith("-o") and len(a) > 2 for a in args):
+        return refused
+    if exe == "git" and args:
+        sub = lowered[0]
+        rest = args[1:]
+        if sub == "branch":
+            if any(a in _EXPLORE_GIT_BRANCH_DENY or a.startswith("--set-upstream")
+                   for a in rest):
+                return refused
+            positional = [a for a in rest if not a.startswith("-")]
+            if positional and not any(
+                a.split("=", 1)[0] in _EXPLORE_GIT_BRANCH_LISTING for a in rest
+            ):
+                return refused
+        elif sub == "remote":
+            if rest and rest[0] not in ("-v", "--verbose", "show", "get-url"):
+                return refused
+    recursive = exe in _EXPLORE_RECURSIVE
+    if recursive and _contains_home(cwd):
+        return ("Refused: explore agents may not run a content search from "
+                "the home directory; use the grep tool with a project path.")
+    for arg in args:
+        value = arg
+        if arg.startswith("-"):
+            if "=" not in arg:
+                continue
+            value = arg.split("=", 1)[1]
+        if not value:
+            continue
+        reason = _explore_path_refusal(value, cwd, recursive)
+        if reason:
+            return f"Refused: explore agents may not run this command: {reason}."
+    return None
+
+
+def _explore_repo_map(cwd: Optional[str], config: Optional[dict] = None) -> str:
+    """The repository map for an explore agent's prompt ("" when repo_map
+    is off or there is no repository)."""
+    try:
+        from .config import get_bool
+        from .repomap import get_repo_map
+
+        if not get_bool(config or {}, "repo_map", True):
+            return ""
+
+        return get_repo_map(cwd or "")
+    except Exception:
+        return ""
+
+
+class ExploreShellClient:
+    """local_shell for explore agents: runs only what
+    :func:`explore_shell_refusal` passes, without prompting, through the
+    parent shell's execution path (sandbox included). Never prompts, never
+    consults the parent's allowlist or agent mode."""
+
+    name = "local_shell"
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    @property
+    def cwd(self) -> Optional[str]:
+        return getattr(self._inner, "_cwd", None)
+
+    @staticmethod
+    def _text(msg: str) -> dict:
+        return {"content": [{"type": "text", "text": msg}]}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        cmd = str((arguments or {}).get("command") or "").strip()
+        if not cmd:
+            return self._text("Error: empty command")
+        try:
+            timeout = int((arguments or {}).get("timeout", 60) or 60)
+        except (TypeError, ValueError):
+            timeout = 60
+        refusal = explore_shell_refusal(cmd, self.cwd)
+        if refusal:
+            print(f"  \033[33m✗ explore: refused\033[0m \033[2m{cmd[:120]}\033[0m",
+                  file=sys.stderr)
+            return self._text(refusal)
+        print(f"  \033[2m(explore — read-only) {cmd[:120]}\033[0m", file=sys.stderr)
+        inner = self._inner
+        if getattr(inner, "_exec_backend", None) is None:
+            # No /undo checkpoint for a read-only command.
+            return inner._run_process(cmd, timeout, shell=True)
+        return inner._run_command(cmd, timeout)
+
+
+class ExploreFileClient:
+    """read_file / grep / glob for explore agents; edit_file and write_file
+    are refused. Wraps a non-interactive, prompt_all copy of the parent's
+    file tools, so a credential-bearing file is refused rather than
+    prompted for."""
+
+    name = "files"
+
+    def __init__(self, inner):
+        if hasattr(inner, "remote_variant"):
+            inner = inner.remote_variant()
+        self._inner = inner
+
+    @property
+    def cwd(self):
+        return getattr(self._inner, "cwd", None)
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        if name not in EXPLORE_FILE_TOOLS:
+            return {
+                "content": [{"type": "text", "text": (
+                    f"Refused: explore agents are read-only; {name} is not "
+                    "available. Report the change you would make instead."
+                )}],
+                "isError": True,
+            }
+        return self._inner.call_tool(name, arguments)
+
+
+def explore_toolset(clients: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
+    """(tool definitions, clients) for an explore agent, built from a
+    session's *clients*: only :data:`EXPLORE_TOOLS` the session has, each
+    behind a read-only wrapper. web_fetch keeps the session's own rule
+    (mode, allowed domains and hosts) but never prompts: a fetch that would
+    ask is refused."""
+    from .filetools import FILE_TOOL_DEFS
+
+    defs: List[dict] = []
+    out: Dict[str, Any] = {}
+    files = next((clients[n] for n in EXPLORE_FILE_TOOLS if n in clients), None)
+    if files is not None:
+        wrapped = ExploreFileClient(files)
+        for tool_def in FILE_TOOL_DEFS:
+            name = tool_def["function"]["name"]
+            if name in EXPLORE_FILE_TOOLS:
+                defs.append(tool_def)
+                out[name] = wrapped
+    shell = clients.get("local_shell")
+    if shell is not None and hasattr(shell, "_run_process"):
+        defs.append(EXPLORE_SHELL_TOOL)
+        out["local_shell"] = ExploreShellClient(shell)
+    web = clients.get("web_fetch")
+    if web is not None and hasattr(web, "policy"):
+        import dataclasses
+
+        from .webfetch import WEB_FETCH_TOOL, WebFetchClient
+
+        quiet = WebFetchClient(permissions=getattr(web, "_permissions", None),
+                               config=getattr(web, "_config", None))
+        quiet.set_policy(dataclasses.replace(web.policy, interactive=False))
+        quiet.set_result_budget(getattr(web, "_result_budget", 0))
+        quiet._allowed_hosts = set(getattr(web, "_allowed_hosts", ()) or ())
+        defs.append(WEB_FETCH_TOOL)
+        out["web_fetch"] = quiet
+    return defs, out
 
 
 # ---------------------------------------------------------------------------
@@ -2873,6 +3193,12 @@ class DelegateTaskClient:
             return self._text("Error: 'task' is required")
         if self._chat_state is None:
             return self._text("Error: delegate_task not initialized")
+        mode = str(arguments.get("mode") or "general").strip().lower()
+        if mode not in SUBAGENT_MODES:
+            return self._text(
+                f"Error: unknown mode '{mode}' (use general or explore)"
+            )
+        explore = mode == EXPLORE_MODE
         skill = None
         skill_name = (arguments.get("skill") or "").strip().lower()
         if skill_name:
@@ -2893,6 +3219,8 @@ class DelegateTaskClient:
         if provider and model and model.split("/", 1)[0].lower() != provider:
             model = f"{provider}/{model}"
         label = f"[{skill['name']}] {task}" if skill else task
+        if explore:
+            label = f"[explore] {label}"
         # Serialize: one subagent at a time (single local GPU).
         if not self._lock.acquire(blocking=False):
             return self._text(
@@ -2902,7 +3230,8 @@ class DelegateTaskClient:
         token = subagent_activity.start("delegate", label, model)
         status, summary = "failed", "no result"
         try:
-            result = self._run(task, (arguments.get("context") or "").strip(), skill)
+            result = self._run(task, (arguments.get("context") or "").strip(), skill,
+                               explore=explore)
             text = str(((result.get("content") or [{}])[0]).get("text") or "")
             if text.startswith("Subagent summary:"):
                 status, summary = "done", text[len("Subagent summary:"):]
@@ -2919,7 +3248,8 @@ class DelegateTaskClient:
             subagent_activity.finish(token, status, summary)
             self._lock.release()
 
-    def _run(self, task: str, context: str, skill: Optional[dict] = None) -> dict:
+    def _run(self, task: str, context: str, skill: Optional[dict] = None,
+             explore: bool = False) -> dict:
         from .config import get_int
         from .providers import RAW_FNS
         from .runtime import truncate_tool_result
@@ -2939,7 +3269,17 @@ class DelegateTaskClient:
             config, "subagent_rounds", self.DEFAULT_ROUNDS
         )
 
-        if skill is not None and skill.get("tools") is not None:
+        if explore:
+            # Read-only profile: only the explore tools, each behind a
+            # read-only wrapper; a skill can narrow the set, never widen it.
+            sub_tools, sub_clients = explore_toolset(self._builtin_clients)
+            if skill is not None and skill.get("tools") is not None:
+                allowed = set(skill["tools"])
+                sub_tools = [t for t in sub_tools
+                             if t["function"]["name"] in allowed]
+                sub_clients = {k: v for k, v in sub_clients.items()
+                               if k in allowed}
+        elif skill is not None and skill.get("tools") is not None:
             # Skill-scoped toolset (plan 4.2): only the skill's allowed tools
             # (minus the always-excluded self-management set), drawn from the
             # full loaded tool list so profile filtering doesn't hide them.
@@ -2974,6 +3314,14 @@ class DelegateTaskClient:
                     forks[id(client)] = client.fork()
                 sub_clients[key] = forks[id(client)]
         system_prompt = self.SUBAGENT_PROMPT
+        if explore:
+            system_prompt += "\n\n" + EXPLORE_PROMPT
+            repo_map = _explore_repo_map(
+                self._session.cwd if self._session is not None else None,
+                config,
+            )
+            if repo_map:
+                system_prompt += "\n\n" + repo_map
         if skill is not None:
             from . import skills as skills_mod
             system_prompt += (
@@ -2986,6 +3334,8 @@ class DelegateTaskClient:
             {"role": "user", "content": user_content},
         ]
         label = f"subagent[{skill['name']}]" if skill else "subagent"
+        if explore:
+            label = f"explore {label}"
         print(f"  \033[2m({label}: {task[:70]})\033[0m", file=sys.stderr)
         # Child session: shares the parent's permission state (a subagent's
         # authority is never wider than its parent's) but owns its own config
@@ -3011,7 +3361,9 @@ class DelegateTaskClient:
             reply, usage = child.run_turn(
                 messages,
                 tools=sub_tools or None,
-                tool_map=getattr(self._chat_state, "tool_map", {}) or {},
+                # Explore agents get no MCP tools: only the wrapped set.
+                tool_map=({} if explore else
+                          getattr(self._chat_state, "tool_map", {}) or {}),
             )
         except Exception as exc:
             return self._text(f"Error: subagent failed: {exc}")

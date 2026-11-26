@@ -205,6 +205,30 @@ class UpdateCheckoutTests(unittest.TestCase):
         self.assertEqual(self.out("status", "--porcelain"), "")
         self.assertEqual(self.stashes(), "")
 
+    def nested_worktree(self):
+        nested = self.consumer / ".claude" / "worktrees" / "agent"
+        self.git("worktree", "add", "-q", "-b", "agent", str(nested))
+        return nested
+
+    def test_fast_forward_skips_untracked_nested_worktree(self):
+        nested = self.nested_worktree()
+        upstream = self.publish()
+        self.assertIs(self.update(), True)
+        self.assertEqual(self.out("rev-parse", "HEAD"), upstream)
+        self.assertTrue((nested / ".git").exists())
+        self.assertEqual(self.out("rev-parse", "HEAD", root=nested), self.base)
+        self.assertEqual(self.stashes(), "")
+
+    def test_nested_worktree_with_dirty_work_still_updates_and_restores(self):
+        nested = self.nested_worktree()
+        before = self.dirty_work()
+        upstream = self.publish()
+        self.assertIs(self.update(), True)
+        self.assertEqual(self.out("rev-parse", "HEAD"), upstream)
+        self.assert_dirty_work(before)
+        self.assertTrue((nested / ".git").exists())
+        self.assertEqual(self.stashes(), "")
+
     def test_up_to_date_checkout_is_unchanged(self):
         before = self.state()
         self.assertIs(self.update(), False)

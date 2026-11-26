@@ -112,8 +112,33 @@ def _head(root: Path) -> str:
 
 
 def _status(root: Path) -> str:
-    return _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
-                "--ignore-submodules=none").stdout
+    """Return porcelain status, minus untracked nested Git checkouts.
+
+    ``git stash --include-untracked`` cannot save an untracked directory that
+    holds its own ``.git`` (an agent worktree or a cloned repo), so such entries
+    would survive the stash and look like a concurrent writer. Integration never
+    touches them: merge and rebase refuse to overwrite untracked paths.
+    """
+    raw = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+               "--ignore-submodules=none").stdout
+    kept = []
+    entries = raw.split("\0")
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if not entry:
+            continue
+        if "R" in entry[:2] or "C" in entry[:2]:
+            # Renames and copies carry their source path in the next field.
+            kept.append(entry + "\0" + (entries[index] if index < len(entries) else ""))
+            index += 1
+            continue
+        path = entry[3:]
+        if entry.startswith("?? ") and path.endswith("/") and (root / path / ".git").exists():
+            continue
+        kept.append(entry)
+    return "\0".join(kept)
 
 
 def _checkout_state(root: Path) -> Tuple[str, str, str, str]:

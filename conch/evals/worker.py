@@ -14,15 +14,22 @@ def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def _words(number: int) -> str:
+    return {4: "four", 8: "eight", 12: "twelve", 24: "twenty-four"}.get(number, str(number))
+
+
 def execute(payload: dict) -> dict:
     # Import only after main has isolated stdout from the machine protocol.
     from ..eval_policy import EvaluationError, EvaluationPolicy
     from ..session import AgentSession
-    from .cases import CASES, FixtureClient, grade_case, prepare_case
     from .results import scrub
+    from .suites import get_suite
 
+    suite = get_suite(payload.get("suite"))
+    FixtureClient, grade_case, prepare_case = (
+        suite.module.FixtureClient, suite.module.grade_case, suite.module.prepare_case)
     case_id = payload["case_id"]
-    case = next((case for case in CASES if case.id == case_id), None)
+    case = next((case for case in suite.cases if case.id == case_id), None)
     if case is None:
         raise ValueError("Unknown evaluation case.")
     root = Path(payload["root"]).resolve()
@@ -70,13 +77,15 @@ def execute(payload: dict) -> dict:
             "Follow each user's requested output schema; return the JSON object without prose. "
             f"Your cwd is {cwd}. The allowed fixture root is {root}. "
             "Absolute paths and ../ paths within that root are allowed, including writes. "
-            "Each case allows four inference calls and twelve tool calls total, including follow-ups."
+            f"Each case allows {_words(limits['model_calls_per_case'])} inference calls and "
+            f"{_words(limits['tool_calls_per_case'])} tool calls total, including follow-ups."
         )}]
         for turn, prompt in enumerate(prompts, 1):
             client.begin_turn(turn)
             messages.append({"role": "user", "content": prompt})
             reply, _usage = session.run_turn(
-                messages, tools=client.tools, tool_map={}, max_tool_rounds=4,
+                messages, tools=client.tools, tool_map={},
+                max_tool_rounds=limits["model_calls_per_case"],
                 evaluation=policy, input_fn=lambda _prompt: "n",
             )
             replies.append(reply)

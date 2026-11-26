@@ -1221,7 +1221,7 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     # Read-only reports that may print while a turn runs: they only read
     # session state and never prompt.
     _LIVE_REPORTS = ("/status", "/cost", "/tools", "/profiles", "/skills",
-                     "/facts", "/memories", "/mem", "/tasks")
+                     "/facts", "/memories", "/mem", "/tasks", "/ps")
 
     def _live_command(command):
         """A panel or report typed during a turn opens now, on its own thread,
@@ -2091,6 +2091,17 @@ def chat_loop(new_conversation=False, interactive=True, startup_check=None,
     finally:
         if _ui:
             _ui.close()
+        # Background processes stop with the shell, before the (possibly
+        # slow) summary; session.close() below repeats this idempotently.
+        _bg_shell = builtin_clients.get("local_shell")
+        if hasattr(_bg_shell, "stop_background_processes"):
+            try:
+                _bg_stopped = _bg_shell.stop_background_processes()
+            except Exception:
+                _bg_stopped = []
+            if _bg_stopped:
+                print(f"\033[2mStopped {len(_bg_stopped)} background "
+                      "process(es).\033[0m")
         _save_current()
         if session_usage["turns"] > 0:
             total_in = session_usage["input_tokens"]

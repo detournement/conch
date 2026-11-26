@@ -49,7 +49,7 @@ BUILTIN_SLASH_COMMANDS = (
     "/list", "/llamaidx",
     "/ls", "/mem", "/memories", "/mission", "/missions", "/model",
     "/models", "/new", "/note", "/notes", "/notifications", "/paste", "/profile", "/profiles",
-    "/provider", "/queue", "/registry", "/reload", "/remember", "/rename", "/reset",
+    "/provider", "/ps", "/queue", "/registry", "/reload", "/remember", "/rename", "/reset",
     "/resettools", "/retry", "/rounds", "/s", "/sandbox", "/schedule", "/search",
     "/shortcuts", "/skill", "/skills", "/ssh", "/status", "/subagents", "/switch", "/tasks",
     "/terminal", "/tks", "/todo", "/tools", "/tty", "/undo", "/update", "/verbose",
@@ -152,7 +152,7 @@ SLASH_COMMANDS = [
     ("/infobar [detail|progress]", "Pick and save detailed stats or a context-progress bar"),
     ("/models", "Model picker: every model, roles (fan-out, side tasks), add your own"),
     ("/model <name>", "Switch model (no name: open the model picker)"),
-    ("/eval [provider/model|results|share]", "Evaluate one model on 12 Conch tasks; save locally and optionally share"),
+    ("/eval [provider/model|results|share] [--suite code]", "Evaluate one model on 12 Conch tasks (or 4 coding tasks with --suite code); save locally and optionally share"),
     ("/llamaidx", "Fleet status from the llama-idx registry (up/degraded/down boxes)"),
     ("/registry [set <url>|off]", "Show, wire, or remove the llama-idx registry (llamaidx_url)"),
     ("/provider <name>", "Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)"),
@@ -226,6 +226,7 @@ SLASH_COMMANDS = [
     ("/paste", "Paste lines literally; end with a lone '.' or Ctrl+D"),
     ("/edit", "Compose the next message in your editor"),
     ("/status", "Show version, provider, model, context window, and config"),
+    ("/ps [kill <id>]", "List or stop local_shell background processes"),
     ("/cost", "Show session token usage and cost"),
 ]
 
@@ -1438,6 +1439,62 @@ def _fanout_command(arg: str, config: dict) -> None:
           " <provider/model>.\033[0m\n")
 
 
+def _background_registry(tool_map):
+    shell = (tool_map or {}).get("local_shell")
+    if shell is None or not hasattr(shell, "processes"):
+        return None
+    return shell.processes()
+
+
+def _background_summary(tool_map) -> str:
+    """Summary such as '2 running, 1 finished' for /status ('' when none)."""
+    shell = (tool_map or {}).get("local_shell")
+    registry = getattr(shell, "_processes", None)
+    procs = registry.list() if registry is not None else []
+    if not procs:
+        return ""
+    running = sum(p.running() for p in procs)
+    return f"{running} running, {len(procs) - running} finished"
+
+
+def _ps_command(arg: str, tool_map) -> None:
+    """/ps lists this session's background processes; /ps kill <id|all>."""
+    from .bgproc import status_line
+
+    registry = _background_registry(tool_map)
+    if registry is None:
+        print("\n  \033[33mNo local shell client in this session.\033[0m\n")
+        return
+    parts = arg.split()
+    if parts and parts[0].lower() in ("kill", "stop"):
+        target = parts[1] if len(parts) > 1 else ""
+        if not target:
+            print("\n  Usage: /ps kill <id|all>\n")
+            return
+        if target.lower() == "all":
+            stopped = registry.kill_all()
+            print(f"\n  Stopped {len(stopped)} background process(es).\n")
+            return
+        proc = registry.kill(target)
+        if proc is None:
+            print(f"\n  \033[33mNo background process '{target}'.\033[0m\n")
+        else:
+            print(f"\n  Stopped {status_line(proc)}\n")
+        return
+    if parts:
+        print("\n  Usage: /ps [kill <id|all>]\n")
+        return
+    procs = registry.list()
+    if not procs:
+        print("\n  \033[2mNo background processes in this session.\033[0m\n")
+        return
+    print("\n  \033[1;36mBackground processes:\033[0m")
+    for proc in procs:
+        color = "\033[32m" if proc.running() else "\033[2m"
+        print(f"    {color}{status_line(proc)}\033[0m")
+    print("  \033[2m/ps kill <id|all> stops a process group.\033[0m\n")
+
+
 def handle_slash_command(
     cmd: str,
     config: dict,
@@ -1500,7 +1557,7 @@ def handle_slash_command(
             "  \033[1m/infobar [detail|progress]\033[0m Pick and save the info bar style\n"
             "  \033[1m/models\033[0m              Model picker: every model, roles, add your own\n"
             "  \033[1m/model <name>\033[0m        Switch model (no name: open the model picker)\n"
-            "  \033[1m/eval [provider/model]\033[0m Run 12 model checks; results browses, share publishes with consent\n"
+            "  \033[1m/eval [provider/model] [--suite code]\033[0m Run 12 model checks (--suite code: 4 coding checks); results browses, share publishes with consent\n"
             "  \033[1m/llamaidx\033[0m            Fleet status from the llama-idx registry\n"
             "  \033[1m/registry [set <url>|off]\033[0m  Show, wire, or remove the llama-idx registry\n"
             "  \033[1m/provider <name>\033[0m     Switch provider (claude-code, codex, anthropic, openai, cerebras, bedrock, openrouter, ollama, custom)\n"
@@ -1564,6 +1621,7 @@ def handle_slash_command(
             "  \033[1m/paste\033[0m               Paste lines literally; end with a lone '.' or Ctrl+D\n"
             "  \033[1m/edit\033[0m                Compose the next message in your editor (also /paste --editor)\n"
             "  \033[1m/status\033[0m              Show provider, model, context window, and config\n"
+            "  \033[1m/ps [kill <id>]\033[0m       List or stop background processes\n"
             "  \033[1m/cost\033[0m                Show session token usage and cost\n"
             "  \033[1m/reload\033[0m              Reload MCP tools\n"
             "  \033[1m/resettools\033[0m          Reset tool-calling if the model drifts to textual calls\n"
@@ -2645,6 +2703,10 @@ def handle_slash_command(
         )
         return None
 
+    if command == "/ps":
+        _ps_command(arg, tool_map)
+        return None
+
     if command == "/status":
         import shutil
         import textwrap
@@ -2689,6 +2751,9 @@ def handle_slash_command(
             print(f"    Session:        {turns} turns, {total_in:,} in / {total_out:,} out tokens")
         agent_status = "on" if get_agent_mode() else "off"
         print(f"    Agent mode:     {agent_status}")
+        _bg = _background_summary(tool_map)
+        if _bg:
+            print(f"    Background:     {_bg}  \033[2m(/ps)\033[0m")
         config_path = get_config_path()
         exists = "" if os.path.isfile(config_path) else "  \033[2m(not created yet — using defaults)\033[0m"
         print(f"    Config file:    {display_path(config_path)}{exists}")

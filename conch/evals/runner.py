@@ -18,6 +18,7 @@ from ..model_tuning import context_for, effort_for
 from ..providers import (DEFAULT_API_KEY_ENVS, RAW_FNS, _billing_kind,
                          get_custom_base_url, get_ollama_base_url)
 from .results import new_report, now, run_lock, save_report, scrub
+from .suites import DEFAULT_SUITE
 
 _RUN_LOCK = threading.Lock()
 _TRANSPORT_KEYS = (
@@ -147,14 +148,14 @@ def _recover_admissions(row: dict, path: Path) -> None:
 
 
 def _worker_case(config: dict, case_id: str, root: Path, limits: dict,
-                 deadline: float, progress) -> tuple:
+                 deadline: float, progress, suite: str = DEFAULT_SUITE) -> tuple:
     # -I ignores user site/PYTHONPATH. Explicitly locate this installed Conch,
     # not a package in the user's cwd or a second editable checkout.
     package_root = str(Path(__file__).resolve().parents[2])
     bootstrap = ("import sys; sys.path.insert(0, sys.argv[1]); "
                  "from conch.evals.worker import main; main()")
     checkpoint_path = root.parent / ("." + case_id + ".progress.json")
-    payload = json.dumps({"config": config, "case_id": case_id, "root": str(root),
+    payload = json.dumps({"config": config, "suite": suite, "case_id": case_id, "root": str(root),
                           "limits": limits,
                           "deadline_at": time.time() + max(0.0, deadline - time.monotonic()),
                           "checkpoint_path": str(checkpoint_path)}, allow_nan=False).encode()
@@ -219,7 +220,7 @@ def _worker_case(config: dict, case_id: str, root: Path, limits: dict,
 
 
 def run_suite(config: dict, target: dict, *, deadline_seconds: int = 300,
-              progress=None) -> dict:
+              progress=None, suite: str = DEFAULT_SUITE) -> dict:
     if isinstance(deadline_seconds, bool) or not isinstance(deadline_seconds, int) or not 1 <= deadline_seconds <= 3600:
         raise ValueError("Evaluation timeout must be between 1 and 3600 seconds.")
     if config.get("provider") != target.get("provider") or config.get("chat_model") != target.get("requested_model"):
@@ -228,7 +229,7 @@ def run_suite(config: dict, target: dict, *, deadline_seconds: int = 300,
         raise RuntimeError("An evaluation is already running in this Conch process.")
     report = None
     try:
-        report = new_report(target, deadline_seconds=deadline_seconds)
+        report = new_report(target, deadline_seconds=deadline_seconds, suite=suite)
         deadline = time.monotonic() + deadline_seconds
         with run_lock(report["run_id"]):
             save_report(report)
@@ -246,7 +247,7 @@ def run_suite(config: dict, target: dict, *, deadline_seconds: int = 300,
                     try:
                         result, interruption = _worker_case(
                             config, row["id"], Path(directory) / row["id"],
-                            report["limits"], deadline, progress,
+                            report["limits"], deadline, progress, report["suite"]["id"],
                         )
                         if result:
                             row.update(scrub(result))

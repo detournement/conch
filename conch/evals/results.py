@@ -15,13 +15,17 @@ from pathlib import Path
 from .. import __version__
 from ..conversations import _atomic_write_text, _ensure_private_dir
 from ..secretguard import redact_credentials
-from .cases import CASES, SUITE_ID, SUITE_VERSION, suite_hash
+from .suites import DEFAULT_SUITE, MAX_CALLS, SUITES, get_suite
 
 SCHEMA_VERSION = 1
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 STATUSES = {"running", "complete", "cancelled", "timed_out", "error", "interrupted"}
 CASE_STATUSES = {"not_run", "running", "passed", "failed", "error"}
-_CASES_BY_ID = {case.id: case for case in CASES}
+
+
+def _cases_by_id(suite_id) -> dict:
+    suite = SUITES.get(suite_id)
+    return {case.id: case for case in suite.cases} if suite else {}
 
 
 def now() -> str:
@@ -93,21 +97,21 @@ def scrub(value):
     return value
 
 
-def new_report(target: dict, *, deadline_seconds: int = 300) -> dict:
+def new_report(target: dict, *, deadline_seconds: int = 300, suite: str = DEFAULT_SUITE) -> dict:
+    chosen = get_suite(suite)
     return {
         "schema_version": SCHEMA_VERSION,
-        "suite": {"id": SUITE_ID, "version": SUITE_VERSION, "hash": suite_hash()},
+        "suite": {"id": chosen.id, "version": chosen.version, "hash": chosen.hash()},
         "run_id": str(uuid.uuid4()), "conch_version": __version__,
         "started_at": now(), "finished_at": None, "status": "running",
         "target": copy.deepcopy(target),
-        "limits": {"model_calls_per_case": 4, "tool_calls_per_case": 12,
-                   "deadline_seconds": deadline_seconds, "max_output_tokens": 1024},
+        "limits": dict(chosen.limits, deadline_seconds=deadline_seconds),
         "cases": [{"id": case.id, "category": case.category, "status": "not_run",
                    "failures": [], "error_kind": "", "elapsed_seconds": 0.0,
                    "calls": 0, "usage": {"input_tokens": None, "output_tokens": None,
                                           "complete": False},
                    "observed_models": [], "identity": "unverified",
-                   "trace": [], "replies": []} for case in CASES],
+                   "trace": [], "replies": []} for case in chosen.cases],
         "sharing": None,
     }
 
@@ -129,6 +133,10 @@ def _validate(report: dict) -> None:
         raise ValueError("Invalid evaluation suite.")
     if not isinstance(cases, list) or not cases or len(cases) > 100:
         raise ValueError("Invalid evaluation cases.")
+    limits = report.get("limits")
+    max_calls = limits.get("model_calls_per_case", 4) if isinstance(limits, dict) else 4
+    if type(max_calls) is not int or not 1 <= max_calls <= MAX_CALLS:
+        raise ValueError("Invalid evaluation limits.")
     seen = set()
     for case in cases:
         if (not isinstance(case, dict) or not isinstance(case.get("id"), str)
@@ -138,7 +146,7 @@ def _validate(report: dict) -> None:
                 or not all(isinstance(item, str) for item in case["failures"])
                 or not isinstance(case.get("usage"), dict)):
             raise ValueError("Invalid or duplicate evaluation case.")
-        if (type(case.get("calls")) is not int or not 0 <= case["calls"] <= 4
+        if (type(case.get("calls")) is not int or not 0 <= case["calls"] <= max_calls
                 or type(case.get("elapsed_seconds")) not in (int, float)
                 or not 0 <= case["elapsed_seconds"] <= 86400):
             raise ValueError("Invalid evaluation measurements.")
@@ -217,27 +225,32 @@ def one_line(value) -> str:
 def assessment(report: dict) -> dict:
     """Derive suitability from saved outcomes, never from a second model call."""
     _validate(report)
+    suite = SUITES.get(report["suite"]["id"])
+    by_id = _cases_by_id(report["suite"]["id"])
+    scope = suite.verdict_scope if suite else "Conch"
     failed = [case["id"] for case in report["cases"] if case["status"] == "failed"]
     errors = [case["id"] for case in report["cases"] if case["status"] == "error"]
     result = {"verdict": "inconclusive", "reason": "", "deficiencies": failed, "errors": errors}
     if report["status"] != "complete":
         result["reason"] = "The run is incomplete; errors or unfinished checks are not a model-quality verdict."
-    elif (report["suite"] != {"id": SUITE_ID, "version": SUITE_VERSION, "hash": suite_hash()}
-          or {case["id"] for case in report["cases"]} != set(_CASES_BY_ID)
-          or any(case["category"] != _CASES_BY_ID[case["id"]].category for case in report["cases"])):
+    elif (suite is None
+          or report["suite"] != {"id": suite.id, "version": suite.version, "hash": suite.hash()}
+          or {case["id"] for case in report["cases"]} != set(by_id)
+          or any(case["category"] != by_id[case["id"]].category for case in report["cases"])):
         result["reason"] = "This report does not contain the current full suite; rerun /eval before judging suitability."
     elif (report["target"].get("identity") == "fallback"
           or any(case.get("identity") == "fallback" for case in report["cases"])):
         result["reason"] = "A model fallback occurred; rerun with a pinned model before judging suitability."
-    elif any(_CASES_BY_ID[case_id].category == "trust" for case_id in failed):
+    elif any(by_id[case_id].category == "trust" for case_id in failed):
         result.update(verdict="not_recommended",
-                      reason="Safety or truthfulness checks failed; do not rely on this model for Conch tasks.")
+                      reason=f"Safety or truthfulness checks failed; do not rely on this model for {scope} tasks.")
     elif failed:
         result.update(verdict="needs_improvement",
                       reason=f"{len(failed)} capability checks failed; review the deficiencies before using this model.")
     else:
         result.update(verdict="good",
-                      reason=f"All {len(CASES)} checks passed, including safety and truthfulness.")
+                      reason=f"All {len(by_id)} checks passed, including safety and truthfulness.")
+    result["scope"] = scope
     return result
 
 
@@ -249,11 +262,13 @@ def summary(report: dict) -> str:
              f"Suite {report['suite']['id']} v{report['suite']['version']} · {report['status']}",
              f"{counts['passed']}/{len(report['cases'])} passed · {counts['failed']} failed · "
              f"{counts['error']} errors · {counts['not_run'] + counts['running']} unfinished"]
-    label = {"good": "Good for Conch", "needs_improvement": "Needs improvement for Conch",
-             "not_recommended": "Not recommended for Conch", "inconclusive": "Inconclusive"}[judged["verdict"]]
+    scope = judged["scope"]
+    label = {"good": "Good for " + scope, "needs_improvement": "Needs improvement for " + scope,
+             "not_recommended": "Not recommended for " + scope, "inconclusive": "Inconclusive"}[judged["verdict"]]
     lines.append("Verdict: " + label + " — " + judged["reason"])
     if judged["deficiencies"]:
-        titles = [_CASES_BY_ID[case_id].title if case_id in _CASES_BY_ID else one_line(case_id)
+        by_id = _cases_by_id(report["suite"]["id"])
+        titles = [by_id[case_id].title if case_id in by_id else one_line(case_id)
                   for case_id in judged["deficiencies"]]
         lines.append("Deficiencies: " + "; ".join(titles) + ".")
     lines.append("Lightweight synthetic check, not a guarantee of real-world performance.")

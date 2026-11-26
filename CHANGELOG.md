@@ -7,6 +7,21 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.6.0 predate this changelog.
 
+## [1.0.6] - 2026-11-26
+
+### Fixed
+
+- `conch update` (and Option-U) no longer refuses to update a checkout that
+  contains an untracked nested Git checkout, such as a coding agent's
+  worktree under `.claude/worktrees/`. Git cannot stash those directories,
+  so the updater mistook them for a concurrent writer and stopped with
+  "The checkout changed during preparation". They are now left in place;
+  merge and rebase still refuse to overwrite any untracked path.
+
+### Changed
+
+- `.gitignore` ignores `.claude/worktrees/`.
+
 ## [1.0.5] - 2026-11-25
 
 ### Added
@@ -875,6 +890,7 @@ Releases before 0.6.0 predate this changelog.
   values in place of private deployment identifiers, and the live-test org
   id is now supplied by the environment rather than a hardcoded default.
 
+[1.0.6]: https://github.com/detournement/conch/releases/tag/v1.0.6
 [1.0.5]: https://github.com/detournement/conch/releases/tag/v1.0.5
 [1.0.4]: https://github.com/detournement/conch/releases/tag/v1.0.4
 [1.0.3]: https://github.com/detournement/conch/releases/tag/v1.0.3

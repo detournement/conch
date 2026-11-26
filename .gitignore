@@ -40,3 +40,6 @@ build/
 .DS_Store
 *.swp
 *.swo
+
+# Coding agent worktrees
+.claude/worktrees/
